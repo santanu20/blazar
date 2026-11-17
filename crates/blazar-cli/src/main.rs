@@ -776,12 +776,11 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List every configured model pool with live member scores and
-    /// the decision each strategy would take right now
+    /// Inspect and steer model pools: live member tables, watch mode,
+    /// and runtime drain/pin overrides per member
     Pool {
-        /// Print the raw pools JSON instead of the cards
-        #[arg(long)]
-        json: bool,
+        #[command(subcommand)]
+        action: Option<PoolAction>,
     },
     /// One model, one report: residency, certificate, usage, sentinel
     /// detections, routing decision and the explain verdict combined
@@ -2668,7 +2667,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             timeout_secs,
         } => replicate_cmd(&model, peers.as_deref(), timeout_secs).await,
         Cmd::Route { model, json } => route_cmd(&model, json).await,
-        Cmd::Pool { json } => pool_cmd(json).await,
+        Cmd::Pool { action } => pool_cmd(action).await,
         Cmd::Diagnose { model, json } => diagnose_cmd(&model, json).await,
         Cmd::Why {
             trace,
@@ -14145,15 +14144,80 @@ async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `blazar pool`: every configured model pool with its live member
-/// table and the decision the strategy would take right now - the
-/// fleet-wide rollup of `blazar route <pool>`, from `GET /api/pools`.
-async fn pool_cmd(json: bool) -> Result<()> {
-    let base = ensure_daemon().await?;
+/// `blazar pool ...`: dispatches to the list cards, the live watch
+/// loop, and the per-member drain/pin operator verbs.
+async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
+    match action {
+        Some(PoolAction::Watch { interval_secs }) => pool_watch(interval_secs).await,
+        Some(PoolAction::Drain {
+            pool,
+            member,
+            ttl_secs,
+        }) => pool_member_op(&pool, &member, "drain", ttl_secs).await,
+        Some(PoolAction::Undrain { pool, member }) => {
+            pool_member_op(&pool, &member, "undrain", None).await
+        }
+        Some(PoolAction::Pin { pool, member }) => pool_member_op(&pool, &member, "pin", None).await,
+        Some(PoolAction::Unpin { pool, member }) => {
+            pool_member_op(&pool, &member, "unpin", None).await
+        }
+        // Bare `blazar pool` reads as `blazar pool list`.
+        Some(PoolAction::List { json }) => pool_list(json).await,
+        None => pool_list(false).await,
+    }
+}
+
+/// Fetch `GET /api/pools` (admin bearer attaches once keys exist) and
+/// return the parsed payload, teaching on non-success.
+async fn pools_fetch(base: &str) -> Result<serde_json::Value> {
     let mut req = cli_http()
         .get(format!("{base}/api/pools"))
         .timeout(std::time::Duration::from_secs(30));
-    // Member tables disclose peer URLs - admin plane, like /api/route.
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await?;
+    if !ok {
+        anyhow::bail!("daemon: {text}");
+    }
+    serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))
+}
+
+/// `blazar pool watch`: clear-screen refresh of the pool cards until
+/// Ctrl-C. Client-side polling by design - the tables exist already;
+/// a server stream would be a second transport for the same bytes.
+async fn pool_watch(interval_secs: u64) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    println!("refreshing every {interval_secs}s - Ctrl-C to stop");
+    loop {
+        let v = pools_fetch(&base).await?;
+        print!("\x1b[2J\x1b[1;1H");
+        render_pool_cards(&v);
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// POST /api/pools/{pool}/{action} with the member body, then print
+/// the daemon's note plus the pool's updated decision.
+async fn pool_member_op(
+    pool: &str,
+    member: &str,
+    action: &str,
+    ttl_secs: Option<u64>,
+) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let mut body = serde_json::json!({ "member": member });
+    if let Some(ttl) = ttl_secs {
+        body["ttl_secs"] = serde_json::json!(ttl);
+    }
+    let mut req = cli_http()
+        .post(format!("{base}/api/pools/{pool}/{action}"))
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&body);
+    // Overrides steer routing - admin plane, like the tables they act on.
     if let Some(b) = admin_bearer() {
         req = req.bearer_auth(b);
     }
@@ -14165,6 +14229,23 @@ async fn pool_cmd(json: bool) -> Result<()> {
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    if let Some(note) = v["note"].as_str() {
+        println!("{note}");
+    }
+    println!(
+        "decision   {} - {}",
+        v["decision"]["target"].as_str().unwrap_or("unknown"),
+        v["decision"]["reason"].as_str().unwrap_or("unknown"),
+    );
+    Ok(())
+}
+
+/// `blazar pool list`: every configured model pool with its live
+/// member table and the decision the strategy would take right now -
+/// the fleet-wide rollup of `blazar route <pool>`, from `GET /api/pools`.
+async fn pool_list(json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let v = pools_fetch(&base).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -14173,6 +14254,18 @@ async fn pool_cmd(json: bool) -> Result<()> {
     if pools.is_empty() {
         println!("no model pools configured (see [[model_pools]] in the setup docs)");
         return Ok(());
+    }
+    render_pool_cards(&v);
+    Ok(())
+}
+
+/// The pool card renderer shared by `list` (one shot) and `watch`
+/// (refreshed): header + decision + member table per pool.
+fn render_pool_cards(v: &serde_json::Value) {
+    let pools = v["pools"].as_array().cloned().unwrap_or_default();
+    if pools.is_empty() {
+        println!("no model pools configured (see [[model_pools]] in the setup docs)");
+        return;
     }
     for p in &pools {
         println!(
@@ -14205,11 +14298,14 @@ async fn pool_cmd(json: bool) -> Result<()> {
                             ),
                             m["affinity_keys"].as_u64().unwrap_or(0).to_string(),
                             if m["down"].as_bool().unwrap_or(false) {
-                                "down"
+                                "down".to_string()
+                            } else if m["drained"].as_bool().unwrap_or(false) {
+                                "drained".to_string()
+                            } else if m["pinned"].as_bool().unwrap_or(false) {
+                                "pinned".to_string()
                             } else {
-                                "-"
-                            }
-                            .to_string(),
+                                "-".to_string()
+                            },
                         ]
                     })
                     .collect()
@@ -14220,9 +14316,7 @@ async fn pool_cmd(json: bool) -> Result<()> {
             println!(
                 "{}",
                 render_table(
-                    &[
-                        "MEMBER", "TIER", "EST WAIT", "SERVICE", "AFFINITY", "BREAKER",
-                    ],
+                    &["MEMBER", "TIER", "EST WAIT", "SERVICE", "AFFINITY", "STATE",],
                     &rows,
                     &[2, 3],
                 )
@@ -14230,7 +14324,6 @@ async fn pool_cmd(json: bool) -> Result<()> {
         }
         println!();
     }
-    Ok(())
 }
 
 async fn route_cmd(model: &str, json: bool) -> Result<()> {
@@ -14854,6 +14947,41 @@ Alternatives: model_overrides in ~/.config/blazar/config.toml, or per-request op
         spec.loras.len()
     );
     Ok(())
+}
+
+/// `blazar pool [list]|watch|drain|undrain|pin|unpin` - the member
+/// tables and operator overrides for configured model pools.
+#[derive(clap::Subcommand)]
+enum PoolAction {
+    /// List every configured pool with live member scores and the
+    /// decision each strategy would take right now
+    List {
+        /// Print the raw pools JSON instead of the cards
+        #[arg(long)]
+        json: bool,
+    },
+    /// Live-refresh the pool cards (Ctrl-C to stop)
+    Watch {
+        /// Seconds between refreshes
+        #[arg(long, default_value_t = 2)]
+        interval_secs: u64,
+    },
+    /// Stop routing new requests to one member (maintenance window);
+    /// with no alternative the pool still serves through it
+    Drain {
+        pool: String,
+        /// Member as routed (the `effective` string from `blazar pool`)
+        member: String,
+        /// Re-enable automatically after this many seconds
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+    /// Resume routing to a drained member
+    Undrain { pool: String, member: String },
+    /// Prefer one member above the strategy while it stays healthy
+    Pin { pool: String, member: String },
+    /// Release a pinned member back to the strategy
+    Unpin { pool: String, member: String },
 }
 
 /// `blazar keys [list]|add|rm` - HTTP client to the daemon's

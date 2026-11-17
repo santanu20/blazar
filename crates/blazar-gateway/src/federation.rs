@@ -472,6 +472,129 @@ pub async fn pools(
     axum::Json(serde_json::json!({ "pools": pools, "count": count })).into_response()
 }
 
+/// `POST /api/pools/{name}/{action}` - runtime operator overrides on
+/// one pool member. Actions: `drain` (cordon, optional `ttl_secs`
+/// after which the member re-enters rotation), `undrain`, `pin`
+/// (outrank the strategy while healthy), `unpin`. Body: `{ "member":
+/// "<effective string>", "ttl_secs": <optional> }`. In-memory only -
+/// a restart clears every override; permanent membership changes
+/// belong in `[[model_pools]]`. Same admin gate as the pool reads.
+///
+/// Refuses the contradictory combination outright: pinning a drained
+/// member answers 400 (undrain first), and draining a pinned member
+/// auto-unpins (a drain is an explicit "no traffic" - leaving the pin
+/// would flip traffic straight back on TTL expiry).
+#[allow(clippy::too_many_lines)] // one cohesive action parser; splitting scatters the 404/400 contract
+pub async fn pool_member_op(
+    State(state): State<Arc<AppState>>,
+    Path((name, action)): Path<(String, String)>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key_ext.as_deref())
+    {
+        return api_error(code, &msg);
+    }
+    let cfg = state.cfg();
+    let Some(pool) = crate::pools::find(&cfg, &name) else {
+        return api_error(
+            404,
+            &format!("no pool named '{name}' (GET /api/pools lists the configured ones)"),
+        );
+    };
+    let Some(member) = body["member"].as_str().map(str::to_string) else {
+        return api_error(400, "body needs {\"member\": \"<effective string>\"}");
+    };
+    // Validate against the live member table so the error teaches the
+    // exact effective strings (remote members are "peer:model", local
+    // members their configured spelling).
+    let scored = crate::pools::score_members(&state, pool);
+    if !scored.iter().any(|m| m.effective == member) {
+        let known: Vec<&str> = scored.iter().map(|m| m.effective.as_str()).collect();
+        return api_error(
+            404,
+            &format!(
+                "pool '{name}' has no member '{member}' (members: {})",
+                known.join(", ")
+            ),
+        );
+    }
+    let ttl_secs = body["ttl_secs"].as_u64();
+    let key = crate::pools::ops_key(&name, &member);
+    let now = std::time::Instant::now();
+    let mut note = String::new();
+    if let Ok(mut ops) = state.pools_ops.lock() {
+        match action.as_str() {
+            "drain" => {
+                let entry = ops.entry(key.clone()).or_default();
+                let was_pinned = entry.pinned;
+                *entry = crate::pools::MemberOps {
+                    drained: true,
+                    drained_until: ttl_secs.map(|s| now + std::time::Duration::from_secs(s)),
+                    pinned: false,
+                };
+                note = format!(
+                    "member '{member}' drained{}{} - excluded from picks while an alternative exists",
+                    ttl_secs.map_or_else(String::new, |s| format!(" for {s}s")),
+                    if was_pinned {
+                        " (pin dropped - a drain is an explicit no-traffic)"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            "undrain" => {
+                let entry = ops.entry(key.clone()).or_default();
+                entry.drained = false;
+                entry.drained_until = None;
+                if *entry == crate::pools::MemberOps::default() {
+                    ops.remove(&key);
+                }
+                note = format!("member '{member}' restored to rotation");
+            }
+            "pin" => {
+                let entry = ops.entry(key.clone()).or_default();
+                if entry.is_drained(now) {
+                    return api_error(
+                        400,
+                        &format!(
+                            "member '{member}' is drained - undrain it before pinning (a pin would immediately re-enter traffic)"
+                        ),
+                    );
+                }
+                entry.pinned = true;
+                note = format!(
+                    "member '{member}' pinned - outranks the {:?} strategy while healthy",
+                    pool.strategy
+                );
+            }
+            "unpin" => {
+                let entry = ops.entry(key.clone()).or_default();
+                entry.pinned = false;
+                if *entry == crate::pools::MemberOps::default() {
+                    ops.remove(&key);
+                }
+                note = format!(
+                    "member '{member}' returned to the {:?} strategy",
+                    pool.strategy
+                );
+            }
+            other => {
+                return api_error(
+                    400,
+                    &format!("unknown action '{other}' (drain | undrain | pin | unpin)"),
+                );
+            }
+        }
+    }
+    // Echo the fresh member table + decision plus what happened, so
+    // one response shows both the override and its effect.
+    let mut payload = crate::pools::route_json(&state, pool);
+    payload["note"] = serde_json::Value::String(note);
+    payload["member"] = serde_json::Value::String(member);
+    axum::Json(payload).into_response()
+}
+
 /// `GET /api/route/{model}` - the scheduling decision an incoming
 /// request for this model would take, with every signal behind it.
 /// Read-only; forces a presence refresh only when the model is not

@@ -458,6 +458,141 @@ async fn client__model_pool__routes_member_scope_and_route_table() {
     stub.shutdown().await;
 }
 
+/// Pool member operator overrides: drain skips a member while an
+/// alternative exists, undrain restores it, pin outranks the strategy,
+/// and both verbs are admin-plane (scoped keys get 403).
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn client__model_pool__drain_and_pin_operator_overrides() {
+    let stub = support::spawn_remote_stub().await;
+    let cfg = blazar_core::Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "admin".into(),
+                key: "plm_admin".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "scoped".into(),
+                key: "plm_scoped".into(),
+                models: vec!["far:m1".into()],
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..blazar_core::Config::default()
+    };
+    let cfg = support::with_remote(cfg, "far", &stub.base);
+    let cfg = support::with_pool(
+        cfg,
+        "svc",
+        blazar_core::config::PoolStrategy::Ordered,
+        &[("local", "m1"), ("far", "m1")],
+    );
+    let ts = start(cfg).await;
+    let c = client();
+
+    let route = |c: &reqwest::Client| {
+        c.get(format!("{}/api/route/svc", ts.base))
+            .bearer_auth("plm_admin")
+    };
+    let op = |c: &reqwest::Client, action: &str, member: &str, bearer: &str| {
+        c.post(format!("{}/api/pools/svc/{action}", ts.base))
+            .bearer_auth(bearer)
+            .json(&serde_json::json!({ "member": member }))
+    };
+
+    // Baseline: ordered picks the first declared (local) member.
+    let r: serde_json::Value = route(&c).send().await.unwrap().json().await.unwrap();
+    assert_eq!(r["decision"]["target"], "m1", "baseline: {r}");
+
+    // Drain the local member: the decision moves to the remote one and
+    // the table flags the drained state.
+    let r: serde_json::Value = op(&c, "drain", "m1", "plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r["decision"]["target"], "far:m1",
+        "drain moves the pick: {r}"
+    );
+    assert!(
+        r["note"].as_str().is_some_and(|n| !n.is_empty()),
+        "operator response carries a note: {r}"
+    );
+    let drained = r["pool"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["effective"].as_str() == Some("m1"))
+        .expect("local member listed");
+    assert_eq!(drained["drained"], true, "table flags the drain");
+
+    // Operator verbs are admin-plane: a scoped inference key gets 403.
+    let resp = op(&c, "drain", "m1", "plm_scoped").send().await.unwrap();
+    assert_eq!(resp.status(), 403, "scoped key cannot steer the pool");
+
+    // Pinning a drained member teaches instead of contradicting drain.
+    let resp = op(&c, "pin", "m1", "plm_admin").send().await.unwrap();
+    assert_eq!(resp.status(), 400, "pin on drained member refuses");
+
+    // Undrain restores declaration order.
+    let r: serde_json::Value = op(&c, "undrain", "m1", "plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["decision"]["target"], "m1", "undrain restores: {r}");
+
+    // Pin outranks the strategy (ordered would pick the local member).
+    let r: serde_json::Value = op(&c, "pin", "far:m1", "plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r["decision"]["target"], "far:m1",
+        "pin outranks ordered: {r}"
+    );
+    assert!(
+        r["decision"]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("operator pinned")),
+        "decision reason names the override: {r}"
+    );
+
+    // Unpin returns the pool to strategy order.
+    let r: serde_json::Value = op(&c, "unpin", "far:m1", "plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["decision"]["target"], "m1", "unpin restores: {r}");
+
+    // Unknown member and unknown pool teach back what exists.
+    let resp = op(&c, "drain", "nope", "plm_admin").send().await.unwrap();
+    assert_eq!(resp.status(), 404, "unknown member refused");
+    let resp = c
+        .post(format!("{}/api/pools/ghost/drain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "member": "m1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown pool refused");
+
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub.shutdown().await;
+}
+
 /// Local member service EWMA: completing one chat through a
 /// local-member pool stamps the per-model EWMA, and the route table
 /// reflects `service_measured: true` for that member (the local twin

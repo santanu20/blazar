@@ -171,6 +171,9 @@ pub struct StickyPick {
 
 /// A member with its synthesized score and effective routing string.
 #[derive(Debug, Clone)]
+// A scoring row: strategy inputs plus operator-state flags. Bools
+// read clearer than a bitfield here (each names one exact override).
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct MemberScore {
     /// Index into `pool.members` (declaration order survives ties).
     pub idx: usize,
@@ -191,6 +194,43 @@ pub(crate) struct MemberScore {
     /// by `ordered`; score-aware strategies already rank it last via
     /// the unknown/cold tier plus its stale signals).
     pub down: bool,
+    /// Operator drain (`POST /api/pools/{name}/drain`): the member
+    /// receives no new picks while any alternative exists. Never
+    /// persists across restarts.
+    pub drained: bool,
+    /// Operator pin (`POST /api/pools/{name}/pin`): outranks every
+    /// strategy while the member's peer is healthy.
+    pub pinned: bool,
+}
+
+/// Runtime operator override for one pool member, keyed
+/// `"{pool}:{effective}"` in [`AppState::pools_ops`]. Drain optionally
+/// carries a deadline (maintenance window) after which the member
+/// quietly rejoins the rotation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemberOps {
+    pub drained: bool,
+    pub drained_until: Option<Instant>,
+    pub pinned: bool,
+}
+
+impl MemberOps {
+    /// Drain is active while the flag is set and the optional deadline
+    /// (a maintenance-window TTL) has not passed.
+    #[must_use]
+    pub fn is_drained(&self, now: Instant) -> bool {
+        self.drained
+            && match self.drained_until {
+                None => true,
+                Some(deadline) => now < deadline,
+            }
+    }
+}
+
+/// Key under which a member's [`MemberOps`] live.
+#[must_use]
+pub fn ops_key(pool: &str, effective: &str) -> String {
+    format!("{pool}:{effective}")
 }
 
 /// Find the pool a request name addresses, if any. Exact match only -
@@ -278,6 +318,8 @@ pub(crate) fn score_members_core(
                     service_ms,
                     measured,
                     down: false,
+                    drained: false,
+                    pinned: false,
                 }
             } else {
                 let remote = cfg
@@ -300,6 +342,8 @@ pub(crate) fn score_members_core(
                     service_ms,
                     measured,
                     down,
+                    drained: false,
+                    pinned: false,
                 }
             }
         })
@@ -351,7 +395,8 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
             (m.model.clone(), row_name)
         })
         .collect();
-    score_members_core(
+    let now = Instant::now();
+    let mut members = score_members_core(
         pool,
         &state.cfg(),
         queue_depth,
@@ -361,15 +406,39 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         &local_service,
         &local_ttft,
         &local_names,
-        Instant::now(),
-    )
+        now,
+    );
+    // Operator overrides (drain/pin) stamp on top of the scored view;
+    // lazy deadline expiry keeps the map honest without a sweeper.
+    if let Ok(ops) = state.pools_ops.lock() {
+        for m in &mut members {
+            if let Some(op) = ops.get(&ops_key(&pool.name, &m.effective)).copied() {
+                m.drained = op.is_drained(now);
+                // A drained member can never be pinned (the API refuses
+                // the combination; expired drains release the pin slot).
+                m.pinned = op.pinned && !m.drained;
+            }
+        }
+    }
+    members
 }
 
 /// Pick the serving member per the pool strategy. Ties break to
-/// declaration order (stable min over `idx`). When every remote
-/// member is down and no other member exists, the least-bad member is
-/// still returned so the request surfaces the peer's real error
-/// instead of a confusing not-found on the pool name.
+/// declaration order (stable min over `idx`).
+///
+/// Eligibility first: members whose peer is marked down or that the
+/// operator drained are excluded from every strategy. When EVERY
+/// member is excluded the strategy runs over the raw list instead -
+/// pools never hard-fail on health or drains alone, so the request
+/// surfaces the real state (the peer's error, or the drained member
+/// itself) rather than a confusing not-found on the pool name.
+///
+/// A pinned member returns before any strategy arm: pinning is an
+/// operator override, not a strategy signal, and operator intent
+/// outranks strategy choice - including `ordered`'s declaration
+/// determinism (the operator IS reordering, deliberately). A pinned
+/// member that goes down or gets drained re-enters the normal
+/// eligibility rules automatically.
 ///
 /// `sticky` is the pool's last adaptive pick (hysteresis): a healthy
 /// member within [`POOL_STICKY_MARGIN`] of the best expected
@@ -381,10 +450,16 @@ pub(crate) fn pick<'a>(
     sticky: Option<&StickyPick>,
     affinity: Option<(&str, u64)>,
 ) -> Option<&'a MemberScore> {
+    let view: Vec<&MemberScore> = members.iter().filter(|m| !m.down && !m.drained).collect();
+    let all: Vec<&MemberScore> = members.iter().collect();
+    let list: &[&MemberScore] = if view.is_empty() { &all } else { &view };
+    if let Some(pinned) = list.iter().copied().find(|m| m.pinned) {
+        return Some(pinned);
+    }
     match pool.strategy {
-        // Failover posture: first member whose peer is not marked
-        // down. The local member is always eligible.
-        PoolStrategy::Ordered => members.iter().find(|m| !m.down),
+        // Failover posture: first eligible member in declaration
+        // order (drains and breaker state skip ahead).
+        PoolStrategy::Ordered => list.first().copied(),
         // Wait-first posture: the affinity member's re-prefill cost
         // drops out of its wait estimate exactly as it does for
         // `adaptive` - a member holding the prefix KV serves this
@@ -396,18 +471,12 @@ pub(crate) fn pick<'a>(
                 }
                 _ => m.score.est_wait_ms,
             };
-            members
-                .iter()
-                .filter(|m| !m.down)
-                .min_by_key(|m| (wait(m), m.idx))
-                .or_else(|| members.iter().min_by_key(|m| (m.score.est_wait_ms, m.idx)))
+            list.iter().copied().min_by_key(|m| (wait(m), m.idx))
         }
         // Warm-first: the PeerScore order (tier, wait, free VRAM) with
         // the same affinity discount the other scoring strategies
-        // apply - among equally-warm members, the one holding this
-        // opener's prefix KV genuinely serves sooner. Down peers are
-        // excluded (all-down falls back to the raw order so the
-        // request surfaces the peer's real error).
+        // apply - among equally warm members, the one holding this
+        // opener's prefix KV genuinely serves sooner.
         PoolStrategy::WarmFirst => {
             let rank = |m: &MemberScore| {
                 let wait = match affinity {
@@ -418,20 +487,16 @@ pub(crate) fn pick<'a>(
                 };
                 (m.score.tier, wait, m.score.free_vram)
             };
-            members
-                .iter()
-                .filter(|m| !m.down)
-                .min_by_key(|m| (rank(m), m.idx))
-                .or_else(|| members.iter().min_by_key(|m| (m.score, m.idx)))
+            list.iter().copied().min_by_key(|m| (rank(m), m.idx))
         }
         // Least expected completion: wait + service time, warm tier as
-        // the tie-break. Until at least one member carries a measured
-        // service EWMA the service term is the declared default for
-        // everyone and the completion order collapses onto the
-        // warm-first order (documented parity, pinned by test).
+        // the tie-break. Until at least one ELIGIBLE member carries a
+        // measured service EWMA the service term is the declared
+        // default for everyone and the completion order collapses onto
+        // the warm-first order (documented parity, pinned by test).
         PoolStrategy::Adaptive => {
-            if !members.iter().any(|m| m.measured) {
-                return members.iter().min_by_key(|m| (m.score, m.idx));
+            if !list.iter().any(|m| m.measured) {
+                return list.iter().copied().min_by_key(|m| (m.score, m.idx));
             }
             // Cache affinity: the member that recently served this
             // prompt prefix likely still holds its KV cache, so its
@@ -446,10 +511,10 @@ pub(crate) fn pick<'a>(
                     _ => base,
                 }
             };
-            let best_total = members.iter().filter(|m| !m.down).map(total).min()?;
-            let best = members
+            let best_total = list.iter().copied().map(total).min()?;
+            let best = list
                 .iter()
-                .filter(|m| !m.down)
+                .copied()
                 .min_by_key(|m| (total(m), m.score.tier, m.idx))?;
             // Hysteresis: keep the previous pick when it is still
             // healthy, fresh, and within the margin of the best
@@ -458,9 +523,7 @@ pub(crate) fn pick<'a>(
             // stays in integer math: best + best/10 = +10%.
             if let Some(s) = sticky
                 && s.at.elapsed() < POOL_STICKY_WINDOW
-                && let Some(current) = members
-                    .iter()
-                    .find(|m| m.effective == s.effective && !m.down)
+                && let Some(current) = list.iter().copied().find(|m| m.effective == s.effective)
             {
                 let current_total = total(current);
                 let threshold = best_total.saturating_add(best_total / 10);
@@ -603,6 +666,8 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "service_measured": m.measured,
                 "free_vram": m.score.free_vram.0,
                 "down": m.down,
+                "drained": m.drained,
+                "pinned": m.pinned,
                 "affinity_keys": affinity_live
                     .iter()
                     .filter(|(eff, _)| *eff == m.effective)
@@ -627,13 +692,14 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "member": format!("{}:{}", pool.members[m.idx].peer, pool.members[m.idx].model),
                 "strategy": format!("{:?}", pool.strategy),
                 "reason": format!(
-                    "pool '{}' picked member {} under {:?} (tier {}, est wait {} ms, service {} ms{})",
+                    "pool '{}' picked member {} under {:?} (tier {}, est wait {} ms, service {} ms{}{})",
                     pool.name,
                     m.effective,
                     pool.strategy,
                     crate::federation::tier_name(m.score.tier),
                     m.score.est_wait_ms,
                     m.service_ms,
+                    if m.pinned { ", operator pinned" } else { "" },
                     if sticky_held { ", sticky" } else { "" }
                 ),
             })
@@ -711,6 +777,8 @@ mod tests {
             service_ms: SERVICE_DEFAULT_MS,
             measured: false,
             down,
+            drained: false,
+            pinned: false,
         }
     }
 
@@ -908,6 +976,138 @@ mod tests {
         ];
         let picked = pick(&p, &members, None, Some(("far:m1", 750))).expect("two members");
         assert_eq!(picked.idx, 0, "ordered keeps declaration order");
+    }
+
+    /// `MemberOps::is_drained` truth table: an undrained entry never
+    /// counts, a deadline-free drain lasts forever, a future deadline
+    /// holds and an expired one self-restores the member.
+    #[test]
+    fn unit__member_ops__drain_deadline_truth_table() {
+        let now = Instant::now();
+        let undrained = MemberOps {
+            drained: false,
+            drained_until: Some(now + std::time::Duration::from_secs(60)),
+            pinned: false,
+        };
+        assert!(!undrained.is_drained(now));
+        let forever = MemberOps {
+            drained: true,
+            drained_until: None,
+            pinned: false,
+        };
+        assert!(forever.is_drained(now));
+        let ttl = MemberOps {
+            drained: true,
+            drained_until: Some(now + std::time::Duration::from_secs(60)),
+            pinned: false,
+        };
+        assert!(ttl.is_drained(now));
+        assert!(
+            !ttl.is_drained(now + std::time::Duration::from_secs(61)),
+            "an expired drain self-restores"
+        );
+    }
+
+    /// A drained member is skipped while an alternative exists - even
+    /// by `ordered`, where declaration order otherwise wins.
+    #[test]
+    fn unit__pick__drained_member_skipped_while_alternative_exists() {
+        let p = pool(PoolStrategy::Ordered);
+        let members = vec![
+            MemberScore {
+                drained: true,
+                ..scored(0, "m1", 0, 10, 9999, false)
+            },
+            scored(1, "far:m1", 2, 1500, 0, false),
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 1, "drained first-declared member is skipped");
+        // The exclusion reaches every strategy, not just ordered.
+        let p = pool(PoolStrategy::LeastWait);
+        let members = vec![
+            MemberScore {
+                drained: true,
+                ..scored(0, "m1", 0, 10, 9999, false)
+            },
+            scored(1, "far:m1", 2, 1500, 0, false),
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(
+            picked.idx, 1,
+            "drained member loses least_wait despite lower wait"
+        );
+    }
+
+    /// When every member is down or drained the pool still serves
+    /// through the least-bad one instead of failing the request -
+    /// the unified fallback contract across all strategies.
+    #[test]
+    fn unit__pick__all_excluded_falls_back_to_raw_order() {
+        for strategy in [
+            PoolStrategy::Ordered,
+            PoolStrategy::LeastWait,
+            PoolStrategy::WarmFirst,
+            PoolStrategy::Adaptive,
+        ] {
+            let p = pool(strategy);
+            let members = vec![
+                MemberScore {
+                    drained: true,
+                    ..scored(0, "m1", 0, 10, 9999, false)
+                },
+                scored(1, "far:m1", 2, 1500, 0, true),
+            ];
+            let picked = pick(&p, &members, None, None)
+                .unwrap_or_else(|| panic!("{strategy:?} still picks"));
+            assert_eq!(picked.idx, 0, "{strategy:?} falls back to the raw order");
+        }
+    }
+
+    /// A pinned member outranks the strategy while healthy - even
+    /// `ordered`'s declaration order (the operator IS the reorder) -
+    /// and the pin auto-voids when the member is down or drained.
+    #[test]
+    fn unit__pick__pinned_member_outranks_strategy_until_unhealthy() {
+        let p = pool(PoolStrategy::Ordered);
+        let members = vec![
+            scored(0, "m1", 0, 10, 9999, false),
+            MemberScore {
+                pinned: true,
+                ..scored(1, "far:m1", 2, 1500, 0, false)
+            },
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 1, "pin outranks ordered declaration order");
+        let p = pool(PoolStrategy::LeastWait);
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 1, "pin outranks least_wait's smaller wait");
+        // Down or drained voids the pin: no eligible member carries it.
+        let down_pinned = vec![
+            scored(0, "m1", 0, 10, 9999, false),
+            MemberScore {
+                pinned: true,
+                ..scored(1, "far:m1", 2, 1500, 0, true)
+            },
+        ];
+        let picked = pick(&p, &down_pinned, None, None).expect("two members");
+        assert_eq!(picked.idx, 0, "a down pinned member loses its pin");
+    }
+
+    /// A drained-but-pinned member is excluded, not pinned: drain is
+    /// the stronger operator statement (maintenance wins).
+    #[test]
+    fn unit__pick__drain_beats_pin() {
+        let p = pool(PoolStrategy::Ordered);
+        let members = vec![
+            scored(0, "m1", 0, 10, 9999, false),
+            MemberScore {
+                drained: true,
+                pinned: true,
+                ..scored(1, "far:m1", 2, 1500, 0, false)
+            },
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 0, "drained member excluded despite pin");
     }
 
     /// Adaptive without any measured service signal equals warm-first:

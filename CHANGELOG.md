@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Pool member drain/pin operator overrides + `blazar pool watch`.** `POST /api/pools/{pool}/{drain|undrain|pin|unpin}` steers routing at runtime without a config edit or restart: drain skips a member while an alternative exists (optional `ttl_secs` maintenance window self-restores it), pin holds one member above the strategy while it stays healthy - even for `ordered`, where the operator is deliberately the reorder. Drained members cannot be pinned; if every member is down or drained the pool still serves through the least-bad one. All overrides are in-memory (restart clears) and admin-plane, and surface as `drained`/`pinned` flags in the member tables. The `blazar pool` command grew subcommands (`pool list --json`, `pool watch` live-refresh, and the four verbs) - `blazar pool --json` from earlier today reads as `blazar pool list --json` now.
 - **`GET /api/pools` + `blazar pool`.** Every configured model pool in one admin read: per-pool member table (tier, measured/default wait and service estimates, live cache-affinity keys, breaker state) and the decision each strategy would take right now - the fleet rollup of `/api/route/{pool}`.
 - **Affinity-aware `warm_first` + down-safe scoring.** The cache-affinity discount now reaches `warm_first` (within a warm tier, the member holding this opener's prefix KV wins ties and closes wait gaps up to the discount), and a peer marked down can no longer win `warm_first` on a stale score - the same down-safety `least_wait` received. `ordered` deliberately stays pure declaration order: determinism is that strategy's contract.
 - **Measured local TTFT lane for pool wait estimates.** The usage tap now folds time-to-first-token into a per-model EWMA (stamped under both the requested alias and the effective member, the same double-row identity usage attribution uses). Pool scoring multiplies local members' queue waves by this measured TTFT instead of the fixed default - mirroring how remote members already scale by their per-peer TTFT EWMA - with the same 5-minute staleness decay toward the declared default.
@@ -147,6 +148,7 @@ tracked here.
   before re-enabling strict mode.
 
 ### Fixed
+- Pool strategies `ordered`, `warm_first` and `adaptive` previously returned no member when every member was down (only `least_wait` had a fallback); all strategies now degrade to the least-bad member so the request surfaces the peer's real error instead of a not-found on the pool name.
 
 - **OpenAI remote lane now charges key token budgets.** Requests to
   `<remote>:<model>` on the `/v1` chat lane previously returned the
