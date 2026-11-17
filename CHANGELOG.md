@@ -7,6 +7,8 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Service-EWMA staleness decay.** Service-time EWMA observations (local per-model and remote per-peer) now carry a timestamp and blend linearly back toward the declared default over 5 minutes of silence; a fully stale observation reads as unmeasured, restoring the `adaptive` == `warm_first` no-signal parity for idle members whose engines have likely been idle-sleep-evicted.
+- **`blazar keys show <name>`.** One key in detail: redacted secret, model scope, rate/token/concurrency limits, scheduling weight, MCP server/tool grants, and today's live usage - the CLI twin of the console Keys tab. Unknown names teach back the configured key list.
 - MCP grant visibility: `blazar keys` lists per-key `mcp_servers`/`mcp_tools` scopes and the `/ui` console gains a Keys tab (paste an unscoped admin key per tab session to list keys, scopes and usage).
 
 - **Local per-model service-time EWMA.** Completed local chat round

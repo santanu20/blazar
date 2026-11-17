@@ -1147,7 +1147,9 @@ pub fn charge_outgoing(
 /// out via the EWMA. Poisoned or missing map entries are skipped -
 /// the probe is advisory telemetry, never a request-path failure.
 pub struct LocalServiceStamp {
-    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    map: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+    >,
     model: String,
     started: std::time::Instant,
     /// Set by [`LocalServiceStamp::cancel`]: failed forwards and
@@ -1160,7 +1162,9 @@ impl LocalServiceStamp {
     /// (chat routes, success status, non-empty model) - this is just
     /// the captured context.
     pub fn new(
-        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+        map: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+        >,
         model: &str,
     ) -> Self {
         Self {
@@ -1181,7 +1185,9 @@ impl LocalServiceStamp {
     /// start (`t0`), so the probe measures the full round trip, not
     /// just the post-response build tail.
     pub fn from_started(
-        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+        map: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+        >,
         model: &str,
         started: std::time::Instant,
     ) -> Self {
@@ -1200,11 +1206,15 @@ impl Drop for LocalServiceStamp {
             return;
         }
         let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let now = std::time::Instant::now();
         if let Ok(mut map) = self.map.lock() {
             match map.get_mut(&self.model) {
-                Some(ewma) => *ewma = crate::hint_ewma(Some(*ewma), ms),
+                Some((ewma, at)) => {
+                    *ewma = crate::hint_ewma(Some(*ewma), ms);
+                    *at = now;
+                }
                 None => {
-                    map.insert(self.model.clone(), ms);
+                    map.insert(self.model.clone(), (ms, now));
                 }
             }
         }
@@ -2005,14 +2015,15 @@ mod tests {
     /// caller's `t0` (buffered round trips).
     #[test]
     fn unit__local_service_stamp__drop_stamps_per_model_ewma() {
-        let map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
-            std::sync::Arc::default();
+        let map: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+        > = std::sync::Arc::default();
         {
             let s = LocalServiceStamp::new(std::sync::Arc::clone(&map), "m1");
             std::thread::sleep(std::time::Duration::from_millis(30));
             drop(s);
         }
-        let first = *map.lock().unwrap().get("m1").expect("first stamp landed");
+        let first = map.lock().unwrap().get("m1").expect("first stamp landed").0;
         assert!(first >= 30.0, "elapsed ms observed, got {first}");
         {
             // Second observation blends: 0.7 * first + 0.3 * 100.
@@ -2022,12 +2033,16 @@ mod tests {
             let s = LocalServiceStamp::from_started(std::sync::Arc::clone(&map), "m1", started);
             drop(s);
         }
-        let blended = *map.lock().unwrap().get("m1").unwrap();
+        let blended = map.lock().unwrap().get("m1").unwrap().0;
         // 0.7*first + 0.3*100; assert the blend moved toward 100 from
         // first without pinning wall-clock exactness.
         assert!(
             blended > first * 0.69 && blended < first + 31.0,
             "EWMA blend 0.3 between {first} and 100, got {blended}"
+        );
+        // Timestamps ride along for the pools' staleness decay.
+        assert!(
+            map.lock().unwrap().get("m1").unwrap().1.elapsed() < std::time::Duration::from_secs(1)
         );
         // A different model keeps its own entry.
         assert!(!map.lock().unwrap().contains_key("m2"));

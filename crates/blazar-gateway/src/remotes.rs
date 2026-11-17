@@ -42,8 +42,13 @@ pub struct RemoteHealth {
     /// streams only) in milliseconds. Measured by the EOF lease lane;
     /// `None` until the first cleanly-drained stream. Consumed by pool
     /// `adaptive` scoring ONLY - `score_peer` deliberately ignores it so
-    /// federation route ranking keeps its established semantics.
+    /// federation route ranking keeps its established semantics. Ages
+    /// toward irrelevance via `last_service_at` (see pools' decay).
     pub service_ewma_ms: Option<f64>,
+    /// When `service_ewma_ms` was last stamped. Pool scoring blends the
+    /// EWMA toward the declared default as this ages; a timestamp
+    /// without a value (or vice versa) reads as unmeasured.
+    pub last_service_at: Option<std::time::Instant>,
 }
 
 pub(crate) fn health_key(remote: &Remote) -> String {
@@ -129,10 +134,12 @@ impl RemoteLease {
     /// [`lease_to_eof`].
     fn record_service(&self) {
         let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let now = std::time::Instant::now();
         if let Ok(mut m) = self.map.lock()
             && let Some(h) = m.get_mut(&self.key)
         {
             h.service_ewma_ms = Some(crate::hint_ewma(h.service_ewma_ms, ms));
+            h.last_service_at = Some(now);
         }
     }
 }

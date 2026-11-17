@@ -14517,6 +14517,8 @@ Alternatives: model_overrides in ~/.config/blazar/config.toml, or per-request op
 enum KeysAction {
     /// List keys with redacted secrets + today's usage
     List,
+    /// Show one key in detail: scopes, limits, grants, live usage
+    Show { name: String },
     /// Add a key; prints the generated secret ONCE
     Add {
         name: String,
@@ -14653,6 +14655,78 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
                     println!("  mcp: servers [{servers_out}] tools [{tools_out}]");
                 }
             }
+            Ok(())
+        }
+        KeysAction::Show { name } => {
+            let mut req = client.get(format!("{base}/api/keys"));
+            if let Some(b) = &bearer {
+                req = req.bearer_auth(b);
+            }
+            let resp = req.send().await?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "{}",
+                    body["error"]["message"].as_str().unwrap_or("list failed")
+                ));
+            }
+            let keys = body["keys"].as_array().cloned().unwrap_or_default();
+            let Some(k) = keys
+                .iter()
+                .find(|k| k["name"].as_str() == Some(name.as_str()))
+            else {
+                let known: Vec<&str> = keys.iter().filter_map(|k| k["name"].as_str()).collect();
+                return Err(anyhow!(
+                    "no key named '{name}' (configured: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            };
+            let models = k["models"].as_array().cloned().unwrap_or_default();
+            let models = if models.is_empty() {
+                "* (admin)".to_string()
+            } else {
+                models
+                    .iter()
+                    .filter_map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            println!("key          {}", k["name"].as_str().unwrap_or("?"));
+            println!("secret       {}", k["key"].as_str().unwrap_or("?"));
+            println!("models       {models}");
+            println!(
+                "limits       rpm {} | tpm {} | daily {} tokens | concurrent {}",
+                k["rpm"].as_u64().unwrap_or(0),
+                k["tpm"].as_u64().unwrap_or(0),
+                k["daily_tokens"].as_u64().unwrap_or(0),
+                k["max_concurrent"].as_u64().unwrap_or(0),
+            );
+            println!("weight       {}", k["weight"].as_u64().unwrap_or(1));
+            let join = |field: &str| -> String {
+                let v = k[field].as_array().cloned().unwrap_or_default();
+                if v.is_empty() {
+                    "all".to_string()
+                } else {
+                    v.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            };
+            println!("mcp servers  {}", join("mcp_servers"));
+            println!("mcp tools    {}", join("mcp_tools"));
+            let u = &k["usage"];
+            println!(
+                "usage today  {} - {} requests, {} tokens",
+                u["day"].as_str().unwrap_or("-"),
+                u["requests"].as_u64().unwrap_or(0),
+                u["tokens"].as_u64().unwrap_or(0),
+            );
             Ok(())
         }
         KeysAction::Add {

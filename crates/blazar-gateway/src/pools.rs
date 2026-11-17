@@ -43,6 +43,31 @@ const SERVICE_DEFAULT_MS: u64 = remotes::REMOTE_TTFT_DEFAULT_MS as u64;
 /// strategy reconsiders from scratch (anti-thrash window).
 const POOL_STICKY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a service-time EWMA stays authoritative before it has
+/// fully decayed back to the declared default. Idle-sleep evicts
+/// idle models on this order, so an estimate older than this
+/// describes an engine state that no longer exists.
+const SERVICE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Blend a measured service EWMA toward the declared default as it
+/// ages: fresh observations pass through verbatim, observations older
+/// than [`SERVICE_STALE_AFTER`] are indistinguishable from never
+/// having been measured (the no-signal `warm_first` parity contract),
+/// and ages in between interpolate linearly. Returns the effective
+/// milliseconds and whether a measurement still informs the value.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)] // SERVICE_DEFAULT_MS is the exact constant 750; blend math is advisory
+pub(crate) fn effective_service(measured: f64, age: std::time::Duration) -> (u64, bool) {
+    let stale = SERVICE_STALE_AFTER.as_secs_f64();
+    let factor = (age.as_secs_f64() / stale).clamp(0.0, 1.0);
+    let target = SERVICE_DEFAULT_MS as f64;
+    let blended = measured + (target - measured) * factor;
+    (blended.ceil() as u64, factor < 1.0)
+}
+
 /// The last `adaptive` decision for one pool, consumed as hysteresis:
 /// a healthy sticky member within the margin of the best estimate is
 /// retained so bursty load cannot flip-flop members request to request.
@@ -111,7 +136,7 @@ pub(crate) fn score_members_core(
     ps_rows: &[blazar_runtime::supervisor::PsRow],
     healths: &HashMap<String, RemoteHealth>,
     caps: &HashMap<String, PeerCapacity>,
-    local_service: &HashMap<String, f64>,
+    local_service: &HashMap<String, (f64, Instant)>,
     local_names: &HashMap<String, String>,
     now: Instant,
 ) -> Vec<MemberScore> {
@@ -138,7 +163,7 @@ pub(crate) fn score_members_core(
                 let queue = queue_depth.saturating_add(busy);
                 let waves = queue.div_ceil(slots);
                 let (service_ms, measured) = match local_service.get(&row_name) {
-                    Some(ewma) => (ewma.ceil() as u64, true),
+                    Some((ewma, at)) => effective_service(*ewma, now.duration_since(*at)),
                     None => (SERVICE_DEFAULT_MS, false),
                 };
                 MemberScore {
@@ -163,9 +188,9 @@ pub(crate) fn score_members_core(
                 let h = healths.get(&hkey).copied().unwrap_or_default();
                 let cap = caps.get(&hkey);
                 let down = h.down_until.is_some_and(|t| now < t);
-                let (service_ms, measured) = match h.service_ewma_ms {
-                    Some(ewma) => (ewma.ceil() as u64, true),
-                    None => (SERVICE_DEFAULT_MS, false),
+                let (service_ms, measured) = match (h.service_ewma_ms, h.last_service_at) {
+                    (Some(ewma), Some(at)) => effective_service(ewma, now.duration_since(at)),
+                    _ => (SERVICE_DEFAULT_MS, false),
                 };
                 MemberScore {
                     idx,
@@ -717,6 +742,7 @@ mod tests {
                 consec_failures: 0,
                 down_until: None,
                 in_flight: 2,
+                last_service_at: None,
                 ttft_ewma_ms: Some(250.0),
                 service_ewma_ms: None,
             },
@@ -812,7 +838,7 @@ mod tests {
             members: vec![member("local", "m1"), member("local", "m2")],
         };
         let mut local_service = HashMap::new();
-        local_service.insert("m1".to_string(), 4000.0);
+        local_service.insert("m1".to_string(), (4000.0, Instant::now()));
         let members = score_members_core(
             &local_pool,
             &cfg,
@@ -830,6 +856,60 @@ mod tests {
         assert!(!members[1].measured, "m2 has no observation yet");
     }
 
+    /// Staleness decay: a service EWMA older than the stale horizon is
+    /// indistinguishable from never having been measured (default
+    /// value, `measured = false`), restoring the no-signal parity
+    /// contract for idle members.
+    #[test]
+    fn unit__score_members_core__stale_local_service_decays_to_default() {
+        let cfg = cfg_with(None);
+        let local_pool = ModelPool {
+            name: "svc".into(),
+            strategy: PoolStrategy::Adaptive,
+            members: vec![member("local", "m1")],
+        };
+        let mut local_service = HashMap::new();
+        let ancient = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .expect("10 min is always in the past on test hosts");
+        local_service.insert("m1".to_string(), (4000.0, ancient));
+        let members = score_members_core(
+            &local_pool,
+            &cfg,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &local_service,
+            &HashMap::new(),
+            Instant::now(),
+        );
+        assert_eq!(members[0].service_ms, SERVICE_DEFAULT_MS);
+        assert!(!members[0].measured, "a stale observation no longer counts");
+    }
+
+    /// The decay blend itself: fresh observations pass through, the
+    /// halfway age interpolates, and the horizon boundary flips to the
+    /// unmeasured posture.
+    #[test]
+    fn unit__effective_service__blends_toward_default_with_age() {
+        let (fresh, measured) = effective_service(4000.0, std::time::Duration::from_secs(0));
+        assert_eq!((fresh, measured), (4000, true));
+
+        let (half, measured) = effective_service(4000.0, std::time::Duration::from_secs(150));
+        assert!(measured, "halfway still carries measurement weight");
+        // 4000 + (750 - 4000) * 0.5 = 2375 exactly.
+        assert_eq!(half, 2375);
+
+        let (stale, measured) = effective_service(4000.0, std::time::Duration::from_secs(301));
+        assert_eq!((stale, measured), (SERVICE_DEFAULT_MS, false));
+
+        // A measurement BELOW the default blends upward the same way.
+        let (rising, measured) = effective_service(100.0, std::time::Duration::from_secs(150));
+        assert!(measured);
+        assert_eq!(rising, 425); // 100 + (750 - 100) * 0.5
+    }
+
     /// A pool member whose peer is marked down carries `down = true`.
     #[test]
     fn unit__score_members_core__down_peer_flagged() {
@@ -841,6 +921,7 @@ mod tests {
                 consec_failures: 9,
                 down_until: Some(Instant::now() + std::time::Duration::from_secs(30)),
                 in_flight: 0,
+                last_service_at: None,
                 ttft_ewma_ms: None,
                 service_ewma_ms: None,
             },

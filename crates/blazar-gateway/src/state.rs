@@ -267,8 +267,9 @@ pub struct AppState {
     /// when local chat streams complete (see `keys::LocalServiceStamp`)
     /// and consumed by pool `adaptive` scoring - the local twin of the
     /// remote lane's per-peer `service_ewma_ms`.
-    pub service_ewma_local:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    pub service_ewma_local: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
+    >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
