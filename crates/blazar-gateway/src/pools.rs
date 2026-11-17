@@ -61,6 +61,13 @@ const AFFINITY_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 /// expired entries are dropped first, a still-full map is cleared.
 const AFFINITY_CAP: usize = 256;
 
+/// Response header carrying the member a pool request actually served
+/// (`local:model` or `peer:model`). Set by the five pool-aware lanes
+/// when expansion fires; the usage meter reads it to attribute the
+/// request to the serving member alongside the requested alias, and
+/// clients may inspect it for transparency.
+pub const EFFECTIVE_MODEL_HEADER: &str = "x-blazar-effective-model";
+
 /// The affinity discount for an entry of this age (see
 /// [`AFFINITY_FULL_MS`]). Pure integer math, unit-pinned.
 fn affinity_discount(age: std::time::Duration) -> u64 {
@@ -486,6 +493,24 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
         .ok()
         .and_then(|m| m.get(&pool.name).cloned());
     let chosen = pick(pool, &members, sticky.as_ref(), None);
+    // Live affinity keys for THIS pool: bounded map, "{pool}:{hash}"
+    // keys, each holding the member that served the opener last.
+    // Read-only introspection - the request path records.
+    let affinity_now = std::time::Instant::now();
+    let affinity_entries: Vec<(String, std::time::Instant)> = state
+        .pools_affinity
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| k.strip_prefix(&format!("{}:", pool.name)).is_some())
+                .map(|(_, (eff, at))| (eff.clone(), *at))
+                .collect()
+        })
+        .unwrap_or_default();
+    let affinity_live: Vec<&(String, std::time::Instant)> = affinity_entries
+        .iter()
+        .filter(|(_, at)| affinity_now.duration_since(*at) < AFFINITY_TTL)
+        .collect();
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
@@ -499,6 +524,18 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "service_measured": m.measured,
                 "free_vram": m.score.free_vram.0,
                 "down": m.down,
+                "affinity_keys": affinity_live
+                    .iter()
+                    .filter(|(eff, _)| *eff == m.effective)
+                    .count(),
+                "affinity_freshest_ms": affinity_live
+                    .iter()
+                    .filter(|(eff, _)| *eff == m.effective)
+                    .map(|(_, at)| {
+                        u64::try_from(affinity_now.duration_since(*at).as_millis())
+                            .unwrap_or(u64::MAX)
+                    })
+                    .min(),
             })
         })
         .collect();
@@ -533,6 +570,10 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
         "pool": {
             "strategy": format!("{:?}", pool.strategy),
             "members": member_lines,
+            "affinity": {
+                "live_keys": affinity_live.len(),
+                "ttl_secs": AFFINITY_TTL.as_secs(),
+            },
         },
         "decision": decision,
     })

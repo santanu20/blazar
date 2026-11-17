@@ -14138,11 +14138,15 @@ async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
 
 async fn route_cmd(model: &str, json: bool) -> Result<()> {
     let base = ensure_daemon().await?;
-    let resp = cli_http()
+    let mut req = cli_http()
         .get(format!("{base}/api/route/{}", encode_path_segment(model)))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await?;
+        .timeout(std::time::Duration::from_secs(30));
+    // `/api/route` gates on an admin bearer once [[keys]] exist, like
+    // every other management surface.
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
     let ok = resp.status().is_success();
     let text = resp.text().await?;
     if !ok {
@@ -14208,6 +14212,27 @@ async fn route_cmd(model: &str, json: bool) -> Result<()> {
             &rows,
             &[2, 3],
         );
+    }
+    // Pool cache affinity: live opener keys per member (adaptive
+    // routing discounts them; see the pools docs). Rendered only when
+    // the route answered for a pool with affinity state.
+    let members = v["pool"]["members"].as_array().cloned().unwrap_or_default();
+    let affinity_rows: Vec<Vec<String>> = members
+        .iter()
+        .filter(|m| m["affinity_keys"].as_u64().unwrap_or(0) > 0)
+        .map(|m| {
+            vec![
+                m["effective"].as_str().unwrap_or("?").to_string(),
+                m["affinity_keys"].as_u64().unwrap_or(0).to_string(),
+                format!("{} ms", m["affinity_freshest_ms"].as_u64().unwrap_or(0)),
+            ]
+        })
+        .collect();
+    if !affinity_rows.is_empty() {
+        let live = v["pool"]["affinity"]["live_keys"].as_u64().unwrap_or(0);
+        println!();
+        println!("cache affinity: {live} live opener key(s)");
+        render_table(&["MEMBER", "KEYS", "FRESHEST"], &affinity_rows, &[1, 2]);
     }
     Ok(())
 }

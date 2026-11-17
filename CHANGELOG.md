@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Pool member attribution in usage + route affinity observability.** Pool-aliased responses now carry `x-blazar-effective-model` naming the member that actually served (all five pool-aware lanes), and the usage meter records the request under both the requested alias and the serving member - `blazar diagnose <member>` and `/api/usage` see real per-model rows (totalling all rows double-counts pool traffic; filter by exact model). `GET /api/route/<pool>` and `blazar route <pool>` additionally show the live cache-affinity keys per member with the freshest age, making the `adaptive` opener steering observable.
 - **Service-EWMA staleness decay.** Service-time EWMA observations (local per-model and remote per-peer) now carry a timestamp and blend linearly back toward the declared default over 5 minutes of silence; a fully stale observation reads as unmeasured, restoring the `adaptive` == `warm_first` no-signal parity for idle members whose engines have likely been idle-sleep-evicted.
 - **`blazar keys show <name>`.** One key in detail: redacted secret, model scope, rate/token/concurrency limits, scheduling weight, MCP server/tool grants, and today's live usage - the CLI twin of the console Keys tab. Unknown names teach back the configured key list.
 - MCP grant visibility: `blazar keys` lists per-key `mcp_servers`/`mcp_tools` scopes and the `/ui` console gains a Keys tab (paste an unscoped admin key per tab session to list keys, scopes and usage).

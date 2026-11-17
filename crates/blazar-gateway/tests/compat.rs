@@ -510,6 +510,15 @@ async fn client__model_pool__local_member_stamps_service_ewma() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "local member serves the pool ask");
+    // Pool attribution: the serving member rides the response so the
+    // usage meter (and clients) can see past the requested alias.
+    assert_eq!(
+        resp.headers()
+            .get("x-blazar-effective-model")
+            .and_then(|v| v.to_str().ok()),
+        Some("m1"),
+        "effective member stamped on the pool response"
+    );
 
     let route: serde_json::Value = c
         .get(format!("{}/api/route/svc_local", ts.base))
@@ -523,6 +532,23 @@ async fn client__model_pool__local_member_stamps_service_ewma() {
     assert_eq!(
         route["pool"]["members"][0]["service_measured"], true,
         "route table after one completed chat: {route}"
+    );
+    // Affinity observability: the opener key recorded by the request
+    // is visible per member and pooled into the live total.
+    assert!(
+        route["pool"]["members"][0]["affinity_keys"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "route affinity keys after one pool chat: {route}"
+    );
+    assert!(
+        route["pool"]["members"][0]["affinity_freshest_ms"].is_u64(),
+        "freshest affinity age rendered: {route}"
+    );
+    assert!(
+        route["pool"]["affinity"]["live_keys"].as_u64().unwrap_or(0) >= 1,
+        "pool-level live key total: {route}"
     );
     assert!(
         route["pool"]["members"][0]["service_ms"]

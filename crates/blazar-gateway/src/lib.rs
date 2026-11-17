@@ -383,6 +383,19 @@ async fn request_log(
         && let Some(model_name) = usage_model
     {
         let (parts, body) = resp.into_parts();
+        // Pool attribution: when a pool-aware lane rewrote the model,
+        // it stamps the serving member here. The meter then records
+        // the request under BOTH identities - the requested alias
+        // (gateway view, unchanged) and the member that actually
+        // served (per-model dashboards: diagnose, usage). Totalling
+        // across all rows double-counts pool-aliased traffic; filter
+        // by exact model.
+        let effective_model = parts
+            .headers
+            .get(crate::pools::EFFECTIVE_MODEL_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .filter(|e| *e != model_name);
         // Frame fallback arms only for line-framed streams: a JSON
         // body's usage rides its final object, and its single giant
         // line must not be mistaken for token frames.
@@ -449,6 +462,16 @@ async fn request_log(
                     gen_secs,
                     ttft_ms,
                 );
+                if let Some(effective) = effective_model.as_deref() {
+                    meter.record(
+                        effective,
+                        in_tok.unwrap_or(0),
+                        out_tok.unwrap_or(0),
+                        cached_tok.unwrap_or(0),
+                        gen_secs,
+                        ttft_ms,
+                    );
+                }
                 Ok::<axum::body::Bytes, axum::Error>(axum::body::Bytes::new())
             }),
         );

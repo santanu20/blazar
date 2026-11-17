@@ -53,6 +53,7 @@ pub async fn messages(
     // lane translates local engines only - a pool pick that lands on a
     // remote member refuses with the pool named (same posture as a
     // directly remote-prefixed ask, one lane, one contract).
+    let requested_model = model.clone();
     if let Some((effective, rewritten)) = crate::pools::expand_request(&state, &model, &body) {
         if crate::remotes::split_remote(&effective, &state.cfg()).is_some() {
             return anthropic_error(
@@ -78,6 +79,9 @@ pub async fn messages(
              remote-prefixed models are not translated (their dialect is the remote's own)",
         );
     }
+    // Pool attribution (see the OpenAI/ollama lanes): stamp the member
+    // that actually served so the usage meter double-rows the request.
+    let pool_member = (model != requested_model).then(|| model.clone());
     // Failover chains (Anthropic dialect): the translate lane serves
     // LOCAL targets only - a remote hop would need dialect re-translation
     // both ways, which this lane refuses by design (see above). Mixed
@@ -385,11 +389,18 @@ pub async fn messages(
             ))
         };
         let events = anthropic_sse_stream(child_stream, StreamState::new(&id, &model_label), guard);
-        return Response::builder()
+        let mut resp = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .body(Body::from_stream(events))
             .unwrap_or_else(|e| anthropic_error(500, "api_error", &format!("stream: {e}")));
+        if let Some(member) = &pool_member
+            && let Ok(v) = axum::http::HeaderValue::from_str(member)
+        {
+            resp.headers_mut()
+                .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
+        }
+        return resp;
     }
     // Best-of-N: judge N candidates on the translated child body, return
     // the winner as a normal child response (usage summed across
@@ -532,6 +543,12 @@ pub async fn messages(
     let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
     crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
     crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
+    if let Some(member) = &pool_member
+        && let Ok(v) = axum::http::HeaderValue::from_str(member)
+    {
+        resp.headers_mut()
+            .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
+    }
     resp
 }
 

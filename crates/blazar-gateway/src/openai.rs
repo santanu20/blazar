@@ -701,13 +701,14 @@ pub async fn openai_proxy(
         })
         .flatten()
         .filter(|(effective, _)| Some(effective.as_str()) != model.as_deref());
-    let (model, body, mut parsed_body) = match pool_expansion {
+    let (model, body, mut parsed_body, pool_member) = match pool_expansion {
         Some((effective, rewritten)) => {
             tracing::info!(target: "blazar::pools", member = %effective, "openai proxy: pool routed to member");
             let reparsed = serde_json::from_slice(&rewritten).ok();
-            (Some(effective), rewritten, reparsed)
+            let member = effective.clone();
+            (Some(effective), rewritten, reparsed, Some(member))
         }
-        None => (model, body, parsed_body),
+        None => (model, body, parsed_body, None),
     };
     // Routed-lane surface gate: needs the model to know which engine
     // will serve it (GGUF routes llamacpp regardless of the active row).
@@ -1297,6 +1298,15 @@ pub async fn openai_proxy(
         recipe,
     )
     .await;
+    // Pool attribution: the member that actually serves this request
+    // rides the response so the usage meter (and clients) can see
+    // past the requested alias.
+    if let Some(member) = &pool_member
+        && let Ok(v) = axum::http::HeaderValue::from_str(member)
+    {
+        resp.headers_mut()
+            .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
+    }
     // Teaching stamp rides the same seam the voice path rebuilds from,
     // so buffered 200s keep the header through the audio re-encode.
     if let Some(note) = llamacpp_tool_choice_note {
@@ -2052,7 +2062,7 @@ pub async fn responses_api(
     // chat lane: the member string is what admission, reserve and the
     // forward below key off. Multipart asks skip pools (same edge
     // contract as the chat lane - the body cannot carry the rewrite).
-    let (model, body) = if !model.is_empty()
+    let (model, body, pool_member) = if !model.is_empty()
         && !headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
@@ -2061,12 +2071,13 @@ pub async fn responses_api(
         match crate::pools::expand_request(&state, &model, &body) {
             Some((effective, rewritten)) if effective != model => {
                 tracing::info!(target: "blazar::pools", member = %effective, "responses: pool routed to member");
-                (effective, rewritten)
+                let member = effective.clone();
+                (effective, rewritten, Some(member))
             }
-            _ => (model, body),
+            _ => (model, body, None),
         }
     } else {
-        (model, body)
+        (model, body, None)
     };
     if let Some(key) = key_ext.as_ref().map(|Extension(k)| k)
         && let Some(entry) = state.keys.entry(&key.name)
@@ -2278,6 +2289,13 @@ pub async fn responses_api(
                 ),
             );
         }
+        // Pool attribution rides stored responses too (see chat lane).
+        if let Some(member) = &pool_member
+            && let Ok(v) = axum::http::HeaderValue::from_str(member)
+        {
+            r.headers_mut()
+                .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
+        }
         return r;
     }
 
@@ -2391,6 +2409,11 @@ pub async fn responses_api(
         && let Ok(v) = axum::http::HeaderValue::from_str(h)
     {
         builder = builder.header(crate::bestof::HEADER, v);
+    }
+    if let Some(member) = &pool_member
+        && let Ok(v) = axum::http::HeaderValue::from_str(member)
+    {
+        builder = builder.header(crate::pools::EFFECTIVE_MODEL_HEADER, v);
     }
     builder
         .body(axum::body::Body::from(
