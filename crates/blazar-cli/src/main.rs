@@ -1393,7 +1393,15 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Observability",
-        &["why", "explain", "model-doctor", "route", "watch", "usage"],
+        &[
+            "why",
+            "explain",
+            "model-doctor",
+            "route",
+            "diagnose",
+            "watch",
+            "usage",
+        ],
     ),
     (
         "Refused by design (no cloud services)",
@@ -14045,7 +14053,9 @@ async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
                 let reqs: u64 = mine.iter().filter_map(|r| r["requests"].as_u64()).sum();
                 let toks: u64 = mine
                     .iter()
-                    .map(|r| r["in_tokens"].as_u64().unwrap_or(0) + r["out_tokens"].as_u64().unwrap_or(0))
+                    .map(|r| {
+                        r["in_tokens"].as_u64().unwrap_or(0) + r["out_tokens"].as_u64().unwrap_or(0)
+                    })
                     .sum();
                 format!("{reqs} requests, {toks} tokens (7d)")
             }
