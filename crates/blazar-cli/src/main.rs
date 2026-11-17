@@ -14153,13 +14153,27 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
             pool,
             member,
             ttl_secs,
-        }) => pool_member_op(&pool, &member, "drain", ttl_secs).await,
-        Some(PoolAction::Undrain { pool, member }) => {
-            pool_member_op(&pool, &member, "undrain", None).await
+            all,
+            stagger_secs,
+        }) => {
+            pool_member_op(
+                &pool,
+                member.as_deref(),
+                "drain",
+                ttl_secs,
+                all,
+                stagger_secs,
+            )
+            .await
         }
-        Some(PoolAction::Pin { pool, member }) => pool_member_op(&pool, &member, "pin", None).await,
+        Some(PoolAction::Undrain { pool, member, all }) => {
+            pool_member_op(&pool, member.as_deref(), "undrain", None, all, None).await
+        }
+        Some(PoolAction::Pin { pool, member }) => {
+            pool_member_op(&pool, Some(&member), "pin", None, false, None).await
+        }
         Some(PoolAction::Unpin { pool, member }) => {
-            pool_member_op(&pool, &member, "unpin", None).await
+            pool_member_op(&pool, Some(&member), "unpin", None, false, None).await
         }
         // Bare `blazar pool` reads as `blazar pool list`.
         Some(PoolAction::List { json }) => pool_list(json).await,
@@ -14204,14 +14218,28 @@ async fn pool_watch(interval_secs: u64) -> Result<()> {
 /// the daemon's note plus the pool's updated decision.
 async fn pool_member_op(
     pool: &str,
-    member: &str,
+    member: Option<&str>,
     action: &str,
     ttl_secs: Option<u64>,
+    all: bool,
+    stagger_secs: Option<u64>,
 ) -> Result<()> {
     let base = ensure_daemon().await?;
-    let mut body = serde_json::json!({ "member": member });
+    if member.is_none() && !all {
+        anyhow::bail!("pass a member or --all (drain every member of '{pool}')");
+    }
+    let mut body = match member {
+        Some(m) => serde_json::json!({ "member": m }),
+        None => serde_json::json!({ "all": true }),
+    };
+    if all {
+        body["all"] = serde_json::json!(true);
+    }
     if let Some(ttl) = ttl_secs {
         body["ttl_secs"] = serde_json::json!(ttl);
+    }
+    if let Some(stagger) = stagger_secs {
+        body["stagger_secs"] = serde_json::json!(stagger);
     }
     let mut req = cli_http()
         .post(format!("{base}/api/pools/{pool}/{action}"))
@@ -14971,13 +14999,27 @@ enum PoolAction {
     Drain {
         pool: String,
         /// Member as routed (the `effective` string from `blazar pool`)
-        member: String,
+        member: Option<String>,
         /// Re-enable automatically after this many seconds
         #[arg(long)]
         ttl_secs: Option<u64>,
+        /// Drain every member of the pool (rolling maintenance)
+        #[arg(long, conflicts_with = "member")]
+        all: bool,
+        /// With --all --ttl-secs: space each member's return window by
+        /// this many seconds (declaration order) so re-warm traffic
+        /// never hits all replicas at once
+        #[arg(long, requires = "ttl_secs")]
+        stagger_secs: Option<u64>,
     },
-    /// Resume routing to a drained member
-    Undrain { pool: String, member: String },
+    /// Resume routing to a drained member (or all of them with --all)
+    Undrain {
+        pool: String,
+        member: Option<String>,
+        /// Restore every member of the pool
+        #[arg(long, conflicts_with = "member")]
+        all: bool,
+    },
     /// Prefer one member above the strategy while it stays healthy
     Pin { pool: String, member: String },
     /// Release a pinned member back to the strategy

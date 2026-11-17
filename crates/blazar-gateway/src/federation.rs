@@ -502,88 +502,170 @@ pub async fn pool_member_op(
             &format!("no pool named '{name}' (GET /api/pools lists the configured ones)"),
         );
     };
-    let Some(member) = body["member"].as_str().map(str::to_string) else {
-        return api_error(400, "body needs {\"member\": \"<effective string>\"}");
-    };
+    let all = body["all"].as_bool().unwrap_or(false);
+    let member = body["member"].as_str().map(str::to_string);
+    if all && member.is_some() {
+        return api_error(400, "pass either \"member\" or \"all\", not both");
+    }
+    if !all && member.is_none() {
+        return api_error(
+            400,
+            "body needs {\"member\": \"<effective string>\"} or {\"all\": true}",
+        );
+    }
+    let ttl_secs = body["ttl_secs"].as_u64();
+    let stagger_secs = body["stagger_secs"].as_u64().unwrap_or(0);
+    if stagger_secs > 0 && ttl_secs.is_none() {
+        return api_error(
+            400,
+            "stagger_secs slices a ttl_secs budget - pass both (drain --all --ttl-secs N --stagger-secs M)",
+        );
+    }
     // Validate against the live member table so the error teaches the
     // exact effective strings (remote members are "peer:model", local
     // members their configured spelling).
     let scored = crate::pools::score_members(&state, pool);
-    if !scored.iter().any(|m| m.effective == member) {
-        let known: Vec<&str> = scored.iter().map(|m| m.effective.as_str()).collect();
-        return api_error(
-            404,
-            &format!(
-                "pool '{name}' has no member '{member}' (members: {})",
-                known.join(", ")
-            ),
-        );
-    }
-    let ttl_secs = body["ttl_secs"].as_u64();
-    let key = crate::pools::ops_key(&name, &member);
     let now = std::time::Instant::now();
     let mut note = String::new();
     if let Ok(mut ops) = state.pools_ops.lock() {
-        match action.as_str() {
-            "drain" => {
-                let entry = ops.entry(key.clone()).or_default();
-                let was_pinned = entry.pinned;
-                *entry = crate::pools::MemberOps {
-                    drained: true,
-                    drained_until: ttl_secs.map(|s| now + std::time::Duration::from_secs(s)),
-                    pinned: false,
-                };
-                note = format!(
-                    "member '{member}' drained{}{} - excluded from picks while an alternative exists",
-                    ttl_secs.map_or_else(String::new, |s| format!(" for {s}s")),
-                    if was_pinned {
-                        " (pin dropped - a drain is an explicit no-traffic)"
-                    } else {
-                        ""
-                    },
-                );
-            }
-            "undrain" => {
-                let entry = ops.entry(key.clone()).or_default();
-                entry.drained = false;
-                entry.drained_until = None;
-                if *entry == crate::pools::MemberOps::default() {
-                    ops.remove(&key);
+        if all {
+            match action.as_str() {
+                // Rolling maintenance: every member drains now, but
+                // returns in declaration order spaced by the stagger so
+                // re-warm traffic never hits all replicas at once.
+                "drain" => {
+                    let ttls = crate::pools::stagger_ttls(
+                        scored.len(),
+                        ttl_secs.unwrap_or(0),
+                        stagger_secs,
+                    );
+                    for (m, ttl) in scored.iter().zip(ttls) {
+                        let key = crate::pools::ops_key(&name, &m.effective);
+                        let entry = ops.entry(key).or_default();
+                        entry.pinned = false;
+                        entry.drained = true;
+                        entry.drained_until =
+                            ttl_secs.map(|_| now + std::time::Duration::from_secs(ttl));
+                    }
+                    note = match ttl_secs {
+                        Some(t) => format!(
+                            "drained {} member(s) for {t}s{} - they return in declaration order, the last after {}s",
+                            scored.len(),
+                            if stagger_secs > 0 {
+                                format!(", staggered every {stagger_secs}s")
+                            } else {
+                                String::new()
+                            },
+                            t.saturating_add(
+                                stagger_secs.saturating_mul(scored.len().saturating_sub(1) as u64,)
+                            ),
+                        ),
+                        None => format!(
+                            "drained {} member(s) with no deadline - undrain restores them",
+                            scored.len()
+                        ),
+                    };
                 }
-                note = format!("member '{member}' restored to rotation");
-            }
-            "pin" => {
-                let entry = ops.entry(key.clone()).or_default();
-                if entry.is_drained(now) {
+                "undrain" => {
+                    let mut restored = 0usize;
+                    for m in &scored {
+                        let key = crate::pools::ops_key(&name, &m.effective);
+                        let entry = ops.entry(key.clone()).or_default();
+                        entry.drained = false;
+                        entry.drained_until = None;
+                        if *entry == crate::pools::MemberOps::default() {
+                            ops.remove(&key);
+                        }
+                        restored += 1;
+                    }
+                    note = format!("restored {restored} member(s) to rotation");
+                }
+                "pin" | "unpin" => {
                     return api_error(
                         400,
-                        &format!(
-                            "member '{member}' is drained - undrain it before pinning (a pin would immediately re-enter traffic)"
-                        ),
+                        "pin/unpin are per-member by design - name one \"member\"",
                     );
                 }
-                entry.pinned = true;
-                note = format!(
-                    "member '{member}' pinned - outranks the {:?} strategy while healthy",
-                    pool.strategy
-                );
-            }
-            "unpin" => {
-                let entry = ops.entry(key.clone()).or_default();
-                entry.pinned = false;
-                if *entry == crate::pools::MemberOps::default() {
-                    ops.remove(&key);
+                other => {
+                    return api_error(
+                        400,
+                        &format!("unknown action '{other}' (drain | undrain | pin | unpin)"),
+                    );
                 }
-                note = format!(
-                    "member '{member}' returned to the {:?} strategy",
-                    pool.strategy
+            }
+        } else if let Some(member) = member.as_deref() {
+            if !scored.iter().any(|m| m.effective == member) {
+                let known: Vec<&str> = scored.iter().map(|m| m.effective.as_str()).collect();
+                return api_error(
+                    404,
+                    &format!(
+                        "pool '{name}' has no member '{member}' (members: {})",
+                        known.join(", ")
+                    ),
                 );
             }
-            other => {
-                return api_error(
-                    400,
-                    &format!("unknown action '{other}' (drain | undrain | pin | unpin)"),
-                );
+            let key = crate::pools::ops_key(&name, member);
+            match action.as_str() {
+                "drain" => {
+                    let entry = ops.entry(key.clone()).or_default();
+                    let was_pinned = entry.pinned;
+                    *entry = crate::pools::MemberOps {
+                        drained: true,
+                        drained_until: ttl_secs.map(|s| now + std::time::Duration::from_secs(s)),
+                        pinned: false,
+                    };
+                    note = format!(
+                        "member '{member}' drained{}{} - excluded from picks while an alternative exists",
+                        ttl_secs.map_or_else(String::new, |s| format!(" for {s}s")),
+                        if was_pinned {
+                            " (pin dropped - a drain is an explicit no-traffic)"
+                        } else {
+                            ""
+                        },
+                    );
+                }
+                "undrain" => {
+                    let entry = ops.entry(key.clone()).or_default();
+                    entry.drained = false;
+                    entry.drained_until = None;
+                    if *entry == crate::pools::MemberOps::default() {
+                        ops.remove(&key);
+                    }
+                    note = format!("member '{member}' restored to rotation");
+                }
+                "pin" => {
+                    let entry = ops.entry(key.clone()).or_default();
+                    if entry.is_drained(now) {
+                        return api_error(
+                            400,
+                            &format!(
+                                "member '{member}' is drained - undrain it before pinning (a pin would immediately re-enter traffic)"
+                            ),
+                        );
+                    }
+                    entry.pinned = true;
+                    note = format!(
+                        "member '{member}' pinned - outranks the {:?} strategy while healthy",
+                        pool.strategy
+                    );
+                }
+                "unpin" => {
+                    let entry = ops.entry(key.clone()).or_default();
+                    entry.pinned = false;
+                    if *entry == crate::pools::MemberOps::default() {
+                        ops.remove(&key);
+                    }
+                    note = format!(
+                        "member '{member}' returned to the {:?} strategy",
+                        pool.strategy
+                    );
+                }
+                other => {
+                    return api_error(
+                        400,
+                        &format!("unknown action '{other}' (drain | undrain | pin | unpin)"),
+                    );
+                }
             }
         }
     }
@@ -591,7 +673,7 @@ pub async fn pool_member_op(
     // one response shows both the override and its effect.
     let mut payload = crate::pools::route_json(&state, pool);
     payload["note"] = serde_json::Value::String(note);
-    payload["member"] = serde_json::Value::String(member);
+    payload["member"] = serde_json::Value::String(member.unwrap_or_else(|| "(all)".to_string()));
     axum::Json(payload).into_response()
 }
 

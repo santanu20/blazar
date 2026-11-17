@@ -198,6 +198,10 @@ pub(crate) struct MemberScore {
     /// receives no new picks while any alternative exists. Never
     /// persists across restarts.
     pub drained: bool,
+    /// Remaining seconds of a TTL drain (None = no deadline set or
+    /// not drained) - what `blazar pool watch` counts down during a
+    /// maintenance window.
+    pub drained_for_secs: Option<u64>,
     /// Operator pin (`POST /api/pools/{name}/pin`): outranks every
     /// strategy while the member's peer is healthy.
     pub pinned: bool,
@@ -231,6 +235,19 @@ impl MemberOps {
 #[must_use]
 pub fn ops_key(pool: &str, effective: &str) -> String {
     format!("{pool}:{effective}")
+}
+
+/// Rolling-maintenance plan: draining a whole pool staggers the
+/// members' return windows in declaration order - member `i`
+/// re-enters rotation after `ttl + i * stagger` seconds, so replicas
+/// come back one at a time instead of thundering back together.
+/// Saturating arithmetic: an absurd stagger plan drains everyone for
+/// "as long as possible" rather than overflowing.
+#[must_use]
+pub fn stagger_ttls(count: usize, ttl_secs: u64, stagger_secs: u64) -> Vec<u64> {
+    (0..count)
+        .map(|i| ttl_secs.saturating_add(stagger_secs.saturating_mul(i as u64)))
+        .collect()
 }
 
 /// Find the pool a request name addresses, if any. Exact match only -
@@ -319,6 +336,7 @@ pub(crate) fn score_members_core(
                     measured,
                     down: false,
                     drained: false,
+                    drained_for_secs: None,
                     pinned: false,
                 }
             } else {
@@ -343,6 +361,7 @@ pub(crate) fn score_members_core(
                     measured,
                     down,
                     drained: false,
+                    drained_for_secs: None,
                     pinned: false,
                 }
             }
@@ -414,6 +433,11 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         for m in &mut members {
             if let Some(op) = ops.get(&ops_key(&pool.name, &m.effective)).copied() {
                 m.drained = op.is_drained(now);
+                m.drained_for_secs = op
+                    .drained_until
+                    .filter(|_| m.drained)
+                    .and_then(|deadline| deadline.checked_duration_since(now))
+                    .map(|left| left.as_secs());
                 // A drained member can never be pinned (the API refuses
                 // the combination; expired drains release the pin slot).
                 m.pinned = op.pinned && !m.drained;
@@ -667,6 +691,7 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "free_vram": m.score.free_vram.0,
                 "down": m.down,
                 "drained": m.drained,
+                "drained_for_secs": m.drained_for_secs,
                 "pinned": m.pinned,
                 "affinity_keys": affinity_live
                     .iter()
@@ -778,6 +803,7 @@ mod tests {
             measured: false,
             down,
             drained: false,
+            drained_for_secs: None,
             pinned: false,
         }
     }
@@ -1380,6 +1406,17 @@ mod tests {
         assert!(members[0].measured, "m1 carries a stamped EWMA");
         assert_eq!(members[1].service_ms, SERVICE_DEFAULT_MS);
         assert!(!members[1].measured, "m2 has no observation yet");
+    }
+
+    /// Rolling-maintenance stagger: member i returns after
+    /// `ttl + i * stagger` seconds, saturating instead of overflowing
+    /// even for absurd inputs.
+    #[test]
+    fn unit__stagger_ttls__spaces_return_windows_in_declaration_order() {
+        assert_eq!(stagger_ttls(3, 60, 30), vec![60, 90, 120]);
+        assert_eq!(stagger_ttls(2, 60, 0), vec![60, 60]);
+        // u64::MAX stagger must saturate, not wrap.
+        assert_eq!(stagger_ttls(2, 10, u64::MAX), vec![10, u64::MAX]);
     }
 
     /// Staleness decay: a service EWMA older than the stale horizon is

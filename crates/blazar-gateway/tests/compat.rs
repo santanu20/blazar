@@ -589,6 +589,89 @@ async fn client__model_pool__drain_and_pin_operator_overrides() {
         .unwrap();
     assert_eq!(resp.status(), 404, "unknown pool refused");
 
+    // Rolling maintenance: drain --all with a staggered TTL budget
+    // drains BOTH members with spaced return windows; every member is
+    // excluded, so the all-excluded fallback still serves (raw order).
+    let r: serde_json::Value = c
+        .post(format!("{}/api/pools/svc/drain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "all": true, "ttl_secs": 60, "stagger_secs": 30 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["member"], "(all)", "all-mode echoes (all): {r}");
+    let table = r["pool"]["members"].as_array().unwrap().clone();
+    for m in &table {
+        assert_eq!(m["drained"], true, "all-mode drains every member: {r}");
+    }
+    let local = table
+        .iter()
+        .find(|m| m["effective"].as_str() == Some("m1"))
+        .unwrap();
+    let remote = table
+        .iter()
+        .find(|m| m["effective"].as_str() == Some("far:m1"))
+        .unwrap();
+    let local_ttl = local["drained_for_secs"]
+        .as_u64()
+        .expect("local ttl present");
+    let remote_ttl = remote["drained_for_secs"]
+        .as_u64()
+        .expect("remote ttl present");
+    assert!(
+        remote_ttl > local_ttl,
+        "stagger spaces the windows (local {local_ttl}s < remote {remote_ttl}s): {r}"
+    );
+
+    // pin + all is rejected: pinning is per-member by design.
+    let resp = c
+        .post(format!("{}/api/pools/svc/pin", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "all": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "pin refuses all-mode");
+
+    // stagger without a ttl budget is rejected.
+    let resp = c
+        .post(format!("{}/api/pools/svc/drain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "all": true, "stagger_secs": 30 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "stagger needs a ttl budget");
+
+    // member + all together is rejected.
+    let resp = c
+        .post(format!("{}/api/pools/svc/drain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "all": true, "member": "m1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "member and all are exclusive");
+
+    // Undrain --all restores the whole pool.
+    let r: serde_json::Value = c
+        .post(format!("{}/api/pools/svc/undrain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "all": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for m in r["pool"]["members"].as_array().unwrap() {
+        assert_eq!(m["drained"], false, "undrain --all restores: {r}");
+    }
+    assert_eq!(r["decision"]["target"], "m1", "declaration order back: {r}");
+
     ts.state.sup.shutdown_all().await.unwrap();
     stub.shutdown().await;
 }
