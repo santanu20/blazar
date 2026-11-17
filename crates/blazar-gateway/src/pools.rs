@@ -266,6 +266,36 @@ pub fn member_ops_from_persisted(
     (live, expired)
 }
 
+/// Restore persisted cache-affinity rows into the live map. Rows
+/// older than [`AFFINITY_TTL`] are dead by definition - they are
+/// skipped and reported by key so the caller clears them from the
+/// store. `at_unix` converts back to the monotonic clock as
+/// "now minus age"; a wall clock older than the process (or an
+/// unreadable instant) is treated as stale rather than guessed.
+#[must_use]
+pub fn affinity_from_persisted(
+    rows: &[(String, String, i64)],
+    now_unix: i64,
+) -> (HashMap<String, (String, Instant)>, Vec<String>) {
+    let mut live = HashMap::new();
+    let mut stale = Vec::new();
+    let now = Instant::now();
+    for (key, effective, at_unix) in rows {
+        let age_secs = now_unix.saturating_sub(*at_unix).max(0);
+        if age_secs >= AFFINITY_TTL.as_secs().cast_signed() {
+            stale.push(key.clone());
+            continue;
+        }
+        // Rebuild the monotonic stamp: fresh entries keep most of
+        // their discount window across the restart.
+        let stamped = now
+            .checked_sub(std::time::Duration::from_secs(age_secs.cast_unsigned()))
+            .unwrap_or(now);
+        live.insert(key.clone(), (effective.clone(), stamped));
+    }
+    (live, stale)
+}
+
 /// Key under which a member's [`MemberOps`] live.
 #[must_use]
 pub fn ops_key(pool: &str, effective: &str) -> String {
@@ -687,7 +717,18 @@ pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option
                 m.clear();
             }
         }
-        m.insert(k, (effective.clone(), Instant::now()));
+        // Persistence rides the operator-override flag: write only
+        // when this opener is NEW or switched members, so steady
+        // same-opener traffic never touches the store. Cap-hygiene
+        // evictions are not mirrored - stale rows self-clear at boot.
+        let changed = m.get(&k).is_none_or(|(prev, _)| *prev != effective);
+        m.insert(k.clone(), (effective.clone(), Instant::now()));
+        if changed && cfg.pools_ops_persist {
+            let at_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs().cast_signed());
+            let _ = state.with_store(|s| s.put_pool_affinity(&k, &effective, at_unix));
+        }
     }
     let rewritten = remotes::rewrite_model(body.clone(), &effective);
     Some((effective, rewritten))
@@ -1092,6 +1133,36 @@ mod tests {
         assert!(!live["svc:both"].pinned, "drain beats pin at read");
         assert!(!live["svc:pin"].drained);
         assert!(live["svc:pin"].pinned);
+    }
+
+    /// Persisted affinity rows: fresh openers rehydrate with their
+    /// monotonic stamp inside the TTL window, stale rows (older than
+    /// `AFFINITY_TTL`) drop and report for store cleanup.
+    #[test]
+    fn unit__affinity_from_persisted__conversion_truth_table() {
+        let now_unix = 1_800_000_000_i64;
+        let rows = vec![
+            // Fresh opener: 10s old, well inside the 120s TTL.
+            ("svc:abc".to_string(), "m1".to_string(), now_unix - 10),
+            // Boundary: exactly the TTL reads as stale (a discount of
+            // zero carries no routing weight - nothing to restore).
+            ("svc:edge".to_string(), "m1".to_string(), now_unix - 120),
+            // Long dead: dropped and reported.
+            ("svc:old".to_string(), "far:m1".to_string(), now_unix - 900),
+        ];
+        let (live, stale) = affinity_from_persisted(&rows, now_unix);
+        assert_eq!(stale, vec!["svc:edge".to_string(), "svc:old".to_string()]);
+        assert_eq!(live.len(), 1, "only the fresh opener rehydrates");
+        let (effective, stamped) = &live["svc:abc"];
+        assert_eq!(effective, "m1");
+        // The rebuilt monotonic stamp is ~10s in the past: newer than
+        // now-11s, older than now.
+        let before = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(11))
+            .expect("11s is always in the past on test hosts");
+        let after = Instant::now();
+        assert!(stamped > &before, "stamp reflects the stored age");
+        assert!(stamped <= &after, "stamp is not in the future");
     }
 
     /// Persisted-key pool matching: an exact `{pool}:` prefix keeps a

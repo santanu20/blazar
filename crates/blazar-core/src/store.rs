@@ -55,7 +55,9 @@ pub struct Store {
 /// engine defaults, and an honest unknown beats a guessed provenance.
 /// v20 adds `pools_ops` (persisted gateway pool member overrides,
 /// opt-in via `pools_ops_persist`).
-const SCHEMA_VERSION: i32 = 20;
+/// v21 adds `pools_affinity` (persisted pool cache-affinity rows,
+/// riding the same `pools_ops_persist` opt-in).
+const SCHEMA_VERSION: i32 = 21;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -146,6 +148,11 @@ CREATE TABLE IF NOT EXISTS pools_ops (
     drained       INTEGER NOT NULL DEFAULT 0,
     drained_until INTEGER,           -- unix secs deadline, NULL = no TTL
     pinned        INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pools_affinity (
+    key           TEXT PRIMARY KEY,  -- '{pool}:{opener hash}'
+    effective     TEXT NOT NULL,     -- member that served the opener
+    at_unix       INTEGER NOT NULL   -- unix secs of the last serve
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     day           INTEGER NOT NULL,  -- yyyymmdd local day
@@ -2465,6 +2472,46 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
     }
 
+    /// Persist one pool cache-affinity row (v21): which member served
+    /// the opener hashed by `key`, at unix `at_unix`. Plain tuples on
+    /// purpose - the gateway owns clock and TTL semantics.
+    pub fn put_pool_affinity(&self, key: &str, effective: &str, at_unix: i64) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO pools_affinity (key, effective, at_unix)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                  effective = excluded.effective,
+                  at_unix = excluded.at_unix",
+            params![key, effective, at_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one pool cache-affinity row (expired at boot, or its
+    /// pool vanished from the config).
+    pub fn clear_pool_affinity(&self, key: &str) -> CoreResult<()> {
+        self.conn
+            .execute("DELETE FROM pools_affinity WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// All persisted pool cache-affinity rows: `(key, effective,
+    /// at_unix)`. TTL freshness checks and instant conversion live in
+    /// the gateway.
+    pub fn load_pool_affinity(&self) -> CoreResult<Vec<(String, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, effective, at_unix FROM pools_affinity")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     pub fn put_spec_receipt(
         &self,
         model: &str,
@@ -3849,6 +3896,47 @@ mod tests {
         s.clear_pool_op("svc:far:m1").unwrap();
         let rows = s.load_pool_ops().unwrap();
         assert_eq!(rows, vec![("svc:m1".to_string(), false, None, false)]);
+    }
+
+    #[test]
+    fn unit__store_pool_affinity__roundtrip_and_v20_upgrade() {
+        // Simulate a v20 database (no pools_affinity table): reopen
+        // replays SCHEMA_SQL additively and stamps 21; an affinity
+        // row round-trips through put/load and clear removes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE pools_affinity; PRAGMA user_version = 20;")
+                .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let v: i64 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::from(SCHEMA_VERSION));
+        assert!(s.load_pool_affinity().unwrap().is_empty());
+        s.put_pool_affinity("svc:abcdef0123456789", "m1", 1_900_000_100)
+            .unwrap();
+        let rows = s.load_pool_affinity().unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "svc:abcdef0123456789".to_string(),
+                "m1".to_string(),
+                1_900_000_100_i64
+            )]
+        );
+        // Upsert rebinds the opener to the member that now serves it.
+        s.put_pool_affinity("svc:abcdef0123456789", "far:m1", 1_900_000_200)
+            .unwrap();
+        s.clear_pool_affinity("svc:abcdef0123456789").unwrap();
+        assert!(s.load_pool_affinity().unwrap().is_empty());
     }
 
     #[test]

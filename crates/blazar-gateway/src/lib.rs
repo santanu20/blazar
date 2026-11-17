@@ -1526,6 +1526,27 @@ pub async fn serve(
         for key in expired {
             let _ = state.with_store(|s| s.clear_pool_op(&key));
         }
+        // Cache-affinity rows ride the same opt-in: conversations in
+        // flight across a restart keep their member steering (rows
+        // older than the affinity TTL are dead by definition and
+        // self-clear here, as do rows whose pool vanished).
+        let rows = state
+            .with_store(blazar_core::store::Store::load_pool_affinity)
+            .and_then(std::result::Result::ok)
+            .unwrap_or_default();
+        let (rows, gone): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|(key, ..)| crate::pools::ops_key_pool_known(&pools_cfg, key));
+        for (key, ..) in gone {
+            let _ = state.with_store(|s| s.clear_pool_affinity(&key));
+        }
+        let (live, expired) = crate::pools::affinity_from_persisted(&rows, now_unix);
+        if let Ok(mut m) = state.pools_affinity.lock() {
+            *m = live;
+        }
+        for key in expired {
+            let _ = state.with_store(|s| s.clear_pool_affinity(&key));
+        }
     }
     let app = router(state.clone());
     // Durable jobs boot hygiene, detached: sweep latency is not boot
