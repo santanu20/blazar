@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- MCP grant visibility: `blazar keys` lists per-key `mcp_servers`/`mcp_tools` scopes and the `/ui` console gains a Keys tab (paste an unscoped admin key per tab session to list keys, scopes and usage).
 
 - **Local per-model service-time EWMA.** Completed local chat round
   trips (ollama chat/generate, OpenAI chat + Responses, Anthropic

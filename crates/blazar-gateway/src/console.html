@@ -63,6 +63,7 @@
   <button data-tab="benchmarks">Benchmarks</button>
   <button data-tab="jobs">Jobs</button>
   <button data-tab="sessions">Sessions</button>
+  <button data-tab="keys">Keys</button>
 </nav>
 
 <section id="dashboard" class="on">
@@ -77,6 +78,7 @@
 <section id="benchmarks"><div id="benchmarks-body"></div></section>
 <section id="jobs"><div id="jobs-body"></div></section>
 <section id="sessions"><div id="sessions-body"></div></section>
+<section id="keys"><div id="keys-body"></div></section>
 
 <script>
 "use strict";
@@ -100,10 +102,18 @@ const when = (x) => val(x, (v) => {
 });
 const ago = (secs) => val(secs, (v) => (typeof v === "number" ? v.toFixed(0) + "s" : esc(v)));
 
-async function fetchJSON(url) {
-  const r = await fetch(url);
+async function fetchJSON(url, headers) {
+  const r = await fetch(url, { headers: headers || {} });
   if (!r.ok) throw new Error("HTTP " + r.status);
   return r.json();
+}
+
+// Management surfaces (key listing) are admin-bearer-gated; the
+// operator pastes an unscoped key once per tab session — never
+// persisted beyond it.
+function adminAuth() {
+  const k = sessionStorage.getItem("blazar-admin-key");
+  return k ? { "Authorization": "Bearer " + k } : undefined;
 }
 
 function errorRow(msg) {
@@ -134,6 +144,7 @@ async function pull() {
     fetchJSON("/api/benchmarks").then((v) => out.bench = v).catch((e) => out.benchErr = e),
     fetchJSON("/v1/jobs").then((v) => out.jobs = v).catch((e) => out.jobsErr = e),
     fetchJSON("/api/sessions").then((v) => out.sessions = v).catch((e) => out.sessionsErr = e),
+    fetchJSON("/api/keys", adminAuth()).then((v) => out.keys = v).catch((e) => out.keysErr = e),
   ];
   await Promise.all(jobs);
   return out;
@@ -152,6 +163,7 @@ function render(d) {
   renderBenchmarks(d);
   renderJobs(d);
   renderSessions(d);
+  renderKeys(d);
 }
 
 function renderDashboard(d) {
@@ -300,6 +312,60 @@ function renderSessions(d) {
   const rows = list.map((s) => headers.map((k) =>
     typeof s[k] === "number" ? when(s[k]) : val(s[k])));
   $("sessions-body").innerHTML = table(headers, rows);
+}
+
+function renderKeys(d) {
+  const prompt = `<p class="muted">admin key (unscoped): ` +
+    `<input id="admin-key-in" type="password" placeholder="sk-…" size="24"> ` +
+    `<button id="admin-key-set">load</button> ` +
+    `<span class="muted">kept for this tab only</span></p>`;
+  const bind = () => {
+    const set = $("admin-key-set");
+    if (!set) return;
+    set.addEventListener("click", () => {
+      const v = $("admin-key-in").value.trim();
+      if (v) sessionStorage.setItem("blazar-admin-key", v);
+      tick();
+    });
+  };
+  if (d.keysErr) {
+    // 401/403 = the paste above unlocks the listing; 403 "no keys
+    // configured" = authless gateway, nothing to list.
+    const msg = String(d.keysErr.message || "");
+    $("keys-body").innerHTML = prompt +
+      `<p class="note err">key listing unavailable — ${esc(msg)}</p>` +
+      (msg.includes("401") ? `<p class="muted">paste an unscoped (admin) key above, or run \`blazar keys\`</p>` : "");
+    bind();
+    return;
+  }
+  const list = (d.keys && d.keys.keys) || [];
+  if (!list.length) {
+    $("keys-body").innerHTML = prompt +
+      `<p class="gap">no keys on record</p>`;
+    bind();
+    return;
+  }
+  const headers = ["name", "models", "rpm", "tpm", "daily", "conc", "mcp servers", "mcp tools", "usage today"];
+  const rows = list.map((k) => {
+    const grants = (arr) => Array.isArray(arr) && arr.length
+      ? esc(arr.join(", "))
+      : '<span class="gap">all</span>';
+    const models = Array.isArray(k.models) && k.models.length
+      ? esc(k.models.join(","))
+      : '<span class="gap">* (admin)</span>';
+    const u = k.usage || {};
+    return [
+      esc(k.name),
+      models,
+      val(k.rpm), val(k.tpm), val(k.daily_tokens), val(k.max_concurrent),
+      grants(k.mcp_servers),
+      grants(k.mcp_tools),
+      `${esc(u.day || "-")} · ${val(u.requests)} req · ${val(u.tokens)} tok`,
+    ];
+  });
+  $("keys-body").innerHTML = prompt + table(headers, rows) +
+    `<p class="muted">${esc(d.keys.token_accounting || "")}</p>`;
+  bind();
 }
 
 // ---- tabs + refresh ----------------------------------------------------

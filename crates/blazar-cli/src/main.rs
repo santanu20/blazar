@@ -14629,6 +14629,29 @@ async fn keys_cmd(action: Option<KeysAction>) -> Result<()> {
                     u["requests"].as_u64().unwrap_or(0),
                     u["tokens"].as_u64().unwrap_or(0),
                 );
+                // MCP grants: surfaced only when scoped, so keyless
+                // deployments keep their compact output.
+                let servers = k["mcp_servers"].as_array().cloned().unwrap_or_default();
+                let tools = k["mcp_tools"].as_array().cloned().unwrap_or_default();
+                if !servers.is_empty() || !tools.is_empty() {
+                    let show = |v: &[serde_json::Value]| {
+                        v.iter()
+                            .filter_map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    let servers_out = if servers.is_empty() {
+                        "all".to_string()
+                    } else {
+                        show(&servers)
+                    };
+                    let tools_out = if tools.is_empty() {
+                        "all".to_string()
+                    } else {
+                        show(&tools)
+                    };
+                    println!("  mcp: servers [{servers_out}] tools [{tools_out}]");
+                }
             }
             Ok(())
         }
