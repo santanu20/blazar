@@ -234,6 +234,8 @@ pub async fn messages(
             .is_some_and(serde_json::Value::is_array),
         false,
     );
+    // Request-scope clock for the local service EWMA (both branches).
+    let served_t0 = std::time::Instant::now();
     let (engine, _load_ms) = match ensure_with_admission(
         &state,
         &model,
@@ -361,9 +363,26 @@ pub async fn messages(
                 budget_sniffer,
                 std::sync::Arc::clone(&state.keys),
                 anthropic_lease,
+                Some(crate::keys::LocalServiceStamp::from_started(
+                    std::sync::Arc::clone(&state.service_ewma_local),
+                    &engine.name,
+                    served_t0,
+                )),
             ))
         } else {
-            futures::StreamExt::boxed(resp.bytes_stream())
+            // Keyless traffic still feeds the local service EWMA
+            // (stamp-only tap).
+            futures::StreamExt::boxed(crate::keys::tap_usage(
+                resp.bytes_stream(),
+                None,
+                std::sync::Arc::clone(&state.keys),
+                None,
+                Some(crate::keys::LocalServiceStamp::from_started(
+                    std::sync::Arc::clone(&state.service_ewma_local),
+                    &engine.name,
+                    served_t0,
+                )),
+            ))
         };
         let events = anthropic_sse_stream(child_stream, StreamState::new(&id, &model_label), guard);
         return Response::builder()
@@ -490,6 +509,14 @@ pub async fn messages(
         return r;
     }
     let translated = translate_response(&openai, &model);
+    // Local service-time probe (buffered lane): measures the full
+    // round trip from t0, stamps on scope drop when the response
+    // hands off complete.
+    let _service = crate::keys::LocalServiceStamp::from_started(
+        std::sync::Arc::clone(&state.service_ewma_local),
+        &engine.name,
+        served_t0,
+    );
     // A2: blend the completion's decode rate into the model's EWMA.
     if let Some(n) = openai
         .pointer("/usage/completion_tokens")

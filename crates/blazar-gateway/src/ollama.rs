@@ -1292,7 +1292,13 @@ pub async fn chat(
                 .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0))
             && let Some((name, _entry)) = &key_entry
         {
-            out = crate::keys::charge_outgoing(out, name, Arc::clone(&state.keys), budget_lease);
+            out = crate::keys::charge_outgoing(
+                out,
+                name,
+                Arc::clone(&state.keys),
+                budget_lease,
+                None,
+            );
         }
         return out;
     }
@@ -1330,6 +1336,7 @@ pub async fn chat(
                         name,
                         std::sync::Arc::clone(&state.keys),
                         budget_lease,
+                        None,
                     );
                 }
                 return out;
@@ -1722,6 +1729,13 @@ pub async fn chat(
     // handler future, which resolves at headers-ready for streams and
     // can be dropped mid-flight on client disconnects. The guard began
     // at the admission gate above.
+    let model_stamp = model_name.clone();
+    // Full-service clock: starts BEFORE generation (the wrap at the
+    // end only carries it to stream completion).
+    let service = crate::keys::LocalServiceStamp::new(
+        std::sync::Arc::clone(&state.service_ewma_local),
+        &model_stamp,
+    );
     let mut out = crate::proxy::hold_body(
         guard,
         (async move {
@@ -1778,7 +1792,15 @@ pub async fn chat(
             .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0))
         && let Some((name, _entry)) = &key_entry
     {
-        out = crate::keys::charge_outgoing(out, name, Arc::clone(&state.keys), budget_lease);
+        out = crate::keys::charge_outgoing(
+            out,
+            name,
+            Arc::clone(&state.keys),
+            budget_lease,
+            Some(service),
+        );
+    } else {
+        out = crate::keys::stamp_service_body(out, service);
     }
     out
 }
@@ -3882,6 +3904,13 @@ pub async fn generate(
         );
     }
     let state_ej = state.clone();
+    let model_stamp = model_name.clone();
+    // Full-service clock: starts BEFORE generation (the wrap at the
+    // end only carries it to stream completion).
+    let service = crate::keys::LocalServiceStamp::new(
+        std::sync::Arc::clone(&state.service_ewma_local),
+        &model_stamp,
+    );
     let mut out = crate::proxy::hold_body(
         guard,
         (async move {
@@ -3930,7 +3959,15 @@ pub async fn generate(
             .is_some_and(|(_, e)| e.tpm > 0 || e.daily_tokens > 0))
         && let Some((name, _entry)) = &key_entry
     {
-        out = crate::keys::charge_outgoing(out, name, Arc::clone(&state.keys), budget_lease);
+        out = crate::keys::charge_outgoing(
+            out,
+            name,
+            Arc::clone(&state.keys),
+            budget_lease,
+            Some(service),
+        );
+    } else {
+        out = crate::keys::stamp_service_body(out, service);
     }
     out
 }

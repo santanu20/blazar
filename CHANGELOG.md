@@ -8,6 +8,16 @@ tracked here.
 
 ### Added
 
+- **Local per-model service-time EWMA.** Completed local chat round
+  trips (ollama chat/generate, OpenAI chat + Responses, Anthropic
+  messages - streaming and buffered, budgeted and keyless) now fold
+  their request-to-completion duration into a per-model EWMA. Pool
+  `adaptive` scoring consumes it for local members exactly as it does
+  the per-peer EWMA for remote members, so a measured local member
+  competes on real numbers instead of the declared default; the route
+  table (`GET /api/route/<pool>`, `blazar route`) reports
+  `service_measured` per member. Federation route ranking is
+  untouched.
 - **PID-reuse-proof orphan signalling (Linux).** The boot-time orphan
   reclaim, the SIGKILL escalation, and the pidfile sweep now signal
   through a `pidfd` pinned BEFORE the identity check: a PID that exits

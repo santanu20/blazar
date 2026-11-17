@@ -1028,6 +1028,8 @@ struct FinishSniffer(
     Option<crate::keys::UsageSniffer>,
     std::sync::Arc<crate::keys::KeysLimiter>,
     Option<crate::keys::BudgetLease>,
+    // Carried, never read: dropping this field stamps the EWMA.
+    #[allow(dead_code)] Option<crate::keys::LocalServiceStamp>,
 );
 impl Drop for FinishSniffer {
     fn drop(&mut self) {
@@ -1287,10 +1289,18 @@ pub async fn proxy_request(
             }
         }
     }
+    let mut service_stamp = (is_chat_route(path_query) && !model.is_empty()).then(|| {
+        // Full-service clock from admission (pre-forward): the wrap
+        // below carries it to stream/buffered completion.
+        crate::keys::LocalServiceStamp::new(std::sync::Arc::clone(&state.service_ewma_local), model)
+    });
     let upstream = forward_once(state, engine, method, &url, headers, body).await;
     let resp = match upstream {
         Ok(r) => r,
         Err(e) => {
+            if let Some(s) = service_stamp.take() {
+                s.cancel(); // failed forward never samples
+            }
             // Terminal status reflects the dominant failure: a wedged
             // LIVE child is a gateway timeout (504); a dead child that
             // could not be revived is a bad gateway (502).
@@ -1488,6 +1498,13 @@ pub async fn proxy_request(
                 // still settle budgets from the token-frame count.
                 .with_frame_counting(sse)
         });
+    // Non-success child responses cancel the probe (error bodies
+    // must not sample the service EWMA).
+    if !status.is_success()
+        && let Some(s) = service_stamp.take()
+    {
+        s.cancel();
+    }
     // Enforce (opt-in): non-stream chat requests get judged BEFORE any
     // byte is released - the client waits for the full JSON anyway, so
     // buffering costs no extra round trip. F62: bodies whose declared
@@ -1834,6 +1851,7 @@ pub async fn proxy_request(
         sniffer,
         Arc::clone(&state.keys),
         budget_lease,
+        service_stamp,
     )));
     let cache_tap = std::sync::Arc::new(CacheTap::new());
     let tap_map = std::sync::Arc::clone(&cache_tap);

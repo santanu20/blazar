@@ -103,6 +103,7 @@ pub fn find<'a>(cfg: &'a Config, requested: &str) -> Option<&'a ModelPool> {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )] // in_flight clamped >= 0; wave counts exact in f64
+#[allow(clippy::too_many_arguments)] // signal snapshot inputs, one per telemetry lane
 pub(crate) fn score_members_core(
     pool: &ModelPool,
     cfg: &Config,
@@ -110,6 +111,8 @@ pub(crate) fn score_members_core(
     ps_rows: &[blazar_runtime::supervisor::PsRow],
     healths: &HashMap<String, RemoteHealth>,
     caps: &HashMap<String, PeerCapacity>,
+    local_service: &HashMap<String, f64>,
+    local_names: &HashMap<String, String>,
     now: Instant,
 ) -> Vec<MemberScore> {
     pool.members
@@ -117,7 +120,15 @@ pub(crate) fn score_members_core(
         .enumerate()
         .map(|(idx, member)| {
             if member.peer == "local" {
-                let resident: Vec<_> = ps_rows.iter().filter(|r| r.name == member.model).collect();
+                // A qualified member ("name:quant") serves under its
+                // resolved row name - the same canonicalization the
+                // serving lanes apply - so tier/service lookups key by
+                // the row name, never the qualified spelling.
+                let row_name = local_names
+                    .get(&member.model)
+                    .cloned()
+                    .unwrap_or_else(|| member.model.clone());
+                let resident: Vec<_> = ps_rows.iter().filter(|r| r.name == row_name).collect();
                 let (tier, slots, busy) = if resident.is_empty() {
                     (remotes::REMOTE_TIER_COLD, 1u64, 0u64)
                 } else {
@@ -126,6 +137,10 @@ pub(crate) fn score_members_core(
                 };
                 let queue = queue_depth.saturating_add(busy);
                 let waves = queue.div_ceil(slots);
+                let (service_ms, measured) = match local_service.get(&row_name) {
+                    Some(ewma) => (ewma.ceil() as u64, true),
+                    None => (SERVICE_DEFAULT_MS, false),
+                };
                 MemberScore {
                     idx,
                     effective: member.model.clone(),
@@ -134,8 +149,8 @@ pub(crate) fn score_members_core(
                         est_wait_ms: (waves as f64 * LOCAL_TTFT_DEFAULT_MS).ceil() as u64,
                         free_vram: std::cmp::Reverse(0),
                     },
-                    service_ms: SERVICE_DEFAULT_MS,
-                    measured: false,
+                    service_ms,
+                    measured,
                     down: false,
                 }
             } else {
@@ -180,6 +195,31 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         .lock()
         .map(|c| c.clone())
         .unwrap_or_default();
+    let local_service = state
+        .service_ewma_local
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    // Resolve each local member to its serving row name (qualified
+    // spellings like "name:quant" canonicalize exactly as the serving
+    // lanes do), so tier and service lookups match the names the
+    // runtime and the EWMA stamps actually use.
+    let local_names: HashMap<String, String> = pool
+        .members
+        .iter()
+        .filter(|m| m.peer == "local")
+        .map(|m| {
+            let row_name = state
+                .with_store(|s| {
+                    crate::proxy::resolve_model(s, &m.model)
+                        .ok()
+                        .map(|row| row.name)
+                })
+                .flatten()
+                .unwrap_or_else(|| m.model.clone());
+            (m.model.clone(), row_name)
+        })
+        .collect();
     score_members_core(
         pool,
         &state.cfg(),
@@ -187,6 +227,8 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         &ps_rows,
         &healths,
         &caps,
+        &local_service,
+        &local_names,
         Instant::now(),
     )
 }
@@ -707,6 +749,8 @@ mod tests {
             &[],
             &healths,
             &caps,
+            &HashMap::new(),
+            &HashMap::new(),
             Instant::now(),
         );
         assert_eq!(members.len(), 2);
@@ -746,11 +790,44 @@ mod tests {
             &ps_rows,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
             Instant::now(),
         );
         assert_eq!(members[0].score.tier, remotes::REMOTE_TIER_WARM);
         // (2 queued + 4 busy) / 2 slots = 3 waves * 750 ms.
         assert_eq!(members[0].score.est_wait_ms, 2250);
+    }
+
+    /// A local member's service estimate comes from the per-model EWMA
+    /// map (stamped by `keys::LocalServiceStamp` at local stream
+    /// completion); absent entries keep the declared default and stay
+    /// unmeasured.
+    #[test]
+    fn unit__score_members_core__local_member_consumes_service_ewma_map() {
+        let cfg = cfg_with(None);
+        let local_pool = ModelPool {
+            name: "svc".into(),
+            strategy: PoolStrategy::Adaptive,
+            members: vec![member("local", "m1"), member("local", "m2")],
+        };
+        let mut local_service = HashMap::new();
+        local_service.insert("m1".to_string(), 4000.0);
+        let members = score_members_core(
+            &local_pool,
+            &cfg,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &local_service,
+            &HashMap::new(),
+            Instant::now(),
+        );
+        assert_eq!(members[0].service_ms, 4000);
+        assert!(members[0].measured, "m1 carries a stamped EWMA");
+        assert_eq!(members[1].service_ms, SERVICE_DEFAULT_MS);
+        assert!(!members[1].measured, "m2 has no observation yet");
     }
 
     /// A pool member whose peer is marked down carries `down = true`.
@@ -774,6 +851,8 @@ mod tests {
             0,
             &[],
             &healths,
+            &HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
             Instant::now(),
         );

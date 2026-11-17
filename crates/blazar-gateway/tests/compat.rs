@@ -458,6 +458,82 @@ async fn client__model_pool__routes_member_scope_and_route_table() {
     stub.shutdown().await;
 }
 
+/// Local member service EWMA: completing one chat through a
+/// local-member pool stamps the per-model EWMA, and the route table
+/// reflects `service_measured: true` for that member (the local twin
+/// of the remote lane's per-peer EWMA).
+#[tokio::test]
+async fn client__model_pool__local_member_stamps_service_ewma() {
+    let cfg = blazar_core::Config {
+        keys: vec![blazar_core::ApiKey {
+            name: "admin".into(),
+            key: "plm_admin".into(),
+            ..blazar_core::ApiKey::default()
+        }],
+        ..blazar_core::Config::default()
+    };
+    let cfg = support::with_pool(
+        cfg,
+        "svc_local",
+        blazar_core::config::PoolStrategy::Adaptive,
+        &[("local", "m1")],
+    );
+    let ts = start(cfg).await;
+    let c = client();
+
+    // Before any traffic: the member carries the declared default and
+    // no measurement.
+    let route: serde_json::Value = c
+        .get(format!("{}/api/route/svc_local", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        route["pool"]["members"][0]["service_measured"], false,
+        "{route}"
+    );
+
+    // One completed generation through the pool (expansion rewrites
+    // the model to the local member "m1").
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "model": "svc_local", "stream": false,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "local member serves the pool ask");
+
+    let route: serde_json::Value = c
+        .get(format!("{}/api/route/svc_local", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        route["pool"]["members"][0]["service_measured"], true,
+        "route table after one completed chat: {route}"
+    );
+    assert!(
+        route["pool"]["members"][0]["service_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 0),
+        "measured service time is positive: {route}"
+    );
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 /// C4: same-named remotes form a POOL; a conversation prefix sticks to
 /// the member that served it (its KV holds the prefix), surfaced via
 /// `x-blazar-remote`.

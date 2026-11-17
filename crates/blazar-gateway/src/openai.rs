@@ -1653,7 +1653,13 @@ fn maybe_charge_remote(
     if !budgeted {
         return resp;
     }
-    crate::keys::charge_outgoing(resp, key_name, std::sync::Arc::clone(&state.keys), lease)
+    crate::keys::charge_outgoing(
+        resp,
+        key_name,
+        std::sync::Arc::clone(&state.keys),
+        lease,
+        None,
+    )
 }
 
 /// Child surfaces only llama-server implements. A non-llamacpp child
@@ -2588,6 +2594,13 @@ async fn buffered_response_roundtrip(
             crate::proxy::others_peak(entry_live, state.sup.model_live_streams(model_name)),
         );
     }
+    // Local service-time probe (Responses buffered lane): stamps the
+    // full round trip from t0 into the per-model EWMA on scope drop.
+    let _service = crate::keys::LocalServiceStamp::from_started(
+        std::sync::Arc::clone(&state.service_ewma_local),
+        model_name,
+        t0,
+    );
     // FIX6: this buffered branch bypasses proxy_request's sniffer -
     // charge token budgets directly from the parsed usage. The strict
     // lane settles its reservation through the same numbers.

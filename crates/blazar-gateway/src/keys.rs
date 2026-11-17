@@ -1066,6 +1066,7 @@ pub fn charge_outgoing(
     name: &str,
     limiter: std::sync::Arc<KeysLimiter>,
     lease: Option<BudgetLease>,
+    service: Option<LocalServiceStamp>,
 ) -> axum::response::Response {
     use futures::StreamExt as _;
     /// Abort-safe finisher: `Drop` runs on clean drain AND client abort.
@@ -1073,6 +1074,8 @@ pub fn charge_outgoing(
         Option<UsageSniffer>,
         std::sync::Arc<KeysLimiter>,
         Option<BudgetLease>,
+        // Carried, never read: dropping this field stamps the EWMA.
+        #[allow(dead_code)] Option<LocalServiceStamp>,
     );
     impl Drop for Finish {
         fn drop(&mut self) {
@@ -1118,6 +1121,7 @@ pub fn charge_outgoing(
         Some(UsageSniffer::new(name).with_frame_counting(streaming_ct)),
         limiter,
         lease,
+        service,
     )));
     let mapped = body.into_data_stream().map(move |r| {
         if let Ok(bytes) = r.as_ref()
@@ -1125,6 +1129,105 @@ pub fn charge_outgoing(
         {
             f.push(bytes);
         }
+        r.map_err(|e| std::io::Error::other(e.to_string()))
+    });
+    let stream = mapped.chain(futures::stream::unfold((), |()| async { None }));
+    axum::http::Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+
+/// Local-lane service-time probe: constructed when a chat request's
+/// serving model is known, dropped when the response stream completes
+/// (or the scope of a buffered build ends). `Drop` folds the observed
+/// request-to-completion milliseconds into a per-model EWMA that pool
+/// `adaptive` scoring consumes - the local twin of the remote lane's
+/// per-peer `service_ewma_ms`.
+///
+/// Semantics: stamps chat routes on successful child responses; client
+/// aborts mid-stream under-measure (the guard drops early) and blend
+/// out via the EWMA. Poisoned or missing map entries are skipped -
+/// the probe is advisory telemetry, never a request-path failure.
+pub struct LocalServiceStamp {
+    map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+    model: String,
+    started: std::time::Instant,
+    /// Set by [`LocalServiceStamp::cancel`]: failed forwards and
+    /// non-success responses must never sample the EWMA.
+    cancelled: bool,
+}
+
+impl LocalServiceStamp {
+    /// Start the clock for one served model. Callers gate construction
+    /// (chat routes, success status, non-empty model) - this is just
+    /// the captured context.
+    pub fn new(
+        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+        model: &str,
+    ) -> Self {
+        Self {
+            map,
+            model: model.to_string(),
+            started: std::time::Instant::now(),
+            cancelled: false,
+        }
+    }
+
+    /// Abort the probe without sampling: failed forwards and error
+    /// responses drop out of the EWMA entirely.
+    pub fn cancel(mut self) {
+        self.cancelled = true;
+    }
+
+    /// Buffered-lane variant: the caller already holds the request
+    /// start (`t0`), so the probe measures the full round trip, not
+    /// just the post-response build tail.
+    pub fn from_started(
+        map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
+        model: &str,
+        started: std::time::Instant,
+    ) -> Self {
+        Self {
+            map,
+            model: model.to_string(),
+            started,
+            cancelled: false,
+        }
+    }
+}
+
+impl Drop for LocalServiceStamp {
+    fn drop(&mut self) {
+        if self.cancelled {
+            return;
+        }
+        let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(mut map) = self.map.lock() {
+            match map.get_mut(&self.model) {
+                Some(ewma) => *ewma = crate::hint_ewma(Some(*ewma), ms),
+                None => {
+                    map.insert(self.model.clone(), ms);
+                }
+            }
+        }
+    }
+}
+
+/// Body wrapper that carries ONLY a [`LocalServiceStamp`] to stream
+/// end - open-gateway lanes with no budget key still feed the local
+/// service EWMA (mirrors [`charge_outgoing`] for the stamp-only case).
+#[must_use]
+pub fn stamp_service_body(
+    resp: axum::response::Response,
+    service: LocalServiceStamp,
+) -> axum::response::Response {
+    use futures::StreamExt as _;
+    struct StampOnly(
+        // Carried, never read: dropping this field stamps the EWMA.
+        #[allow(dead_code)] LocalServiceStamp,
+    );
+    let (parts, body) = resp.into_parts();
+    let finish = std::sync::Arc::new(StampOnly(service));
+    let mapped = body.into_data_stream().map(move |r| {
+        let _hold = std::sync::Arc::clone(&finish);
         r.map_err(|e| std::io::Error::other(e.to_string()))
     });
     let stream = mapped.chain(futures::stream::unfold((), |()| async { None }));
@@ -1165,6 +1268,7 @@ pub fn tap_usage<S, E>(
     sniffer: Option<UsageSniffer>,
     limiter: std::sync::Arc<KeysLimiter>,
     lease: Option<BudgetLease>,
+    service: Option<LocalServiceStamp>,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, E>>
 where
     S: futures::Stream<Item = Result<axum::body::Bytes, E>>,
@@ -1174,6 +1278,8 @@ where
         Option<UsageSniffer>,
         std::sync::Arc<KeysLimiter>,
         Option<BudgetLease>,
+        // Carried, never read: dropping this field stamps the EWMA.
+        #[allow(dead_code)] Option<LocalServiceStamp>,
     );
     impl Drop for Tap {
         fn drop(&mut self) {
@@ -1199,7 +1305,7 @@ where
             }
         }
     }
-    let tap = std::sync::Arc::new(std::sync::Mutex::new(Tap(sniffer, limiter, lease)));
+    let tap = std::sync::Arc::new(std::sync::Mutex::new(Tap(sniffer, limiter, lease, service)));
     let mapped = stream.map(move |r| {
         if let Ok(bytes) = r.as_ref()
             && let Some(t) = tap.lock().expect("usage tap").0.as_mut()
@@ -1891,5 +1997,39 @@ mod tests {
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}\n\n",
         );
         assert_eq!(s.sniff(), 9 + 3 * 2);
+    }
+
+    /// `LocalServiceStamp` folds request-to-completion milliseconds
+    /// into a per-model EWMA on drop; successive observations blend at
+    /// the hint rate (0.3), and `from_started` measures from the
+    /// caller's `t0` (buffered round trips).
+    #[test]
+    fn unit__local_service_stamp__drop_stamps_per_model_ewma() {
+        let map: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>> =
+            std::sync::Arc::default();
+        {
+            let s = LocalServiceStamp::new(std::sync::Arc::clone(&map), "m1");
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(s);
+        }
+        let first = *map.lock().unwrap().get("m1").expect("first stamp landed");
+        assert!(first >= 30.0, "elapsed ms observed, got {first}");
+        {
+            // Second observation blends: 0.7 * first + 0.3 * 100.
+            let started = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(100))
+                .expect("100 ms is always in the past on test hosts");
+            let s = LocalServiceStamp::from_started(std::sync::Arc::clone(&map), "m1", started);
+            drop(s);
+        }
+        let blended = *map.lock().unwrap().get("m1").unwrap();
+        // 0.7*first + 0.3*100; assert the blend moved toward 100 from
+        // first without pinning wall-clock exactness.
+        assert!(
+            blended > first * 0.69 && blended < first + 31.0,
+            "EWMA blend 0.3 between {first} and 100, got {blended}"
+        );
+        // A different model keeps its own entry.
+        assert!(!map.lock().unwrap().contains_key("m2"));
     }
 }
