@@ -14156,6 +14156,7 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
             all,
             stagger_secs,
             dry_run,
+            yes,
         }) => {
             pool_member_op(
                 &pool,
@@ -14165,17 +14166,38 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
                 all,
                 stagger_secs,
                 dry_run,
+                yes,
             )
             .await
         }
         Some(PoolAction::Undrain { pool, member, all }) => {
-            pool_member_op(&pool, member.as_deref(), "undrain", None, all, None, false).await
+            pool_member_op(
+                &pool,
+                member.as_deref(),
+                "undrain",
+                None,
+                all,
+                None,
+                false,
+                false,
+            )
+            .await
         }
         Some(PoolAction::Pin { pool, member }) => {
-            pool_member_op(&pool, Some(&member), "pin", None, false, None, false).await
+            pool_member_op(&pool, Some(&member), "pin", None, false, None, false, false).await
         }
         Some(PoolAction::Unpin { pool, member }) => {
-            pool_member_op(&pool, Some(&member), "unpin", None, false, None, false).await
+            pool_member_op(
+                &pool,
+                Some(&member),
+                "unpin",
+                None,
+                false,
+                None,
+                false,
+                false,
+            )
+            .await
         }
         // Bare `blazar pool` reads as `blazar pool list`.
         Some(PoolAction::List { json }) => pool_list(json).await,
@@ -14218,6 +14240,12 @@ async fn pool_watch(interval_secs: u64) -> Result<()> {
 
 /// POST /api/pools/{pool}/{action} with the member body, then print
 /// the daemon's note plus the pool's updated decision.
+///
+/// A permanent `--all` drain (no TTL) is the one verb here that can
+/// silently idle a whole service, so an interactive terminal gets a
+/// confirmation naming the blast radius; non-interactive callers must
+/// pass `--yes` (or scope the drain with `--ttl-secs`/`--stagger-secs`).
+#[allow(clippy::too_many_arguments)] // one parameter per CLI knob - a struct would obscure the call sites
 async fn pool_member_op(
     pool: &str,
     member: Option<&str>,
@@ -14225,10 +14253,35 @@ async fn pool_member_op(
     ttl_secs: Option<u64>,
     all: bool,
     stagger_secs: Option<u64>,
+    dry_run: bool,
+    yes: bool,
 ) -> Result<()> {
     let base = ensure_daemon().await?;
     if member.is_none() && !all {
         anyhow::bail!("pass a member or --all (drain every member of '{pool}')");
+    }
+    if action == "drain" && all && ttl_secs.is_none() && !dry_run && !yes {
+        // State the blast radius in the prompt: a permanent drain of
+        // the whole pool only returns when someone runs `undrain`.
+        let members = pools_fetch(&base).await.ok().and_then(|v| {
+            v["pools"]
+                .as_array()
+                .and_then(|ps| ps.iter().find(|p| p["model"].as_str() == Some(pool)))
+                .and_then(|p| p["pool"]["members"].as_array())
+                .map(Vec::len)
+        });
+        let scope = match members {
+            Some(n) => format!("all {n} member(s) of pool '{pool}'"),
+            None => format!("every member of pool '{pool}'"),
+        };
+        match prompt_line(&format!(
+            "Permanently drain {scope} (no TTL - they return only via `pool undrain`)? [y/N] "
+        )) {
+            Some(ans) if ans.eq_ignore_ascii_case("y") => {}
+            _ => anyhow::bail!(
+                "aborted - pass --ttl-secs for a self-returning drain, or --yes to skip this prompt"
+            ),
+        }
     }
     let mut body = match member {
         Some(m) => serde_json::json!({ "member": m }),
@@ -14242,6 +14295,9 @@ async fn pool_member_op(
     }
     if let Some(stagger) = stagger_secs {
         body["stagger_secs"] = serde_json::json!(stagger);
+    }
+    if dry_run {
+        body["dry_run"] = serde_json::json!(true);
     }
     let mut req = cli_http()
         .post(format!("{base}/api/pools/{pool}/{action}"))
@@ -14261,6 +14317,13 @@ async fn pool_member_op(
         serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
     if let Some(note) = v["note"].as_str() {
         println!("{note}");
+    }
+    if let Some(schedule) = v["schedule"].as_array() {
+        for line in schedule {
+            if let Some(s) = line.as_str() {
+                println!("  {s}");
+            }
+        }
     }
     println!(
         "decision   {} - {}",
@@ -15017,6 +15080,10 @@ enum PoolAction {
         /// drained, nothing persisted
         #[arg(long)]
         dry_run: bool,
+        /// Skip the confirmation a permanent `--all` drain asks for
+        /// (scripts and CI; an interactive terminal gets a prompt)
+        #[arg(long)]
+        yes: bool,
     },
     /// Resume routing to a drained member (or all of them with --all)
     Undrain {
