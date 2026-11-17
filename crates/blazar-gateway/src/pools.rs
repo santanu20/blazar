@@ -49,6 +49,64 @@ const POOL_STICKY_WINDOW: std::time::Duration = std::time::Duration::from_secs(1
 /// describes an engine state that no longer exists.
 const SERVICE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Cache-affinity discount: one default TTFT (the prefill the
+/// affinity member likely skips because its KV cache still holds the
+/// prompt prefix). Full while the entry is [`AFFINITY_FRESH`] old,
+/// then decays linearly to zero at [`AFFINITY_TTL`] - past that the
+/// prefix is assumed evicted and the affinity entry is ignored.
+const AFFINITY_FULL_MS: u64 = 750;
+const AFFINITY_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+const AFFINITY_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Bound on tracked prompt prefixes per gateway (memory hygiene);
+/// expired entries are dropped first, a still-full map is cleared.
+const AFFINITY_CAP: usize = 256;
+
+/// The affinity discount for an entry of this age (see
+/// [`AFFINITY_FULL_MS`]). Pure integer math, unit-pinned.
+fn affinity_discount(age: std::time::Duration) -> u64 {
+    if age <= AFFINITY_FRESH {
+        return AFFINITY_FULL_MS;
+    }
+    if age >= AFFINITY_TTL {
+        return 0;
+    }
+    let span = AFFINITY_TTL
+        .checked_sub(AFFINITY_FRESH)
+        .expect("TTL outlives FRESH by construction")
+        .as_secs();
+    let left = AFFINITY_TTL
+        .checked_sub(age)
+        .expect("age < TTL guarded above")
+        .as_secs();
+    // ratio in basis points avoids float math: left/span in [0,1).
+    AFFINITY_FULL_MS * left / span
+}
+
+/// Stable-ish key for one conversation prefix: the first message's
+/// text (string content, or the first `text` part of multimodal
+/// content), truncated to 512 chars. Only the OPENING of the prompt
+/// decides affinity - the prefix whose KV reuse matters is the one
+/// both turns share. `None` when the body has no textual opener.
+fn affinity_key(pool: &str, body: &serde_json::Value) -> Option<String> {
+    use std::hash::{Hash as _, Hasher as _};
+    let first = body.get("messages")?.as_array()?.first()?;
+    let content = match first.get("content") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .find_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .unwrap_or_default(),
+        _ => "",
+    };
+    let prefix: String = content.chars().take(512).collect();
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    prefix.hash(&mut h);
+    Some(format!("{pool}:{:016x}", h.finish()))
+}
+
 /// Blend a measured service EWMA toward the declared default as it
 /// ages: fresh observations pass through verbatim, observations older
 /// than [`SERVICE_STALE_AFTER`] are indistinguishable from never
@@ -272,6 +330,7 @@ pub(crate) fn pick<'a>(
     pool: &ModelPool,
     members: &'a [MemberScore],
     sticky: Option<&StickyPick>,
+    affinity: Option<(&str, u64)>,
 ) -> Option<&'a MemberScore> {
     match pool.strategy {
         // Failover posture: first member whose peer is not marked
@@ -288,15 +347,24 @@ pub(crate) fn pick<'a>(
             if !members.iter().any(|m| m.measured) {
                 return members.iter().min_by_key(|m| (m.score, m.idx));
             }
-            let best_total = members
+            // Cache affinity: the member that recently served this
+            // prompt prefix likely still holds its KV cache, so its
+            // re-prefill cost (about one TTFT) drops out of the
+            // completion estimate. The discount is request-scoped -
+            // introspection (`route_json`) passes `None` and reports
+            // the affinity-free estimate.
+            let total = |m: &MemberScore| {
+                let base = m.score.est_wait_ms.saturating_add(m.service_ms);
+                match affinity {
+                    Some((eff, discount)) if m.effective == eff => base.saturating_sub(discount),
+                    _ => base,
+                }
+            };
+            let best_total = members.iter().filter(|m| !m.down).map(total).min()?;
+            let best = members
                 .iter()
                 .filter(|m| !m.down)
-                .map(|m| m.score.est_wait_ms.saturating_add(m.service_ms))
-                .min()?;
-            let best = members.iter().filter(|m| !m.down).min_by_key(|m| {
-                let total = m.score.est_wait_ms.saturating_add(m.service_ms);
-                (total, m.score.tier, m.idx)
-            })?;
+                .min_by_key(|m| (total(m), m.score.tier, m.idx))?;
             // Hysteresis: keep the previous pick when it is still
             // healthy, fresh, and within the margin of the best
             // estimate - small estimate noise must not reshuffle
@@ -308,9 +376,9 @@ pub(crate) fn pick<'a>(
                     .iter()
                     .find(|m| m.effective == s.effective && !m.down)
             {
-                let total = current.score.est_wait_ms.saturating_add(current.service_ms);
+                let current_total = total(current);
                 let threshold = best_total.saturating_add(best_total / 10);
-                if total <= threshold {
+                if current_total <= threshold {
                     return Some(current);
                 }
             }
@@ -325,6 +393,12 @@ pub(crate) fn pick<'a>(
 /// name is not a pool (the untouched legacy path). Adaptive pools also
 /// record their pick as hysteresis state for the next request.
 pub fn expand(state: &AppState, requested: &str) -> Option<String> {
+    expand_with(state, requested, None)
+}
+
+/// [`expand`] with an optional request-scoped cache-affinity hint
+/// (effective member + discount) for the adaptive arm.
+fn expand_with(state: &AppState, requested: &str, affinity: Option<(&str, u64)>) -> Option<String> {
     let cfg = state.cfg();
     let pool = find(&cfg, requested)?;
     let members = score_members(state, pool);
@@ -333,7 +407,7 @@ pub fn expand(state: &AppState, requested: &str) -> Option<String> {
         .lock()
         .ok()
         .and_then(|m| m.get(&pool.name).cloned());
-    let picked = pick(pool, &members, sticky.as_ref())?;
+    let picked = pick(pool, &members, sticky.as_ref(), affinity)?;
     if pool.strategy == PoolStrategy::Adaptive
         && let Ok(mut m) = state.pools_sticky.lock()
     {
@@ -354,8 +428,46 @@ pub fn expand(state: &AppState, requested: &str) -> Option<String> {
 /// id regardless). Unparseable bodies ride unchanged - the engine
 /// reports its own error, same fail-open contract as
 /// [`remotes::rewrite_model`], which does the swap.
+///
+/// Adaptive pools additionally consult and record per-prefix cache
+/// affinity: the member that served the same opening prompt recently
+/// gets its re-prefill cost discounted (see [`AFFINITY_FULL_MS`]).
 pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option<(String, Bytes)> {
-    let effective = expand(state, requested)?;
+    let cfg = state.cfg();
+    let pool = find(&cfg, requested)?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let key = parsed.as_ref().and_then(|v| affinity_key(&pool.name, v));
+    let affinity = key.as_ref().and_then(|k| {
+        state
+            .pools_affinity
+            .lock()
+            .ok()
+            .and_then(|m| m.get(k).cloned())
+            .and_then(|(effective, at)| {
+                let age = Instant::now().duration_since(at);
+                let discount = affinity_discount(age);
+                (discount > 0).then_some((effective, discount))
+            })
+    });
+    let effective = expand_with(
+        state,
+        requested,
+        affinity.as_ref().map(|(e, d)| (e.as_str(), *d)),
+    )?;
+    if let Some(k) = key
+        && let Ok(mut m) = state.pools_affinity.lock()
+    {
+        // Hygiene: drop expired entries at the cap, clear if still
+        // full (a burst of unique prefixes is not worth unbounded
+        // memory; the next request re-seeds).
+        if m.len() >= AFFINITY_CAP {
+            m.retain(|_, (_, at)| at.elapsed() < AFFINITY_TTL);
+            if m.len() >= AFFINITY_CAP {
+                m.clear();
+            }
+        }
+        m.insert(k, (effective.clone(), Instant::now()));
+    }
     let rewritten = remotes::rewrite_model(body.clone(), &effective);
     Some((effective, rewritten))
 }
@@ -373,7 +485,7 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
         .lock()
         .ok()
         .and_then(|m| m.get(&pool.name).cloned());
-    let chosen = pick(pool, &members, sticky.as_ref());
+    let chosen = pick(pool, &members, sticky.as_ref(), None);
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
@@ -533,14 +645,14 @@ mod tests {
             scored(0, "m1", 0, 900, 0, false),
             scored(1, "far:m1", 0, 10, 0, true),
         ];
-        let picked = pick(&p, &members, None).expect("local member eligible");
+        let picked = pick(&p, &members, None, None).expect("local member eligible");
         assert_eq!(picked.idx, 0);
 
         let members = vec![
             scored(0, "far:m1", 0, 10, 0, true),
             scored(1, "m1", 0, 900, 0, false),
         ];
-        let picked = pick(&p, &members, None).expect("second member eligible");
+        let picked = pick(&p, &members, None, None).expect("second member eligible");
         assert_eq!(picked.idx, 1);
     }
 
@@ -550,7 +662,7 @@ mod tests {
     fn unit__pick__all_down_returns_least_bad_member() {
         let p = pool(PoolStrategy::Ordered);
         let members = vec![scored(0, "far:m1", 0, 10, 0, true)];
-        let picked = pick(&p, &members, None).expect("degenerate pool still picks");
+        let picked = pick(&p, &members, None, None).expect("degenerate pool still picks");
         assert_eq!(picked.effective, "far:m1");
     }
 
@@ -563,7 +675,7 @@ mod tests {
             scored(0, "m1", 0, 1500, 0, false),
             scored(1, "far:m1", 2, 100, 0, false),
         ];
-        let picked = pick(&p, &members, None).expect("two members");
+        let picked = pick(&p, &members, None, None).expect("two members");
         assert_eq!(picked.idx, 1, "cold peer with the smaller wait must win");
     }
 
@@ -576,14 +688,14 @@ mod tests {
             scored(0, "far:m1", 2, 10, 9999, false),
             scored(1, "m1", 0, 800, 0, false),
         ];
-        let picked = pick(&p, &members, None).expect("two members");
+        let picked = pick(&p, &members, None, None).expect("two members");
         assert_eq!(picked.idx, 1, "warm member wins despite larger wait");
 
         let members = vec![
             scored(0, "m1", 0, 750, 5, false),
             scored(1, "far:m1", 0, 750, 5, false),
         ];
-        let picked = pick(&p, &members, None).expect("two members");
+        let picked = pick(&p, &members, None, None).expect("two members");
         assert_eq!(picked.idx, 0, "full tie breaks to declaration order");
     }
 
@@ -597,8 +709,8 @@ mod tests {
             scored(0, "far:m1", 1, 100, 0, false),
             scored(1, "m1", 2, 50, 0, false),
         ];
-        let warm = pick(&pool(PoolStrategy::WarmFirst), &members, None);
-        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members, None);
+        let warm = pick(&pool(PoolStrategy::WarmFirst), &members, None, None);
+        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members, None, None);
         assert_eq!(
             warm.map(|m| m.idx),
             adaptive.map(|m| m.idx),
@@ -616,8 +728,8 @@ mod tests {
             scored_service(0, "m1", 0, 800, SERVICE_DEFAULT_MS, false),
             scored_service(1, "far:m1", 2, 100, 200, true),
         ];
-        let warm = pick(&pool(PoolStrategy::WarmFirst), &members, None);
-        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members, None);
+        let warm = pick(&pool(PoolStrategy::WarmFirst), &members, None, None);
+        let adaptive = pick(&pool(PoolStrategy::Adaptive), &members, None, None);
         assert_eq!(
             warm.unwrap().idx,
             0,
@@ -645,7 +757,7 @@ mod tests {
             effective: "m1".into(),
             at: Instant::now(),
         };
-        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky)).unwrap();
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky), None).unwrap();
         assert_eq!(picked.idx, 0, "sticky member within 10% margin is kept");
 
         // Challenger is >10% better (best 1000, sticky total 1200):
@@ -654,7 +766,7 @@ mod tests {
             scored_service(0, "m1", 0, 1100, 100, true),
             scored_service(1, "far:m1", 0, 900, 100, true),
         ];
-        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky)).unwrap();
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky), None).unwrap();
         assert_eq!(picked.idx, 1, "materially better challenger takes over");
     }
 
@@ -673,7 +785,7 @@ mod tests {
                 .checked_sub(POOL_STICKY_WINDOW + std::time::Duration::from_secs(1))
                 .expect("sticky window well inside Instant range"),
         };
-        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&stale)).unwrap();
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&stale), None).unwrap();
         assert_eq!(
             picked.idx, 1,
             "expired sticky pick loses to the best estimate"
@@ -698,7 +810,7 @@ mod tests {
             effective: "m1".into(),
             at: Instant::now(),
         };
-        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky)).unwrap();
+        let picked = pick(&pool(PoolStrategy::Adaptive), &members, Some(&sticky), None).unwrap();
         assert_eq!(picked.idx, 1, "down sticky member is never retained");
     }
 
@@ -941,6 +1053,87 @@ mod tests {
     }
 
     /// `find()` is exact-match and prefix-safe.
+    /// The affinity discount math: full while fresh, linear decay,
+    /// zero at (and past) the TTL.
+    #[test]
+    fn unit__affinity_discount__full_fresh_linear_decay_zero_stale() {
+        assert_eq!(affinity_discount(std::time::Duration::from_secs(0)), 750);
+        assert_eq!(affinity_discount(std::time::Duration::from_secs(30)), 750);
+        // 750 * (120-75)/(120-30) = 750*45/90 = 375.
+        assert_eq!(affinity_discount(std::time::Duration::from_secs(75)), 375);
+        assert_eq!(affinity_discount(std::time::Duration::from_secs(120)), 0);
+        assert_eq!(affinity_discount(std::time::Duration::from_secs(600)), 0);
+    }
+
+    /// Two equally-measured members tie to declaration order; a
+    /// request-scoped affinity discount for the second member flips
+    /// the adaptive pick to it (its KV cache skips the re-prefill).
+    #[test]
+    fn unit__pick_adaptive__affinity_discount_flips_tie() {
+        let members = vec![
+            scored_service(0, "m1", 0, 100, 750, true),
+            scored_service(1, "far:m2", 0, 100, 750, true),
+        ];
+        let p = pool(PoolStrategy::Adaptive);
+        let tie = pick(&p, &members, None, None).unwrap();
+        assert_eq!(tie.effective, "m1", "equal estimates tie to idx");
+        let pinned = pick(&p, &members, None, Some(("far:m2", 750))).unwrap();
+        assert_eq!(
+            pinned.effective, "far:m2",
+            "discounted affinity member wins"
+        );
+        // With a 200 ms wait gap a partial discount cannot bridge, the
+        // cheaper member keeps the request; one that covers the gap
+        // flips it.
+        let gap = vec![
+            scored_service(0, "m1", 0, 100, 750, true),
+            scored_service(1, "far:m2", 0, 300, 750, true),
+        ];
+        let weak = pick(&p, &gap, None, Some(("far:m2", 49))).unwrap();
+        assert_eq!(weak.effective, "m1", "49 ms discount < 200 ms gap");
+        let strong = pick(&p, &gap, None, Some(("far:m2", 250))).unwrap();
+        assert_eq!(strong.effective, "far:m2", "250 ms discount > 200 ms gap");
+    }
+
+    /// The affinity key derives from the conversation opener only:
+    /// same opener across turns -> same key; different opener or
+    /// empty/textless body -> None (no affinity signal).
+    #[test]
+    fn unit__affinity_key__opener_prefix_and_misses() {
+        let base = serde_json::json!({"model": "svc", "messages": [
+            {"role": "system", "content": "you are terse"},
+            {"role": "user", "content": "summarize this"},
+        ]});
+        let k1 = affinity_key("svc", &base).expect("string opener keys");
+        let k2 = affinity_key(
+            "svc",
+            &serde_json::json!({"messages": [
+                {"role": "system", "content": "you are terse"},
+                {"role": "user", "content": "unrelated follow-up"},
+            ]}),
+        )
+        .expect("second turn keys");
+        assert_eq!(k1, k2, "shared opener -> shared affinity key");
+        assert!(k1.starts_with("svc:"));
+        let parts = serde_json::json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "describe"}]}
+        ]});
+        assert!(
+            affinity_key("svc", &parts).is_some(),
+            "multimodal text part keys"
+        );
+        assert_eq!(
+            affinity_key(
+                "svc",
+                &serde_json::json!({"messages": [
+            {"role": "user", "content": ""}]})
+            ),
+            None,
+            "empty opener never keys"
+        );
+        assert_eq!(affinity_key("svc", &serde_json::json!({})), None);
+    }
+
     #[test]
     fn unit__find__exact_match_only() {
         let mut cfg = cfg_with(None);

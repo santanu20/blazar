@@ -776,6 +776,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// One model, one report: residency, certificate, usage, sentinel
+    /// detections, routing decision and the explain verdict combined
+    /// from the gateway's existing read endpoints.
+    Diagnose {
+        /// Model name (any form the gateway resolves)
+        model: String,
+        /// Emit the composed report JSON instead of the card
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask why a request misbehaved: sentinel detections for a trace id
     /// (or the most recent observations) with fix hints
     Why {
@@ -2642,6 +2652,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             timeout_secs,
         } => replicate_cmd(&model, peers.as_deref(), timeout_secs).await,
         Cmd::Route { model, json } => route_cmd(&model, json).await,
+        Cmd::Diagnose { model, json } => diagnose_cmd(&model, json).await,
         Cmd::Why {
             trace,
             watch: live,
@@ -13913,6 +13924,208 @@ async fn replicate_cmd(
 
 /// `blazar route <model>`: the scheduling decision the gateway would
 /// take for this model, with the signals behind it.
+/// Tolerant GET: `None` on any transport/status/parse failure so one
+/// missing endpoint degrades its report section instead of killing
+/// the whole diagnosis.
+async fn get_json(
+    client: &reqwest::Client,
+    url: &str,
+    bearer: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut req = client.get(url);
+    if let Some(b) = bearer {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+/// `blazar diagnose <model>`: one card composing the gateway's
+/// existing per-model read endpoints - residency (`/api/ps`),
+/// capability certificate (model doctor), recent usage, sentinel
+/// detections (`/api/why`), the routing decision and the explain
+/// verdict. Every section degrades to `n/a` with its reason when the
+/// endpoint or data is missing; the daemon stays untouched.
+#[allow(clippy::too_many_lines)] // one composed report, flat by design
+async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let client = cli_http();
+    let bearer = admin_bearer();
+
+    let ps = get_json(&client, &format!("{base}/api/ps"), bearer.as_deref()).await;
+    let cert = get_json(
+        &client,
+        &format!("{base}/api/model-doctor/{model}"),
+        bearer.as_deref(),
+    )
+    .await;
+    let usage = get_json(
+        &client,
+        &format!("{base}/api/usage?days=7"),
+        bearer.as_deref(),
+    )
+    .await;
+    let why = get_json(
+        &client,
+        &format!("{base}/api/why?model={model}&limit=20"),
+        bearer.as_deref(),
+    )
+    .await;
+    let route = get_json(
+        &client,
+        &format!("{base}/api/route/{model}"),
+        bearer.as_deref(),
+    )
+    .await;
+    let explain = get_json(
+        &client,
+        &format!("{base}/api/explain/{model}"),
+        bearer.as_deref(),
+    )
+    .await;
+
+    // Residency: first ps row whose name matches the model (prefix or
+    // qualified spelling - the ps rows carry base row names).
+    let row = ps
+        .as_ref()
+        .and_then(|p| p["models"].as_array())
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n == model || n.starts_with(&format!("{model}:")))
+            })
+        });
+    let residency = match row {
+        Some(r) => format!(
+            "resident (engine {}, in-flight {})",
+            r["blazar_engine"].as_str().unwrap_or("?"),
+            r["blazar_in_flight"].as_u64().unwrap_or(0)
+        ),
+        None => "not resident".to_string(),
+    };
+
+    // Certificate: summarize the capability map when present.
+    let cert_line = match cert.as_ref() {
+        Some(c) => match c["capabilities"].as_object() {
+            Some(caps) => {
+                let ok: Vec<&str> = caps
+                    .iter()
+                    .filter(|(_, v)| v["ok"].as_bool().unwrap_or(false))
+                    .map(|(k, _)| k.as_str())
+                    .collect();
+                if ok.is_empty() {
+                    "certificate on record, no passing capabilities".to_string()
+                } else {
+                    format!("certified: {}", ok.join(", "))
+                }
+            }
+            None => "certificate format unrecognized".to_string(),
+        },
+        None => "no certificate on record (run `blazar model-doctor`)".to_string(),
+    };
+
+    // Usage: sum this model's rows over the window.
+    let usage_line = match usage.as_ref().and_then(|u| u["days"].as_array()) {
+        Some(days) => {
+            let mine: Vec<&serde_json::Value> = days
+                .iter()
+                .filter(|r| {
+                    r["model"]
+                        .as_str()
+                        .is_some_and(|m| m == model || m.starts_with(&format!("{model}:")))
+                })
+                .collect();
+            if mine.is_empty() {
+                "no traffic in the 7-day window".to_string()
+            } else {
+                let reqs: u64 = mine.iter().filter_map(|r| r["requests"].as_u64()).sum();
+                let toks: u64 = mine
+                    .iter()
+                    .map(|r| r["in_tokens"].as_u64().unwrap_or(0) + r["out_tokens"].as_u64().unwrap_or(0))
+                    .sum();
+                format!("{reqs} requests, {toks} tokens (7d)")
+            }
+        }
+        None => "usage unavailable".to_string(),
+    };
+
+    // Sentinel: count records + distinct detection codes.
+    let sentinel_line = match why.as_ref() {
+        Some(w) => {
+            let recs = w["records"].as_array().cloned().unwrap_or_default();
+            let flagged: Vec<&serde_json::Value> = recs
+                .iter()
+                .filter(|r| r["detections"].as_array().is_some_and(|d| !d.is_empty()))
+                .collect();
+            if flagged.is_empty() {
+                format!("{} recent observation(s), none flagged", recs.len())
+            } else {
+                let codes: Vec<String> = flagged
+                    .iter()
+                    .filter_map(|r| r["detections"].as_array())
+                    .flatten()
+                    .filter_map(|d| d["code"].as_str().map(String::from))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                format!(
+                    "{} flagged of {} recent (codes: {})",
+                    flagged.len(),
+                    recs.len(),
+                    codes.join(", ")
+                )
+            }
+        }
+        None => "sentinel unavailable".to_string(),
+    };
+
+    let route_line = match route.as_ref() {
+        Some(r) => r["decision"]["reason"]
+            .as_str()
+            .unwrap_or("decision returned")
+            .to_string(),
+        None => "no routing decision (unknown model or gateway refusal)".to_string(),
+    };
+    // The explain payload is a nested signal tree; the load verdict
+    // is the one-line takeaway a diagnosis needs.
+    let explain_line = match explain.as_ref() {
+        Some(e) => match e["admission"]["load"]["verdict"].as_str() {
+            Some(v) => format!("load verdict: {v}"),
+            None => "explain returned, no load verdict".to_string(),
+        },
+        None => "explain unavailable".to_string(),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "object": "blazar.diagnose",
+                "model": model,
+                "residency": residency,
+                "certificate": cert_line,
+                "usage": usage_line,
+                "sentinel": sentinel_line,
+                "route": route_line,
+                "explain": explain_line,
+            })
+        );
+        return Ok(());
+    }
+    println!("MODEL       {model}");
+    println!("  residency   {residency}");
+    println!("  cert        {cert_line}");
+    println!("USAGE       {usage_line}");
+    println!("SENTINEL    {sentinel_line}");
+    println!("ROUTE       {route_line}");
+    println!("EXPLAIN     {explain_line}");
+    Ok(())
+}
+
 async fn route_cmd(model: &str, json: bool) -> Result<()> {
     let base = ensure_daemon().await?;
     let resp = cli_http()

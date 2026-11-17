@@ -270,6 +270,13 @@ pub struct AppState {
     pub service_ewma_local: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, (f64, std::time::Instant)>>,
     >,
+    /// Per-prefix cache affinity for adaptive pools: conversation
+    /// opener hash -> (member effective string, when it served).
+    /// Consulted and recorded by `pools::expand_request`; bounded and
+    /// expired by the pools module's own hygiene rules.
+    pub pools_affinity: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
@@ -494,6 +501,7 @@ impl AppState {
             remote_capacity: std::sync::Arc::default(),
             pools_sticky: std::sync::Arc::default(),
             service_ewma_local: std::sync::Arc::default(),
+            pools_affinity: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),
