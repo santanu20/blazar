@@ -402,7 +402,28 @@ pub(crate) fn pick<'a>(
                 .min_by_key(|m| (wait(m), m.idx))
                 .or_else(|| members.iter().min_by_key(|m| (m.score.est_wait_ms, m.idx)))
         }
-        PoolStrategy::WarmFirst => members.iter().min_by_key(|m| (m.score, m.idx)),
+        // Warm-first: the PeerScore order (tier, wait, free VRAM) with
+        // the same affinity discount the other scoring strategies
+        // apply - among equally-warm members, the one holding this
+        // opener's prefix KV genuinely serves sooner. Down peers are
+        // excluded (all-down falls back to the raw order so the
+        // request surfaces the peer's real error).
+        PoolStrategy::WarmFirst => {
+            let rank = |m: &MemberScore| {
+                let wait = match affinity {
+                    Some((eff, discount)) if m.effective == eff => {
+                        m.score.est_wait_ms.saturating_sub(discount)
+                    }
+                    _ => m.score.est_wait_ms,
+                };
+                (m.score.tier, wait, m.score.free_vram)
+            };
+            members
+                .iter()
+                .filter(|m| !m.down)
+                .min_by_key(|m| (rank(m), m.idx))
+                .or_else(|| members.iter().min_by_key(|m| (m.score, m.idx)))
+        }
         // Least expected completion: wait + service time, warm tier as
         // the tie-break. Until at least one member carries a measured
         // service EWMA the service term is the declared default for
@@ -832,6 +853,61 @@ mod tests {
         ];
         let picked = pick(&p, &members, None, None).expect("two members");
         assert_eq!(picked.idx, 0, "full tie breaks to declaration order");
+    }
+
+    /// The affinity discount reaches `warm_first` too: among equally
+    /// warm members the one holding this opener's prefix KV wins, even
+    /// across a raw-wait gap up to the discount - the KV holder
+    /// genuinely serves sooner.
+    #[test]
+    fn unit__pick__warm_first_honors_affinity_discount() {
+        let p = pool(PoolStrategy::WarmFirst);
+        let members = vec![
+            scored(0, "m1", 0, 1000, 5, false),
+            scored(1, "far:m1", 0, 1400, 5, false),
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 0, "no affinity: smaller wait wins the tier tie");
+        // 1400 - 750 = 650 < 1000: the KV-holding peer wins the tier.
+        let picked = pick(&p, &members, None, Some(("far:m1", 750))).expect("two members");
+        assert_eq!(picked.idx, 1);
+        // 300 < 400 gap: the discount must NOT flip the tie.
+        let picked = pick(&p, &members, None, Some(("far:m1", 300))).expect("two members");
+        assert_eq!(picked.idx, 0);
+    }
+
+    /// A down peer never wins `warm_first` on a stale score; the
+    /// all-down case degrades to the raw order so the request still
+    /// surfaces a real answer from the member it would try anyway.
+    #[test]
+    fn unit__pick__warm_first_skips_down_members() {
+        let p = pool(PoolStrategy::WarmFirst);
+        let members = vec![
+            scored(0, "m1", 0, 10, 9999, true),
+            scored(1, "far:m1", 2, 800, 0, false),
+        ];
+        let picked = pick(&p, &members, None, None).expect("two members");
+        assert_eq!(picked.idx, 1, "down member must not win on a stale score");
+        let all_down = vec![
+            scored(0, "m1", 0, 10, 9999, true),
+            scored(1, "far:m1", 2, 800, 0, true),
+        ];
+        let picked = pick(&p, &all_down, None, None).expect("all-down still picks");
+        assert_eq!(picked.idx, 0, "all-down degrades to the raw order");
+    }
+
+    /// `ordered` stays pure declaration order regardless of affinity:
+    /// determinism is that strategy's contract - operators pin a
+    /// member sequence exactly because nothing reorders it.
+    #[test]
+    fn unit__pick__ordered_ignores_affinity() {
+        let p = pool(PoolStrategy::Ordered);
+        let members = vec![
+            scored(0, "m1", 0, 1500, 0, false),
+            scored(1, "far:m1", 0, 10, 9999, false),
+        ];
+        let picked = pick(&p, &members, None, Some(("far:m1", 750))).expect("two members");
+        assert_eq!(picked.idx, 0, "ordered keeps declaration order");
     }
 
     /// Adaptive without any measured service signal equals warm-first:

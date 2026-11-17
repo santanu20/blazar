@@ -447,6 +447,31 @@ pub async fn replicate(
     .into_response()
 }
 
+/// `GET /api/pools` - every configured model pool with its live
+/// member table and the decision the strategy would take right now.
+/// Same admin gate and per-pool envelope as `GET /api/route/{pool}`
+/// (see [`crate::pools::route_json`]); this is the fleet-wide rollup
+/// the `blazar pool` command renders.
+pub async fn pools(
+    State(state): State<Arc<AppState>>,
+    key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
+) -> Response {
+    // Pool member tables disclose peer URLs and fleet topology -
+    // admin-plane, exactly like the per-model route above.
+    if let Err((code, msg)) = crate::keys::control_plane_authorized(&state.keys, key_ext.as_deref())
+    {
+        return api_error(code, &msg);
+    }
+    let pools: Vec<serde_json::Value> = state
+        .cfg()
+        .model_pools
+        .iter()
+        .map(|p| crate::pools::route_json(&state, p))
+        .collect();
+    let count = pools.len();
+    axum::Json(serde_json::json!({ "pools": pools, "count": count })).into_response()
+}
+
 /// `GET /api/route/{model}` - the scheduling decision an incoming
 /// request for this model would take, with every signal behind it.
 /// Read-only; forces a presence refresh only when the model is not

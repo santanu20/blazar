@@ -776,6 +776,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// List every configured model pool with live member scores and
+    /// the decision each strategy would take right now
+    Pool {
+        /// Print the raw pools JSON instead of the cards
+        #[arg(long)]
+        json: bool,
+    },
     /// One model, one report: residency, certificate, usage, sentinel
     /// detections, routing decision and the explain verdict combined
     /// from the gateway's existing read endpoints.
@@ -1398,6 +1405,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
             "explain",
             "model-doctor",
             "route",
+            "pool",
             "diagnose",
             "watch",
             "usage",
@@ -2660,6 +2668,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             timeout_secs,
         } => replicate_cmd(&model, peers.as_deref(), timeout_secs).await,
         Cmd::Route { model, json } => route_cmd(&model, json).await,
+        Cmd::Pool { json } => pool_cmd(json).await,
         Cmd::Diagnose { model, json } => diagnose_cmd(&model, json).await,
         Cmd::Why {
             trace,
@@ -14133,6 +14142,94 @@ async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
     println!("SENTINEL    {sentinel_line}");
     println!("ROUTE       {route_line}");
     println!("EXPLAIN     {explain_line}");
+    Ok(())
+}
+
+/// `blazar pool`: every configured model pool with its live member
+/// table and the decision the strategy would take right now - the
+/// fleet-wide rollup of `blazar route <pool>`, from `GET /api/pools`.
+async fn pool_cmd(json: bool) -> Result<()> {
+    let base = ensure_daemon().await?;
+    let mut req = cli_http()
+        .get(format!("{base}/api/pools"))
+        .timeout(std::time::Duration::from_secs(30));
+    // Member tables disclose peer URLs - admin plane, like /api/route.
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req.send().await?;
+    let ok = resp.status().is_success();
+    let text = resp.text().await?;
+    if !ok {
+        anyhow::bail!("daemon: {text}");
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("daemon: {text}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    let pools = v["pools"].as_array().cloned().unwrap_or_default();
+    if pools.is_empty() {
+        println!("no model pools configured (see [[model_pools]] in the setup docs)");
+        return Ok(());
+    }
+    for p in &pools {
+        println!(
+            "pool       {} ({})",
+            p["model"].as_str().unwrap_or("?"),
+            p["pool"]["strategy"].as_str().unwrap_or("?"),
+        );
+        println!(
+            "decision   {} - {}",
+            p["decision"]["target"].as_str().unwrap_or("unknown"),
+            p["decision"]["reason"].as_str().unwrap_or("unknown"),
+        );
+        let rows: Vec<Vec<String>> = p["pool"]["members"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|m| {
+                        vec![
+                            m["effective"].as_str().unwrap_or("?").to_string(),
+                            m["tier"].as_str().unwrap_or("?").to_string(),
+                            format!("{} ms", m["est_wait_ms"].as_u64().unwrap_or(0)),
+                            format!(
+                                "{} ms{}",
+                                m["service_ms"].as_u64().unwrap_or(0),
+                                if m["service_measured"].as_bool().unwrap_or(false) {
+                                    ""
+                                } else {
+                                    " (default)"
+                                }
+                            ),
+                            m["affinity_keys"].as_u64().unwrap_or(0).to_string(),
+                            if m["down"].as_bool().unwrap_or(false) {
+                                "down"
+                            } else {
+                                "-"
+                            }
+                            .to_string(),
+                        ]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            println!();
+            println!(
+                "{}",
+                render_table(
+                    &[
+                        "MEMBER", "TIER", "EST WAIT", "SERVICE", "AFFINITY", "BREAKER",
+                    ],
+                    &rows,
+                    &[2, 3],
+                )
+            );
+        }
+        println!();
+    }
     Ok(())
 }
 

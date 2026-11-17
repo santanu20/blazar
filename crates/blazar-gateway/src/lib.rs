@@ -695,6 +695,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ui", get(console::ui))
         .route("/api/replicate", post(federation::replicate))
         .route("/api/route/{model}", get(federation::route))
+        .route("/api/pools", get(federation::pools))
         .route(
             "/api/engine/recommend",
             get(engine_recommend::engine_recommend),
@@ -1354,7 +1355,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                         "/audio/transcriptions", "/audio/translations"],
             "ollama": ["/api/chat", "/api/generate", "/api/tags", "/api/ps", "/api/capacity", "/api/explain/{model}", "/api/show", "/api/tokenize",
                        "/api/usage",
-                       "/api/replicate", "/api/route/{model}",
+                       "/api/replicate", "/api/route/{model}", "/api/pools",
                        "/api/model-doctor", "/api/model-doctor/{model}",
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
