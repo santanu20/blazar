@@ -526,6 +526,80 @@ pub async fn pool_member_op(
     // members their configured spelling).
     let scored = crate::pools::score_members(&state, pool);
     let now = std::time::Instant::now();
+    // A dry run answers "what would this drain do?" - it computes the
+    // exact stagger plan and teaches it back WITHOUT touching the live
+    // overrides or the persistence store, so an operator can inspect a
+    // maintenance window before committing to it.
+    if body["dry_run"].as_bool().unwrap_or(false) {
+        if action != "drain" {
+            return api_error(
+                400,
+                "dry_run previews a drain - drop it to execute, or keep it with action drain",
+            );
+        }
+        let (schedule, note) = if all {
+            let ttls =
+                crate::pools::stagger_ttls(scored.len(), ttl_secs.unwrap_or(0), stagger_secs);
+            let schedule: Vec<String> = scored
+                .iter()
+                .zip(ttls)
+                .map(|(m, t)| format!("{} returns after {t}s", m.effective))
+                .collect();
+            let note = match ttl_secs {
+                Some(t) => format!(
+                    "DRY RUN: would drain {} member(s) for {t}s{} - they return in declaration order, the last after {}s",
+                    scored.len(),
+                    if stagger_secs > 0 {
+                        format!(", staggered every {stagger_secs}s")
+                    } else {
+                        String::new()
+                    },
+                    t.saturating_add(
+                        stagger_secs.saturating_mul(scored.len().saturating_sub(1) as u64),
+                    ),
+                ),
+                None => format!(
+                    "DRY RUN: would drain {} member(s) with no deadline - undrain restores them",
+                    scored.len()
+                ),
+            };
+            (schedule, note)
+        } else if let Some(member) = member.as_deref() {
+            if !scored.iter().any(|m| m.effective == member) {
+                let known: Vec<&str> = scored.iter().map(|m| m.effective.as_str()).collect();
+                return api_error(
+                    404,
+                    &format!(
+                        "pool '{name}' has no member '{member}' (members: {})",
+                        known.join(", ")
+                    ),
+                );
+            }
+            let note = match ttl_secs {
+                Some(t) => format!(
+                    "DRY RUN: would drain member '{member}' for {t}s - excluded from picks while an alternative exists"
+                ),
+                None => format!(
+                    "DRY RUN: would drain member '{member}' with no deadline - undrain restores it"
+                ),
+            };
+            (
+                vec![format!("{member} returns after {}s", ttl_secs.unwrap_or(0))],
+                note,
+            )
+        } else {
+            return api_error(
+                400,
+                "body needs {\"member\": \"<effective string>\"} or {\"all\": true}",
+            );
+        };
+        let mut payload = crate::pools::route_json(&state, pool);
+        payload["note"] = serde_json::json!(note);
+        payload["member"] = serde_json::json!(member.unwrap_or_else(|| "(all)".into()));
+        payload["dry_run"] = serde_json::json!(true);
+        payload["schedule"] = serde_json::json!(schedule);
+        return axum::Json(payload).into_response();
+    }
     let mut note = String::new();
     if let Ok(mut ops) = state.pools_ops.lock() {
         if all {

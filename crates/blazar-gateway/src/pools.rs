@@ -272,6 +272,19 @@ pub fn ops_key(pool: &str, effective: &str) -> String {
     format!("{pool}:{effective}")
 }
 
+/// Whether a persisted ops key belongs to a still-configured pool.
+/// Keys are `{pool}:{effective}` and effective strings may contain
+/// colons themselves (`peer:model`), so the test is an exact
+/// `{pool-name}:` prefix against every configured pool - a key
+/// matching no pool is inert (nothing reads it) and drops safely at
+/// boot when pool config has changed since it was written.
+#[must_use]
+pub fn ops_key_pool_known(pools: &[ModelPool], key: &str) -> bool {
+    pools
+        .iter()
+        .any(|p| key.starts_with(&format!("{}:", p.name)))
+}
+
 /// Rolling-maintenance plan: draining a whole pool staggers the
 /// members' return windows in declaration order - member `i`
 /// re-enters rotation after `ttl + i * stagger` seconds, so replicas
@@ -1079,6 +1092,29 @@ mod tests {
         assert!(!live["svc:both"].pinned, "drain beats pin at read");
         assert!(!live["svc:pin"].drained);
         assert!(live["svc:pin"].pinned);
+    }
+
+    /// Persisted-key pool matching: an exact `{pool}:` prefix keeps a
+    /// row alive through config edits; keys for removed pools (and
+    /// prefix lookalikes like `ab:` vs pool `a`) drop at boot.
+    #[test]
+    fn unit__ops_key_pool_known__prefix_truth_table() {
+        let mk = |name: &str| ModelPool {
+            name: name.into(),
+            strategy: PoolStrategy::Ordered,
+            members: vec![],
+        };
+        let pools = vec![mk("svc"), mk("a:b")];
+        assert!(ops_key_pool_known(&pools, "svc:m1"));
+        // Remote effectives carry their own colon - still the svc row.
+        assert!(ops_key_pool_known(&pools, "svc:far:m1"));
+        // A pool name containing a colon matches on its full prefix.
+        assert!(ops_key_pool_known(&pools, "a:b:m1"));
+        // Prefix lookalike must NOT match pool "svc"/"a:b".
+        assert!(!ops_key_pool_known(&pools, "sv:m1"));
+        assert!(!ops_key_pool_known(&pools, "a:bm1"));
+        // A pool deleted from config: its rows become GC candidates.
+        assert!(!ops_key_pool_known(&pools, "gone:m1"));
     }
 
     #[test]

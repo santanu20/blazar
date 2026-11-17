@@ -14155,6 +14155,7 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
             ttl_secs,
             all,
             stagger_secs,
+            dry_run,
         }) => {
             pool_member_op(
                 &pool,
@@ -14163,17 +14164,18 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
                 ttl_secs,
                 all,
                 stagger_secs,
+                dry_run,
             )
             .await
         }
         Some(PoolAction::Undrain { pool, member, all }) => {
-            pool_member_op(&pool, member.as_deref(), "undrain", None, all, None).await
+            pool_member_op(&pool, member.as_deref(), "undrain", None, all, None, false).await
         }
         Some(PoolAction::Pin { pool, member }) => {
-            pool_member_op(&pool, Some(&member), "pin", None, false, None).await
+            pool_member_op(&pool, Some(&member), "pin", None, false, None, false).await
         }
         Some(PoolAction::Unpin { pool, member }) => {
-            pool_member_op(&pool, Some(&member), "unpin", None, false, None).await
+            pool_member_op(&pool, Some(&member), "unpin", None, false, None, false).await
         }
         // Bare `blazar pool` reads as `blazar pool list`.
         Some(PoolAction::List { json }) => pool_list(json).await,
@@ -15011,6 +15013,10 @@ enum PoolAction {
         /// never hits all replicas at once
         #[arg(long, requires = "ttl_secs")]
         stagger_secs: Option<u64>,
+        /// Print the stagger plan the drain would apply - nothing is
+        /// drained, nothing persisted
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Resume routing to a drained member (or all of them with --all)
     Undrain {

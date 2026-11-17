@@ -646,6 +646,52 @@ async fn client__model_pool__drain_and_pin_operator_overrides() {
         .unwrap();
     assert_eq!(resp.status(), 400, "stagger needs a ttl budget");
 
+    // A dry run previews the stagger plan WITHOUT draining anything:
+    // same math, same teaching note, zero mutation (both members stay
+    // drained from the real drain above until the undrain below).
+    let r: serde_json::Value = c
+        .post(format!("{}/api/pools/svc/drain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({
+            "all": true,
+            "ttl_secs": 120,
+            "stagger_secs": 30,
+            "dry_run": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["dry_run"], true, "dry run marks itself: {r}");
+    assert!(
+        r["note"].as_str().unwrap().contains("DRY RUN"),
+        "dry run note teaches: {r}"
+    );
+    let schedule = r["schedule"].as_array().unwrap().clone();
+    assert_eq!(schedule.len(), 2, "one line per member: {r}");
+    assert!(
+        schedule
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("far:m1 returns after 150s")),
+        "stagger math lands in the schedule (120 + 30): {r}"
+    );
+    // Nothing was mutated: the members keep the REAL drain state from
+    // above (drained: true), not a dry-run flip.
+    for m in r["pool"]["members"].as_array().unwrap() {
+        assert_eq!(m["drained"], true, "dry run must not touch overrides: {r}");
+    }
+    // dry_run is a drain preview only.
+    let resp = c
+        .post(format!("{}/api/pools/svc/undrain", ts.base))
+        .bearer_auth("plm_admin")
+        .json(&serde_json::json!({ "all": true, "dry_run": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "dry_run previews drains only");
+
     // member + all together is rejected.
     let resp = c
         .post(format!("{}/api/pools/svc/drain", ts.base))

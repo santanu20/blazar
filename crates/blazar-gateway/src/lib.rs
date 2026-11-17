@@ -1502,10 +1502,20 @@ pub async fn serve(
     // clock, expired rows are cleared from the store, and the default
     // (pools_ops_persist = false) keeps overrides restart-ephemeral.
     if state.cfg().pools_ops_persist {
+        let pools_cfg = state.cfg().model_pools.clone();
         let rows = state
             .with_store(blazar_core::store::Store::load_pool_ops)
             .and_then(std::result::Result::ok)
             .unwrap_or_default();
+        // Config-change GC: rows whose pool no longer exists are inert
+        // by key design but would linger forever - drop them at boot
+        // so the store tracks only live pools.
+        let (rows, gone): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|(key, ..)| crate::pools::ops_key_pool_known(&pools_cfg, key));
+        for (key, ..) in gone {
+            let _ = state.with_store(|s| s.clear_pool_op(&key));
+        }
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs().cast_signed());
