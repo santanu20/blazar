@@ -669,6 +669,41 @@ pub async fn pool_member_op(
             }
         }
     }
+    // Write-through: mirror the mutated overrides into the store when
+    // persistence is opted in. A default/cleared entry deletes its row
+    // so the store never accumulates stale no-op overrides. Error arms
+    // above return before this point - they mutate nothing.
+    if cfg.pools_ops_persist {
+        let targets: Vec<String> = if all {
+            scored
+                .iter()
+                .map(|m| crate::pools::ops_key(&name, &m.effective))
+                .collect()
+        } else if let Some(member) = member.as_deref() {
+            vec![crate::pools::ops_key(&name, member)]
+        } else {
+            Vec::new()
+        };
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().cast_signed());
+        if let Ok(ops) = state.pools_ops.lock() {
+            for key in targets {
+                match ops.get(&key) {
+                    Some(op) if *op != crate::pools::MemberOps::default() => {
+                        let deadline = op.drained_until.map(|d| {
+                            now_unix + i64::try_from(d.duration_since(now).as_secs()).unwrap_or(0)
+                        });
+                        let _ = state
+                            .with_store(|s| s.put_pool_op(&key, op.drained, deadline, op.pinned));
+                    }
+                    _ => {
+                        let _ = state.with_store(|s| s.clear_pool_op(&key));
+                    }
+                }
+            }
+        }
+    }
     // Echo the fresh member table + decision plus what happened, so
     // one response shows both the override and its effect.
     let mut payload = crate::pools::route_json(&state, pool);

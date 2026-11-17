@@ -1497,6 +1497,26 @@ pub async fn serve(
     if let Err(refusal) = crate::pools::validate_boot(&state) {
         anyhow::bail!("{refusal}");
     }
+    // Opt-in rehydration of pool operator overrides (drain/pin) from
+    // the store: wall-clock deadlines convert back to the monotonic
+    // clock, expired rows are cleared from the store, and the default
+    // (pools_ops_persist = false) keeps overrides restart-ephemeral.
+    if state.cfg().pools_ops_persist {
+        let rows = state
+            .with_store(blazar_core::store::Store::load_pool_ops)
+            .and_then(std::result::Result::ok)
+            .unwrap_or_default();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().cast_signed());
+        let (live, expired) = crate::pools::member_ops_from_persisted(&rows, now_unix);
+        if let Ok(mut ops) = state.pools_ops.lock() {
+            *ops = live;
+        }
+        for key in expired {
+            let _ = state.with_store(|s| s.clear_pool_op(&key));
+        }
+    }
     let app = router(state.clone());
     // Durable jobs boot hygiene, detached: sweep latency is not boot
     // latency. Abandons in-flight rows from a previous gateway process

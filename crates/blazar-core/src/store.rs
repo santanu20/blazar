@@ -53,7 +53,9 @@ pub struct Store {
 /// evidence base tuning adoption will be judged against. Existing
 /// `spec_receipts` rows keep tuned=0: every pre-v19 ngram race ran
 /// engine defaults, and an honest unknown beats a guessed provenance.
-const SCHEMA_VERSION: i32 = 19;
+/// v20 adds `pools_ops` (persisted gateway pool member overrides,
+/// opt-in via `pools_ops_persist`).
+const SCHEMA_VERSION: i32 = 20;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -138,6 +140,12 @@ CREATE TABLE IF NOT EXISTS spec_receipts (
     tuned         INTEGER NOT NULL DEFAULT 0, -- knobs deliberately configured vs engine defaults
     reps          INTEGER NOT NULL DEFAULT 1, -- race repetitions behind the number
     PRIMARY KEY (model, engine_tag, mode)
+);
+CREATE TABLE IF NOT EXISTS pools_ops (
+    key           TEXT PRIMARY KEY,  -- '{pool}:{member effective}'
+    drained       INTEGER NOT NULL DEFAULT 0,
+    drained_until INTEGER,           -- unix secs deadline, NULL = no TTL
+    pinned        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     day           INTEGER NOT NULL,  -- yyyymmdd local day
@@ -2407,6 +2415,56 @@ impl Store {
     /// receipt is "current truth for this hardware", not an audit log.
     /// `prov` carries the provenance axes (hw fingerprint, exact knobs,
     /// tuned flag, repetitions) that make the receipt trustworthy.
+    /// Persist one pool-member operator override row (v20). Plain
+    /// tuples on purpose: the core store cannot see gateway types, so
+    /// the gateway converts to/from `MemberOps` at its edges.
+    pub fn put_pool_op(
+        &self,
+        key: &str,
+        drained: bool,
+        drained_until_unix: Option<i64>,
+        pinned: bool,
+    ) -> CoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO pools_ops (key, drained, drained_until, pinned)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) DO UPDATE SET
+                  drained = excluded.drained,
+                  drained_until = excluded.drained_until,
+                  pinned = excluded.pinned",
+            params![key, drained, drained_until_unix, pinned],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one pool-member override row (undrain/unpin back to
+    /// defaults).
+    pub fn clear_pool_op(&self, key: &str) -> CoreResult<()> {
+        self.conn
+            .execute("DELETE FROM pools_ops WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// All persisted pool-member overrides: `(key, drained,
+    /// drained_until unix secs, pinned)`. Expired-deadline filtering
+    /// and instant conversion live in the gateway (clock semantics
+    /// are a gateway concern).
+    #[allow(clippy::type_complexity)] // one row tuple: (key, drained, deadline_unix, pinned)
+    pub fn load_pool_ops(&self) -> CoreResult<Vec<(String, bool, Option<i64>, bool)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, drained, drained_until, pinned FROM pools_ops")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     pub fn put_spec_receipt(
         &self,
         model: &str,
@@ -3753,6 +3811,44 @@ mod tests {
         // Receipts are scoped per model+engine: another lane sees none.
         assert!(s.list_spec_receipts("m", "other").unwrap().is_empty());
         assert!(s.list_spec_receipts("other", "e").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unit__store_pool_ops__roundtrip_and_v19_upgrade() {
+        // Simulate a v19 database (no pools_ops table): reopen replays
+        // SCHEMA_SQL additively and stamps 20; an override row
+        // round-trips through put/load and clear removes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE pools_ops; PRAGMA user_version = 19;")
+                .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let v: i64 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::from(SCHEMA_VERSION));
+        assert!(s.load_pool_ops().unwrap().is_empty());
+        s.put_pool_op("svc:m1", true, Some(1_900_000_000), false)
+            .unwrap();
+        s.put_pool_op("svc:far:m1", false, None, true).unwrap();
+        let mut rows = s.load_pool_ops().unwrap();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("svc:far:m1".into(), false, None, true));
+        assert_eq!(rows[1], ("svc:m1".into(), true, Some(1_900_000_000), false));
+        // Overwrite on conflict, then clear back to empty.
+        s.put_pool_op("svc:m1", false, None, false).unwrap();
+        s.clear_pool_op("svc:far:m1").unwrap();
+        let rows = s.load_pool_ops().unwrap();
+        assert_eq!(rows, vec![("svc:m1".to_string(), false, None, false)]);
     }
 
     #[test]

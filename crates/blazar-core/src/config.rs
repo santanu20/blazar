@@ -75,6 +75,13 @@ pub struct Config {
     /// strict mode.
     #[serde(default = "default_true")]
     pub legacy_open_records: bool,
+    /// Persist pool member operator overrides (drain/pin) across
+    /// daemon restarts into the store's `pools_ops` table. `false`
+    /// (default) keeps them in-memory: a restart clears every
+    /// override, which is the safest posture for transient
+    /// maintenance state.
+    #[serde(default)]
+    pub pools_ops_persist: bool,
     /// Strict token-budget lane for keyed requests. `false` (default)
     /// keeps charge-on-measure semantics: tpm/daily budgets are checked
     /// at admission against already-settled usage and charged when the
@@ -3716,6 +3723,7 @@ impl Default for Config {
             port: 11435,
             allow_unauthenticated_remote: false,
             legacy_open_records: true,
+            pools_ops_persist: false,
             reserve_budgets: false,
             reserve_default_tokens: 1024,
             default_ctx: 16384,
@@ -4197,6 +4205,7 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
             "port",
             "allow_unauthenticated_remote",
             "legacy_open_records",
+            "pools_ops_persist",
             "reserve_budgets",
             "reserve_default_tokens",
             "log_level",

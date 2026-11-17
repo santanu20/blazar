@@ -13330,6 +13330,7 @@ def phase_commands() -> None:
             "reserve_budgets": True,
             "reserve_default_tokens": 2048,
             "legacy_open_records": False,
+            "pools_ops_persist": False,
             "keys": [
                 {"name": "admin", "key": "plm-validate-admin-1"},
                 {

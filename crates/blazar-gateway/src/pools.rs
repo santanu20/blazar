@@ -231,6 +231,41 @@ impl MemberOps {
     }
 }
 
+/// Rehydrate operator overrides from persisted rows (store tuples:
+/// `(key, drained, drained_until_unix, pinned)`). Deadlines persist
+/// as absolute unix seconds so a restart converts wall-clock back to
+/// the monotonic clock: `now + remaining`. Expired rows are dropped
+/// (and reported by key so the caller can clear them from the store);
+/// a drained member never rehydrates its pin - drain beats pin at
+/// read exactly as the live handler enforces.
+#[must_use]
+pub fn member_ops_from_persisted(
+    rows: &[(String, bool, Option<i64>, bool)],
+    now_unix: i64,
+) -> (std::collections::HashMap<String, MemberOps>, Vec<String>) {
+    let mut live = std::collections::HashMap::new();
+    let mut expired = Vec::new();
+    for (key, drained, drained_until_unix, pinned) in rows {
+        let drained = *drained;
+        let mut ops = MemberOps {
+            drained,
+            drained_until: None,
+            pinned: *pinned && !drained,
+        };
+        if let (true, Some(deadline)) = (drained, drained_until_unix) {
+            let remaining = deadline - now_unix;
+            if remaining <= 0 {
+                expired.push(key.clone());
+                continue;
+            }
+            ops.drained_until =
+                Some(Instant::now() + std::time::Duration::from_secs(remaining.cast_unsigned()));
+        }
+        live.insert(key.clone(), ops);
+    }
+    (live, expired)
+}
+
 /// Key under which a member's [`MemberOps`] live.
 #[must_use]
 pub fn ops_key(pool: &str, effective: &str) -> String {
@@ -1007,6 +1042,45 @@ mod tests {
     /// `MemberOps::is_drained` truth table: an undrained entry never
     /// counts, a deadline-free drain lasts forever, a future deadline
     /// holds and an expired one self-restores the member.
+    /// Persisted rows convert back into live ops: wall-clock
+    /// deadlines become monotonic ones, expired rows are dropped and
+    /// reported for store cleanup, and a row that is both drained and
+    /// pinned keeps only the drain (drain-beats-pin at read, same as
+    /// at write).
+    #[test]
+    fn unit__member_ops_from_persisted__conversion_truth_table() {
+        let now_unix = 1_800_000_000_i64;
+        let rows = vec![
+            // Fresh drain with a deadline: live, deadline in the future.
+            ("svc:m1".to_string(), true, Some(now_unix + 300), false),
+            // Expired drain: dropped and reported.
+            ("svc:old".to_string(), true, Some(now_unix - 5), false),
+            // Permanent drain (no deadline) passes through.
+            ("svc:perm".to_string(), true, None, false),
+            // Drain beats pin on the same row.
+            ("svc:both".to_string(), true, Some(now_unix + 60), true),
+            // Pure pin survives.
+            ("svc:pin".to_string(), false, None, true),
+        ];
+        let (live, expired) = member_ops_from_persisted(&rows, now_unix);
+        assert_eq!(expired, vec!["svc:old".to_string()]);
+        assert_eq!(live.len(), 4, "expired row dropped, rest live");
+        let m1 = &live["svc:m1"];
+        assert!(m1.drained);
+        let deadline = m1.drained_until.expect("deadline mapped");
+        let after = Instant::now();
+        assert!(deadline > after, "deadline is in the future");
+        assert!(
+            deadline < after + std::time::Duration::from_secs(300),
+            "deadline is the stored remaining window"
+        );
+        assert!(live["svc:perm"].drained_until.is_none());
+        assert!(live["svc:both"].drained);
+        assert!(!live["svc:both"].pinned, "drain beats pin at read");
+        assert!(!live["svc:pin"].drained);
+        assert!(live["svc:pin"].pinned);
+    }
+
     #[test]
     fn unit__member_ops__drain_deadline_truth_table() {
         let now = Instant::now();
