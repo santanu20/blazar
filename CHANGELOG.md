@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **`pool status` alerts headline.** One line on the fleet card summarizing breaker-down, drained and pinned members fleet-wide with the soonest retry/return countdowns - omitted entirely while every pool is healthy, so silence is the all-clear.
 - **Per-member steering trends + pressure-aware watch refresh.** Steering-hit events now carry the member they steered to: each pool member with in-window traffic exposes `hit_history` (same 15x20s buckets) and `blazar pool status` appends volume-scaled per-member `trend` lines under the pool trend - which replica the conversations landed on, at a glance. `pool status --watch` drops to a 1s refresh while any request is in flight or any member is down/drained, returning to the configured interval on an idle healthy fleet (effective rate shown on every redrawn card).
 
 - **Steering sparkline + status snapshot stamp.** The route table's affinity block now carries `history` - the rolling steering window sliced into 15 equal 20-second buckets (`history_bucket_secs` declares the span), and `blazar pool status` renders it as a `trend` sparkline per pool (quiet buckets show a gap dot, never a fake zero bar). `blazar pool status --json` stamps `generated_unix` so scripted scrapers can tell a fresh fleet snapshot from a stale one.

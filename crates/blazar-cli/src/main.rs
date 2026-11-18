@@ -14296,7 +14296,58 @@ async fn status_fetch(base: &str) -> Result<(serde_json::Value, Option<serde_jso
     Ok((pools, ps))
 }
 
+/// Fleet-wide operator-attention summary over a `/api/pools` payload:
+/// how many members are breaker-down (soonest retry), drained (soonest
+/// return) or pinned. `None` when everything is healthy - silence is
+/// the all-clear, the card stays clean.
+fn alerts_summary(pools: &serde_json::Value) -> Option<String> {
+    let mut down = 0u64;
+    let mut drained = 0u64;
+    let mut pinned = 0u64;
+    let mut soonest_retry: Option<u64> = None;
+    let mut soonest_return: Option<u64> = None;
+    for m in pools["pools"]
+        .as_array()?
+        .iter()
+        .filter_map(|p| p["pool"]["members"].as_array())
+        .flatten()
+    {
+        if m["down"].as_bool().unwrap_or(false) {
+            down += 1;
+            if let Some(secs) = m["retry_in_secs"].as_u64() {
+                soonest_retry = Some(soonest_retry.map_or(secs, |best: u64| best.min(secs)));
+            }
+        }
+        if m["drained"].as_bool().unwrap_or(false) {
+            drained += 1;
+            if let Some(secs) = m["drained_for_secs"].as_u64() {
+                soonest_return = Some(soonest_return.map_or(secs, |best: u64| best.min(secs)));
+            }
+        }
+        if m["pinned"].as_bool().unwrap_or(false) {
+            pinned += 1;
+        }
+    }
+    if down == 0 && drained == 0 && pinned == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if down > 0 {
+        let retry = soonest_retry.map_or(String::new(), |s| format!(" (soonest retry {s}s)"));
+        parts.push(format!("down {down}{retry}"));
+    }
+    if drained > 0 {
+        let ret = soonest_return.map_or(String::new(), |s| format!(" (soonest return {s}s)"));
+        parts.push(format!("drained {drained}{ret}"));
+    }
+    if pinned > 0 {
+        parts.push(format!("pinned {pinned}"));
+    }
+    Some(parts.join(", "))
+}
+
 /// The fleet card shared by `pool status` and `pool status --watch`.
+#[allow(clippy::too_many_lines)] // one card renderer; splitting per-pool helpers would scatter the layout
 fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>) {
     let pool_list = pools["pools"].as_array().cloned().unwrap_or_default();
     if pool_list.is_empty() {
@@ -14317,6 +14368,9 @@ fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>)
         );
     }
     println!("pools       {} configured", pool_list.len());
+    if let Some(alerts) = alerts_summary(pools) {
+        println!("alerts      {alerts}");
+    }
     for p in &pool_list {
         let members = p["pool"]["members"].as_array().cloned().unwrap_or_default();
         let tier = |name: &str| {
@@ -30529,6 +30583,49 @@ mod tests {
         let row = out2.lines().nth(1).unwrap();
         assert!(row.contains("имя-модели-очень-длинное"));
         assert!(row.contains("..."), "oversized arch must cap: {row}");
+    }
+
+    #[test]
+    fn unit__alerts_summary__healthy_fleet_is_silent() {
+        let pools = serde_json::json!({
+            "pools": [{
+                "pool": {"members": [
+                    {"down": false, "drained": false, "pinned": false},
+                    {"down": false, "drained": true, "drained_for_secs": 42, "pinned": false},
+                ]}
+            }]
+        });
+        // Drained members are operator-scheduled, not incidents - but
+        // they DO surface: the line exists whenever anything needs a
+        // glance.
+        assert_eq!(
+            alerts_summary(&pools).as_deref(),
+            Some("drained 1 (soonest return 42s)")
+        );
+
+        let healthy = serde_json::json!({
+            "pools": [{"pool": {"members": [{"down": false, "drained": false, "pinned": false}]}}]
+        });
+        assert_eq!(alerts_summary(&healthy), None);
+    }
+
+    #[test]
+    fn unit__alerts_summary__counts_fleet_wide_and_picks_soonest() {
+        let pools = serde_json::json!({
+            "pools": [
+                {"pool": {"members": [
+                    {"down": true, "retry_in_secs": 30, "drained": false, "pinned": false},
+                    {"down": true, "retry_in_secs": 8, "drained": false, "pinned": true},
+                ]}},
+                {"pool": {"members": [
+                    {"down": false, "drained": true, "pinned": false},
+                ]}},
+            ]
+        });
+        assert_eq!(
+            alerts_summary(&pools).as_deref(),
+            Some("down 2 (soonest retry 8s), drained 1, pinned 1")
+        );
     }
 
     #[test]
