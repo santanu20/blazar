@@ -60,7 +60,11 @@ pub struct Store {
 /// v22 adds `pools_window_events` (rolling steering-rate event log,
 /// snapshot-replaced at graceful shutdown so history and rates survive
 /// a restart; same opt-in).
-const SCHEMA_VERSION: i32 = 22;
+/// v23 adds `loras.sha256` (adapter-file digest captured at `lora add`
+/// time; session-bank identity binds the adapter set by (path, sha),
+/// so a swapped adapter file under an unchanged path can never silently
+/// ride a bank restored for the bytes that actually produced it).
+const SCHEMA_VERSION: i32 = 23;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -101,7 +105,8 @@ CREATE TABLE IF NOT EXISTS loras (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     model_name TEXT NOT NULL,
     path       TEXT NOT NULL,
-    scale      REAL NOT NULL DEFAULT 1.0
+    scale      REAL NOT NULL DEFAULT 1.0,
+    sha256     TEXT
 );
 CREATE TABLE IF NOT EXISTS key_usage (
     day      TEXT NOT NULL, -- UTC YYYY-MM-DD
@@ -729,6 +734,12 @@ pub struct LoraRow {
     pub model_name: String,
     pub path: String,
     pub scale: f64,
+    /// Adapter-file digest captured at `lora add` time. `None` marks a
+    /// legacy row (pre-v23) or one whose file could not be hashed -
+    /// the strict restore gate refuses to certify those, so an unknown
+    /// never silently passes for the bytes on disk.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// One durable background job (audio/image/video async work). `state` is
@@ -1005,6 +1016,16 @@ impl Store {
             // tables are CREATE-IF-NOT-EXISTS in SCHEMA_SQL - replay
             // covers them.
             self.migrate_v19_spec_provenance()?;
+            // v22->v23: `loras.sha256` (adapter digest for session-bank
+            // identity). Same replay-safe guarded-ALTER shape as the
+            // engines.kind step above: fresh stores get the column from
+            // SCHEMA_SQL, upgrade stores take the ALTER, legacy rows
+            // keep NULL - an honest unknown the strict restore gate
+            // treats as unverifiable, never as a match.
+            if !self.table_columns("loras")?.contains(&"sha256".to_string()) {
+                self.conn
+                    .execute("ALTER TABLE loras ADD COLUMN sha256 TEXT", [])?;
+            }
         }
         // v15->v16: `model_modalities` (engine-advertised output
         // modalities, e.g. llama-server's architecture object marking
@@ -2703,10 +2724,17 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
     }
 
-    pub fn add_lora(&self, model_name: &str, path: &str, scale: f64) -> CoreResult<i64> {
+    #[allow(clippy::too_many_arguments)] // flat row mirror, not logic
+    pub fn add_lora(
+        &self,
+        model_name: &str,
+        path: &str,
+        scale: f64,
+        sha256: Option<&str>,
+    ) -> CoreResult<i64> {
         self.conn.execute(
-            "INSERT INTO loras (model_name, path, scale) VALUES (?1, ?2, ?3)",
-            params![model_name, path, scale],
+            "INSERT INTO loras (model_name, path, scale, sha256) VALUES (?1, ?2, ?3, ?4)",
+            params![model_name, path, scale, sha256],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -2721,11 +2749,11 @@ impl Store {
     pub fn list_loras(&self, model_name: Option<&str>) -> CoreResult<Vec<LoraRow>> {
         let (sql, binds): (&str, Vec<&str>) = match model_name {
             Some(m) => (
-                "SELECT id, model_name, path, scale FROM loras WHERE model_name = ?1 ORDER BY id",
+                "SELECT id, model_name, path, scale, sha256 FROM loras WHERE model_name = ?1 ORDER BY id",
                 vec![m],
             ),
             None => (
-                "SELECT id, model_name, path, scale FROM loras ORDER BY id",
+                "SELECT id, model_name, path, scale, sha256 FROM loras ORDER BY id",
                 vec![],
             ),
         };
@@ -2736,6 +2764,7 @@ impl Store {
                 model_name: r.get(1)?,
                 path: r.get(2)?,
                 scale: r.get(3)?,
+                sha256: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -5382,14 +5411,64 @@ mod tests {
     #[test]
     fn unit__lora_add_list_delete() {
         let (_t, s) = tmp_store();
-        let id = s.add_lora("m", "/loras/a.bin", 0.8).unwrap();
-        s.add_lora("other", "/loras/b.bin", 1.0).unwrap();
+        let id = s
+            .add_lora("m", "/loras/a.bin", 0.8, Some("aaa111"))
+            .unwrap();
+        s.add_lora("other", "/loras/b.bin", 1.0, None).unwrap();
         let for_m = s.list_loras(Some("m")).unwrap();
         assert_eq!(for_m.len(), 1);
         assert!((for_m[0].scale - 0.8).abs() < f64::EPSILON);
+        assert_eq!(for_m[0].sha256.as_deref(), Some("aaa111"));
+        let other = s.list_loras(Some("other")).unwrap();
+        assert_eq!(other[0].sha256, None);
         assert_eq!(s.list_loras(None).unwrap().len(), 2);
         assert!(s.delete_lora(id).unwrap());
         assert_eq!(s.list_loras(Some("m")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn unit__migrate_v23__adds_loras_sha256_to_legacy_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        // Hand-build a v22 store: loras WITHOUT the sha256 column and
+        // one legacy row, exactly the shape pre-v23 databases had.
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        {
+            let raw = rusqlite::Connection::open(dirs.data_dir.join("blazar.db")).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE loras (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_name TEXT NOT NULL,
+                    path       TEXT NOT NULL,
+                    scale      REAL NOT NULL DEFAULT 1.0
+                );
+                 INSERT INTO loras (model_name, path, scale)
+                 VALUES ('m', '/loras/legacy.gguf', 1.0);
+                 PRAGMA user_version = 22;",
+            )
+            .unwrap();
+        }
+        // Opening runs the migration ladder: guarded ALTER adds the
+        // column, the version stamps 23, the legacy row survives with
+        // its honest NULL.
+        let s = Store::open(&dirs).unwrap();
+        let version: i32 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 23);
+        let rows = s.list_loras(Some("m")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/loras/legacy.gguf");
+        assert_eq!(rows[0].sha256, None);
+        // New writes carry the digest; both live side-by-side.
+        s.add_lora("m", "/loras/new.gguf", 1.0, Some("bbb222"))
+            .unwrap();
+        let rows = s.list_loras(Some("m")).unwrap();
+        assert_eq!(rows[1].sha256.as_deref(), Some("bbb222"));
     }
 
     /// The quantized-safetensors routing signal: pull-convention dir

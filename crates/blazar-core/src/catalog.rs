@@ -237,6 +237,7 @@ mod tests {
             model_name: "m".into(),
             path: path.into(),
             scale: 1.0,
+            sha256: None,
         };
         let rows = vec![
             row(1, "/models/adapters/anonymizer"),

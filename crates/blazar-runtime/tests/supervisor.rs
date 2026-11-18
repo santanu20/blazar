@@ -786,7 +786,7 @@ async fn integration__lora_hot_attach__llamacpp_reconciles_scales_over_spawn_set
     std::fs::write(&adapter, b"gguf").unwrap();
     let store = Store::open(&dirs).unwrap();
     let row_id = store
-        .add_lora("m1", &adapter.display().to_string(), 1.0)
+        .add_lora("m1", &adapter.display().to_string(), 1.0, None)
         .unwrap();
     let sup = supervisor(&dirs, base_config(), true);
     let ep = sup.ensure("m1").await.expect("ensure");
@@ -882,7 +882,7 @@ async fn integration__lora_hot_attach__llamacpp_reconciles_scales_over_spawn_set
     // omit the path (older CLIs) must still match the loaded adapter by
     // its file stem. The row leaves the store first, mirroring the CLI.
     let row_id = store
-        .add_lora("m1", &adapter.display().to_string(), 1.0)
+        .add_lora("m1", &adapter.display().to_string(), 1.0, None)
         .unwrap();
     let verdict = sup
         .lora_hot_attach("m1", true, "anonymizer", &adapter.display().to_string())

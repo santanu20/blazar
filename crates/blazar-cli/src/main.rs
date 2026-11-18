@@ -24154,10 +24154,27 @@ async fn lora_cmd(cmd: LoraCmd) -> Result<()> {
             let model = resolve_model_cli(&model);
             let row = store.get_model(&model)?;
             validate_lora_attach(&model, row.as_ref(), &path)?;
-            let id = store.add_lora(&model, &path.display().to_string(), scale)?;
+            // Digest the adapter bytes at attach time: session-bank
+            // identity binds the adapter set by (path, sha), so a file
+            // swapped under an unchanged path can never silently ride a
+            // bank restored for the bytes that produced it. A read
+            // failure aborts the attach - an unhashable adapter is an
+            // unverifiable one, and unverifiable never passes strict
+            // restore anyway.
+            let sha = file_sha256(&path).ok_or_else(|| {
+                anyhow!(
+                    "cannot read {} to hash the adapter - refusing to attach an \
+                     unverifiable lora (banks would refuse to restore it)",
+                    path.display()
+                )
+            })?;
+            let id = store.add_lora(&model, &path.display().to_string(), scale, Some(&sha))?;
             println!(
                 "{}",
-                ok_line(&format!("lora #{id} attached to {model} (scale {scale})"))
+                ok_line(&format!(
+                    "lora #{id} attached to {model} (scale {scale}, sha {})",
+                    &sha[..12]
+                ))
             );
             // Resident sglang children pick the adapter up live; the
             // adapter registers under its directory's file stem.

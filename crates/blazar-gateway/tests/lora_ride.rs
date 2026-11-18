@@ -18,7 +18,7 @@ async fn gateway__llamacpp_lora_variant__rides_dense_child_with_request_stamp() 
     std::fs::write(&adapter, b"gguf").unwrap();
     let store = blazar_core::Store::open(&ts.dirs).unwrap();
     store
-        .add_lora("m1", &adapter.display().to_string(), 1.0)
+        .add_lora("m1", &adapter.display().to_string(), 1.0, None)
         .unwrap();
 
     let c = support::client();

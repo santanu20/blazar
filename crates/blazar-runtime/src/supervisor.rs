@@ -11968,7 +11968,7 @@ mod routing_tests {
         }
         // Attached + on disk: alias fires.
         store
-            .add_lora("m", &adapter.to_string_lossy(), 1.0)
+            .add_lora("m", &adapter.to_string_lossy(), 1.0, None)
             .unwrap();
         assert!(
             sup.sglang_variant_rides_base("m", "anonymizer")
@@ -12084,7 +12084,7 @@ mod routing_tests {
         }
         // Attached + on disk: alias fires.
         store
-            .add_lora("m", &adapter.to_string_lossy(), 1.0)
+            .add_lora("m", &adapter.to_string_lossy(), 1.0, None)
             .unwrap();
         assert!(
             sup.llamacpp_variant_rides_base("m", "anonymizer")
@@ -13344,6 +13344,7 @@ mod routing_tests {
             model_name: "m".into(),
             path,
             scale,
+            sha256: None,
         };
         let rows = vec![row(1, p("rsmma.gguf"), 1.0), row(2, p("x.gguf"), 0.5)];
         // Dense lane: every attached row, always-on semantics preserved.
@@ -13395,6 +13396,7 @@ mod routing_tests {
             model_name: "m".into(),
             path,
             scale: 1.0,
+            sha256: None,
         };
         // Dense arm: one missing row sinks the whole admission with the
         // row id and the repair command - never a silent partial load.
@@ -13448,6 +13450,7 @@ mod routing_tests {
             model_name: "m".into(),
             path: dir.display().to_string(),
             scale: 0.5,
+            sha256: None,
         }];
         let full = Supervisor::resolve_lora_lane(&rows, "m", Some("anonymizer-qwen3-1.7b"))
             .expect("dotted full dir name must resolve");
