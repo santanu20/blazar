@@ -849,6 +849,16 @@ async fn client__model_pool__local_member_stamps_service_ewma() {
         Some(1),
         "repeat opener steered to the recorded member: {route}"
     );
+    assert_eq!(
+        route["pool"]["affinity"]["requests"].as_u64(),
+        Some(2),
+        "both pool chats counted as routed requests: {route}"
+    );
+    assert_eq!(
+        route["pool"]["affinity"]["hit_rate_pct"].as_f64(),
+        Some(50.0),
+        "1 steering hit out of 2 routed requests: {route}"
+    );
     assert!(
         route["pool"]["members"][0]["service_ms"]
             .as_u64()

@@ -14148,7 +14148,11 @@ async fn diagnose_cmd(model: &str, json: bool) -> Result<()> {
 /// loop, and the per-member drain/pin operator verbs.
 async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
     match action {
-        Some(PoolAction::Status { json }) => pool_status(json).await,
+        Some(PoolAction::Status {
+            json,
+            watch,
+            interval_secs,
+        }) => pool_status(json, watch, interval_secs).await,
         Some(PoolAction::Watch { interval_secs }) => pool_watch(interval_secs).await,
         Some(PoolAction::Drain {
             pool,
@@ -14210,34 +14214,59 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
 /// pool's current decision, member states (drained/pinned/down,
 /// warm/cold), affinity steering, and local engine residency, from
 /// `GET /api/pools` + `GET /api/ps`.
-async fn pool_status(json: bool) -> Result<()> {
+async fn pool_status(json: bool, watch: bool, interval_secs: u64) -> Result<()> {
     let base = ensure_daemon().await?;
-    let pools = pools_fetch(&base).await?;
-    let mut req = cli_http()
-        .get(format!("{base}/api/ps"))
-        .timeout(std::time::Duration::from_secs(30));
-    if let Some(b) = admin_bearer() {
-        req = req.bearer_auth(b);
-    }
-    // Residency is a bonus panel, not a hard requirement - an authless
-    // daemon serves it open, a keyed one needs the admin bearer.
-    let ps: Option<serde_json::Value> = match req.send().await {
-        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
-        _ => None,
-    };
     if json {
+        // Raw JSON is a one-shot dump; watching bytes stream is curl's
+        // job, not a card renderer's.
+        let (pools, ps) = status_fetch(&base).await?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({ "pools": pools, "ps": ps }))?
         );
         return Ok(());
     }
+    if watch {
+        let interval = std::time::Duration::from_secs(interval_secs.max(1));
+        println!("refreshing every {interval_secs}s - Ctrl-C to stop");
+        loop {
+            let (pools, ps) = status_fetch(&base).await?;
+            print!("\x1b[2J\x1b[1;1H");
+            render_status_card(&pools, ps.as_ref());
+            tokio::time::sleep(interval).await;
+        }
+    }
+    let (pools, ps) = status_fetch(&base).await?;
+    render_status_card(&pools, ps.as_ref());
+    Ok(())
+}
+
+/// Fetch both status panels: the pools rollup (required) and the ps
+/// residency snapshot (bonus - tolerated absent on keyed daemons
+/// without an admin bearer).
+async fn status_fetch(base: &str) -> Result<(serde_json::Value, Option<serde_json::Value>)> {
+    let pools = pools_fetch(base).await?;
+    let mut req = cli_http()
+        .get(format!("{base}/api/ps"))
+        .timeout(std::time::Duration::from_secs(30));
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let ps = match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
+        _ => None,
+    };
+    Ok((pools, ps))
+}
+
+/// The fleet card shared by `pool status` and `pool status --watch`.
+fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>) {
     let pool_list = pools["pools"].as_array().cloned().unwrap_or_default();
     if pool_list.is_empty() {
         println!("no model pools configured (see [[model_pools]] in the setup docs)");
-        return Ok(());
+        return;
     }
-    if let Some(ps) = ps.as_ref()
+    if let Some(ps) = ps
         && let Some(rows) = ps["models"].as_array()
     {
         let in_flight: u64 = rows
@@ -14290,10 +14319,18 @@ async fn pool_status(json: bool) -> Result<()> {
             .map(|m| m["affinity_hits"].as_u64().unwrap_or(0))
             .sum();
         if keys > 0 || hits > 0 {
-            println!("    affinity: {keys} live key(s), {hits} steering hit(s)");
+            // The rate frames hits against every routed request for
+            // the pool (session counters, daemon-side).
+            let rate = p["pool"]["affinity"]["hit_rate_pct"].as_f64();
+            let reqs = p["pool"]["affinity"]["requests"].as_u64().unwrap_or(0);
+            match (rate, reqs) {
+                (Some(rate), reqs) if reqs > 0 => println!(
+                    "    affinity: {keys} live key(s), {hits} steering hit(s) ({rate:.1}% of {reqs} request(s))"
+                ),
+                _ => println!("    affinity: {keys} live key(s), {hits} steering hit(s)"),
+            }
         }
     }
-    Ok(())
 }
 
 /// Fetch `GET /api/pools` (admin bearer attaches once keys exist) and
@@ -15143,6 +15180,13 @@ enum PoolAction {
         /// Print the raw pools + ps JSON instead of the card
         #[arg(long)]
         json: bool,
+        /// Keep refreshing the card until Ctrl-C (like `pool watch`,
+        /// but over the whole fleet view)
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval for --watch, in seconds
+        #[arg(long, default_value_t = 2)]
+        interval_secs: u64,
     },
     /// List every configured pool with live member scores and the
     /// decision each strategy would take right now

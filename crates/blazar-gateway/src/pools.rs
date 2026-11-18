@@ -659,6 +659,12 @@ fn expand_with(state: &AppState, requested: &str, affinity: Option<(&str, u64)>)
         .ok()
         .and_then(|m| m.get(&pool.name).cloned());
     let picked = pick(pool, &members, sticky.as_ref(), affinity)?;
+    // Denominator for the steering hit-rate: every successful
+    // expansion routes one pool request, whatever lane initiated it
+    // (chat, generate, responses, count-tokens).
+    if let Ok(mut reqs) = state.pools_requests.lock() {
+        *reqs.entry(pool.name.clone()).or_insert(0) += 1;
+    }
     if pool.strategy == PoolStrategy::Adaptive
         && let Ok(mut m) = state.pools_sticky.lock()
     {
@@ -787,6 +793,23 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 .collect()
         })
         .unwrap_or_default();
+    // Pool-level steering rate: hits against every routed request for
+    // this pool (session counters both). Percent with one decimal so
+    // small fleets read honestly (1 of 3 = 33.3, not "33").
+    let pool_requests = state
+        .pools_requests
+        .lock()
+        .ok()
+        .and_then(|r| r.get(&pool.name).copied())
+        .unwrap_or(0);
+    let hits_total: u64 = affinity_hits.values().sum();
+    let steer_rate = if pool_requests > 0 {
+        #[allow(clippy::cast_precision_loss)] // advisory percent, 0.1 resolution
+        let pct = hits_total as f64 / pool_requests as f64 * 100.0;
+        Some((pct * 10.0).round() / 10.0)
+    } else {
+        None
+    };
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
@@ -857,6 +880,8 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
             "affinity": {
                 "live_keys": affinity_live.len(),
                 "ttl_secs": AFFINITY_TTL.as_secs(),
+                "requests": pool_requests,
+                "hit_rate_pct": steer_rate,
             },
         },
         "decision": decision,
