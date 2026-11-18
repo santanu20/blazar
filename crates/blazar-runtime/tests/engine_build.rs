@@ -367,7 +367,11 @@ async fn integration__curated_fork__never_activates_when_no_engine_row_exists() 
     set_env("STUB_SERVER", stub_server_bin());
 
     assert!(
-        Store::open(&dirs).unwrap().active_engine().unwrap().is_none(),
+        Store::open(&dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .is_none(),
         "test starts with no active engine"
     );
     let row = manager(&dirs)
@@ -405,11 +409,9 @@ async fn integration__curated_build__rejects_registry_arch_not_present_in_pinned
 
     let mut lines = Vec::new();
     let err = manager(&dirs)
-        .build_and_install_for_arch(
-            &o,
-            "not_in_pinned_source",
-            &mut |line| lines.push(line.to_string()),
-        )
+        .build_and_install_for_arch(&o, "not_in_pinned_source", &mut |line| {
+            lines.push(line.to_string())
+        })
         .await
         .unwrap_err()
         .to_string();
@@ -420,7 +422,11 @@ async fn integration__curated_build__rejects_registry_arch_not_present_in_pinned
         "CMake must not run before the source proves the required architecture"
     );
     assert!(
-        Store::open(&dirs).unwrap().list_engines().unwrap().is_empty(),
+        Store::open(&dirs)
+            .unwrap()
+            .list_engines()
+            .unwrap()
+            .is_empty(),
         "a metadata-mismatched lane must never be registered"
     );
 }
