@@ -381,7 +381,11 @@ async fn integration__curated_fork__never_activates_when_no_engine_row_exists() 
 
     assert!(!row.active, "curated fork must be registered additively");
     assert!(
-        Store::open(&dirs).unwrap().active_engine().unwrap().is_none(),
+        Store::open(&dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .is_none(),
         "curated fork must not become the global active engine"
     );
 }
