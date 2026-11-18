@@ -144,10 +144,28 @@ impl LlamaCppSlotIo {
     }
 }
 
+/// The vllm offload store: a filesystem tier the ENGINE manages for
+/// itself (`[vllm.kv_offload]` spawns the child with the built-in
+/// `OffloadingConnector`). There is no gateway-commanded transfer
+/// protocol - the connector exists so capability inquiries (doctor,
+/// route scoring) report the persistent prefix store honestly instead
+/// of "unsupported protocol", and transfer attempts fail with
+/// teaching rather than simulation.
+pub struct VllmOffloadIo;
+
+impl VllmOffloadIo {
+    const TRANSFER_TEACHING: &str = concat!(
+        "the vllm offload store is engine-managed ([vllm.kv_offload]): ",
+        "the child tiers and reloads blocks itself; the gateway observes ",
+        "reuse via cached_tokens, it does not command individual transfers"
+    );
+}
+
 /// Engine-dispatched connector. Construct through
 /// [`registry::connector_for`]; never matched by callers.
 pub enum KvConnector {
     LlamaCpp(LlamaCppSlotIo),
+    Vllm(VllmOffloadIo),
     Unsupported(&'static str),
 }
 
@@ -163,6 +181,19 @@ impl KvConnector {
                 cross_process: false,
                 supported_formats: vec!["llama-slot-bank".into()],
             },
+            Self::Vllm(_) => KvCapabilities {
+                // Gateway-commanded transfers do not exist for this
+                // store - but the engine-side persistence it provides
+                // (prefix reuse across restarts, content-addressed by
+                // run-config digest) is exactly what the persistent /
+                // prefix_blocks / cross_process flags describe.
+                export: false,
+                import: false,
+                persistent: true,
+                prefix_blocks: true,
+                cross_process: true,
+                supported_formats: vec!["vllm-offload-fs ([vllm.kv_offload])".into()],
+            },
             Self::Unsupported(_) => KvCapabilities {
                 export: false,
                 import: false,
@@ -177,6 +208,9 @@ impl KvConnector {
     pub async fn export_prefix(&self, req: KvExportRequest<'_>) -> Result<KvSlotReceipt, KvError> {
         match self {
             Self::LlamaCpp(io) => io.export_prefix(req).await,
+            Self::Vllm(_) => Err(KvError::Unsupported(
+                VllmOffloadIo::TRANSFER_TEACHING.into(),
+            )),
             Self::Unsupported(why) => Err(KvError::Unsupported((*why).to_string())),
         }
     }
@@ -184,6 +218,9 @@ impl KvConnector {
     pub async fn import_prefix(&self, req: KvImportRequest<'_>) -> Result<KvSlotReceipt, KvError> {
         match self {
             Self::LlamaCpp(io) => io.import_prefix(req).await,
+            Self::Vllm(_) => Err(KvError::Unsupported(
+                VllmOffloadIo::TRANSFER_TEACHING.into(),
+            )),
             Self::Unsupported(why) => Err(KvError::Unsupported((*why).to_string())),
         }
     }

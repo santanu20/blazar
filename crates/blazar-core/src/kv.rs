@@ -99,3 +99,111 @@ impl KvModelIdentity {
             && !self.rope_fingerprint.is_empty()
     }
 }
+
+/// Prefix-coverage snapshot for one candidate route: how much of the
+/// incoming prompt a cache with a compatible identity already holds.
+///
+/// The gateway's measured reuse (`cached_tokens` in usage) is the truth
+/// this decision input is built from; routing layers consume the score
+/// to prefer the instance whose cache covers the request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KvRouteScore {
+    /// Prompt tokens the request will process.
+    pub prompt_tokens: u64,
+    /// Tokens a compatible cache holds as a prefix of that prompt
+    /// (never more than `prompt_tokens`; callers clamp, readers trust).
+    pub cached_prefix_tokens: u64,
+    /// Compatibility-policy verdict for the cache behind this route:
+    /// only an `Exact`/`Transformable` identity may feed the ratio.
+    pub identity_compatible: bool,
+}
+
+impl KvRouteScore {
+    /// Cached-prefix fraction in `0.0..=1.0`. `0.0` when the identity
+    /// did not match or there is no prompt to cover.
+    #[allow(clippy::cast_precision_loss)] // token counts live far below 2^53
+    #[must_use]
+    pub fn ratio(&self) -> f64 {
+        if !self.identity_compatible || self.prompt_tokens == 0 {
+            return 0.0;
+        }
+        (self.cached_prefix_tokens as f64 / self.prompt_tokens as f64).min(1.0)
+    }
+
+    /// Prefer the cached route only when the identity matched and the
+    /// covered fraction reaches `min_ratio` (`0.0..=1.0`, inclusive).
+    /// An incompatible or empty cache never routes on - cold prefill is
+    /// the fallback, not a gamble.
+    #[must_use]
+    pub fn should_use_cached_route(&self, min_ratio: f64) -> bool {
+        self.ratio() >= min_ratio && self.identity_compatible
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__kv_route_score__full_coverage_ratio_one() {
+        let s = KvRouteScore {
+            prompt_tokens: 100,
+            cached_prefix_tokens: 100,
+            identity_compatible: true,
+        };
+        assert!((s.ratio() - 1.0).abs() < f64::EPSILON);
+        assert!(s.should_use_cached_route(0.5));
+        assert!(s.should_use_cached_route(1.0));
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__kv_route_score__partial_coverage_meets_threshold_at_boundary() {
+        let s = KvRouteScore {
+            prompt_tokens: 200,
+            cached_prefix_tokens: 100,
+            identity_compatible: true,
+        };
+        assert!((s.ratio() - 0.5).abs() < f64::EPSILON);
+        // Inclusive boundary: exactly-at-threshold routes on.
+        assert!(s.should_use_cached_route(0.5));
+        assert!(!s.should_use_cached_route(0.51));
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__kv_route_score__incompatible_identity_never_routes_on() {
+        let s = KvRouteScore {
+            prompt_tokens: 100,
+            cached_prefix_tokens: 100,
+            identity_compatible: false,
+        };
+        assert!((s.ratio() - 0.0).abs() < f64::EPSILON);
+        assert!(!s.should_use_cached_route(0.0));
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__kv_route_score__empty_prompt_and_overreport_clamp() {
+        let empty = KvRouteScore {
+            prompt_tokens: 0,
+            cached_prefix_tokens: 0,
+            identity_compatible: true,
+        };
+        assert!((empty.ratio() - 0.0).abs() < f64::EPSILON);
+        assert!(!empty.should_use_cached_route(0.5));
+        // A lying count above the prompt clamps to full coverage, never
+        // beyond 1.0.
+        let over = KvRouteScore {
+            prompt_tokens: 10,
+            cached_prefix_tokens: 50,
+            identity_compatible: true,
+        };
+        assert!((over.ratio() - 1.0).abs() < f64::EPSILON);
+    }
+}

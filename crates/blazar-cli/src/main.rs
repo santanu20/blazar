@@ -19970,6 +19970,7 @@ fn mlx_hint_families() -> Vec<&'static str> {
 fn vllm_hint_families() -> Vec<&'static str> {
     vec![
         "gpu_memory_utilization = 0.85    # fraction of GPU memory vllm may claim; lower it when sharing the GPU",
+        "[vllm.kv_offload]                # persistent KV reuse: enabled = true, cpu_bytes_gib (default 2), root_dir (default <data>/kv/vllm)",
     ]
 }
 

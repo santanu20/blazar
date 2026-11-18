@@ -2159,6 +2159,62 @@ pub struct VllmTuning {
     /// processes on shared GPUs; an explicit pin wins over the
     /// compiler's 0.85 default.
     pub gpu_memory_utilization: Option<f32>,
+    /// Persistent KV offloading (opt-in). See [`VllmKvOffload`].
+    #[serde(default)]
+    pub kv_offload: VllmKvOffload,
+}
+
+/// `[vllm.kv_offload]`: persistent KV reuse for the vllm lane.
+///
+/// vLLM's built-in `OffloadingConnector` tiers completed KV blocks into a
+/// pinned CPU buffer plus a content-addressed filesystem store, so a
+/// restarted child reloads matching prompt prefixes instead of
+/// recomputing them (observed as `cached_tokens` in usage, which feeds
+/// the gateway's warm/cold TTFT split). The store keys blocks by a
+/// digest of the run configuration - a different model or layout writes
+/// a different tree and reads nothing back, so a mismatch fails cold,
+/// never with wrong reuse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VllmKvOffload {
+    /// Master switch. `false` (the default) emits no KV offload flags;
+    /// the child keeps only its in-GPU prefix cache.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host memory reserved for the CPU tier, in GiB, total across
+    /// workers (not per-worker).
+    #[serde(default = "default_vllm_kv_cpu_gib")]
+    pub cpu_bytes_gib: u32,
+    /// Filesystem-tier root directory. Defaults to
+    /// `<data_dir>/kv/vllm` so the store survives engine reinstalls
+    /// (the per-engine cache directory does not).
+    pub root_dir: Option<std::path::PathBuf>,
+}
+
+fn default_vllm_kv_cpu_gib() -> u32 {
+    2
+}
+
+impl Default for VllmKvOffload {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cpu_bytes_gib: default_vllm_kv_cpu_gib(),
+            root_dir: None,
+        }
+    }
+}
+
+impl VllmKvOffload {
+    fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        if !(1..=64).contains(&self.cpu_bytes_gib) {
+            return Err(CoreError::Config(format!(
+                "{where_}.cpu_bytes_gib must be 1..=64 (GiB), got {}",
+                self.cpu_bytes_gib
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl VllmTuning {
@@ -2177,6 +2233,7 @@ impl VllmTuning {
                 "{where_}.gpu_memory_utilization must be 0.05..=0.95, got {frac}"
             )));
         }
+        self.kv_offload.validate(&format!("{where_}.kv_offload"))?;
         Ok(())
     }
 }

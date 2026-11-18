@@ -4943,6 +4943,35 @@ fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
         argv.push(slots.to_string());
     }
 
+    // --- KV reuse observability: vllm only populates usage
+    // prompt_tokens_details (the cached_tokens field the gateway's
+    // warm/cold TTFT split and prompt_eval_cached_count read) when
+    // asked. Reporting is free, so the flag rides every spawn.
+    argv.push("--enable-prompt-tokens-details".to_string());
+
+    // --- persistent KV offload (opt-in): tier completed blocks into a
+    // pinned CPU buffer + a content-addressed fs store so a restarted
+    // child reloads matching prefixes. The store digest binds the run
+    // configuration (model, block size, parallelism, dtype): a
+    // different config writes a different tree and reads nothing back.
+    if tun.kv_offload.enabled {
+        let root = tun.kv_offload.root_dir.as_ref().map_or_else(
+            || format!("{}/kv/vllm", input.data_dir.trim_end_matches('/')),
+            |p| p.to_string_lossy().into_owned(),
+        );
+        let kv_cfg = serde_json::json!({
+            "kv_connector": "OffloadingConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "spec_name": "TieringOffloadingSpec",
+                "cpu_bytes_to_use": u64::from(tun.kv_offload.cpu_bytes_gib) * 1024 * 1024 * 1024,
+                "secondary_tiers": [ { "type": "fs", "root_dir": root } ],
+            },
+        });
+        argv.push("--kv-transfer-config".to_string());
+        argv.push(kv_cfg.to_string());
+    }
+
     // User extra_args ride after the knobs: on a repeat flag the later
     // token wins in argparse, so an explicit extra_args pin always
     // overrides the knob's value (same last-wins contract as mlx/sglang).
@@ -4970,7 +4999,18 @@ fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
 /// the serve pins are reserved (blazar sets them from the quintet), and
 /// unknown flags refuse instead of dying at child boot.
 fn vllm_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
-    const RESERVED: &[&str] = &["--served-model-name", "--host", "--port", "--api-key"];
+    const RESERVED: &[&str] = &[
+        "--served-model-name",
+        "--host",
+        "--port",
+        "--api-key",
+        // KV plumbing is compiler-owned: the reporting flag rides every
+        // spawn and --kv-transfer-config is emitted when [vllm.kv_offload]
+        // is enabled. Both stay reserved even with offload off, so an
+        // extra_args pin can never fight the compiler's emission.
+        "--kv-transfer-config",
+        "--enable-prompt-tokens-details",
+    ];
     let Some(extra) = &input.overlay.extra_args else {
         return Ok(Vec::new());
     };
@@ -20482,8 +20522,11 @@ mod tests {
                 "16384",
                 "--gpu-memory-utilization",
                 "0.85",
+                // Reporting flag rides every spawn: cached_tokens feeds
+                // the gateway's warm/cold TTFT split.
+                "--enable-prompt-tokens-details",
             ],
-            "default compile is exactly ctx + utilization"
+            "default compile is exactly ctx + utilization + reuse reporting"
         );
         assert_eq!(p.ctx, 16384);
         // KV byte estimation is GGUF-geometry-only today; HF lanes ride
@@ -20527,6 +20570,7 @@ mod tests {
         let cfg = Config {
             vllm: crate::config::VllmTuning {
                 gpu_memory_utilization: Some(0.6),
+                kv_offload: crate::config::VllmKvOffload::default(),
             },
             ..Config::default()
         };
@@ -20545,6 +20589,7 @@ mod tests {
         let mut overlay = DEFAULT_OVERLAY.clone();
         overlay.vllm = Some(crate::config::VllmTuning {
             gpu_memory_utilization: Some(0.3),
+            kv_offload: crate::config::VllmKvOffload::default(),
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -20586,6 +20631,92 @@ mod tests {
     }
 
     #[test]
+    fn unit__vllm_compile__kv_offload_disabled_by_default_and_enabled_emits_connector_json() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        // Default: opt-in is OFF - no offload flag, only the reporting.
+        let inp = vllm_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--kv-transfer-config".to_string()),
+            "offload is opt-in: {:?}",
+            p.argv
+        );
+
+        // Enabled: full OffloadingConnector config with the default
+        // root under the data dir and the pinned CPU tier.
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            gpu_memory_utilization: None,
+            kv_offload: crate::config::VllmKvOffload {
+                enabled: true,
+                cpu_bytes_gib: 3,
+                root_dir: None,
+            },
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--kv-transfer-config")
+            .expect("offload flag emitted");
+        let raw = &p.argv[idx + 1];
+        let v: serde_json::Value = serde_json::from_str(raw).expect("argument is valid JSON");
+        assert_eq!(v["kv_connector"], "OffloadingConnector");
+        assert_eq!(v["kv_role"], "kv_both");
+        assert_eq!(
+            v["kv_connector_extra_config"]["spec_name"],
+            "TieringOffloadingSpec"
+        );
+        assert_eq!(
+            v["kv_connector_extra_config"]["cpu_bytes_to_use"],
+            3 * 1024 * 1024 * 1024u64
+        );
+        let tiers = v["kv_connector_extra_config"]["secondary_tiers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0]["type"], "fs");
+        // Default root lands under the data dir (trailing '/' trimmed).
+        assert_eq!(tiers[0]["root_dir"], "/tmp/blazar-test-data/kv/vllm");
+    }
+
+    #[test]
+    fn unit__vllm_compile__kv_offload_root_dir_pin_wins_and_json_is_spawn_safe() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            gpu_memory_utilization: None,
+            kv_offload: crate::config::VllmKvOffload {
+                enabled: true,
+                cpu_bytes_gib: 2,
+                root_dir: Some("/store/kv-custom".into()),
+            },
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--kv-transfer-config")
+            .expect("offload flag emitted");
+        let v: serde_json::Value =
+            serde_json::from_str(&p.argv[idx + 1]).expect("argument is valid JSON");
+        assert_eq!(
+            v["kv_connector_extra_config"]["secondary_tiers"][0]["root_dir"], "/store/kv-custom",
+            "explicit pin replaces the data-dir default"
+        );
+        // The JSON travels as one argv element (Vec<String> spawn - no
+        // shell), and carries no NUL/newline that would corrupt it.
+        assert!(!p.argv[idx + 1].contains('\n'));
+        assert!(!p.argv[idx + 1].contains('\0'));
+    }
+
+    #[test]
     fn unit__vllm_extra_args__reserved_refused_and_unknown_refused() {
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
@@ -20597,6 +20728,16 @@ mod tests {
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
         assert!(err.contains("reserved"), "{err}");
+
+        // KV plumbing stays compiler-owned even with offload disabled -
+        // an extra_args pin can never fight the compiler's emission.
+        for reserved in ["--kv-transfer-config", "--enable-prompt-tokens-details"] {
+            let mut overlay = DEFAULT_OVERLAY.clone();
+            overlay.extra_args = Some(vec![reserved.into(), "{}".into()]);
+            let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+            let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+            assert!(err.contains("reserved"), "{reserved}: {err}");
+        }
 
         // Unknown-to-this-build flags refuse at compile time, not at
         // child boot after a multi-GB model load.

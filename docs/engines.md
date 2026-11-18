@@ -109,9 +109,21 @@ venv's own `vllm serve`. The profile compiler owns the VRAM guardrails:
 emitted (default 0.85 - set `[vllm] gpu_memory_utilization` lower when the
 GPU is shared with a co-tenant daemon or another lane), and
 `--max-num-seqs` when a slot pin exists. Tool calling
-(`--enable-auto-tool-choice` + parser selection) and the KV-connector
-surfaces are the incremental-certification wave; v0 ships plain chat,
-streaming, and strict `json_schema` output.
+(`--enable-auto-tool-choice` + parser selection) is the
+incremental-certification wave; v0 ships plain chat, streaming, and strict
+`json_schema` output.
+
+Persistent KV reuse ships behind `[vllm.kv_offload]` (opt-in): the child
+boots with the built-in OffloadingConnector (`kv_both`) tiering completed
+blocks into a pinned CPU buffer (`cpu_bytes_gib`, default 2 GiB) plus a
+content-addressed filesystem store (`root_dir`, default
+`<data_dir>/kv/vllm`). The store keys blocks by a digest of the run
+configuration - a different model or context pin writes a different tree
+and reads nothing back, so a mismatch fails cold, never with wrong reuse.
+Restarted children reload matching prompt prefixes instead of recomputing
+them; the effect is observable as `cached_tokens` in usage (the
+`--enable-prompt-tokens-details` flag rides every spawn) and surfaces in
+the gateway's warm/cold TTFT split and `prompt_eval_cached_count`.
 
 ### MLX
 

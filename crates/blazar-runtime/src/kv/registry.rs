@@ -17,6 +17,14 @@ pub fn connector_for(
     auth: Option<String>,
     router_model: Option<String>,
 ) -> KvConnector {
+    // The vllm offload store is engine-managed, not gateway-commanded:
+    // this arm exists for capability inquiries (doctor, route
+    // scoring). The supervisor's bank_save/bank_restore paths gate on
+    // supports_slot_banks() before they ever reach here, so a vllm
+    // instance never rides the slot-bank protocol by accident.
+    if kind == EngineKind::Vllm {
+        return KvConnector::Vllm(super::VllmOffloadIo);
+    }
     if kind.supports_slot_banks() {
         KvConnector::LlamaCpp(LlamaCppSlotIo::new(auth, router_model))
     } else {
@@ -55,5 +63,39 @@ mod tests {
         let conn = connector_for(EngineKind::LlamaCpp, None, None);
         assert!(conn.capabilities().export);
         assert!(conn.capabilities().import);
+    }
+
+    #[tokio::test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    async fn unit__registry__vllm_reports_engine_managed_store_and_refuses_transfers() {
+        let conn = connector_for(EngineKind::Vllm, None, None);
+        let caps = conn.capabilities();
+        // The fs tier persists prefixes across restarts, but the
+        // gateway cannot command individual transfers.
+        assert!(!caps.export);
+        assert!(!caps.import);
+        assert!(caps.persistent);
+        assert!(caps.prefix_blocks);
+        assert!(caps.cross_process);
+        assert_eq!(
+            caps.supported_formats,
+            vec!["vllm-offload-fs ([vllm.kv_offload])"]
+        );
+        let err = conn
+            .import_prefix(crate::kv::KvImportRequest {
+                slot: 0,
+                filename: "x",
+                client: crate::supervisor::test_local_http(),
+                base: "http://127.0.0.1:1",
+            })
+            .await
+            .unwrap_err();
+        match err {
+            blazar_core::kv::KvError::Unsupported(why) => {
+                assert!(why.contains("engine-managed"));
+            }
+            other => panic!("expected Unsupported teaching, got {other:?}"),
+        }
     }
 }
