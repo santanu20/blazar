@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **`blazar why --prom` + affinity purge on cold members.** The sentinel observations now expose a Prometheus text lane (`records/flagged/degraded` totals, per-code occurrences, live engine-degrade count) matching `pool status --prom`; and pool scoring purges cache-affinity entries whose local member lost its engine process (crash, external unload, idle recycle), so the steering discount never points at a prefix KV that no longer exists.
 - **`pool status --prom` + affinity eviction on unload.** The fleet card can emit Prometheus text exposition (pool/member gauges, steering counters, breaker retry, engine residency) for scrape pipelines; and when a local model unloads (evict API, idle recycle, keep-alive-0, router unload), the pool affinity map drops openers steered toward that model's members so routing stops preferring a now-cold replica within the TTL window.
 
 - **Steering windows survive graceful restart (schema v22).** `pools_window_events` snapshots the rolling request/hit windows at graceful shutdown and restores them on boot (same `pools_ops_persist` opt-in), so trend history and rolling hit rates cross a restart; a crash starts windows blank - telemetry, not correctness state.

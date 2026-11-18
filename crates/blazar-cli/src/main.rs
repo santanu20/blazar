@@ -813,6 +813,10 @@ enum Cmd {
         /// Tail sentinel detections live instead (same as `blazar watch`)
         #[arg(long, conflicts_with = "trace")]
         watch: bool,
+        /// Emit the observations as Prometheus text exposition instead
+        /// of the human record list (scrape lane for the why counters)
+        #[arg(long)]
+        prom: bool,
     },
     /// Explain the effective configuration for a model: engine lane,
     /// context provenance, slots, speculation, caches - every value
@@ -2676,6 +2680,7 @@ blazar mmproj <model> <mmproj.gguf path>"
             model,
             limit,
             flagged,
+            prom,
         } => {
             if live {
                 watch().await
@@ -2686,6 +2691,7 @@ blazar mmproj <model> <mmproj.gguf path>"
                     model.as_deref(),
                     limit,
                     flagged,
+                    prom,
                 )
                 .await
             }
@@ -13705,6 +13711,7 @@ async fn why(
     model: Option<&str>,
     limit: usize,
     flagged: bool,
+    prom: bool,
 ) -> Result<()> {
     let base = ensure_daemon().await?;
     // trace/code/model values are trace ids, snake_case codes, and model
@@ -13725,9 +13732,12 @@ async fn why(
         q.push("flagged=1".into());
     }
     let url = format!("{base}/api/why?{}", q.join("&"));
-    let resp = cli_http()
-        .get(&url)
-        .timeout(Duration::from_secs(10))
+    let mut req = cli_http().get(&url).timeout(Duration::from_secs(10));
+    // Observability reads are admin-plane on keyed daemons.
+    if let Some(b) = admin_bearer() {
+        req = req.bearer_auth(b);
+    }
+    let resp = req
         .send()
         .await?;
     if !resp.status().is_success() {
@@ -13737,6 +13747,10 @@ async fn why(
     let v: serde_json::Value = resp.json().await?;
     if !v["sentinel"].as_bool().unwrap_or(false) {
         println!("sentinel is disabled (config: sentinel = false) - no observations recorded");
+        return Ok(());
+    }
+    if prom {
+        print!("{}", render_why_prom(&v));
         return Ok(());
     }
     // Live engine degrades come first: they explain WHY everything below
@@ -13754,6 +13768,59 @@ async fn why(
         print_record(r);
     }
     Ok(())
+}
+
+/// Prometheus text exposition of `/api/why`'s counters: record,
+/// flagged and degraded totals, per-code occurrence counts and the live
+/// engine-degrade count. Same scrape lane as `pool status --prom`; the
+/// human list stays the default because the hints are the point there.
+fn render_why_prom(v: &serde_json::Value) -> String {
+    use std::fmt::Write as _;
+    let records = v["records"].as_array().cloned().unwrap_or_default();
+    let flagged = records
+        .iter()
+        .filter(|r| r["detections"].as_array().is_some_and(|d| !d.is_empty()))
+        .count();
+    let degraded = records
+        .iter()
+        .filter(|r| r["degraded"].as_bool().unwrap_or(false))
+        .count();
+    let mut codes: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for r in &records {
+        if let Some(dets) = r["detections"].as_array() {
+            for d in dets {
+                if let Some(code) = d["code"].as_str() {
+                    *codes.entry(code).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let engine_degrades = v["engine_degrades"]
+        .as_array()
+        .map_or(0, std::vec::Vec::len);
+    let mut out = String::new();
+    out.push_str("# HELP blazar_why_records_total sentinel observations in the returned window\n");
+    out.push_str("# TYPE blazar_why_records_total gauge\n");
+    let _ = writeln!(out, "blazar_why_records_total {}", records.len());
+    out.push_str("# HELP blazar_why_flagged_total observations carrying at least one detection\n");
+    out.push_str("# TYPE blazar_why_flagged_total gauge\n");
+    let _ = writeln!(out, "blazar_why_flagged_total {flagged}");
+    out.push_str("# HELP blazar_why_degraded_total observations the engines marked degraded\n");
+    out.push_str("# TYPE blazar_why_degraded_total gauge\n");
+    let _ = writeln!(out, "blazar_why_degraded_total {degraded}");
+    out.push_str("# HELP blazar_why_code_occurrences detection occurrences per sentinel code\n");
+    out.push_str("# TYPE blazar_why_code_occurrences gauge\n");
+    for (code, n) in &codes {
+        let _ = writeln!(
+            out,
+            "blazar_why_code_occurrences{{code=\"{}\"}} {n}",
+            esc(code)
+        );
+    }
+    out.push_str("# HELP blazar_why_engine_degrades live engine children reporting a degrade\n");
+    out.push_str("# TYPE blazar_why_engine_degrades gauge\n");
+    let _ = writeln!(out, "blazar_why_engine_degrades {engine_degrades}");
+    out
 }
 
 /// Render /api/why's `engine_degrades` for the CLI: live children whose
@@ -14290,12 +14357,15 @@ async fn pool_status(json: bool, prom: bool, watch: bool, interval_secs: u64) ->
 /// residency panel. Label values are escaped defensively; anything
 /// the daemon did not report is simply omitted (Prometheus treats a
 /// missing series as "unknown", which is the honest answer).
+/// Escape a Prometheus label value: backslash, double quote and
+/// newline are the three characters the exposition format requires.
+fn esc(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 fn render_prom(pools: &serde_json::Value, ps: Option<&serde_json::Value>) -> String {
-    fn esc(v: &str) -> String {
-        v.replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-    }
     let mut out = String::new();
     let empty = serde_json::json!([]);
     let pool_list = pools["pools"]
@@ -30669,6 +30739,26 @@ mod tests {
         let row = out2.lines().nth(1).unwrap();
         assert!(row.contains("имя-модели-очень-длинное"));
         assert!(row.contains("..."), "oversized arch must cap: {row}");
+    }
+
+    #[test]
+    fn unit__render_why_prom__counts_records_flags_and_codes() {
+        let v = serde_json::json!({
+            "sentinel": true,
+            "engine_degrades": [{"model": "m1"}],
+            "records": [
+                {"detections": [{"code": "reasoning_no_answer"}], "degraded": false},
+                {"detections": [{"code": "reasoning_no_answer"}, {"code": "empty_reply"}], "degraded": true},
+                {"detections": [], "degraded": false}
+            ]
+        });
+        let out = render_why_prom(&v);
+        assert!(out.contains("blazar_why_records_total 3"));
+        assert!(out.contains("blazar_why_flagged_total 2"));
+        assert!(out.contains("blazar_why_degraded_total 1"));
+        assert!(out.contains("blazar_why_code_occurrences{code=\"reasoning_no_answer\"} 2"));
+        assert!(out.contains("blazar_why_code_occurrences{code=\"empty_reply\"} 1"));
+        assert!(out.contains("blazar_why_engine_degrades 1"));
     }
 
     #[test]

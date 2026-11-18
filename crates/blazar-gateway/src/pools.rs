@@ -828,6 +828,27 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
             }
         }
     }
+    // A local member observed cold lost its engine process - idle-sleep
+    // eviction, explicit unload, or a crash the runtime is still
+    // respawning - and with it the prefix KV its affinity entries
+    // promised. Purge those entries at scoring time so the affinity
+    // discount never steers toward a cache that no longer exists.
+    // Remote members stay TTL-reaped: their residency signal is
+    // peer-reported and may lag a live process.
+    let cold_local: Vec<String> = local_names
+        .iter()
+        .filter(|(_, row)| !ps_rows.iter().any(|r| r.name == row.as_str()))
+        .map(|(member, _)| member.clone())
+        .collect();
+    if !cold_local.is_empty()
+        && let Ok(mut affinity) = state.pools_affinity.lock()
+    {
+        let dropping: std::collections::HashSet<String> =
+            affinity_keys_dropping_for(&affinity, &cold_local)
+                .into_iter()
+                .collect();
+        affinity.retain(|_, (effective, _)| !dropping.contains(effective));
+    }
     members
 }
 
