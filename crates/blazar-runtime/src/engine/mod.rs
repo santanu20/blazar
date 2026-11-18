@@ -1084,7 +1084,11 @@ impl EngineManager {
         opts.jobs = opts.jobs.clamp(1, 4);
         (on_line)(&format!(
             "auto-installing curated lane {} ({}@{}, backend {}, architecture {})",
-            lane.id, lane.repo, lane.ref_sha, backend.as_str(), architecture
+            lane.id,
+            lane.repo,
+            lane.ref_sha,
+            backend.as_str(),
+            architecture
         ));
         self.build_and_install_for_arch(&opts, architecture, on_line)
             .await
