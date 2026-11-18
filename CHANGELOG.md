@@ -164,6 +164,7 @@ tracked here.
   before re-enabling strict mode.
 
 ### Fixed
+- **Session-bank restores are fail-closed.** Checkpoint identity now binds to the actual serving instance (engine kind + build, canonical model digest, effective context and slot count) instead of the global active engine and replica-suffixed instance keys; a missing manifest or unavailable current identity rejects the restore (previously an empty mismatch list let it proceed), legacy manifests without engine-kind identity cold-start, and router-mode PD synthetic instances no longer bank at all.
 - Pool strategies `ordered`, `warm_first` and `adaptive` previously returned no member when every member was down (only `least_wait` had a fallback); all strategies now degrade to the least-bad member so the request surfaces the peer's real error instead of a not-found on the pool name.
 
 - **OpenAI remote lane now charges key token budgets.** Requests to

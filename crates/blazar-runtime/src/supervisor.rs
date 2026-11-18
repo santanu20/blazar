@@ -516,6 +516,18 @@ pub fn is_pd_family_key(key: &str) -> bool {
     key.ends_with("#pd-pre") || key.ends_with("#pd-dec") || key.ends_with("#pd-router")
 }
 
+/// Parallelism a spawn will actually use: the `-np`/`--parallel` the
+/// child was spawned with, falling back to the configured slot count.
+/// Shared by the live instance counter and the pre-serve restore gate
+/// so both sides of a checkpoint agree on the same number.
+fn argv_slots(argv: &[String], fallback: u32) -> u32 {
+    argv.windows(2)
+        .find(|w| w[0] == "-np" || w[0] == "--parallel")
+        .and_then(|w| w[1].parse::<u32>().ok())
+        .unwrap_or(fallback)
+        .max(1)
+}
+
 /// Instance display name: like [`model_of_key`] but KEEPS the `+lora`
 /// marker so `ps` distinguishes an adapted child from the dense one.
 /// `@vision` and `#N` stay hidden - those are the same weights serving
@@ -7057,6 +7069,8 @@ impl Supervisor {
                         profile.ctx,
                         auth.as_ref().map(|a| a.secret.as_str()),
                         engine.kind(),
+                        &manifest.tag,
+                        argv_slots(&argv, self.cfg().slots),
                     )
                     .await;
 
@@ -7955,12 +7969,7 @@ drop them from rpc_servers in config.toml",
     /// `--parallel`), config fallback, floor 1 - the same walk
     /// `slot_headroom` does per replica.
     fn instance_slot_count(&self, inst: &Arc<Instance>) -> u32 {
-        inst.argv
-            .windows(2)
-            .find(|w| w[0] == "-np" || w[0] == "--parallel")
-            .and_then(|w| w[1].parse::<u32>().ok())
-            .unwrap_or(self.cfg().slots)
-            .max(1)
+        argv_slots(&inst.argv, self.cfg().slots)
     }
 
     /// Session-bank restore, IN-SPAWN and synchronous: warms the child's
@@ -7977,6 +7986,9 @@ drop them from rpc_servers in config.toml",
     /// continues cold - the bank stays on disk for the next spawn.
     /// A #20 identity mismatch SKIPS the set: injecting KV from a
     /// different runtime shape is worse than a cold start.
+    // Call-shape is fixed by the spawn site (identity inputs); the arg
+    // count mirrors the identity tuple it verifies.
+    #[allow(clippy::too_many_arguments)]
     async fn bank_restore_sync(
         &self,
         key: &str,
@@ -7984,6 +7996,8 @@ drop them from rpc_servers in config.toml",
         ctx: u32,
         auth: Option<&str>,
         kind: blazar_core::engine_kind::EngineKind,
+        engine_tag: &str,
+        slots: u32,
     ) {
         if !self.cfg().session_bank {
             return;
@@ -8024,15 +8038,30 @@ drop them from rpc_servers in config.toml",
         // Manifests are identical across the set (same live instance),
         // so any member's manifest gates the whole set.
         let gate_file = self.bank_slot_file(key, ctx, restores[0].0);
+        // Fail-closed: a missing manifest or an unavailable current
+        // identity REJECTS the restore (cold start) instead of an empty
+        // mismatch list that would let unverified state through. The
+        // identity is built from the canonical model name (instance
+        // keys carry `#N` replica suffixes) and the engine actually
+        // serving it, then compared with the strict restore verifier.
+        let canonical = key.split('#').next().unwrap_or(key);
         let diffs = match (
             blazar_core::session_identity::read_manifest(&gate_file),
-            blazar_core::session_identity::build(&self.dirs, &self.cfg(), key),
+            blazar_core::session_identity::build_for_instance(
+                &self.dirs,
+                &self.cfg(),
+                canonical,
+                engine_tag,
+                kind,
+                ctx,
+                slots,
+            ),
         ) {
-            (Some(saved), Some(mut cur)) => {
-                cur.ctx = ctx;
-                blazar_core::session_identity::verify(&saved, &cur)
+            (Some(saved), Some(cur)) => {
+                blazar_core::session_identity::verify_for_restore(&saved, &cur)
             }
-            _ => Vec::new(),
+            (None, _) => vec!["checkpoint identity manifest missing".to_string()],
+            (_, None) => vec!["current runtime identity unavailable".to_string()],
         };
         if !diffs.is_empty() {
             tracing::warn!(
@@ -8141,6 +8170,16 @@ drop them from rpc_servers in config.toml",
         if !self.cfg().session_bank || inst.in_flight.load(Ordering::SeqCst) > 0 {
             return;
         }
+        // PD-family keys (`#pd-pre`/`#pd-dec`/`#pd-router`) are one
+        // disaggregated unit, not independent cache owners - the
+        // router never holds model KV and worker KV moves through the
+        // engine's own transfer lane. The capability gate below
+        // already excludes their engine today; this guard survives any
+        // future widening of it. Cold beats a checkpoint of a synthetic
+        // identity.
+        if is_pd_family_key(&inst.name) {
+            return;
+        }
         // Dirty gate: the sweep exists to persist KV that is NEWER than
         // the last bank. A not-dirty instance has nothing new - and for
         // a child that already slept (KV dropped at sleep, live-repro'd
@@ -8247,10 +8286,22 @@ drop them from rpc_servers in config.toml",
                 banked_bytes += md.len();
             }
             // #20 identity manifest: stamp the shape so bank restores
-            // can refuse stale KV (built from the LIVE instance ctx).
-            match blazar_core::session_identity::build(&self.dirs, &self.cfg(), &inst.name) {
-                Some(mut id) => {
-                    id.ctx = inst.profile_ctx;
+            // can refuse stale KV. Bound to the ACTUAL serving instance
+            // (engine tag/kind from the instance, effective ctx and
+            // live slot count) and the CANONICAL model name - instance
+            // keys carry `#N` replica suffixes that would miss the
+            // model row and silently weaken identity to None==None.
+            let canonical = inst.name.split('#').next().unwrap_or(&inst.name);
+            match blazar_core::session_identity::build_for_instance(
+                &self.dirs,
+                &self.cfg(),
+                canonical,
+                &inst.engine_tag,
+                inst.kind,
+                inst.profile_ctx,
+                self.instance_slot_count(inst),
+            ) {
+                Some(id) => {
                     if let Err(e) = blazar_core::session_identity::write_manifest(&file, &id) {
                         tracing::warn!(target: "blazar::bank", model = %inst.name, "bank identity write failed: {e}");
                     }
@@ -16992,10 +17043,11 @@ mod routing_tests {
         kill_all(&[pid]);
     }
 
-    /// Same gate on the in-spawn restore path: an on-disk bank for an
-    /// unsupported kind is left cold (no dial), while the supported
-    /// kind restores it (legacy banks without an identity manifest
-    /// proceed by design).
+    /// Same gate on the in-spawn restore path: an unsupported kind or
+    /// an unverifiable checkpoint (no identity manifest, or no matching
+    /// engine/model rows to build the current identity from) stays
+    /// cold - no dial. Only a manifest whose identity verifies against
+    /// the actual serving engine restores (fail-closed, PR1).
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
     #[tokio::test]
     async fn unit__bank_capability__restore_gate_by_kind() {
@@ -17018,14 +17070,72 @@ mod routing_tests {
             host: "127.0.0.1".into(),
             port: server.address().port(),
         };
-        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::Sglang)
+        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::Sglang, "t", 1)
             .await;
         let hits_so_far = server
             .received_requests()
             .await
             .expect("expect() mock keeps recording on");
         assert_eq!(hits_so_far.len(), 0, "unsupported kind must not restore");
-        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::LlamaCpp)
+        // Fail-closed: a supported kind with NO identity manifest must
+        // also stay cold - the old empty-diff fallback restored it.
+        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::LlamaCpp, "t", 1)
+            .await;
+        let hits = server
+            .received_requests()
+            .await
+            .expect("expect() mock keeps recording on");
+        assert_eq!(
+            hits.len(),
+            0,
+            "missing manifest must reject the restore (cold start)"
+        );
+        // Positive leg: register the engine + a hashed model, write a
+        // manifest that matches, and the restore proceeds (one dial).
+        let store = blazar_core::store::Store::open(&sup.dirs).expect("store");
+        store
+            .upsert_engine(&blazar_core::store::EngineRow {
+                tag: "t".into(),
+                asset: "llama-server".into(),
+                sha256: "e3b0".into(),
+                installed_at: 1,
+                active: true,
+                manifest: "{}".into(),
+                kind: EngineKind::LlamaCpp,
+            })
+            .expect("engine row");
+        store
+            .upsert_model(&blazar_core::store::ModelRow {
+                name: "m".into(),
+                repo: "r".into(),
+                quant: "q4".into(),
+                path: "/nonexistent/m.gguf".into(),
+                bytes: 1,
+                sha256: Some("cafe".into()),
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+                last_used_at: 1,
+            })
+            .expect("model row");
+        drop(store);
+        let id = blazar_core::session_identity::build_for_instance(
+            &sup.dirs,
+            &sup.cfg(),
+            "m",
+            "t",
+            EngineKind::LlamaCpp,
+            8,
+            1,
+        )
+        .expect("identity builds");
+        let _ = &argv_slots;
+        blazar_core::session_identity::write_manifest(&file, &id).expect("manifest");
+        sup.bank_restore_sync("m", &endpoint, 8, None, EngineKind::LlamaCpp, "t", 1)
             .await;
         server.verify().await;
         let hits = server

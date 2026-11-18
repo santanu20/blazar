@@ -134,7 +134,7 @@ pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer 
     // #20 identity manifest build reads it.
     store
         .upsert_engine(&blazar_core::EngineRow {
-            tag: "stub-1".into(),
+            tag: "stub".into(),
             asset: "stub".into(),
             sha256: "stub-sha".into(),
             installed_at: 1,
@@ -143,7 +143,7 @@ pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer 
             kind: blazar_core::engine_kind::EngineKind::default(),
         })
         .unwrap();
-    store.set_active_engine("stub-1").unwrap();
+    store.set_active_engine("stub").unwrap();
     let manifest = blazar_runtime::probe_manifest(&find_stub(), "stub").unwrap();
     let mut engine = LlamaCppEngine::new(manifest);
     engine.child_env = stub_env

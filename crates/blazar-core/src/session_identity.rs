@@ -1,12 +1,17 @@
 //! KV-checkpoint identity manifests (#20): every session save writes a
 //! sibling `<file>.identity.json` recording the exact runtime shape the
-//! KV bytes were produced under (engine build, model bytes, ctx, cache
-//! type, KV unification, slots). Restores verify before injecting - KV
-//! state from a different shape is silent garbage, not a warm start.
+//! KV bytes were produced under (engine kind and build, model bytes,
+//! ctx, cache type, KV unification, slots). Restores verify before
+//! injecting - KV state from a different shape is silent garbage, not a
+//! warm start.
 //!
-//! Unknown-vs-unknown never fails a restore: a missing `model_sha`
-//! (pulled before hashing existed) is "unverifiable", not "mismatched" -
-//! only fields present on BOTH sides are compared.
+//! Two verification postures live here. [`verify`] compares only
+//! fields present on both sides (a pre-hashing manifest is
+//! "unverifiable", not "mismatched") - suitable for informational
+//! diffs. [`verify_for_restore`] is the strict gate actual KV
+//! restoration must pass: unknown identity REJECTS, because a cold
+//! prefill costs latency while injected incompatible state costs
+//! correctness.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,6 +27,12 @@ use crate::store::Store;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionIdentity {
     pub blazar_version: String,
+    /// Engine kind (e.g. `llama.cpp`, `sglang`). Empty on legacy
+    /// manifests written before this dimension existed - the strict
+    /// restore verifier rejects those as unverifiable (cold start),
+    /// while the informational compare skips the field.
+    #[serde(default)]
+    pub engine_kind: String,
     pub engine_tag: String,
     pub engine_sha: String,
     #[serde(default)]
@@ -53,6 +64,7 @@ pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionI
     let model_sha = store.get_model(model).ok().flatten().and_then(|m| m.sha256);
     Some(SessionIdentity {
         blazar_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_kind: engine.kind.as_str().to_string(),
         engine_tag: engine.tag,
         engine_sha: engine.sha256,
         model_sha,
@@ -80,6 +92,74 @@ pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionI
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
     })
+}
+
+/// Snapshot the runtime shape of one ACTUAL serving instance. Unlike
+/// [`build`] (which snapshots the globally active engine and is kept
+/// for tests/compat), this binds to the engine that will really serve
+/// `model_name` under per-model routing, and takes the effective ctx
+/// and slot count from the caller who knows the instance. `None` =
+/// exact identity cannot be established (unknown model, unhashed
+/// weights, engine row missing/kind-mismatched/unpinned sha) - callers
+/// treat that as "do not bank / do not restore", never as "close
+/// enough".
+#[must_use]
+pub fn build_for_instance(
+    dirs: &BlazarDirs,
+    config: &Config,
+    model_name: &str,
+    engine_tag: &str,
+    engine_kind: crate::engine_kind::EngineKind,
+    ctx: u32,
+    slots: u32,
+) -> Option<SessionIdentity> {
+    let store = Store::open(dirs).ok()?;
+    // An unhashed model cannot establish exact checkpoint identity.
+    let model_sha = store.get_model(model_name).ok()??.sha256?;
+    let engine = store
+        .list_engines()
+        .ok()?
+        .into_iter()
+        .find(|e| e.tag == engine_tag)?;
+    if engine.kind != engine_kind || engine.sha256.is_empty() {
+        return None;
+    }
+    let (cache_k, cache_v) = config.effective_cache_type_kv(model_name);
+    Some(SessionIdentity {
+        blazar_version: env!("CARGO_PKG_VERSION").to_string(),
+        engine_kind: engine_kind.as_str().to_string(),
+        engine_tag: engine.tag,
+        engine_sha: engine.sha256,
+        model_sha: Some(model_sha),
+        ctx,
+        cache_type: if cache_k == cache_v {
+            cache_k
+        } else {
+            format!("{cache_k}/{cache_v}")
+        },
+        kv_unified: config.effective_kv_unified(model_name),
+        slots,
+        saved_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    })
+}
+
+/// Strict restore gate: [`verify`] plus the rejection of any identity
+/// dimension that is merely unknown. A checkpoint whose model digest or
+/// engine kind cannot be established is refused - restoring it would
+/// inject state of unknown provenance, and a cold prefill is the
+/// correct fallback instead.
+#[must_use]
+pub fn verify_for_restore(saved: &SessionIdentity, current: &SessionIdentity) -> Vec<String> {
+    let mut diffs = verify(saved, current);
+    if saved.model_sha.is_none() || current.model_sha.is_none() {
+        diffs.push("model_sha: exact identity unavailable".into());
+    }
+    if saved.engine_kind.is_empty() || current.engine_kind.is_empty() {
+        diffs.push("engine_kind: exact identity unavailable".into());
+    }
+    diffs
 }
 
 /// Write the manifest beside a just-saved checkpoint. Best-effort at
@@ -132,6 +212,20 @@ pub fn verify(saved: &SessionIdentity, current: &SessionIdentity) -> Vec<String>
     {
         push("model_sha", s.clone(), c.clone());
     }
+    // Legacy manifests carry no engine kind: unknown-vs-unknown skips
+    // here, but the strict restore verifier below rejects it - the
+    // kind dimension (e.g. llama.cpp vs sglang) changes the KV byte
+    // format entirely.
+    if !saved.engine_kind.is_empty()
+        && !current.engine_kind.is_empty()
+        && saved.engine_kind != current.engine_kind
+    {
+        push(
+            "engine_kind",
+            saved.engine_kind.clone(),
+            current.engine_kind.clone(),
+        );
+    }
     if saved.ctx != current.ctx {
         push("ctx", saved.ctx.to_string(), current.ctx.to_string());
     }
@@ -161,6 +255,7 @@ mod tests {
     fn ident() -> SessionIdentity {
         SessionIdentity {
             blazar_version: "0.4.0".into(),
+            engine_kind: "llama.cpp".into(),
             engine_tag: "b4091".into(),
             engine_sha: "abc".into(),
             model_sha: Some("def".into()),
@@ -349,5 +444,144 @@ mod tests {
         let mut twin = ident();
         twin.cache_type = "q8_0/q4_0".into();
         assert_eq!(verify(&current, &twin).len(), 0);
+    }
+
+    /// Fixture pair builder for the strict-gate tests.
+    fn pair() -> (SessionIdentity, SessionIdentity) {
+        (ident(), ident())
+    }
+
+    #[test]
+    fn unit__verify_for_restore__rejects_cross_engine_kind() {
+        let (saved, mut current) = pair();
+        current.engine_kind = "sglang".into();
+        let diffs = verify_for_restore(&saved, &current);
+        assert!(diffs.iter().any(|d| d.contains("engine_kind")));
+    }
+
+    #[test]
+    fn unit__verify_for_restore__rejects_engine_sha_and_model_sha_drift() {
+        let (saved, mut current) = pair();
+        current.engine_sha = "zzz".into();
+        assert!(
+            verify_for_restore(&saved, &current)
+                .iter()
+                .any(|d| d.contains("engine_sha"))
+        );
+        let (saved, mut current) = pair();
+        current.model_sha = Some("other".into());
+        assert!(
+            verify_for_restore(&saved, &current)
+                .iter()
+                .any(|d| d.contains("model_sha: saved"))
+        );
+    }
+
+    #[test]
+    fn unit__verify_for_restore__rejects_unknown_identity_even_when_equal() {
+        // Equal unknowns skip the informational compare - but the
+        // strict restore gate rejects them: unverifiable is not
+        // restoreable.
+        let (mut saved, mut current) = pair();
+        saved.model_sha = None;
+        current.model_sha = None;
+        assert!(verify(&saved, &current).is_empty());
+        let diffs = verify_for_restore(&saved, &current);
+        assert!(
+            diffs
+                .iter()
+                .any(|d| d.contains("model_sha: exact identity unavailable"))
+        );
+        // Legacy manifests (no engine_kind) cold-start too.
+        let (mut saved, mut current) = pair();
+        saved.engine_kind = String::new();
+        current.engine_kind = String::new();
+        assert!(
+            verify_for_restore(&saved, &current)
+                .iter()
+                .any(|d| d.contains("engine_kind: exact identity unavailable"))
+        );
+    }
+
+    #[test]
+    fn integration__build_for_instance__binds_named_engine_and_canonical_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dirs = BlazarDirs {
+            config_dir: dir.path().join("cfg"),
+            data_dir: dir.path().join("data"),
+        };
+        let store = Store::open(&dirs).expect("store");
+        store
+            .upsert_engine(&crate::store::EngineRow {
+                tag: "b4091".into(),
+                asset: "llama-server".into(),
+                sha256: "e3b0".into(),
+                installed_at: 1,
+                active: true,
+                manifest: "{}".into(),
+                kind: crate::engine_kind::EngineKind::default(),
+            })
+            .expect("engine");
+        store
+            .upsert_model(&crate::store::ModelRow {
+                name: "m1".into(),
+                repo: "r".into(),
+                quant: "q4".into(),
+                path: dir.path().join("m.gguf").to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: Some("cafe".into()),
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+                last_used_at: 1,
+            })
+            .expect("model");
+        let cfg = Config::default();
+        let kind = crate::engine_kind::EngineKind::default();
+        let id = build_for_instance(&dirs, &cfg, "m1", "b4091", kind, 4096, 7).expect("identity");
+        assert_eq!(id.engine_kind, kind.as_str());
+        assert_eq!(id.engine_tag, "b4091");
+        assert_eq!(id.model_sha.as_deref(), Some("cafe"));
+        assert_eq!(id.ctx, 4096);
+        assert_eq!(id.slots, 7);
+        // Wrong tag / wrong kind / suffixed (non-canonical) model /
+        // unhashed model: exact identity is unavailable, never guessed.
+        assert!(build_for_instance(&dirs, &cfg, "m1", "nope", kind, 8, 1).is_none());
+        assert!(
+            build_for_instance(
+                &dirs,
+                &cfg,
+                "m1",
+                "b4091",
+                crate::engine_kind::EngineKind::Sglang,
+                8,
+                1
+            )
+            .is_none()
+        );
+        assert!(build_for_instance(&dirs, &cfg, "m1#1", "b4091", kind, 8, 1).is_none());
+        store
+            .upsert_model(&crate::store::ModelRow {
+                name: "raw".into(),
+                repo: "r".into(),
+                quant: "q4".into(),
+                path: dir.path().join("raw.gguf").to_string_lossy().into_owned(),
+                bytes: 1,
+                sha256: None,
+                mmproj_path: None,
+                components: vec![],
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 1,
+                last_used_at: 1,
+            })
+            .expect("raw model");
+        assert!(build_for_instance(&dirs, &cfg, "raw", "b4091", kind, 8, 1).is_none());
     }
 }

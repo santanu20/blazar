@@ -228,6 +228,14 @@ async fn integration__bank_multislot__saves_and_restores_every_slot() {
         ..blazar_core::Config::default()
     };
     let ts = start(cfg).await;
+    // Fail-closed banking needs an exact model digest in the store;
+    // the shared harness registers the stub model unhashed.
+    {
+        let store = blazar_core::Store::open(&ts.dirs).unwrap();
+        let mut row = store.get_model("m1").unwrap().expect("m1 registered");
+        row.sha256 = Some("m1-bank-sha".into());
+        store.upsert_model(&row).unwrap();
+    }
     let c = client();
     let r = c
         .post(format!("{}/api/chat", ts.base))
