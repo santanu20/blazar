@@ -859,6 +859,11 @@ async fn client__model_pool__local_member_stamps_service_ewma() {
         Some(50.0),
         "1 steering hit out of 2 routed requests: {route}"
     );
+    assert_eq!(
+        route["pool"]["affinity"]["hit_rate_window_secs"].as_u64(),
+        Some(300),
+        "the rate declares its rolling window: {route}"
+    );
     assert!(
         route["pool"]["members"][0]["service_ms"]
             .as_u64()

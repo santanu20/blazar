@@ -304,6 +304,21 @@ pub struct AppState {
     /// telemetry like the hits map; every successful pool expansion
     /// counts one request, whatever lane initiated it.
     pub pools_requests: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// Timestamped request arrivals per pool for the rolling steering
+    /// rate (paired with `pools_hit_window`; pruned to the window and
+    /// capped, unlike the lifetime `pools_requests` counter).
+    pub pools_req_window: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+        >,
+    >,
+    /// Timestamped steering hits per pool - the numerator of the
+    /// rolling rate, same window and cap as `pools_req_window`.
+    pub pools_hit_window: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+        >,
+    >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax
     /// when disabled). Dropped-line counter is shared with the writer.
     pub audit_tx: Option<tokio::sync::mpsc::Sender<crate::audit::AuditLine>>,
@@ -533,6 +548,8 @@ impl AppState {
             pools_ops: std::sync::Arc::default(),
             pools_affinity_hits: std::sync::Arc::default(),
             pools_requests: std::sync::Arc::default(),
+            pools_req_window: std::sync::Arc::default(),
+            pools_hit_window: std::sync::Arc::default(),
             audit_tx,
             audit_dropped,
             store: std::sync::Mutex::new(store),

@@ -57,6 +57,49 @@ const SERVICE_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(
 const AFFINITY_FULL_MS: u64 = 750;
 const AFFINITY_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 const AFFINITY_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Rolling window for the steering hit-rate (`hit_rate_pct` in the
+/// route table): events older than this stop counting, so the rate
+/// reflects current traffic instead of the whole session.
+const STEER_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+/// Hard cap on retained window events per pool (memory bound under
+/// sustained traffic far above what a 5-minute window needs).
+const STEER_WINDOW_CAP: usize = 1024;
+
+/// Record one event in a rolling window map and report its live size:
+/// expired entries are pruned from the front on both insert and read,
+/// and the cap sheds the oldest events first.
+pub(crate) fn window_push(
+    map: &mut std::collections::HashMap<String, std::collections::VecDeque<Instant>>,
+    pool: &str,
+    now: Instant,
+) {
+    let q = map.entry(pool.to_string()).or_default();
+    q.push_back(now);
+    while let Some(front) = q.front()
+        && now.duration_since(*front) >= STEER_WINDOW
+    {
+        q.pop_front();
+    }
+    while q.len() > STEER_WINDOW_CAP {
+        q.pop_front();
+    }
+}
+
+/// Live event count for a pool's rolling window (prunes first, so the
+/// number always reflects the current window, never stale entries).
+pub(crate) fn window_count(
+    map: &mut std::collections::HashMap<String, std::collections::VecDeque<Instant>>,
+    pool: &str,
+    now: Instant,
+) -> u64 {
+    let Some(q) = map.get_mut(pool) else { return 0 };
+    while let Some(front) = q.front()
+        && now.duration_since(*front) >= STEER_WINDOW
+    {
+        q.pop_front();
+    }
+    q.len() as u64
+}
 /// Bound on tracked prompt prefixes per gateway (memory hygiene);
 /// expired entries are dropped first, a still-full map is cleared.
 const AFFINITY_CAP: usize = 256;
@@ -194,6 +237,9 @@ pub(crate) struct MemberScore {
     /// by `ordered`; score-aware strategies already rank it last via
     /// the unknown/cold tier plus its stale signals).
     pub down: bool,
+    /// When the breaker has this member down: seconds until the next
+    /// retry attempt (`down_until` minus now). `None` while healthy.
+    pub retry_in_secs: Option<u64>,
     /// Operator drain (`POST /api/pools/{name}/drain`): the member
     /// receives no new picks while any alternative exists. Never
     /// persists across restarts.
@@ -413,6 +459,7 @@ pub(crate) fn score_members_core(
                     service_ms,
                     measured,
                     down: false,
+                    retry_in_secs: None,
                     drained: false,
                     drained_for_secs: None,
                     pinned: false,
@@ -427,6 +474,13 @@ pub(crate) fn score_members_core(
                 let h = healths.get(&hkey).copied().unwrap_or_default();
                 let cap = caps.get(&hkey);
                 let down = h.down_until.is_some_and(|t| now < t);
+                let retry_in_secs = if down {
+                    h.down_until
+                        .and_then(|t| t.checked_duration_since(now))
+                        .map(|left| left.as_secs())
+                } else {
+                    None
+                };
                 let (service_ms, measured) = match (h.service_ewma_ms, h.last_service_at) {
                     (Some(ewma), Some(at)) => effective_service(ewma, now.duration_since(at)),
                     _ => (SERVICE_DEFAULT_MS, false),
@@ -438,6 +492,7 @@ pub(crate) fn score_members_core(
                     service_ms,
                     measured,
                     down,
+                    retry_in_secs,
                     drained: false,
                     drained_for_secs: None,
                     pinned: false,
@@ -665,6 +720,9 @@ fn expand_with(state: &AppState, requested: &str, affinity: Option<(&str, u64)>)
     if let Ok(mut reqs) = state.pools_requests.lock() {
         *reqs.entry(pool.name.clone()).or_insert(0) += 1;
     }
+    if let Ok(mut win) = state.pools_req_window.lock() {
+        window_push(&mut win, &pool.name, Instant::now());
+    }
     if pool.strategy == PoolStrategy::Adaptive
         && let Ok(mut m) = state.pools_sticky.lock()
     {
@@ -741,9 +799,13 @@ pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option
     // warm where it arrived. Session-only counter for the route table.
     if let Some((member, _)) = affinity.as_ref()
         && member == &effective
-        && let Ok(mut hits) = state.pools_affinity_hits.lock()
     {
-        *hits.entry(ops_key(&pool.name, &effective)).or_insert(0) += 1;
+        if let Ok(mut hits) = state.pools_affinity_hits.lock() {
+            *hits.entry(ops_key(&pool.name, &effective)).or_insert(0) += 1;
+        }
+        if let Ok(mut win) = state.pools_hit_window.lock() {
+            window_push(&mut win, &pool.name, Instant::now());
+        }
     }
     let rewritten = remotes::rewrite_model(body.clone(), &effective);
     Some((effective, rewritten))
@@ -802,10 +864,21 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
         .ok()
         .and_then(|r| r.get(&pool.name).copied())
         .unwrap_or(0);
-    let hits_total: u64 = affinity_hits.values().sum();
-    let steer_rate = if pool_requests > 0 {
+    // Rolling rate: windowed events on both sides, so current traffic
+    // speaks - a burst that steered 10 minutes ago does not pin the
+    // percentage forever. Lifetime totals stay visible alongside.
+    let steer_now = Instant::now();
+    let window_req = state
+        .pools_req_window
+        .lock()
+        .map_or(0, |mut w| window_count(&mut w, &pool.name, steer_now));
+    let window_hits = state
+        .pools_hit_window
+        .lock()
+        .map_or(0, |mut w| window_count(&mut w, &pool.name, steer_now));
+    let steer_rate = if window_req > 0 {
         #[allow(clippy::cast_precision_loss)] // advisory percent, 0.1 resolution
-        let pct = hits_total as f64 / pool_requests as f64 * 100.0;
+        let pct = window_hits as f64 / window_req as f64 * 100.0;
         Some((pct * 10.0).round() / 10.0)
     } else {
         None
@@ -823,6 +896,7 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "service_measured": m.measured,
                 "free_vram": m.score.free_vram.0,
                 "down": m.down,
+                "retry_in_secs": m.retry_in_secs,
                 "drained": m.drained,
                 "drained_for_secs": m.drained_for_secs,
                 "pinned": m.pinned,
@@ -882,6 +956,7 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "ttl_secs": AFFINITY_TTL.as_secs(),
                 "requests": pool_requests,
                 "hit_rate_pct": steer_rate,
+                "hit_rate_window_secs": STEER_WINDOW.as_secs(),
             },
         },
         "decision": decision,
@@ -941,6 +1016,7 @@ mod tests {
             service_ms: SERVICE_DEFAULT_MS,
             measured: false,
             down,
+            retry_in_secs: None,
             drained: false,
             drained_for_secs: None,
             pinned: false,
@@ -1789,6 +1865,55 @@ mod tests {
             Instant::now(),
         );
         assert!(members[1].down, "remote member inside the down window");
+        assert!(
+            members[1]
+                .retry_in_secs
+                .is_some_and(|left| left > 0 && left <= 30),
+            "breaker countdown mirrors the remaining down window"
+        );
+        assert_eq!(
+            members[0].retry_in_secs, None,
+            "healthy member has no countdown"
+        );
+    }
+
+    /// Rolling steering-rate windows: expired events drop out on read,
+    /// fresh ones count, and the cap bounds memory under sustained
+    /// traffic.
+    #[test]
+    fn unit__window_count__prunes_expired_and_caps_live() {
+        let now = Instant::now();
+        let old_event = now
+            .checked_sub(STEER_WINDOW + std::time::Duration::from_secs(100))
+            .expect("window + 100s is always in the past on test hosts");
+        let mut map = std::collections::HashMap::new();
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(old_event);
+        q.push_back(now);
+        q.push_back(now);
+        map.insert("svc".to_string(), q);
+        assert_eq!(
+            window_count(&mut map, "svc", now),
+            2,
+            "expired event dropped"
+        );
+        assert_eq!(
+            map["svc"].front(),
+            Some(&now),
+            "prune happened in place, front is fresh"
+        );
+        assert_eq!(
+            window_count(&mut map, "other", now),
+            0,
+            "unknown pool reads zero"
+        );
+
+        // Cap: sustained traffic sheds the OLDEST events, keeping the
+        // most recent window slice.
+        for _ in 0..(STEER_WINDOW_CAP + 30) {
+            window_push(&mut map, "svc", now);
+        }
+        assert_eq!(window_count(&mut map, "svc", now), STEER_WINDOW_CAP as u64);
     }
 
     /// `find()` is exact-match and prefix-safe.

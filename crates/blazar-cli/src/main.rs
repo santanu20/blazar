@@ -14319,13 +14319,17 @@ fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>)
             .map(|m| m["affinity_hits"].as_u64().unwrap_or(0))
             .sum();
         if keys > 0 || hits > 0 {
-            // The rate frames hits against every routed request for
-            // the pool (session counters, daemon-side).
+            // The rate is rolling (daemon-side window, default 5
+            // minutes); lifetime totals ride alongside it.
             let rate = p["pool"]["affinity"]["hit_rate_pct"].as_f64();
             let reqs = p["pool"]["affinity"]["requests"].as_u64().unwrap_or(0);
+            let window = p["pool"]["affinity"]["hit_rate_window_secs"]
+                .as_u64()
+                .unwrap_or(300);
             match (rate, reqs) {
                 (Some(rate), reqs) if reqs > 0 => println!(
-                    "    affinity: {keys} live key(s), {hits} steering hit(s) ({rate:.1}% of {reqs} request(s))"
+                    "    affinity: {keys} live key(s), {hits} steering hit(s) ({rate:.1}% of {reqs} request(s), rolling {}m)",
+                    window / 60
                 ),
                 _ => println!("    affinity: {keys} live key(s), {hits} steering hit(s)"),
             }
@@ -14519,7 +14523,10 @@ fn render_pool_cards(v: &serde_json::Value) {
                             ),
                             m["affinity_keys"].as_u64().unwrap_or(0).to_string(),
                             if m["down"].as_bool().unwrap_or(false) {
-                                "down".to_string()
+                                match m["retry_in_secs"].as_u64() {
+                                    Some(left) => format!("down (retry {left}s)"),
+                                    None => "down".to_string(),
+                                }
                             } else if m["drained"].as_bool().unwrap_or(false) {
                                 "drained".to_string()
                             } else if m["pinned"].as_bool().unwrap_or(false) {
