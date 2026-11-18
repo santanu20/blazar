@@ -171,8 +171,9 @@ LANES_WITHOUT_EXTRA_ARGS: set[str] = {"openaihost", "piper"}
 
 # Census surfaces: user-facing inventories that must name every engine
 # lane (EngineKind::ALL in crates/blazar-core/src/engine_kind.rs is the
-# census). A lane missing from one of these was invisible to install
-# menus and docs - the exact drift this gate exists to catch at PR time.
+# census). Bootstrap installers intentionally install only the default
+# llama.cpp lane; they are not engine catalogues. The CLI and documentation
+# are the authoritative full-lane inventories checked here.
 # Token matchers are deliberately loose (name variants, not semantics):
 # the gate asks "does this surface acknowledge the lane exists".
 CENSUS_LANE_TOKENS: dict[str, str] = {
@@ -188,8 +189,6 @@ CENSUS_LANE_TOKENS: dict[str, str] = {
     "openaihost": r"openaihost|litert",
 }
 CENSUS_SURFACES: list[str] = [
-    "scripts/install.sh",
-    "scripts/install.ps1",
     "README.md",
     "docs/engines.md",
     "docs/1.SYSTEM_OVERVIEW.md",
@@ -502,7 +501,7 @@ def render_markdown(
         "  the doc drifts from any input. No timestamps - the bytes are",
         "  the contract.",
         "- census: the same gate also fails when a user-facing inventory",
-        "  surface (install menus, README, engines/usage docs, validate",
+        "  surface (README, engine/usage docs, system overview, validate",
         f"  harness, CLI) stops mentioning any of the {len(CENSUS_LANE_TOKENS)}",
         "  census lanes - exempt files and their reasons live in",
         "  CENSUS_EXEMPT.",
