@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Steering windows survive graceful restart (schema v22).** `pools_window_events` snapshots the rolling request/hit windows at graceful shutdown and restores them on boot (same `pools_ops_persist` opt-in), so trend history and rolling hit rates cross a restart; a crash starts windows blank - telemetry, not correctness state.
 - **`pool status` alerts headline.** One line on the fleet card summarizing breaker-down, drained and pinned members fleet-wide with the soonest retry/return countdowns - omitted entirely while every pool is healthy, so silence is the all-clear.
 - **Per-member steering trends + pressure-aware watch refresh.** Steering-hit events now carry the member they steered to: each pool member with in-window traffic exposes `hit_history` (same 15x20s buckets) and `blazar pool status` appends volume-scaled per-member `trend` lines under the pool trend - which replica the conversations landed on, at a glance. `pool status --watch` drops to a 1s refresh while any request is in flight or any member is down/drained, returning to the configured interval on an idle healthy fleet (effective rate shown on every redrawn card).
 

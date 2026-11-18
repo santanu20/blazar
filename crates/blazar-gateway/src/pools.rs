@@ -481,6 +481,59 @@ pub fn affinity_from_persisted(
     }
     (live, stale)
 }
+/// Rebuild the rolling steering-rate windows from persisted event
+/// rows (`pool`, `kind`, `member`, `at_unix` - the shape
+/// [`crate::blazar_core` store's `load_pool_windows`] returns).
+/// Events older than the window are dropped (a restart longer than
+/// the window starts clean, exactly like an idle daemon), each
+/// surviving event is re-anchored onto the monotonic clock, and the
+/// per-pool cap is enforced by shedding the oldest entries first.
+/// Rows arrive ordered oldest-first; the rebuilt deques preserve
+/// that order so their backs are the newest events.
+#[must_use]
+#[allow(clippy::type_complexity)] // mirrors AppState's window map shapes verbatim
+pub fn windows_from_persisted(
+    rows: &[(String, String, Option<String>, i64)],
+    now_unix: i64,
+    now: Instant,
+) -> (
+    HashMap<String, std::collections::VecDeque<Instant>>,
+    HashMap<String, std::collections::VecDeque<(Instant, String)>>,
+) {
+    let window_secs = STEER_WINDOW.as_secs().cast_signed();
+    let mut req: HashMap<String, std::collections::VecDeque<Instant>> = HashMap::new();
+    let mut hits: HashMap<String, std::collections::VecDeque<(Instant, String)>> = HashMap::new();
+    for (pool, kind, member, at_unix) in rows {
+        let age = now_unix.saturating_sub(*at_unix).max(0);
+        if age >= window_secs {
+            continue;
+        }
+        let stamped = now
+            .checked_sub(std::time::Duration::from_secs(age.cast_unsigned()))
+            .unwrap_or(now);
+        match kind.as_str() {
+            "req" => {
+                let lane = req.entry(pool.clone()).or_default();
+                lane.push_back(stamped);
+                while lane.len() > STEER_WINDOW_CAP {
+                    lane.pop_front();
+                }
+            }
+            "hit" => {
+                let Some(member) = member.as_deref() else {
+                    continue;
+                };
+                let lane = hits.entry(pool.clone()).or_default();
+                lane.push_back((stamped, member.to_string()));
+                while lane.len() > STEER_WINDOW_CAP {
+                    lane.pop_front();
+                }
+            }
+            _ => {}
+        }
+    }
+    (req, hits)
+}
 
 /// Key under which a member's [`MemberOps`] live.
 #[must_use]
@@ -1464,6 +1517,61 @@ mod tests {
         let after = Instant::now();
         assert!(stamped > &before, "stamp reflects the stored age");
         assert!(stamped <= &after, "stamp is not in the future");
+    }
+
+    /// Persisted window events rebuild into the live deques: fresh
+    /// req/hit events land in their maps (hits tagged), expired events
+    /// of both kinds drop, a hit without a member tag is skipped, the
+    /// cap sheds the oldest events, and deques stay chronological
+    /// (back = newest) so bucket math keeps working after a restart.
+    #[test]
+    fn unit__windows_from_persisted__conversion_truth_table() {
+        let now_unix = 1_800_000_000_i64;
+        let now = Instant::now();
+        let fresh = |secs: i64| now_unix - secs;
+        let rows = vec![
+            // Fresh req events for two pools.
+            ("svc".into(), "req".into(), None, fresh(5)),
+            ("svc".into(), "req".into(), None, fresh(3)),
+            ("other".into(), "req".into(), None, fresh(1)),
+            // Fresh tagged hit events.
+            ("svc".into(), "hit".into(), Some("m1".into()), fresh(4)),
+            ("svc".into(), "hit".into(), Some("far:m1".into()), fresh(2)),
+            // Expired events of both kinds drop (>= 300s window).
+            ("svc".into(), "req".into(), None, fresh(300)),
+            ("svc".into(), "hit".into(), Some("m1".into()), fresh(301)),
+            // A hit row without its member tag cannot steer anyone.
+            ("svc".into(), "hit".into(), None, fresh(1)),
+            // Unknown kinds are ignored outright.
+            ("svc".into(), "bogus".into(), None, fresh(1)),
+        ];
+        let (req, hits) = windows_from_persisted(&rows, now_unix, now);
+        assert_eq!(req["svc"].len(), 2);
+        assert_eq!(req["other"].len(), 1);
+        assert_eq!(hits["svc"].len(), 2);
+        // Chronological: the back of each deque is the newest event.
+        let ages: Vec<std::time::Duration> =
+            req["svc"].iter().map(|t| now.duration_since(*t)).collect();
+        assert!(ages[0] > ages[1], "older events sit at the front");
+        assert!(hits["svc"].iter().any(|(_, m)| m == "far:m1"));
+
+        // Cap: more fresh events than the cap (packed inside the
+        // window - many events can share a second) keeps only the
+        // newest STEER_WINDOW_CAP events.
+        #[allow(clippy::cast_possible_wrap)]
+        // test data: tiny indices reinterpreted as second offsets
+        let long: Vec<(String, String, Option<String>, i64)> = (0..STEER_WINDOW_CAP + 30)
+            .map(|i| ("svc".into(), "req".into(), None, fresh((i % 30) as i64)))
+            .collect();
+        let (req, _) = windows_from_persisted(&long, now_unix, now);
+        assert_eq!(req["svc"].len(), STEER_WINDOW_CAP);
+        let oldest = req["svc"].front().expect("cap leaves events");
+        // Everything shed was pushed before the survivors: the front
+        // is at most one 30s sweep old.
+        assert!(
+            now.duration_since(*oldest) < std::time::Duration::from_secs(30 + 2),
+            "front is one of the newest events"
+        );
     }
 
     /// Persisted-key pool matching: an exact `{pool}:` prefix keeps a

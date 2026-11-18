@@ -1547,6 +1547,22 @@ pub async fn serve(
         for key in expired {
             let _ = state.with_store(|s| s.clear_pool_affinity(&key));
         }
+        // The rolling steering-rate windows ride the same opt-in: a
+        // graceful restart restores the trend history and rolling hit
+        // rate instead of starting from blank (rows beyond the window
+        // are dead by definition and drop out of the rebuild).
+        let events = state
+            .with_store(blazar_core::store::Store::load_pool_windows)
+            .and_then(std::result::Result::ok)
+            .unwrap_or_default();
+        let now = std::time::Instant::now();
+        let (req, hits) = crate::pools::windows_from_persisted(&events, now_unix, now);
+        if let Ok(mut m) = state.pools_req_window.lock() {
+            *m = req;
+        }
+        if let Ok(mut m) = state.pools_hit_window.lock() {
+            *m = hits;
+        }
     }
     let app = router(state.clone());
     // Durable jobs boot hygiene, detached: sweep latency is not boot
@@ -1965,6 +1981,37 @@ pub async fn serve(
     // since the last tick lands in the store before exit.
     if let Err(e) = state.usage.flush() {
         tracing::warn!("usage rollup final flush failed: {e}");
+    }
+    // Steering-rate windows snapshot at graceful shutdown (same
+    // opt-in as the other pool persistence). Bulk-replace, never a
+    // request-path write: the trend history survives this restart and
+    // a crash simply starts the windows blank - telemetry, not
+    // correctness state.
+    if state.cfg().pools_ops_persist {
+        let now = std::time::Instant::now();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs().cast_signed());
+        let mut rows: Vec<(String, String, Option<String>, i64)> = Vec::new();
+        if let Ok(win) = state.pools_req_window.lock() {
+            for (pool, events) in win.iter() {
+                for t in events {
+                    let at = now_unix - now.duration_since(*t).as_secs().cast_signed();
+                    rows.push((pool.clone(), "req".into(), None, at));
+                }
+            }
+        }
+        if let Ok(win) = state.pools_hit_window.lock() {
+            for (pool, events) in win.iter() {
+                for (t, member) in events {
+                    let at = now_unix - now.duration_since(*t).as_secs().cast_signed();
+                    rows.push((pool.clone(), "hit".into(), Some(member.clone()), at));
+                }
+            }
+        }
+        if let Some(Err(e)) = state.with_store(|s| s.replace_pool_windows(&rows)) {
+            tracing::warn!("pool window snapshot failed: {e}");
+        }
     }
     // H8: the lazy audio-lane children (if any request spawned them).
     state.whisper.shutdown().await;

@@ -57,7 +57,10 @@ pub struct Store {
 /// opt-in via `pools_ops_persist`).
 /// v21 adds `pools_affinity` (persisted pool cache-affinity rows,
 /// riding the same `pools_ops_persist` opt-in).
-const SCHEMA_VERSION: i32 = 21;
+/// v22 adds `pools_window_events` (rolling steering-rate event log,
+/// snapshot-replaced at graceful shutdown so history and rates survive
+/// a restart; same opt-in).
+const SCHEMA_VERSION: i32 = 22;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -153,6 +156,12 @@ CREATE TABLE IF NOT EXISTS pools_affinity (
     key           TEXT PRIMARY KEY,  -- '{pool}:{opener hash}'
     effective     TEXT NOT NULL,     -- member that served the opener
     at_unix       INTEGER NOT NULL   -- unix secs of the last serve
+);
+CREATE TABLE IF NOT EXISTS pools_window_events (
+    pool          TEXT NOT NULL,     -- pool the event routed through
+    kind          TEXT NOT NULL,     -- 'req' or 'hit'
+    member        TEXT,              -- steered-to member (hit rows only)
+    at_unix       INTEGER NOT NULL   -- unix secs of the routing decision
 );
 CREATE TABLE IF NOT EXISTS usage_daily (
     day           INTEGER NOT NULL,  -- yyyymmdd local day
@@ -2512,6 +2521,52 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
     }
 
+    /// Replace the whole rolling-window event log (v22) in one
+    /// transaction: the gateway snapshots both windows at graceful
+    /// shutdown and hands them over as `(pool, kind, member, at_unix)`
+    /// tuples. Bulk-replace (not per-event writes) keeps the request
+    /// path free of store traffic.
+    pub fn replace_pool_windows(
+        &self,
+        rows: &[(String, String, Option<String>, i64)],
+    ) -> CoreResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM pools_window_events", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO pools_window_events (pool, kind, member, at_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (pool, kind, member, at_unix) in rows {
+                stmt.execute(params![pool, kind, member, at_unix])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All persisted window events ordered oldest-first: `(pool, kind,
+    /// member, at_unix)`. Age pruning and instant conversion live in
+    /// the gateway.
+    /// Plain tuples on purpose - core cannot see gateway types; the
+    /// window maps are rebuilt gateway-side from these rows.
+    #[allow(clippy::type_complexity)]
+    pub fn load_pool_windows(&self) -> CoreResult<Vec<(String, String, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pool, kind, member, at_unix FROM pools_window_events
+             ORDER BY at_unix ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     pub fn put_spec_receipt(
         &self,
         model: &str,
@@ -3937,6 +3992,81 @@ mod tests {
             .unwrap();
         s.clear_pool_affinity("svc:abcdef0123456789").unwrap();
         assert!(s.load_pool_affinity().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unit__store_pool_windows__roundtrip_and_v21_upgrade() {
+        // Simulate a v21 database (no pools_window_events table):
+        // reopen replays SCHEMA_SQL additively and stamps 22; a
+        // snapshot bulk-replace round-trips in at_unix order and a
+        // second replace fully supersedes the first (the shutdown
+        // flush overwrites, never appends).
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.conn()
+                .execute_batch("DROP TABLE pools_window_events; PRAGMA user_version = 21;")
+                .unwrap();
+        }
+        let s = Store::open(&dirs).unwrap();
+        let v: i64 = s
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::from(SCHEMA_VERSION));
+        assert!(s.load_pool_windows().unwrap().is_empty());
+        s.replace_pool_windows(&[
+            ("svc".into(), "req".into(), None, 1_900_000_010),
+            ("svc".into(), "hit".into(), Some("m1".into()), 1_900_000_020),
+            (
+                "svc".into(),
+                "hit".into(),
+                Some("far:m1".into()),
+                1_900_000_030,
+            ),
+        ])
+        .unwrap();
+        let rows = s.load_pool_windows().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "svc".to_string(),
+                    "req".to_string(),
+                    None,
+                    1_900_000_010_i64
+                ),
+                (
+                    "svc".to_string(),
+                    "hit".to_string(),
+                    Some("m1".to_string()),
+                    1_900_000_020_i64
+                ),
+                (
+                    "svc".to_string(),
+                    "hit".to_string(),
+                    Some("far:m1".to_string()),
+                    1_900_000_030_i64
+                ),
+            ]
+        );
+        // The next graceful-shutdown snapshot replaces the whole log.
+        s.replace_pool_windows(&[("svc".into(), "req".into(), None, 1_900_000_040)])
+            .unwrap();
+        let rows = s.load_pool_windows().unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "svc".to_string(),
+                "req".to_string(),
+                None,
+                1_900_000_040_i64
+            )]
+        );
     }
 
     #[test]
