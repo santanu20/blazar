@@ -42,6 +42,14 @@ use crate::events::{BlazarEvent, EventBus, InstanceState};
 /// probes, session-bank save/restore): one connection pool for the
 /// daemon's lifetime instead of a fresh client per call. Each call
 /// site keeps its own per-request `.timeout()` as the bounding clock.
+/// Test-facing alias so the kv module's unit tests can build the
+/// same provider-configured client the dial helper uses (a bare
+/// `reqwest::Client::new()` panics under rustls-no-provider).
+#[cfg(test)]
+pub(crate) fn test_local_http() -> &'static reqwest::Client {
+    local_http()
+}
+
 fn local_http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -2578,15 +2586,6 @@ struct ChildAuth {
     secret: String,
     /// Keyfile removed at teardown (None when argv carries the secret).
     keyfile: Option<std::path::PathBuf>,
-}
-
-/// Token count llama-server reports in slot save/restore responses
-/// (`n_saved` / `n_restored`). `Some(0)` is a real answer - HTTP 200 with
-/// zero tokens is the silent re-prefill bug class (the restore
-/// "succeeds", the slot stays cold), not a warm start. Missing or
-/// non-numeric fields are `None`: unverifiable, not zero.
-fn slot_reported_tokens(body: &serde_json::Value, field: &str) -> Option<u64> {
-    body.get(field).and_then(serde_json::Value::as_u64)
 }
 
 impl Supervisor {
@@ -8077,7 +8076,7 @@ drop them from rpc_servers in config.toml",
         // client, the slot endpoints are unchanged.
         let (client, base) = child_dial(endpoint);
         for (id, filename) in restores {
-            self.bank_restore_one(&client, &base, key, auth, id, &filename)
+            self.bank_restore_one(&client, &base, key, auth, kind, id, &filename)
                 .await;
         }
     }
@@ -8089,35 +8088,38 @@ drop them from rpc_servers in config.toml",
     /// (gateway A9) backstops the lookup-miss variant. Live-probed on
     /// b11070: restore of 31 saved tokens -> next same-prefix completion
     /// ran `cache_n=23`, `prompt_n=1`.
+    // Eight params: the truth-check logging policy keeps key/auth/kind
+    // alongside the dial context rather than a bundle struct for one caller.
+    #[allow(clippy::too_many_arguments)]
     async fn bank_restore_one(
         &self,
         client: &reqwest::Client,
         base: &str,
         key: &str,
         auth: Option<&str>,
+        kind: blazar_core::engine_kind::EngineKind,
         id: u32,
         filename: &str,
     ) {
-        let url = format!("{base}/slots/{id}?action=restore&filename={filename}");
-        let mut body = serde_json::json!({ "filename": filename });
-        if self.cfg().router {
-            body["model"] = serde_json::json!(key);
-        }
-        let mut req = client
-            .post(&url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(5));
-        if let Some(secret) = auth {
-            req = req.bearer_auth(secret);
-        }
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let tokens_back = resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .as_ref()
-                    .and_then(|v| slot_reported_tokens(v, "n_restored"));
+        // Same protocol as the save sweep, through the same
+        // engine-neutral connector; logging here remains the
+        // truth-check policy (n_restored is the injection count).
+        let connector = crate::kv::registry::connector_for(
+            kind,
+            auth.map(str::to_string),
+            self.cfg().router.then(|| key.to_string()),
+        );
+        match connector
+            .import_prefix(crate::kv::KvImportRequest {
+                slot: id,
+                filename,
+                client,
+                base,
+            })
+            .await
+        {
+            Ok(receipt) => {
+                let tokens_back = receipt.tokens;
                 match tokens_back {
                     Some(0) => tracing::warn!(
                         target: "blazar::bank",
@@ -8136,14 +8138,6 @@ drop them from rpc_servers in config.toml",
                     ),
                     None => {}
                 }
-            }
-            Ok(resp) => {
-                tracing::warn!(
-                    target: "blazar::bank",
-                    model = key,
-                    "bank restore HTTP {} on slot {id} - continuing cold",
-                    resp.status()
-                );
             }
             Err(e) => {
                 tracing::warn!(
@@ -8229,32 +8223,33 @@ drop them from rpc_servers in config.toml",
                 format!("_auto-{}-s{id}", inst.profile_ctx)
             };
             let file = self.bank_slot_file(&inst.name, inst.profile_ctx, id);
+            // Slot IO rides the engine-neutral connector; file naming,
+            // budgeting and identity manifests stay here (the
+            // connector owns the protocol, the supervisor the policy).
             let (client, base) = child_dial(&inst.endpoint);
-            let url = format!("{base}/slots/{id}?action=save&filename={filename}");
-            let body = if self.cfg().router {
-                serde_json::json!({"filename": filename, "model": inst.name})
-            } else {
-                serde_json::json!({"filename": filename})
-            };
-            let mut req = client
-                .post(&url)
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(2));
-            if let Some(secret) = &inst.auth {
-                req = req.bearer_auth(secret);
-            }
-            let mut saved = None;
-            let ok = match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    saved = resp
-                        .json::<serde_json::Value>()
-                        .await
-                        .ok()
-                        .as_ref()
-                        .and_then(|v| slot_reported_tokens(v, "n_saved"));
-                    true
+            let connector = crate::kv::registry::connector_for(
+                inst.kind,
+                inst.auth.clone(),
+                self.cfg().router.then(|| inst.name.clone()),
+            );
+            let (saved, ok) = match connector
+                .export_prefix(crate::kv::KvExportRequest {
+                    slot: id,
+                    filename: &filename,
+                    client: &client,
+                    base: &base,
+                })
+                .await
+            {
+                Ok(receipt) => (receipt.tokens, true),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "blazar::bank",
+                        model = %inst.name,
+                        "slot {id} export failed: {e}"
+                    );
+                    (None, false)
                 }
-                _ => false,
             };
             if !ok {
                 failed += 1;
@@ -10435,16 +10430,19 @@ mod routing_tests {
         // legitimate answer (200 with an empty/incompatible checkpoint) and
         // must NOT be conflated with a missing field.
         let saved = serde_json::json!({"id_slot": 3, "n_saved": 31, "n_written": 382_044});
-        assert_eq!(slot_reported_tokens(&saved, "n_saved"), Some(31));
+        assert_eq!(crate::kv::slot_reported_tokens(&saved, "n_saved"), Some(31));
         let empty = serde_json::json!({"id_slot": 0, "n_saved": 0});
-        assert_eq!(slot_reported_tokens(&empty, "n_saved"), Some(0));
+        assert_eq!(crate::kv::slot_reported_tokens(&empty, "n_saved"), Some(0));
         // Missing field / wrong type / empty body: unverifiable, not zero.
         let no_field = serde_json::json!({"id_slot": 0});
-        assert_eq!(slot_reported_tokens(&no_field, "n_saved"), None);
+        assert_eq!(crate::kv::slot_reported_tokens(&no_field, "n_saved"), None);
         let wrong_type = serde_json::json!({"n_saved": "31"});
-        assert_eq!(slot_reported_tokens(&wrong_type, "n_saved"), None);
         assert_eq!(
-            slot_reported_tokens(&serde_json::json!({}), "n_restored"),
+            crate::kv::slot_reported_tokens(&wrong_type, "n_saved"),
+            None
+        );
+        assert_eq!(
+            crate::kv::slot_reported_tokens(&serde_json::json!({}), "n_restored"),
             None
         );
     }

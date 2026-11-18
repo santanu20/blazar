@@ -13,6 +13,7 @@ pub mod gguf;
 pub mod hardware;
 pub mod hfmeta;
 pub mod knob_registry;
+pub mod kv;
 pub mod kv_quality;
 pub mod optimize;
 pub mod predict;

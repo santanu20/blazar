@@ -7,6 +7,7 @@ tracked here.
 ## [Unreleased]
 
 ### Added
+- **Engine-neutral KV connector contract (kv module).** `blazar-core::kv` defines the sharing contract (model identity, memory layout, compatibility verdict, capabilities) and `blazar-runtime::kv` dispatches it: the llama.cpp slot-bank protocol both save and restore have always spoken now rides a real connector, every other engine kind reports `Unsupported` - a capability statement, never a simulated transfer. The strict compatibility policy (model/tokenizer/adapter/config/RoPE digests, layout converters) gates future cross-engine sharing; prefix-affinity routing is untouched.
 - **`blazar why --prom` + affinity purge on cold members.** The sentinel observations now expose a Prometheus text lane (`records/flagged/degraded` totals, per-code occurrences, live engine-degrade count) matching `pool status --prom`; and pool scoring purges cache-affinity entries whose local member lost its engine process (crash, external unload, idle recycle), so the steering discount never points at a prefix KV that no longer exists.
 - **`pool status --prom` + affinity eviction on unload.** The fleet card can emit Prometheus text exposition (pool/member gauges, steering counters, breaker retry, engine residency) for scrape pipelines; and when a local model unloads (evict API, idle recycle, keep-alive-0, router unload), the pool affinity map drops openers steered toward that model's members so routing stops preferring a now-cold replica within the TTL window.
 

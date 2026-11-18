@@ -29,6 +29,7 @@ pub mod hf;
 pub mod hf_parallel;
 pub mod knob_registry;
 pub mod kokoro;
+pub mod kv;
 pub mod models;
 pub mod net_health;
 pub mod optimize_run;
