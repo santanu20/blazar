@@ -755,6 +755,32 @@ impl EngineManager {
         opts: &BuildOpts,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<EngineRow> {
+        self.build_and_install_inner(opts, None, on_line).await
+    }
+
+    /// Curated registry build variant. Unlike an ordinary user build, it
+    /// requires the source-mined architecture set to contain the registry's
+    /// requested architecture before CMake runs.
+    pub async fn build_and_install_for_arch(
+        &self,
+        opts: &BuildOpts,
+        required_arch: &str,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<EngineRow> {
+        anyhow::ensure!(
+            !required_arch.trim().is_empty(),
+            "required architecture must not be empty"
+        );
+        self.build_and_install_inner(opts, Some(required_arch), on_line)
+            .await
+    }
+
+    async fn build_and_install_inner(
+        &self,
+        opts: &BuildOpts,
+        required_arch: Option<&str>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<EngineRow> {
         let tc = opts
             .toolchain
             .clone()
@@ -801,6 +827,7 @@ impl EngineManager {
                 &tag,
                 arch.as_deref(),
                 host_compiler.as_deref(),
+                required_arch,
                 on_line,
             )
             .await;
@@ -847,6 +874,7 @@ impl EngineManager {
         tag: &str,
         arch: Option<&str>,
         host_compiler: Option<&std::path::Path>,
+        required_arch: Option<&str>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(String, Option<PathBuf>, BuiltLane)> {
         let build_root =
@@ -857,6 +885,20 @@ impl EngineManager {
         // capability currency the supervisor's unknown-arch re-route
         // consumes - and pin the lane's identity from it.
         let architectures = super::arch_miner::mine_architectures(&src);
+        if let Some(required) = required_arch {
+            anyhow::ensure!(
+                architectures.contains(required),
+                "curated lane {}@{} advertises architecture {required:?}, but its pinned source does not contain it in llama-arch.cpp - refusing to build/register an architecture-mismatched lane",
+                match &opts.source {
+                    BuildSource::Fork { repo, .. } => repo.as_str(),
+                    BuildSource::Upstream => LLAMA_CPP_REPO,
+                },
+                match &opts.source {
+                    BuildSource::Fork { ref_sha, .. } => ref_sha.as_str(),
+                    BuildSource::Upstream => tag,
+                },
+            );
+        }
         let (engine_tag, mut provenance) = lane_identity(
             &opts.source,
             tag,
