@@ -13,6 +13,11 @@ emission-truth registry.
 - gate: `python3 scripts/engine_coverage.py --check` fails CI when
   the doc drifts from any input. No timestamps - the bytes are
   the contract.
+- census: the same gate also fails when a user-facing inventory
+  surface (install menus, README, engines/usage docs, validate
+  harness, CLI) stops mentioning any of the 10
+  census lanes - exempt files and their reasons live in
+  CENSUS_EXEMPT.
 
 | Disposition | Meaning |
 |---|---|
