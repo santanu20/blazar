@@ -660,6 +660,14 @@ pub struct Config {
     /// the default when this is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_registry_url: Option<String>,
+    /// Allow a failed llama.cpp GGUF load to trigger a background build
+    /// of a matching immutable, curator-approved capability lane. Off by
+    /// default: this compiles third-party source and can consume substantial
+    /// CPU, disk, and build time. Only active entries in the configured
+    /// capability registry are eligible; arbitrary GitHub discovery is
+    /// never performed.
+    #[serde(default)]
+    pub capability_lane_auto_install: bool,
     /// Curated fork lanes this many days past supersede are deleted
     /// automatically (mainline covers their architectures; the source
     /// artifacts can always be rebuilt via the registry). 0 = never
@@ -3815,6 +3823,7 @@ impl Default for Config {
             whisper_vad_min_silence_duration_ms: None,
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
+            capability_lane_auto_install: false,
             fork_retire_days: default_fork_retire_days(),
             keep_tags: default_keep_tags(),
             semantic_cache: SemanticCacheConfig::default(),
