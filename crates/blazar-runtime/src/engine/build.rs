@@ -387,19 +387,11 @@ pub fn cmake_configure_args(
     arch: Option<&str>,
     host_compiler: Option<&Path>,
     compiler_cache: Option<&Path>,
+    rpc: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
         "-DLLAMA_CURL=ON".to_string(),
-        // Parity with upstream prebuilt engines: they ship the
-        // ggml-rpc-server tool (verified live b10896/b10902), and
-        // upstream tools/CMakeLists.txt gates add_subdirectory(rpc)
-        // behind GGML_RPC - without this flag the target does not
-        // exist and BUILD_TARGETS' "ggml-rpc-server" entry fails the
-        // whole build with "No rule to make target" (caught live
-        // 2026-09-11, b10903). The rpc backend is inert unless an
-        // engine is actually launched with --rpc.
-        "-DGGML_RPC=ON".to_string(),
         // CMake build-tree binaries embed an ABSOLUTE build-dir RPATH by
         // default; copying them into the engine store leaves a dead path
         // and the loader fails with a misleading "cannot open shared
@@ -409,7 +401,38 @@ pub fn cmake_configure_args(
         // makes build-tree RPATHs $ORIGIN-relative, matching the layout
         // we install (binary + shared libs in one directory).
         "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON".to_string(),
+        // llama-server's UI assets are a BUILD-TIME network fetch: with
+        // the upstream default LLAMA_USE_PREBUILT_UI=ON, cmake downloads
+        // dist.tar.gz from the ggml-org/llama-ui HF bucket keyed by the
+        // tree's version stamp. Upstream releases populate the bucket;
+        // forks do not - their stamps 404 and the whole build dies with
+        // "UI: download dist.tar.gz.sha256 ... HTTP response code said
+        // error" (caught live 2026-11-18 building the sensenova_loop
+        // capability fork). Blazar spawns llama-server with the UI
+        // disabled either way, so the asset is dead weight here; turning
+        // the option off lets cmake generate an empty embedded table and
+        // also removes the offline-build failure mode for every lane.
+        "-DLLAMA_USE_PREBUILT_UI=OFF".to_string(),
     ];
+    if rpc {
+        // Parity with upstream prebuilt engines: they ship the
+        // ggml-rpc-server tool (verified live b10896/b10902), and
+        // upstream tools/CMakeLists.txt gates add_subdirectory(rpc)
+        // behind GGML_RPC - without this flag the target does not
+        // exist and BUILD_TARGETS' "ggml-rpc-server" entry fails the
+        // whole build with "No rule to make target" (caught live
+        // 2026-09-11, b10903). The rpc backend is inert unless an
+        // engine is actually launched with --rpc.
+        //
+        // FORK builds skip it: a fork that adds ggml ops trips the RPC
+        // header's hardcoded `static_assert(GGML_OP_COUNT == 102)` (the
+        // fork bumped RPC_PROTO_PATCH_VERSION without updating the
+        // count), and RPC is meaningless for a lane whose whole point is
+        // serving one architecture locally (caught live 2026-11-18,
+        // sensenova_loop fork: "GGML_OP_COUNT has changed - update
+        // RPC_PROTO_PATCH_VERSION" at ggml-rpc.h:14).
+        args.push("-DGGML_RPC=ON".to_string());
+    }
     if backend == BuildBackend::Cuda {
         args.push("-DGGML_CUDA=ON".to_string());
         // CI parity (.github/workflows/engine-cuda.yml): the prebuilt
@@ -473,11 +496,15 @@ async fn run_cmake_build(
             "compiler cache: {name} - repeat builds skip recompiling"
         ));
     }
+    // Fork lanes build without the RPC backend (see cmake_configure_args)
+    // and therefore without the ggml-rpc-server target.
+    let rpc = !matches!(opts.source, BuildSource::Fork { .. });
     let args = cmake_configure_args(
         opts.backend,
         arch,
         host_compiler,
         tc.compiler_cache.as_deref(),
+        rpc,
     );
     (on_line)(&format!("configuring {tag} ({})", args.join(" ")));
     let mut cfg = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
@@ -488,16 +515,21 @@ async fn run_cmake_build(
     run_step(cfg, "cmake configure", CONFIGURE_TIMEOUT, on_line).await?;
 
     let mut bldcmd = tokio::process::Command::new(tc.cmake.clone().context("cmake gone")?);
+    let targets: Vec<&str> = BUILD_TARGETS
+        .iter()
+        .copied()
+        .filter(|t| rpc || *t != "ggml-rpc-server")
+        .collect();
     bldcmd
         .arg("--build")
         .arg(bld)
         .arg("--target")
-        .args(BUILD_TARGETS.iter().copied())
+        .args(targets.iter().copied())
         .arg("-j")
         .arg(opts.jobs.to_string());
     (on_line)(&format!(
         "compiling {} targets with {} jobs (10-30 min for CUDA)",
-        BUILD_TARGETS.len(),
+        targets.len(),
         opts.jobs
     ));
     run_step(bldcmd, "cmake --build", opts.timeout, on_line).await
@@ -865,13 +897,16 @@ impl EngineManager {
         // cannot strike here - the region from retire to register is
         // await-free; the guard is what keeps that invariant honest
         // if an await ever sneaks in).
+        // Fork lanes build without the RPC backend and its target
+        // (see cmake_configure_args); the install contract follows suit.
+        let rpc = !matches!(opts.source, BuildSource::Fork { .. });
         let mut guard = CancelledInstallGuard {
             data_dir: self.dirs.data_dir.clone(),
             dir: engine_dir.clone(),
             aside: aside.clone(),
             armed: true,
         };
-        let installed = install_built_binaries(&self.dirs, &bld, &engine_tag, on_line);
+        let installed = install_built_binaries(&self.dirs, &bld, &engine_tag, rpc, on_line);
         // Registration owns the dir from here; a unwind past this
         // point must not delete a dir the store may reference.
         guard.disarm();
@@ -1260,6 +1295,7 @@ fn install_built_binaries(
     dirs: &BlazarDirs,
     bld: &Path,
     engine_tag: &str,
+    rpc: bool,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(PathBuf, String)> {
     let dir = dirs.engines_dir().join(engine_tag);
@@ -1279,8 +1315,13 @@ fn install_built_binaries(
         "llama-server"
     };
     // The five tool binaries are the contract; a missing one is an
-    // upstream layout change worth failing loudly on.
-    for t in BUILD_TARGETS {
+    // upstream layout change worth failing loudly on. Fork builds skip
+    // the RPC backend (see cmake_configure_args) and with it the
+    // ggml-rpc-server binary - its absence there is expected.
+    for t in BUILD_TARGETS
+        .iter()
+        .filter(|&&t| rpc || t != "ggml-rpc-server")
+    {
         let name = if cfg!(windows) {
             format!("{t}.exe")
         } else {
@@ -1539,12 +1580,29 @@ mod tests {
     }
 
     #[test]
+    fn unit__cmake_args__fork_builds_skip_rpc_and_prebuilt_ui() {
+        let fork = cmake_configure_args(BuildBackend::Cuda, None, None, None, false);
+        assert!(
+            !fork.iter().any(|a| a == "-DGGML_RPC=ON"),
+            "fork lanes must not compile the RPC backend (stale static_assert)"
+        );
+        let upstream = cmake_configure_args(BuildBackend::Cuda, None, None, None, true);
+        assert!(upstream.iter().any(|a| a == "-DGGML_RPC=ON"));
+        for args in [&fork, &upstream] {
+            assert!(
+                args.iter().any(|a| a == "-DLLAMA_USE_PREBUILT_UI=OFF"),
+                "UI assets are a build-time network fetch - always off"
+            );
+        }
+    }
+
     fn unit__cmake_args__cuda_vs_cpu() {
         let cuda = cmake_configure_args(
             BuildBackend::Cuda,
             Some("89"),
             Some(Path::new("/usr/bin/g++-12")),
             None,
+            true,
         );
         assert!(cuda.contains(&"-DGGML_CUDA=ON".to_string()));
         assert!(cuda.contains(&"-DCMAKE_CUDA_ARCHITECTURES=89".to_string()));
@@ -1552,7 +1610,7 @@ mod tests {
         assert!(cuda.contains(&"-DLLAMA_CURL=ON".to_string()));
         // rpc tool parity with prebuilts (gates ggml-rpc-server target)
         assert!(cuda.contains(&"-DGGML_RPC=ON".to_string()));
-        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, None);
+        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, None, true);
         assert!(cpu.contains(&"-DGGML_RPC=ON".to_string()));
         assert!(cpu.iter().all(|a| !a.contains("CUDA")));
     }
@@ -1560,16 +1618,16 @@ mod tests {
     #[test]
     fn unit__cmake_args__compiler_cache_launchers() {
         let cache = Path::new("/usr/bin/ccache");
-        let cuda = cmake_configure_args(BuildBackend::Cuda, None, None, Some(cache));
+        let cuda = cmake_configure_args(BuildBackend::Cuda, None, None, Some(cache), true);
         assert!(cuda.contains(&"-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
         assert!(cuda.contains(&"-DCMAKE_CXX_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
         assert!(cuda.contains(&"-DCMAKE_CUDA_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
         // CPU backend must not carry any CUDA flag, cache or otherwise.
-        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, Some(cache));
+        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, Some(cache), true);
         assert!(cpu.contains(&"-DCMAKE_C_COMPILER_LAUNCHER=/usr/bin/ccache".to_string()));
         assert!(cpu.iter().all(|a| !a.contains("CUDA")));
         // No cache on PATH -> no launcher flags at all.
-        let bare = cmake_configure_args(BuildBackend::Cuda, None, None, None);
+        let bare = cmake_configure_args(BuildBackend::Cuda, None, None, None, true);
         assert!(bare.iter().all(|a| !a.contains("LAUNCHER")));
     }
 
@@ -1577,9 +1635,9 @@ mod tests {
     fn unit__cmake_args__cuda_f16_ci_parity() {
         // The overlay CI builds with half-precision CUDA math; a local
         // build without it measured -15% decode on sm89. CPU stays off.
-        let cuda = cmake_configure_args(BuildBackend::Cuda, None, None, None);
+        let cuda = cmake_configure_args(BuildBackend::Cuda, None, None, None, true);
         assert!(cuda.contains(&"-DGGML_CUDA_F16=ON".to_string()));
-        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, None);
+        let cpu = cmake_configure_args(BuildBackend::Cpu, None, None, None, true);
         assert!(cpu.iter().all(|a| !a.contains("F16")));
     }
 
