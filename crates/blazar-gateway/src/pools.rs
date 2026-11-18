@@ -64,6 +64,9 @@ const STEER_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
 /// Hard cap on retained window events per pool (memory bound under
 /// sustained traffic far above what a 5-minute window needs).
 const STEER_WINDOW_CAP: usize = 1024;
+/// Sparkline resolution: the steering window is sliced into this many
+/// equal buckets (300s / 15 = 20s each) for the route table's history.
+const STEER_HISTORY_BUCKETS: u64 = 15;
 
 /// Record one event in a rolling window map and report its live size:
 /// expired entries are pruned from the front on both insert and read,
@@ -99,6 +102,53 @@ pub(crate) fn window_count(
         q.pop_front();
     }
     q.len() as u64
+}
+
+/// Per-bucket steering history for one pool: the rolling window sliced
+/// into [`STEER_HISTORY_BUCKETS`] equal spans (20s each), oldest
+/// bucket first, as `(requests, hits)` counts. This is what the CLI
+/// renders as a sparkline - no traffic in a bucket reads as (0, 0),
+/// which the renderer shows as a gap instead of a zero rate.
+#[allow(clippy::cast_possible_truncation)] // bucket index math, always < 15
+pub(crate) fn window_history(
+    req_map: &mut std::collections::HashMap<String, std::collections::VecDeque<Instant>>,
+    hit_map: &mut std::collections::HashMap<String, std::collections::VecDeque<Instant>>,
+    pool: &str,
+    now: Instant,
+) -> Vec<(u64, u64)> {
+    let bucket_secs = STEER_WINDOW.as_secs() / STEER_HISTORY_BUCKETS;
+    let mut out = vec![(0u64, 0u64); STEER_HISTORY_BUCKETS as usize];
+    let bucketize = |q: &mut std::collections::VecDeque<Instant>,
+                     slot: &mut [(u64, u64)],
+                     hits: bool| {
+        while let Some(front) = q.front()
+            && now.duration_since(*front) >= STEER_WINDOW
+        {
+            q.pop_front();
+        }
+        for t in q.iter() {
+            let elapsed = now.duration_since(*t).as_secs();
+            // Newest events land in the LAST bucket; anything older
+            // than the window (only possible for a caller-built queue,
+            // pruning keeps real ones clean) is skipped, not wrapped.
+            if let Some(idx) = (STEER_HISTORY_BUCKETS - 1).checked_sub(elapsed / bucket_secs.max(1))
+                && let Some(slot) = slot.get_mut(idx as usize)
+            {
+                if hits {
+                    slot.1 += 1;
+                } else {
+                    slot.0 += 1;
+                }
+            }
+        }
+    };
+    if let Some(q) = req_map.get_mut(pool) {
+        bucketize(q, &mut out, false);
+    }
+    if let Some(q) = hit_map.get_mut(pool) {
+        bucketize(q, &mut out, true);
+    }
+    out
 }
 /// Bound on tracked prompt prefixes per gateway (memory hygiene);
 /// expired entries are dropped first, a still-full map is cleared.
@@ -883,6 +933,19 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
     } else {
         None
     };
+    // Sparkline history: the same rolling window sliced into equal
+    // buckets (oldest first). Fixed lock order (requests, then hits)
+    // - this is the only site that holds both guards.
+    let history: Vec<serde_json::Value> =
+        match (state.pools_req_window.lock(), state.pools_hit_window.lock()) {
+            (Ok(mut reqs), Ok(mut hits)) => {
+                window_history(&mut reqs, &mut hits, &pool.name, steer_now)
+                    .into_iter()
+                    .map(|(reqs, hits)| serde_json::json!({ "reqs": reqs, "hits": hits }))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
@@ -957,6 +1020,8 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                 "requests": pool_requests,
                 "hit_rate_pct": steer_rate,
                 "hit_rate_window_secs": STEER_WINDOW.as_secs(),
+                "history_bucket_secs": STEER_WINDOW.as_secs() / STEER_HISTORY_BUCKETS,
+                "history": history,
             },
         },
         "decision": decision,
@@ -1914,6 +1979,51 @@ mod tests {
             window_push(&mut map, "svc", now);
         }
         assert_eq!(window_count(&mut map, "svc", now), STEER_WINDOW_CAP as u64);
+    }
+
+    /// The sparkline history buckets events by age: newest in the last
+    /// slot, boundary ages land in the right bucket, expired events
+    /// never appear, and an unknown pool reads as silence.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // const 15, always fits
+    fn unit__window_history__buckets_by_age_and_drops_expired() {
+        let now = Instant::now();
+        let age = |secs: u64| {
+            now.checked_sub(std::time::Duration::from_secs(secs))
+                .expect("test ages are always in the past on test hosts")
+        };
+        let mut reqs = std::collections::HashMap::new();
+        let mut hits = std::collections::HashMap::new();
+        // Chronological order like the real window keeps (oldest first).
+        reqs.insert(
+            "svc".to_string(),
+            [age(STEER_WINDOW.as_secs() + 50), age(25), age(5), age(5)]
+                .into_iter()
+                .collect(),
+        );
+        hits.insert(
+            "svc".to_string(),
+            [age(STEER_WINDOW.as_secs() + 50), age(25)]
+                .into_iter()
+                .collect(),
+        );
+        let h = window_history(&mut reqs, &mut hits, "svc", now);
+        assert_eq!(h.len(), STEER_HISTORY_BUCKETS as usize);
+        let last = h.len() - 1;
+        let prev = last - 1;
+        assert_eq!(h[last], (2, 0), "newest bucket holds both age-5s requests");
+        assert_eq!(
+            h[prev],
+            (1, 1),
+            "age-25s lands one bucket back, hit and all"
+        );
+        assert!(
+            h[..prev].iter().all(|&(r, x)| r == 0 && x == 0),
+            "older buckets are silent"
+        );
+        // Unknown pool: fifteen silent buckets, no panic.
+        let silent = window_history(&mut reqs, &mut hits, "nonesuch", now);
+        assert!(silent.iter().all(|&(r, x)| r == 0 && x == 0));
     }
 
     /// `find()` is exact-match and prefix-safe.

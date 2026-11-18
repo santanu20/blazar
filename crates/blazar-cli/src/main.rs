@@ -14218,11 +14218,19 @@ async fn pool_status(json: bool, watch: bool, interval_secs: u64) -> Result<()> 
     let base = ensure_daemon().await?;
     if json {
         // Raw JSON is a one-shot dump; watching bytes stream is curl's
-        // job, not a card renderer's.
+        // job, not a card renderer's. The stamp lets a scraper tell a
+        // stale snapshot from a fresh one.
         let (pools, ps) = status_fetch(&base).await?;
+        let generated_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "pools": pools, "ps": ps }))?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "generated_unix": generated_unix,
+                "pools": pools,
+                "ps": ps,
+            }))?
         );
         return Ok(());
     }
@@ -14333,8 +14341,48 @@ fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>)
                 ),
                 _ => println!("    affinity: {keys} live key(s), {hits} steering hit(s)"),
             }
+            // Steering trend: per-bucket rate from the same rolling
+            // window (server slices it into equal buckets, oldest
+            // first). No traffic in a bucket renders as a gap dot, not
+            // a zero bar - silence must not read as "0% steering".
+            let blocks: String = p["pool"]["affinity"]["history"]
+                .as_array()
+                .map(|h| {
+                    h.iter()
+                        .map(|b| {
+                            sparkline_cell(
+                                b["reqs"].as_u64().unwrap_or(0),
+                                b["hits"].as_u64().unwrap_or(0),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !blocks.is_empty() {
+                println!("    trend   {blocks}");
+            }
         }
     }
+}
+
+/// One sparkline cell for a steering-history bucket: the 8-level
+/// block scale for a measured rate, a middle dot for a quiet bucket
+/// (no traffic is silence, not a zero rate).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // advisory glyph pick
+fn sparkline_cell(reqs: u64, hits: u64) -> char {
+    if reqs == 0 {
+        return '\u{00b7}'; // middle dot: quiet bucket
+    }
+    let ratio = hits as f64 / reqs as f64;
+    let levels = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    levels[((ratio * 7.0).round() as usize).min(7)]
 }
 
 /// Fetch `GET /api/pools` (admin bearer attaches once keys exist) and
