@@ -477,7 +477,7 @@ pub fn derive_engine_tag(btag: &str, backend: BuildBackend) -> String {
 // Argument list mirrors the cmake invocation inputs 1:1; a bundling
 // struct would obscure that correspondence.
 #[allow(clippy::too_many_arguments)]
-async fn run_cmake_build<F: FnMut(&str) + ?Sized>(
+async fn run_cmake_build<F>(
     tc: &Toolchain,
     opts: &BuildOpts,
     src: &Path,
@@ -538,7 +538,7 @@ where
     run_step(bldcmd, "cmake --build", opts.timeout, on_line).await
 }
 
-async fn run_step<F: FnMut(&str) + ?Sized>(
+async fn run_step<F>(
     mut cmd: tokio::process::Command,
     what: &str,
     timeout: Duration,
@@ -717,7 +717,7 @@ impl EngineManager {
     ///   (auto-retire windows, supersede mining) for code it is not.
     ///   The tree's own remote is the truth; plain fixture trees (no
     ///   .git) keep the declared source.
-    async fn resolve_effective_source<F: FnMut(&str) + ?Sized>(
+    async fn resolve_effective_source<F>(
         &self,
         tc: &Toolchain,
         opts: &BuildOpts,
@@ -759,7 +759,7 @@ impl EngineManager {
     /// Clone (or take) the source tree, configure, build, install, probe,
     /// activate. The build tree is a tempfile - torn down on every exit
     /// path (Drop), success or failure.
-    pub async fn build_and_install<F: FnMut(&str) + ?Sized>(
+    pub async fn build_and_install<F>(
         &self,
         opts: &BuildOpts,
         on_line: &mut F,
@@ -773,7 +773,7 @@ impl EngineManager {
     /// Curated registry build variant. Unlike an ordinary user build, it
     /// requires the source-mined architecture set to contain the registry's
     /// requested architecture before CMake runs.
-    pub async fn build_and_install_for_arch<F: FnMut(&str) + Send + ?Sized>(
+    pub async fn build_and_install_for_arch<F>(
         &self,
         opts: &BuildOpts,
         required_arch: &str,
@@ -790,7 +790,7 @@ impl EngineManager {
             .await
     }
 
-    async fn build_and_install_inner<F: FnMut(&str) + ?Sized>(
+    async fn build_and_install_inner<F>(
         &self,
         opts: &BuildOpts,
         required_arch: Option<&str>,
@@ -885,7 +885,7 @@ impl EngineManager {
     /// install pass (the live failure of 2026-09-09). Returns the
     /// installed digest, the retired old dir (for the caller's
     /// register/discard decision), and the lane identity.
-    async fn compile_source_lane<F: FnMut(&str) + ?Sized>(
+    async fn compile_source_lane<F>(
         &self,
         tc: &Toolchain,
         opts: &BuildOpts,
@@ -1015,7 +1015,7 @@ async fn cuda_build_facts(
 /// want-refs; the commits API happily resolves short forms. Returns
 /// `None` when the pin is already full-length (or not a fork at all),
 /// so the caller can keep borrowing the original `BuildOpts`.
-async fn resolve_fork_pin<F: FnMut(&str) + ?Sized>(
+async fn resolve_fork_pin<F>(
     gh: &super::gh::GhClient,
     source: &BuildSource,
     on_line: &mut F,
@@ -1203,7 +1203,7 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
 /// origin (no local ref exists for an arbitrary commit), detach onto
 /// `FETCH_HEAD`, verify the checkout matches the pin, then init
 /// submodules - a no-op when the fork carries none.
-async fn fetch_source<F: FnMut(&str) + ?Sized>(
+async fn fetch_source<F>(
     build_root: &Path,
     tc: &Toolchain,
     opts: &BuildOpts,
