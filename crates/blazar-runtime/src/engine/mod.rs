@@ -1028,12 +1028,12 @@ impl EngineManager {
     /// Background callers should bound concurrency and keep the build off the
     /// request path. The generated fork is additive and never replaces the
     /// serving-active engine.
-    pub async fn install_curated_lane_for_arch(
+    pub async fn install_curated_lane_for_arch<F: FnMut(&str) + Send + ?Sized>(
         &self,
         architecture: &str,
         lane_id: &str,
         registry_url: Option<&str>,
-        on_line: &mut dyn FnMut(&str),
+        on_line: &mut F,
     ) -> Result<EngineRow> {
         anyhow::ensure!(
             !architecture.trim().is_empty(),
