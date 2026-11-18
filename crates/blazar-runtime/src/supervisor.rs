@@ -7423,7 +7423,8 @@ impl Supervisor {
                         // Never override a model's explicit engine pin. The
                         // auto-install feature is intentionally opt-in and
                         // only consumes lanes advertised by this registry.
-                        if !forced_lane && overlay.engine.is_none()
+                        if !forced_lane
+                            && overlay.engine.is_none()
                             && let Some(started) =
                                 self.schedule_curated_auto_install(&arch, &lane.id)
                         {
