@@ -1,15 +1,15 @@
 ---
 layout: doc
 title: Engines
-description: The eight serving engines Blazar orchestrates - roles, model formats, and how routing picks between them.
+description: The nine serving engines Blazar orchestrates - roles, model formats, and how routing picks between them.
 doc_kind: Documentation
 ---
-## One gateway, eight engines
+## One gateway, nine engines
 
 Blazar does not replace inference engines - it orchestrates them. Each lane
 is the real upstream binary, managed end-to-end: download or build, keep
 current, configure, supervise, and route requests to it. Pip-installed lanes
-(SGLang, MLX, LiteRT-LM, Kokoro) resolve the package index's latest release
+(SGLang, vLLM, MLX, LiteRT-LM, Kokoro) resolve the package index's latest release
 at install time - falling back to the last verified release with a warning
 when the index is unreachable - while GitHub-release lanes track their
 release channel; `blazar engine pin` freezes a lane when reproducibility
@@ -20,6 +20,7 @@ matters.
 | **llama.cpp** | Mainstream local text serving | GGUF and quantized local models |
 | **mistral.rs** | Alternative text runtime | Supported GGUF and safetensors models |
 | **SGLang** | Safetensors-oriented serving | AWQ, GPTQ, FP8 safetensors models |
+| **vLLM** | Throughput-first OpenAI-native serving | HF safetensors directories (PagedAttention) |
 | **MLX** | Apple-Silicon and CUDA-backed serving | MLX quantized model directories (mlx-community) |
 | **stable-diffusion.cpp** | Media generation | Diffusion images and video |
 | **whisper.cpp** | Speech recognition | Transcription and translation |
@@ -34,7 +35,9 @@ Routing follows model format and engine capability:
 ```text
 GGUF                      -> llama.cpp / mistral.rs
 Quantized safetensors     -> SGLang
-Plain safetensors         -> SGLang / mistral.rs
+Plain safetensors         -> policy order (Throughput: vLLM / SGLang / mistral.rs,
+                             Quality: SGLang / mistral.rs / vLLM,
+                             Latency: mistral.rs / SGLang / vLLM)
 MLX quant directories     -> MLX
 Diffusion component sets  -> stable-diffusion.cpp
 Audio transcription       -> whisper.cpp
@@ -94,6 +97,21 @@ DSpine), context parallelism (`cp_size`/`attn_cp_size`/`dcp_size` plus
 (`attn_dp_size`, must divide `tp_size`), CUDA-graph backend selection per
 phase, PDMux collocation, and the experimental fused-kernel plugin lanes
 (NVIDIA megakernel / AMD monokernel).
+
+### vLLM
+
+The throughput-first lane for plain HF safetensors directories - it wins the
+Throughput policy order (Quality and Latency still prefer SGLang and
+mistral.rs). Installed as a pip venv (Linux + NVIDIA, ~6-8 GiB incl. torch
+and the CUDA wheels), launched through a `vllm-server` shim that execs the
+venv's own `vllm serve`. The profile compiler owns the VRAM guardrails:
+`--max-model-len` from the pinned context, `--gpu-memory-utilization` always
+emitted (default 0.85 - set `[vllm] gpu_memory_utilization` lower when the
+GPU is shared with a co-tenant daemon or another lane), and
+`--max-num-seqs` when a slot pin exists. Tool calling
+(`--enable-auto-tool-choice` + parser selection) and the KV-connector
+surfaces are the incremental-certification wave; v0 ships plain chat,
+streaming, and strict `json_schema` output.
 
 ### MLX
 

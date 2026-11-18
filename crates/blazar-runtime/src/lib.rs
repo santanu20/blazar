@@ -62,7 +62,7 @@ pub use engine::manifest::{Manifest, Vendor, predicted_rescue_lane, probe as pro
 pub use engine::{EngineManager, LOCAL_TAG, system_vendor_hint};
 pub use engine_impl::{
     ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, MlxEngine, OpenAiHostEngine, SdCppEngine,
-    SglangEngine,
+    SglangEngine, VllmEngine,
 };
 pub use events::{BlazarEvent, EventBus, InstanceState};
 pub use hf::{

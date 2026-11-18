@@ -23,6 +23,11 @@ pub enum EngineKind {
     /// sgl-project/sglang `python -m sglang.launch_server` (pip venv;
     /// HF safetensors models, Linux CUDA/ROCm upstream).
     Sglang,
+    /// vllm-project/vllm `vllm serve` (pip venv; HF safetensors
+    /// models, Linux CUDA upstream). `PagedAttention` throughput
+    /// flagship for shard directories: continuous batching at high
+    /// concurrency, OpenAI-native surface.
+    Vllm,
     /// leejet/stable-diffusion.cpp `sd-server` (prebuilt assets +
     /// source build; diffusion/image component sets - never text).
     SdCpp,
@@ -63,10 +68,11 @@ impl EngineKind {
     /// row here is silently skipped by those walks while their summaries
     /// still report success, so grow this in the same edit that adds a
     /// variant (every `match` in this file forces the visit anyway).
-    pub const ALL: [EngineKind; 9] = [
+    pub const ALL: [EngineKind; 10] = [
         EngineKind::LlamaCpp,
         EngineKind::MistralRs,
         EngineKind::Sglang,
+        EngineKind::Vllm,
         EngineKind::SdCpp,
         EngineKind::Whisper,
         EngineKind::Piper,
@@ -81,6 +87,7 @@ impl EngineKind {
             EngineKind::LlamaCpp => "llamacpp",
             EngineKind::MistralRs => "mistralrs",
             EngineKind::Sglang => "sglang",
+            EngineKind::Vllm => "vllm",
             EngineKind::SdCpp => "sdcpp",
             EngineKind::Whisper => "whisper",
             EngineKind::Piper => "piper",
@@ -114,6 +121,7 @@ impl EngineKind {
         match self {
             EngineKind::MistralRs
             | EngineKind::Sglang
+            | EngineKind::Vllm
             | EngineKind::Mlx
             | EngineKind::OpenAiHost => true,
             EngineKind::LlamaCpp
@@ -182,13 +190,6 @@ impl EngineKind {
         installed: &[EngineKind],
         policy: crate::config::RoutingPolicy,
     ) -> Option<EngineKind> {
-        let prefer = |primary: EngineKind, fallback: EngineKind| {
-            installed
-                .iter()
-                .copied()
-                .find(|k| *k == primary)
-                .or_else(|| installed.iter().copied().find(|k| *k == fallback))
-        };
         // Domain gate (bidirectional by construction): a diffusion
         // component set (DiT+VAE+TE) has exactly one serving kind, and
         // the text lanes never see those rows; conversely the preference
@@ -222,28 +223,48 @@ impl EngineKind {
             }
             ShardFormat::SafetensorsDir | ShardFormat::GgufFile => {}
         }
-        let [primary, fallback] = Self::format_preference_order(shape.shards, policy);
-        prefer(primary, fallback)
+        // Ordered pick: first preference-order entry with an installed
+        // row wins. Iterating the order (not a 2-slot destructure) keeps
+        // every arm of format_preference_order authoritative however
+        // many candidates a format names.
+        let order = Self::format_preference_order(shape.shards, policy);
+        order.iter().copied().find(|k| installed.contains(k))
     }
 
     /// The policy-ordered candidate kinds for a format, best first -
     /// the order [`route_format`](Self::route_format) tries and the
     /// order the CLI's just-in-time install offer recommends them in.
+    /// A slice, not a fixed-size array: GGUF names two candidates
+    /// while the safetensors policies name three, and a future lane
+    /// must not need a signature change to join an order.
     #[must_use]
     pub fn format_preference_order(
         shards: ShardFormat,
         policy: crate::config::RoutingPolicy,
-    ) -> [EngineKind; 2] {
+    ) -> &'static [EngineKind] {
         use crate::config::RoutingPolicy;
         if shards.is_dir() {
             match policy {
-                RoutingPolicy::Latency => [EngineKind::MistralRs, EngineKind::Sglang],
-                RoutingPolicy::Quality | RoutingPolicy::Throughput => {
-                    [EngineKind::Sglang, EngineKind::MistralRs]
+                // vllm first under throughput: PagedAttention continuous
+                // batching wins aggregate tok/s at concurrency (the
+                // lane's reason to exist). Latency keeps mistral.rs
+                // first - a vllm child's startup and queueing make it
+                // the last resort for warm-TTFT-sensitive shapes - and
+                // quality keeps sglang first on its measured lead;
+                // vllm is the third candidate there so a roster
+                // missing both incumbents still serves.
+                RoutingPolicy::Latency => {
+                    &[EngineKind::MistralRs, EngineKind::Sglang, EngineKind::Vllm]
+                }
+                RoutingPolicy::Quality => {
+                    &[EngineKind::Sglang, EngineKind::MistralRs, EngineKind::Vllm]
+                }
+                RoutingPolicy::Throughput => {
+                    &[EngineKind::Vllm, EngineKind::Sglang, EngineKind::MistralRs]
                 }
             }
         } else {
-            [EngineKind::LlamaCpp, EngineKind::MistralRs]
+            &[EngineKind::LlamaCpp, EngineKind::MistralRs]
         }
     }
 }
@@ -319,7 +340,7 @@ impl fmt::Display for LaneError {
             }
             Self::FormatUnserved { shape, roster } => write!(
                 f,
-                "no installed engine serves the {} format - install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
+                "no installed engine serves the {} format - install one (vllm|sglang|mistralrs for safetensors, llamacpp for GGUF); installed: {roster}",
                 if shape.shards.is_dir() {
                     "safetensors"
                 } else {
@@ -588,6 +609,7 @@ impl FromStr for EngineKind {
             "llamacpp" => Ok(EngineKind::LlamaCpp),
             "mistralrs" => Ok(EngineKind::MistralRs),
             "sglang" => Ok(EngineKind::Sglang),
+            "vllm" => Ok(EngineKind::Vllm),
             "sdcpp" => Ok(EngineKind::SdCpp),
             "whisper" => Ok(EngineKind::Whisper),
             "piper" => Ok(EngineKind::Piper),
@@ -595,7 +617,7 @@ impl FromStr for EngineKind {
             "mlx" => Ok(EngineKind::Mlx),
             "openaihost" => Ok(EngineKind::OpenAiHost),
             other => Err(format!(
-                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, kokoro, mlx, openaihost)"
+                "unknown engine kind {other:?} (supported: llamacpp, mistralrs, sglang, vllm, sdcpp, whisper, piper, kokoro, mlx, openaihost)"
             )),
         }
     }
@@ -642,7 +664,7 @@ mod tests {
             .filter(|k| k.is_venv_serving_lane())
             .map(|k| k.as_str())
             .collect();
-        assert_eq!(venv, ["mistralrs", "sglang", "mlx", "openaihost"]);
+        assert_eq!(venv, ["mistralrs", "sglang", "vllm", "mlx", "openaihost"]);
         let native: Vec<&str> = EngineKind::ALL
             .iter()
             .filter(|k| !k.is_venv_serving_lane())
@@ -664,6 +686,7 @@ mod tests {
                 EngineKind::LlamaCpp => "llamacpp",
                 EngineKind::MistralRs => "mistralrs",
                 EngineKind::Sglang => "sglang",
+                EngineKind::Vllm => "vllm",
                 EngineKind::SdCpp => "sdcpp",
                 EngineKind::Whisper => "whisper",
                 EngineKind::Piper => "piper",
@@ -672,7 +695,7 @@ mod tests {
                 EngineKind::OpenAiHost => "openaihost",
             })
             .collect();
-        assert_eq!(names.len(), 9, "ALL must carry all 9 lanes");
+        assert_eq!(names.len(), 10, "ALL must carry all 10 lanes");
         let mut uniq = names.clone();
         uniq.sort_unstable();
         uniq.dedup();
@@ -746,6 +769,7 @@ mod tests {
             EngineKind::LlamaCpp,
             EngineKind::MistralRs,
             EngineKind::Sglang,
+            EngineKind::Vllm,
             EngineKind::SdCpp,
             EngineKind::Whisper,
             EngineKind::Piper,
@@ -757,8 +781,8 @@ mod tests {
             assert_eq!(serde_json::from_str::<EngineKind>(&json).unwrap(), k);
         }
         assert_eq!(
-            EngineKind::from_str("vllm").unwrap_err(),
-            "unknown engine kind \"vllm\" (supported: llamacpp, mistralrs, sglang, sdcpp, whisper, piper, kokoro, mlx, openaihost)"
+            EngineKind::from_str("notalane").unwrap_err(),
+            "unknown engine kind \"notalane\" (supported: llamacpp, mistralrs, sglang, vllm, sdcpp, whisper, piper, kokoro, mlx, openaihost)"
         );
         // serde default on missing field = llamacpp (old rows).
         assert_eq!(
@@ -890,6 +914,40 @@ mod tests {
                 Quality
             ),
             None
+        );
+    }
+
+    /// vllm takes the throughput crown when installed but never displaces
+    /// the incumbents under quality/latency; third-slot reachability keeps
+    /// a vllm+llamacpp roster serving (no incumbent present) and GGUF
+    /// ignores the lane entirely.
+    #[test]
+    fn unit__route_format__vllm_wins_throughput_and_stays_third_slot() {
+        use crate::config::RoutingPolicy::{Latency, Quality, Throughput};
+        use EngineKind::{LlamaCpp, MistralRs, Sglang, Vllm};
+
+        let with_vllm = [LlamaCpp, MistralRs, Sglang, Vllm];
+        assert_eq!(
+            EngineKind::route_format(shape(false, SafetensorsDir), &with_vllm, Throughput),
+            Some(Vllm)
+        );
+        assert_eq!(
+            EngineKind::route_format(shape(false, SafetensorsDir), &with_vllm, Quality),
+            Some(Sglang)
+        );
+        assert_eq!(
+            EngineKind::route_format(shape(false, SafetensorsDir), &with_vllm, Latency),
+            Some(MistralRs)
+        );
+        assert_eq!(
+            EngineKind::route_format(shape(false, SafetensorsDir), &[LlamaCpp, Vllm], Quality),
+            Some(Vllm),
+            "no incumbent installed: vllm serves as the third candidate"
+        );
+        assert_eq!(
+            EngineKind::route_format(shape(false, GgufFile), &with_vllm, Throughput),
+            Some(LlamaCpp),
+            "GGUF preference never names vllm"
         );
     }
 
@@ -1031,7 +1089,7 @@ mod tests {
     #[test]
     fn unit__lane_error__missing_kinds_per_class() {
         use crate::config::RoutingPolicy::{Latency, Quality};
-        use EngineKind::{LlamaCpp, MistralRs, SdCpp, Sglang};
+        use EngineKind::{LlamaCpp, MistralRs, SdCpp, Sglang, Vllm};
 
         let roster = "b1 (llamacpp)".to_string();
         assert_eq!(
@@ -1063,14 +1121,15 @@ mod tests {
         );
         assert!(text.contains("diffusion component sets"), "{text}");
         // Policy orders the format candidates: quality wants sglang
-        // first, latency wants mistral.rs first; GGUF is fixed.
+        // first, latency wants mistral.rs first, both trailing vllm as
+        // the third candidate; GGUF is fixed (vllm is not a GGUF lane).
         assert_eq!(
             LaneError::FormatUnserved {
                 shape: shape(false, SafetensorsDir),
                 roster: roster.clone()
             }
             .missing_kinds(Quality),
-            vec![Sglang, MistralRs]
+            vec![Sglang, MistralRs, Vllm]
         );
         assert_eq!(
             LaneError::FormatUnserved {
@@ -1078,7 +1137,7 @@ mod tests {
                 roster: roster.clone()
             }
             .missing_kinds(Latency),
-            vec![MistralRs, Sglang]
+            vec![MistralRs, Sglang, Vllm]
         );
         assert_eq!(
             LaneError::FormatUnserved {
@@ -1158,7 +1217,7 @@ mod tests {
         .to_string();
         assert_eq!(
             fmt_typed,
-            "no installed engine serves the safetensors format - install one (sglang|mistralrs for safetensors, llamacpp for GGUF); installed: b1 (llamacpp)"
+            "no installed engine serves the safetensors format - install one (vllm|sglang|mistralrs for safetensors, llamacpp for GGUF); installed: b1 (llamacpp)"
         );
     }
 

@@ -12,6 +12,7 @@ pub mod manifest;
 pub mod mlx_install;
 pub(crate) mod net_probe;
 pub mod sglang_install;
+pub mod vllm_install;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2078,6 +2079,68 @@ impl EngineManager {
         .await
     }
 
+    /// Install the vLLM lane: python 3.12 venv + `vllm==<version>` wheels
+    /// under `engines/vllm-<version>/` (Linux/CUDA only - upstream's own
+    /// support matrix; llamacpp/mistralrs cover the other OSes). Same
+    /// venv-per-tag + rollback discipline as the sglang lane. `extras`
+    /// are verbatim pip specs layered onto the venv after the base
+    /// install. F88: every failure path after dir creation removes the
+    /// dir (via `install_with_rollback`).
+    pub async fn install_vllm(
+        &self,
+        version: Option<&str>,
+        extras: &[String],
+    ) -> Result<EngineRow> {
+        if !cfg!(target_os = "linux") {
+            anyhow::bail!(
+                "vllm upstream supports Linux (CUDA) only; {} is not \
+                 installable here - llamacpp (default) and mistralrs serve \
+                 Windows/macOS",
+                std::env::consts::OS
+            );
+        }
+        let version = match version {
+            Some(v) => v.to_string(),
+            None => {
+                latest_or_fallback(
+                    "vllm",
+                    vllm_install::pypi_latest_vllm(),
+                    vllm_install::VLLM_FALLBACK_VERSION,
+                )
+                .await
+            }
+        };
+        // Reject malformed pins early: the tag IS the version string that
+        // probe_vllm's semver parse and pip both consume.
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            anyhow::bail!("vllm version must be dotted digits (e.g. 0.34.0), got {version:?}");
+        }
+        if extras.iter().any(|s| s.trim().is_empty()) {
+            anyhow::bail!("vllm install extras must be non-empty pip specs, got {extras:?}");
+        }
+        let tag = format!("vllm-{version}");
+        // Rollback-safe like the sglang lane: a rebuild that dies mid-venv
+        // restores the previously installed engine instead of destroying
+        // it.
+        let mut asset_label = format!("pip:vllm=={version}");
+        if !extras.is_empty() {
+            asset_label = format!("{asset_label} + {} extra pkg(s)", extras.len());
+        }
+        self.install_with_rollback(
+            &tag,
+            &asset_label,
+            "unverified",
+            EngineKind::Vllm,
+            |dir| async move {
+                std::fs::create_dir_all(&dir)?;
+                vllm_install::install_into(&dir, &version, extras)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await
+    }
+
     /// Install the kokoro TTS lane (kokoro-onnx venv + GH model assets).
     /// `model_version` names the MODEL line (v1 files under
     /// `model-files-v*` releases), not the pip package - the package is
@@ -2811,6 +2874,9 @@ impl EngineManager {
             // The install lane writes the shim; anything else is a
             // hand-copied dir, and the shim name is the contract.
             EngineKind::Sglang => find_engine_binary(dir, &["sglang-server"]),
+            // Same venv-shim contract as sglang; the shim execs the venv's
+            // own `vllm` console script on `serve`.
+            EngineKind::Vllm => find_engine_binary(dir, &["vllm-server"]),
             // Same venv-shim contract as sglang (the lane it mirrors).
             EngineKind::Mlx => find_engine_binary(dir, &["mlx-server"]),
             // Same venv-shim contract as sglang/mlx; the shim execs the
@@ -2861,6 +2927,12 @@ impl EngineManager {
             }
             EngineKind::Sglang => {
                 tracing::debug!(target: "blazar::engine", "registered sglang {tag} ({asset_label})");
+            }
+            // venv lane like sglang: devices follow the pip backend
+            // (torch cuda wheels) - an unusable install fails the probe
+            // or spawn, loudly.
+            EngineKind::Vllm => {
+                tracing::debug!(target: "blazar::engine", "registered vllm {tag} ({asset_label})");
             }
             // venv lane like sglang: devices follow the pip backend
             // (mlx-cuda on Linux/NVIDIA, mlx on Apple Silicon) - an
@@ -3116,6 +3188,7 @@ impl EngineManager {
                     | EngineKind::Sglang
                     | EngineKind::SdCpp
                     | EngineKind::Mlx
+                    | EngineKind::Vllm
                     | EngineKind::OpenAiHost => {
                         unreachable!("serving lane inside the lazy-lane guard")
                     }
@@ -4391,6 +4464,7 @@ pub fn smoke_probe(
             })
         }
         EngineKind::Sglang => venv_metadata_probe(manifest, "sglang"),
+        EngineKind::Vllm => venv_metadata_probe(manifest, "vllm"),
         EngineKind::Mlx => venv_metadata_probe(manifest, "mlx_lm"),
         EngineKind::OpenAiHost => venv_metadata_probe(manifest, "litert_lm"),
         // mistral.rs and sd-server both answer --version with a

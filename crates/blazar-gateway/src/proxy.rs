@@ -2360,6 +2360,13 @@ pub(crate) fn child_model_stamp_predicted(
         // same mlx contract as `child_model_stamp` - the spawn-time
         // prediction must equal what the running child registers.
         EngineKind::Mlx => Some(model_path.to_string()),
+        // vllm registers --served-model-name through the same core
+        // sanitizer the argv uses (VllmEngine::vllm_argv), so the
+        // pre-spawn prediction must mirror it exactly - vllm 404s any
+        // body `model` that diverges from the registered name.
+        EngineKind::Vllm => Some(blazar_core::engine_kind::sglang_child_model_name(
+            model_name,
+        )),
         _ => None,
     }
 }
@@ -2481,18 +2488,25 @@ fn is_chat_path(path_query: &str) -> bool {
 /// as ITS lora-suffix convention AND asserts at startup that the
 /// registered `--served-model-name` carries no colon, so it must see
 /// the sanitized registration name (argv and this stamp derive from
-/// the same core `sglang_child_model_name`). llamacpp is
+/// the same core `sglang_child_model_name`). vllm has no sglang-style
+/// colon constraint but enforces registered-name equality, so it
+/// rides the same sanitize-pair (`VllmEngine::vllm_argv` stamps the
+/// identical value into --served-model-name). llamacpp is
 /// indifferent (a single-model server answers any model string), so
 /// the caller's own spelling survives for response-echo fidelity on
 /// the raw passthrough lanes. `None` = no rewrite. Owned `String`
-/// because the sglang stamp is derived, not borrowed from the row.
+/// because the sglang/vllm stamps are derived, not borrowed from the
+/// row.
 pub(crate) fn child_model_stamp(engine: &EngineRef) -> Option<String> {
     use blazar_core::engine_kind::EngineKind;
     match engine.kind {
         EngineKind::MistralRs => Some("default".to_string()),
-        EngineKind::Sglang => Some(blazar_core::engine_kind::sglang_child_model_name(
-            &engine.name,
-        )),
+        // sglang treats the colon as its lora-suffix convention and vllm
+        // enforces registered-name equality - both must see the SAME
+        // sanitized value their argv stamp carries (the doc above).
+        EngineKind::Sglang | EngineKind::Vllm => Some(
+            blazar_core::engine_kind::sglang_child_model_name(&engine.name),
+        ),
         // mlx_lm serves the model under its FULL path (it has no
         // --served-model-name flag, probe-verified) - anything else in
         // the body falls through to its HF-hub resolution and 401s.

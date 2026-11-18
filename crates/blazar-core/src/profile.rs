@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Config, DEFAULT_CACHE_RAM_MB, MmprojPolicy, ModelOverride};
-use crate::config::{MistralrsTuning, MlxTuning, SglangTuning};
+use crate::config::{MistralrsTuning, MlxTuning, SglangTuning, VllmTuning};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
 use crate::hardware::Hardware;
@@ -278,6 +278,15 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // this profile owns the numbers (ctx ladder, VRAM tiers, concurrency).
     if input.engine_kind == crate::engine_kind::EngineKind::Sglang {
         return compile_sglang(input, tuning);
+    }
+    // Dialect fork: vllm speaks `vllm serve` grammar, admits memory via
+    // a GPU fraction (not ctx math), and reads safetensors dirs - none
+    // of the llama-server rules below apply. VllmEngine::build_argv
+    // owns the connection quintet (serve/model/host/port/served-name);
+    // this profile owns the numbers (ctx window, memory fraction,
+    // concurrency cap).
+    if input.engine_kind == crate::engine_kind::EngineKind::Vllm {
+        return compile_vllm(input);
     }
     // Dialect fork: sd-server has no llama grammar either - no ctx/KV
     // ladder, no slots; the argv IS the component set (DiT+VAE+TE) plus
@@ -4879,6 +4888,112 @@ fn openaihost_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String
     Ok(extra.clone())
 }
 
+/// vllm profile: minimal v0 ladder mirroring `compile_mlx`'s honesty
+/// contract. The numbers this profile owns: ctx window (overlay >
+/// config default, clamped to the trained ceiling), GPU memory
+/// fraction (ALWAYS emitted - vllm's 0.9 default claims nearly the
+/// whole card and starves co-tenants on shared GPUs), and the
+/// concurrency cap when the model row pins slots. Everything else
+/// rides vllm's own admission (it self-refuses loudly when weights +
+/// KV do not fit the fraction).
+fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
+    let hf = match input.meta {
+        ModelMeta::Hf(h) => h,
+        ModelMeta::Gguf(g) => {
+            return Err(format!(
+                "model {} is a GGUF file (arch {}) - the vllm engine consumes HF \
+                 safetensors directories; run it on the llamacpp engine (default) or \
+                 pull a safetensors checkpoint (e.g. Qwen/Qwen2.5-0.5B-Instruct)",
+                input.model_name, g.architecture
+            ));
+        }
+    };
+    let mut warnings: Vec<String> = Vec::new();
+    let tun = VllmTuning::effective(input.overlay.vllm.as_ref(), &input.config.vllm);
+    let mut argv: Vec<String> = Vec::new();
+
+    // --- ctx: overlay > config default, clamped to the trained ceiling
+    // (no YaRN auto-extend on this lane yet - teach when it lands).
+    let requested = input.overlay.ctx.unwrap_or(input.config.default_ctx);
+    let ceiling = hf
+        .ctx_train
+        .map_or(u64::from(requested), |t| t.min(u64::from(requested)));
+    let ctx = u32::try_from(ceiling).unwrap_or(u32::MAX);
+    if u64::from(requested) > ceiling {
+        warnings.push(format!(
+            "ctx {requested} exceeds the trained window {ceiling}; \
+             --max-model-len clamped to {ceiling}"
+        ));
+    }
+    argv.push("--max-model-len".to_string());
+    argv.push(ctx.to_string());
+
+    // --- GPU memory fraction: always emitted; the [vllm] pin wins over
+    // the 0.85 compiler default (validated 0.05..=0.95 at config load).
+    let frac = tun.gpu_memory_utilization.unwrap_or(0.85);
+    argv.push("--gpu-memory-utilization".to_string());
+    argv.push(frac.to_string());
+
+    // --- concurrency: a slots pin > 0 caps batch admissions
+    // (--max-num-seqs); 0/absent rides the engine's own sizing.
+    if let Some(slots) = input.overlay.slots
+        && slots > 0
+    {
+        argv.push("--max-num-seqs".to_string());
+        argv.push(slots.to_string());
+    }
+
+    // User extra_args ride after the knobs: on a repeat flag the later
+    // token wins in argparse, so an explicit extra_args pin always
+    // overrides the knob's value (same last-wins contract as mlx/sglang).
+    argv.extend(vllm_extra_args(input)?);
+    push_nonllama_vocab_teaching(input.config, "vllm", &mut warnings);
+
+    // Admission input: planned f16 KV bytes at the compiled window so
+    // the spawn gate can refuse a doomed pin before vllm boots (vllm
+    // self-refuses too, but only after a multi-GB model load).
+    let kv_est_bytes = estimate_kv_vram_charge(input, Some(ctx));
+
+    Ok(Profile {
+        argv,
+        warnings,
+        ctx,
+        gpu: "auto",
+        vram_mib: input.hardware.total_vram_mib(),
+        kv_est_bytes,
+        ctx_autofit: None,
+        capacity: CapacityStatus::Compiled,
+    })
+}
+
+/// Strict manifest-gated `extra_args` passthrough for the vllm dialect:
+/// the serve pins are reserved (blazar sets them from the quintet), and
+/// unknown flags refuse instead of dying at child boot.
+fn vllm_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
+    const RESERVED: &[&str] = &["--served-model-name", "--host", "--port", "--api-key"];
+    let Some(extra) = &input.overlay.extra_args else {
+        return Ok(Vec::new());
+    };
+    for tok in extra {
+        if !tok.starts_with('-') {
+            continue; // value token riding its preceding flag
+        }
+        if RESERVED.contains(&tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is reserved - blazar owns it on the vllm engine \
+                 (serve model + loopback listen + auth pins); remove it from the override"
+            ));
+        }
+        if !input.supported_flags.contains(tok.as_str()) {
+            return Err(format!(
+                "extra_args {tok} is not a flag of this vllm build; remove it or \
+                 run: blazar engine update"
+            ));
+        }
+    }
+    Ok(extra.clone())
+}
+
 fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Profile, String> {
     let mut argv: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -9137,6 +9252,7 @@ mod tests {
         devices: None,
         mistralrs: None,
         mlx: None,
+        vllm: None,
         engine: None,
         warmup: None,
         reasoning_budget: None,
@@ -20286,6 +20402,254 @@ mod tests {
             "missing flag must warn: {:?}",
             p.warnings
         );
+    }
+
+    fn vllm_flags() -> BTreeSet<String> {
+        [
+            "--host",
+            "--port",
+            "--served-model-name",
+            "--api-key",
+            "--max-model-len",
+            "--gpu-memory-utilization",
+            "--max-num-seqs",
+            "--enable-prefix-caching",
+            "--kv-cache-dtype",
+        ]
+        .iter()
+        .map(|f| (*f).to_string())
+        .collect()
+    }
+
+    static VLLM_FLAGS: LazyLock<BTreeSet<String>> = LazyLock::new(vllm_flags);
+
+    fn vllm_input<'a>(
+        hf: &'a crate::hfmeta::HfMeta,
+        hw: &'a Hardware,
+        cfg: &'a Config,
+        overlay: &'a ModelOverride,
+    ) -> ProfileInput<'a> {
+        ProfileInput {
+            engine_kind: crate::engine_kind::EngineKind::Vllm,
+            model_name: "qwen2.5-0.5b-instruct",
+            instance_key: "qwen2.5-0.5b-instruct",
+            model_path: "/models/qwen2.5-0.5b-instruct.d",
+            model_bytes: 988 * MIB,
+            meta: ModelMeta::Hf(hf),
+            hardware: hw,
+            config: cfg,
+            overlay,
+            spec_mode: "off",
+            loras: &[],
+            draft_path: None,
+            draft_gguf: None,
+            mmproj_path: None,
+            components: &[],
+            mmproj_force: false,
+            engine_tag: "vllm-test",
+            supported_flags: &VLLM_FLAGS,
+            spec_types: &[],
+            cache_types: &[],
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 12347,
+            },
+            data_dir: "/tmp/blazar-test-data",
+            cache_hit_rate: None,
+            resident_ram_mib: 0,
+            device_hint: None,
+            engine_census: hw.gpus.clone(),
+            sibling_devices: Vec::new(),
+            auto_tensor_split: None,
+            auto_tp_size: None,
+        }
+    }
+
+    #[test]
+    fn unit__vllm_compile__defaults_emit_ctx_and_utilization_always() {
+        // Byte-exact default: --max-model-len from default_ctx (clamped
+        // by the trained window) and --gpu-memory-utilization 0.85 - the
+        // fraction is NEVER absent (vllm's own 0.9 starves co-tenants).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = vllm_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p.argv,
+            vec![
+                "--max-model-len",
+                "16384",
+                "--gpu-memory-utilization",
+                "0.85",
+            ],
+            "default compile is exactly ctx + utilization"
+        );
+        assert_eq!(p.ctx, 16384);
+        // KV byte estimation is GGUF-geometry-only today; HF lanes ride
+        // vram_mib (total VRAM, family convention with sglang/mlx).
+        assert!(p.kv_est_bytes.is_none());
+        assert!(
+            p.warnings.is_empty(),
+            "no warnings by default: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__ctx_clamps_to_trained_window_with_teaching() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta(); // ctx_train 32768
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.ctx = Some(65_536);
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-model-len" && w[1] == "32768"),
+            "clamped to trained window: {:?}",
+            p.argv
+        );
+        assert_eq!(p.ctx, 32768);
+        assert!(
+            p.warnings.iter().any(|w| w.contains("clamped")),
+            "clamp must teach: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__utilization_pin_wins_over_default() {
+        // [vllm] global pin and per-model override both beat 0.85; the
+        // overlay replaces the whole struct, so overlay wins over global.
+        let cfg = Config {
+            vllm: crate::config::VllmTuning {
+                gpu_memory_utilization: Some(0.6),
+            },
+            ..Config::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = vllm_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-memory-utilization" && w[1] == "0.6"),
+            "global pin: {:?}",
+            p.argv
+        );
+
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            gpu_memory_utilization: Some(0.3),
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--gpu-memory-utilization" && w[1] == "0.3"),
+            "per-model override replaces the global: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__slots_pin_gates_max_num_seqs() {
+        // slots > 0 caps admissions; absent/0 rides vllm's own sizing.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.slots = Some(4);
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-num-seqs" && w[1] == "4"),
+            "slots pin emits: {:?}",
+            p.argv
+        );
+
+        let overlay = DEFAULT_OVERLAY.clone(); // slots: None
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--max-num-seqs".to_string()),
+            "no pin, no flag: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__vllm_extra_args__reserved_refused_and_unknown_refused() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+
+        // Reserved serve pins refuse: blazar owns the quintet + auth.
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.extra_args = Some(vec!["--served-model-name".into(), "evil".into()]);
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+
+        // Unknown-to-this-build flags refuse at compile time, not at
+        // child boot after a multi-GB model load.
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.extra_args = Some(vec!["--no-such-vllm-flag".into()]);
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("not a flag of this vllm build"), "{err}");
+
+        // Advertised extras ride AFTER the knobs (argparse last-wins
+        // lets an extra_args pin override a knob's value).
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.extra_args = Some(vec![
+            "--gpu-memory-utilization".into(),
+            "0.5".into(),
+            "--enable-prefix-caching".into(),
+        ]);
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let i = p
+            .argv
+            .iter()
+            .position(|a| a == "--enable-prefix-caching")
+            .expect("advertised extra rides");
+        let j = p
+            .argv
+            .windows(2)
+            .position(|w| w[0] == "--gpu-memory-utilization" && w[1] == "0.5")
+            .expect("repeated utilization pin rides");
+        assert!(j > 0, "the 0.85 emission stays first; the pin follows");
+        assert!(i > j, "extras ride after knob emissions: {:?}", p.argv);
+    }
+
+    #[test]
+    fn unit__vllm_compile__gguf_refuses_with_llamacpp_teaching() {
+        // GGUF stays on llama.cpp: the error must name the default lane
+        // and a concrete safetensors pull target, not just fail.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let gguf = GgufMeta {
+            architecture: "Qwen2ForCausalLM".into(),
+            ..meta()
+        };
+        let hf = hf_meta();
+        let base = vllm_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let inp = ProfileInput {
+            meta: ModelMeta::Gguf(&gguf),
+            ..base
+        };
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("GGUF"), "{err}");
+        assert!(err.contains("llamacpp"), "{err}");
+        assert!(err.contains("Qwen/Qwen2.5-0.5B-Instruct"), "{err}");
     }
 
     #[test]

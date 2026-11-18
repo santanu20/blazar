@@ -154,9 +154,12 @@ RESERVED: dict[str, list[str]] = {
 # knob_surface(). Kokoro composes its argv inside the lazily-spawned
 # python shim (kokoro-onnx), outside both - its fixture probes flags,
 # but Blazar emits none first-class, and a zero-flag lane is not a valid
-# registry entry.
-LANES_WITHOUT_REGISTRY: set[str] = {"kokoro"}
-
+# registry entry. vLLM is the newest lane: compile_vllm owns a small
+# grammar (--max-model-len, --gpu-memory-utilization, --max-num-seqs)
+# validated at unit tier, and the per-lane registry emission +
+# certification receipts land with the incremental vllm wave - until
+# then every probed vllm flag reports unverified, not passthrough.
+LANES_WITHOUT_REGISTRY: set[str] = {"kokoro", "vllm"}
 # Lanes with NO extra_args surface: argv is composed per call by Blazar,
 # so a non-first-class flag is unreachable, not passthrough. Piper is a
 # one-shot synthesizer spawn (no config knob, no user argv tail).
@@ -165,6 +168,48 @@ LANES_WITHOUT_REGISTRY: set[str] = {"kokoro"}
 # and the synthetic row rides an empty profile, so no user argv tail
 # exists on any model either.
 LANES_WITHOUT_EXTRA_ARGS: set[str] = {"openaihost", "piper"}
+
+# Census surfaces: user-facing inventories that must name every engine
+# lane (EngineKind::ALL in crates/blazar-core/src/engine_kind.rs is the
+# census). A lane missing from one of these was invisible to install
+# menus and docs - the exact drift this gate exists to catch at PR time.
+# Token matchers are deliberately loose (name variants, not semantics):
+# the gate asks "does this surface acknowledge the lane exists".
+CENSUS_LANE_TOKENS: dict[str, str] = {
+    "llamacpp": r"llamacpp|llama\.cpp|llama-server",
+    "mistralrs": r"mistralrs|mistral\.rs",
+    "sglang": r"sglang",
+    "vllm": r"\bvllm\b",
+    "sdcpp": r"sdcpp|sd\.cpp|stable-diffusion\.cpp",
+    "whisper": r"whisper",
+    "piper": r"piper",
+    "kokoro": r"kokoro",
+    "mlx": r"\bmlx\b|mlx-lm",
+    "openaihost": r"openaihost|litert",
+}
+CENSUS_SURFACES: list[str] = [
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    "README.md",
+    "docs/engines.md",
+    "docs/1.SYSTEM_OVERVIEW.md",
+    "docs/9.USAGE.md",
+    "scripts/validate.py",
+    "crates/blazar-cli/src/main.rs",
+]
+# Files that LOOK like lane enumerations but legitimately carry a
+# subset - the reason is the contract; if the reason stops holding,
+# move the file to CENSUS_SURFACES.
+CENSUS_EXEMPT: dict[str, str] = {
+    "scripts/uninstall.sh": (
+        "path-level sweep: engines/ holds every lane wholesale; only "
+        "whisper/ (bin+models) and voices/ (piper) live outside it"
+    ),
+    "docs/4.API_SPEC.md": (
+        "per-route contract: openaihost serves the shared OpenAI "
+        "surface, no lane-specific API row exists by design"
+    ),
+}
 
 # Flags that are not capabilities Blazar could integrate - CLI ergonomics,
 # alternative input surfaces, or long-form aliases of flags the lane
@@ -456,6 +501,11 @@ def render_markdown(
         "- gate: `python3 scripts/engine_coverage.py --check` fails CI when",
         "  the doc drifts from any input. No timestamps - the bytes are",
         "  the contract.",
+        "- census: the same gate also fails when a user-facing inventory",
+        "  surface (install menus, README, engines/usage docs, validate",
+        f"  harness, CLI) stops mentioning any of the {len(CENSUS_LANE_TOKENS)}",
+        "  census lanes - exempt files and their reasons live in",
+        "  CENSUS_EXEMPT.",
         "",
         "| Disposition | Meaning |",
         "|---|---|",
@@ -594,6 +644,19 @@ def cmd_refresh(store: Path) -> int:
     return 0
 
 
+def check_census_surfaces(problems: list[str]) -> None:
+    """Every census surface must acknowledge every lane in the census."""
+    for rel in CENSUS_SURFACES:
+        path = REPO / rel
+        if not path.is_file():
+            problems.append(f"census surface {rel} missing")
+            continue
+        text = path.read_text(errors="replace")
+        for lane, token in CENSUS_LANE_TOKENS.items():
+            if not re.search(token, text, re.IGNORECASE):
+                problems.append(f"census surface {rel} never mentions lane {lane}")
+
+
 def cmd_check() -> int:
     problems: list[str] = []
     try:
@@ -645,7 +708,13 @@ def cmd_check() -> int:
         for p in problems:
             print(f"FAIL {p}", file=sys.stderr)
         return 1
+    check_census_surfaces(problems)
+    if problems:
+        for p in problems:
+            print(f"FAIL {p}", file=sys.stderr)
+        return 1
     print("engine coverage: fixtures, registry and doc are consistent")
+    print(f"engine census: every surface names all {len(CENSUS_LANE_TOKENS)} lanes")
     return 0
 
 

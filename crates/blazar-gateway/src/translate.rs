@@ -1808,7 +1808,7 @@ mod tests {
 
     #[test]
     fn unit__total_duration_fallback__fills_only_when_child_silent() {
-        // Venv lanes (litert, sglang) emit no `timings`: the wall fallback
+        // Venv lanes (litert, sglang, vllm) emit no `timings`: the wall fallback
         // fills total_duration so the ollama shape never reports a lying 0...
         let mut silent = serde_json::json!({"model": "m", "message": {"role": "assistant", "content": "hi"}, "done": true});
         apply_total_duration_fallback(&mut silent, 1_234_000_000);

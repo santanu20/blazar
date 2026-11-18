@@ -5672,6 +5672,9 @@ impl Supervisor {
                 EngineKind::Sglang => {
                     Arc::new(crate::engine_impl::SglangEngine::with_env(manifest, env))
                 }
+                EngineKind::Vllm => {
+                    Arc::new(crate::engine_impl::VllmEngine::with_env(manifest, env))
+                }
                 EngineKind::Mlx => Arc::new(crate::engine_impl::MlxEngine::with_env(manifest, env)),
                 EngineKind::OpenAiHost => Arc::new(crate::engine_impl::OpenAiHostEngine::with_env(
                     manifest, env,

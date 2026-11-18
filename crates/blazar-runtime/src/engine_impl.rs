@@ -1314,6 +1314,39 @@ fn venv_nvidia_lib_dirs(server_path: &str) -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// Prepend the venv's pip CUDA lib dirs (see `venv_nvidia_lib_dirs`)
+/// onto `LD_LIBRARY_PATH` inside `env`. An explicit user `[engine_env]`
+/// `LD_LIBRARY_PATH` keeps its entries - ours prepend so the venv that
+/// owns the binary wins for its own libs; a venv-less layout is a
+/// no-op. Shared by the venv serving lanes (sglang, vllm) whose helper
+/// processes link pip-provided CUDA libraries directly.
+fn prepend_venv_cuda_libs(env: &mut Vec<(String, String)>, server_path: &str) {
+    const LD_LIB: &str = "LD_LIBRARY_PATH";
+    let cuda_dirs = venv_nvidia_lib_dirs(server_path);
+    if cuda_dirs.is_empty() {
+        return;
+    }
+    let user_val = env
+        .iter()
+        .find(|(k, _)| k == LD_LIB)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(LD_LIB).ok())
+        .unwrap_or_default();
+    let ours: Vec<String> = cuda_dirs
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let mut entries = ours;
+    for part in user_val.split(':') {
+        if !part.is_empty() && !entries.iter().any(|e| e == part) {
+            entries.push(part.to_string());
+        }
+    }
+    let merged = entries.join(":");
+    env.retain(|(k, _)| k != LD_LIB);
+    env.push((LD_LIB.to_string(), merged));
+}
+
 #[async_trait]
 impl Engine for SglangEngine {
     fn kind(&self) -> blazar_core::engine_kind::EngineKind {
@@ -1345,36 +1378,12 @@ impl Engine for SglangEngine {
                  child_transport = \"tcp\" in the blazar config"
             ));
         }
+        let mut env: Vec<(String, String)> = self.child_env.clone();
         // Provision the venv's pip CUDA libs onto the linker path before
         // spawning: sglang helper processes link libcudart directly (see
         // `venv_nvidia_lib_dirs`) and there is no ambient
-        // LD_LIBRARY_PATH carrying the venv layout. An explicit user
-        // `[engine_env]` LD_LIBRARY_PATH keeps its entries - ours prepend
-        // so the venv that owns the binary wins for its own libs.
-        let mut env: Vec<(String, String)> = self.child_env.clone();
-        let cuda_dirs = venv_nvidia_lib_dirs(&self.manifest.server_path);
-        if !cuda_dirs.is_empty() {
-            const LD_LIB: &str = "LD_LIBRARY_PATH";
-            let user_val = env
-                .iter()
-                .find(|(k, _)| k == LD_LIB)
-                .map(|(_, v)| v.clone())
-                .or_else(|| std::env::var(LD_LIB).ok())
-                .unwrap_or_default();
-            let ours: Vec<String> = cuda_dirs
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-            let mut entries = ours;
-            for part in user_val.split(':') {
-                if !part.is_empty() && !entries.iter().any(|e| e == part) {
-                    entries.push(part.to_string());
-                }
-            }
-            let merged = entries.join(":");
-            env.retain(|(k, _)| k != LD_LIB);
-            env.push((LD_LIB.to_string(), merged));
-        }
+        // LD_LIBRARY_PATH carrying the venv layout.
+        prepend_venv_cuda_libs(&mut env, &self.manifest.server_path);
         // No --rpc preflight: sglang has no rpc-worker flag surface.
         // spawn_env applies last: a pinned CUDA_VISIBLE_DEVICES pair
         // survives the LD_LIBRARY_PATH surgery above.
@@ -1413,6 +1422,165 @@ impl Engine for SglangEngine {
             // probes/second against a booting scheduler and self-congests
             // the exact responses the poll is waiting for.
             poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+/// vLLM engine: the `vllm-server` venv shim execs the venv's own `vllm`
+/// console script on `serve`, an OpenAI-compatible HTTP server
+/// (`PagedAttention`) for HF safetensors directories. Same lane contract
+/// as the sglang engine it mirrors, with these verified divergences:
+/// - `/health` is a plain readiness endpoint (no generate probe): 200
+///   once the model is loaded; connection-refused while uvicorn is
+///   still binding.
+/// - no unix-socket transport: endpoints are always TCP.
+/// - auth exists upstream (`--api-key`): the supervisor's minted
+///   per-child secret rides the connection quintet like llamacpp.
+/// - no `--list-devices` equivalent; device enumeration unavailable.
+pub struct VllmEngine {
+    pub manifest: crate::engine::manifest::Manifest,
+    /// HTTP client for health polls (children are loopback).
+    http: reqwest::Client,
+    /// Extra env injected into children (config `engine_env`).
+    pub child_env: Vec<(String, String)>,
+}
+
+impl VllmEngine {
+    #[must_use]
+    pub fn new(manifest: crate::engine::manifest::Manifest) -> Self {
+        Self::with_env(manifest, Vec::new())
+    }
+
+    /// `env` pairs apply to every spawned child (config `engine_env`).
+    #[must_use]
+    pub fn with_env(
+        manifest: crate::engine::manifest::Manifest,
+        env: Vec<(String, String)>,
+    ) -> Self {
+        // 5s like the sglang lane: /health here is plain readiness (no
+        // generate probe), but model-load warmup can hold the event
+        // loop briefly - the extra budget costs nothing on loopback.
+        blazar_core::tls::ensure_tls_provider();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("health client");
+        Self {
+            manifest,
+            http,
+            child_env: env,
+        }
+    }
+}
+
+/// vllm connection quintet + compiled profile. The profile argv is
+/// already `vllm serve` grammar (max-model-len, gpu-memory-utilization,
+/// max-num-seqs, ...), so this only PREPENDS what the supervisor owns:
+/// model dir, loopback bind, port, public name. The `serve`
+/// subcommand lives in the `vllm-server` shim itself (it execs
+/// `vllm serve "$@"`), pinning the lane to serving - the console
+/// script's sibling subcommands (chat, complete, bench, ...) are not
+/// reachable through this engine. The per-child `--api-key` secret is
+/// appended by the supervisor's child-auth mint (same choke point as
+/// llamacpp/sglang).
+#[must_use]
+pub fn vllm_argv(
+    model: &blazar_core::ModelRow,
+    profile: &Profile,
+    endpoint: &Endpoint,
+) -> Vec<String> {
+    let port = match endpoint {
+        Endpoint::Tcp { port, .. } => *port,
+        // Supervisor rejects unix endpoints for vllm engines before
+        // argv assembly; a placeholder here cannot produce a valid child.
+        Endpoint::Unix { .. } => 0,
+    };
+    let mut argv = vec![
+        model.path.clone(),
+        // Forced loopback: even with the API key set, the child is not
+        // the public face - the gateway is (same policy as sglang).
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--served-model-name".to_string(),
+        // vLLM has no ':'-syntax assert like sglang's LoRA path, but the
+        // served name must still match the gateway's request-body stamp
+        // exactly - both derive from the same core sanitizer, so the
+        // pair can never diverge.
+        blazar_core::engine_kind::sglang_child_model_name(&model.name),
+    ];
+    argv.extend(profile.argv.iter().cloned());
+    argv
+}
+
+#[async_trait]
+impl Engine for VllmEngine {
+    fn kind(&self) -> blazar_core::engine_kind::EngineKind {
+        blazar_core::engine_kind::EngineKind::Vllm
+    }
+
+    fn capabilities(&self) -> &crate::engine::manifest::Manifest {
+        &self.manifest
+    }
+
+    fn build_argv(
+        &self,
+        model: &blazar_core::ModelRow,
+        profile: &Profile,
+        endpoint: &Endpoint,
+    ) -> Vec<String> {
+        vllm_argv(model, profile, endpoint)
+    }
+
+    async fn spawn(
+        &self,
+        argv: &[String],
+        endpoint: &Endpoint,
+        spawn_env: &[(String, String)],
+    ) -> Result<ChildHandle> {
+        if matches!(endpoint, Endpoint::Unix { .. }) {
+            return Err(anyhow!(
+                "vllm engines have no unix-socket transport; set \
+                 child_transport = \"tcp\" in the blazar config"
+            ));
+        }
+        // Same venv CUDA-lib provisioning as the sglang lane: vllm's
+        // worker processes link the torch wheels' pip-provided CUDA
+        // libraries directly (identical nvidia/<pkg>/lib layout).
+        let mut env: Vec<(String, String)> = self.child_env.clone();
+        prepend_venv_cuda_libs(&mut env, &self.manifest.server_path);
+        spawn_child(&self.manifest.server_path, argv, endpoint, &env, spawn_env)
+    }
+
+    async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {
+        let Endpoint::Tcp { host, port } = endpoint else {
+            return Err(anyhow!("vllm engines require a TCP endpoint"));
+        };
+        let url = format!("http://{host}:{port}");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
+        // Same adaptive poll as the other engines. Readiness = HTTP 200
+        // on /health; connection-refused while uvicorn is still binding
+        // and loading weights is expected startup noise, not failure.
+        // Unlike sglang, /health costs no GPU work (plain readiness, no
+        // generate probe), so the fast-lane 150ms poll cap is safe.
+        let mut poll = std::time::Duration::from_millis(25);
+        loop {
+            if let Ok(resp) = self.http.get(format!("{url}/health")).send().await
+                && resp.status().is_success()
+            {
+                tracing::debug!("vllm healthy at {url} after {:?}", started.elapsed());
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "vllm at {url} did not turn healthy (HTTP 200 on /health) \
+                     within {timeout:?} (model_load_timeout)"
+                ));
+            }
+            tokio::time::sleep(poll).await;
+            poll = std::cmp::min(poll.mul_f64(1.6), std::time::Duration::from_millis(150));
         }
     }
 }
@@ -2497,6 +2665,98 @@ mod tests {
 
     fn mistralrs_flags() -> std::collections::BTreeSet<String> {
         std::collections::BTreeSet::new()
+    }
+
+    fn vllm_row() -> blazar_core::ModelRow {
+        // A colon-bearing name exercises the sanitizer: the served name
+        // and the gateway's body stamp must derive from the same core
+        // fn, so a colon can never leak into the registration.
+        blazar_core::ModelRow {
+            name: "qwen2.5:0.5b".into(),
+            repo: "registry.ollama.ai/library/qwen2.5".into(),
+            quant: "BF16".into(),
+            path: "/store/qwen2.5-0.5b-instruct.d".into(),
+            bytes: 988_000_000,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: Some("Qwen2ForCausalLM".into()),
+            params: None,
+            ctx_train: Some(32_768),
+            pulled_at: 0,
+            last_used_at: 0,
+        }
+    }
+
+    fn vllm_profile(argv: Vec<String>) -> Profile {
+        Profile {
+            argv,
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn unit__vllm_argv__model_leads_quintet_then_profile_knobs() {
+        let row = vllm_row();
+        let profile = vllm_profile(vec![
+            "--max-model-len".into(),
+            "32768".into(),
+            "--gpu-memory-utilization".into(),
+            "0.85".into(),
+        ]);
+        let argv = vllm_argv(
+            &row,
+            &profile,
+            &Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 8123,
+            },
+        );
+        // The supervisor-owned quintet comes first, verbatim - with the
+        // MODEL PATH leading: the vllm-server shim prepends the `serve`
+        // subcommand itself (exec `vllm serve "$@"`), so an argv-level
+        // `serve` token would double up and crash the child with
+        // "unrecognized arguments" (live-proven 2026-11-18).
+        assert_eq!(argv[0], row.path);
+        assert_eq!(argv[1], "--host");
+        assert_eq!(argv[2], "127.0.0.1");
+        assert_eq!(argv[3], "--port");
+        assert_eq!(argv[4], "8123");
+        assert_eq!(argv[5], "--served-model-name");
+        // Sanitized registration name - identical to what the gateway
+        // stamps into request bodies (child_model_stamp). The core
+        // sanitizer maps ':' to "--" (ollama-style tags stay legal).
+        assert_eq!(argv[6], "qwen2.5--0.5b");
+        // Compiled profile knobs ride AFTER the quintet, order intact.
+        assert_eq!(
+            &argv[7..],
+            &[
+                "--max-model-len",
+                "32768",
+                "--gpu-memory-utilization",
+                "0.85"
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__vllm_argv__unix_endpoint_gets_port_zero_placeholder() {
+        // The supervisor rejects unix endpoints for vllm engines before
+        // argv assembly; the placeholder keeps argv assembly total so a
+        // wiring regression surfaces as port 0, not a panic.
+        let argv = vllm_argv(
+            &vllm_row(),
+            &vllm_profile(vec![]),
+            &Endpoint::Unix {
+                socket: "/tmp/blazar-x.sock".into(),
+            },
+        );
+        let i = argv
+            .iter()
+            .position(|a| a == "--port")
+            .expect("--port always present");
+        assert_eq!(argv[i + 1], "0");
     }
 
     #[test]

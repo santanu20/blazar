@@ -996,7 +996,7 @@ enum EngineCmd {
     /// `blazar engine install master-1052-... --kind sdcpp`.
     Update {
         /// Engine lane to update: llamacpp (default) | mistralrs |
-        /// sglang | sdcpp | whisper | piper | mlx | openaihost
+        /// sglang | vllm | sdcpp | whisper | piper | mlx | openaihost
         #[arg(long, default_value = "llamacpp")]
         kind: String,
         tag: Option<String>,
@@ -1036,9 +1036,9 @@ enum EngineCmd {
         /// Exact engine tag (blazar engine list). Mutually exclusive
         /// with --kind.
         tag: Option<String>,
-        /// Engine kind name: llamacpp | mistralrs | sglang | sdcpp |
-        /// whisper | piper | mlx | openaihost - activates the newest
-        /// installed row of that lane. Mutually exclusive with a
+        /// Engine kind name: llamacpp | mistralrs | sglang | vllm |
+        /// sdcpp | whisper | piper | mlx | openaihost - activates the
+        /// newest installed row of that lane. Mutually exclusive with a
         /// positional tag.
         #[arg(long)]
         kind: Option<String>,
@@ -1063,7 +1063,7 @@ enum EngineCmd {
     /// prints them per release, so an `engine update --check`
     /// update-available verdict can be judged before anything
     /// downloads. `PyPI` lanes
-    /// (sglang, mlx, openaihost) teach their version source instead -
+    /// (sglang, vllm, mlx, openaihost) teach their version source instead -
     /// they have no GitHub release notes. llama.cpp b-tags ship without
     /// notes, so that lane reports the build-count gap.
     Changelog {
@@ -1137,20 +1137,22 @@ enum EngineCmd {
         no_gate: bool,
     },
     /// Install + activate an engine lane: mistral.rs (prebuilt upstream
-    /// binary; picks CPU/Metal/CUDA asset from the local GPU + driver)
-    /// or sglang (pip venv lane; Linux + CUDA/ROCm, safetensors models)
+    /// binary; picks CPU/Metal/CUDA asset from the local GPU + driver),
+    /// sglang (pip venv lane; Linux + CUDA/ROCm, safetensors models), or
+    /// vllm (pip venv lane; Linux + CUDA, throughput-first safetensors
+    /// serving)
     ///
     /// These lanes serve HF-style safetensors directories (e.g.
     /// qwen2.5-1.5b-instruct.d) - GGUF files stay on llama.cpp. After
     /// install, `engine use` the tag and restart the daemon to serve
     /// safetensors models.
     Install {
-        /// Engine lane to install: mistralrs | sglang | sdcpp | whisper |
-        /// piper | kokoro | mlx | openaihost (the `LiteRT` venv lane) -
-        /// required; bare `engine install` prints the lane chooser;
-        /// llama.cpp installs ride `engine update` / `engine build`.
-        /// With --lane: build a curated capability lane from the
-        /// registry by id (see `blazar engine offers`).
+        /// Engine lane to install: mistralrs | sglang | vllm | sdcpp |
+        /// whisper | piper | kokoro | mlx | openaihost (the `LiteRT`
+        /// venv lane) - required; bare `engine install` prints the lane
+        /// chooser; llama.cpp installs ride `engine update` /
+        /// `engine build`. With --lane: build a curated capability lane
+        /// from the registry by id (see `blazar engine offers`).
         #[arg(long)]
         kind: Option<String>,
         tag: Option<String>,
@@ -1162,8 +1164,8 @@ enum EngineCmd {
         /// Backend for --lane builds: cuda | cpu (default cpu)
         #[arg(long)]
         backend: Option<String>,
-        /// Extra pip spec layered onto the sglang venv after the base
-        /// install, repeatable (sglang lane only), e.g.
+        /// Extra pip spec layered onto the sglang or vllm venv after
+        /// the base install, repeatable (venv pip lanes only), e.g.
         /// `--with "sglang-dspine @ git+URL"` where URL is the plugin's
         /// git source. Plugin kernels compile at install time against
         /// the venv's pinned CUDA toolchain.
@@ -4434,6 +4436,11 @@ fn engine_offer_line(kind: blazar_core::engine_kind::EngineKind) -> String {
         EngineKind::Sglang => {
             "sglang (~6 GiB, Linux + NVIDIA) - best quality + batching for safetensors".to_string()
         }
+        EngineKind::Vllm => {
+            "vllm (~6-8 GiB, Linux + NVIDIA) - throughput-first OpenAI-native serving for \
+             safetensors (PagedAttention)"
+                .to_string()
+        }
         EngineKind::Mlx => {
             "mlx (~3 GiB, CUDA linux + Apple Silicon) - MLX quant dirs (mlx-community)".to_string()
         }
@@ -4470,6 +4477,7 @@ async fn install_missing_kind(
     use blazar_core::engine_kind::EngineKind;
     match kind {
         EngineKind::Sglang => engine_install_sglang(d, None, &[]).await,
+        EngineKind::Vllm => engine_install_vllm(d, None, &[]).await,
         EngineKind::Mlx => engine_install_mlx(d, None).await,
         EngineKind::OpenAiHost => engine_install_litert(d, None).await,
         EngineKind::MistralRs => engine_install_mistralrs(d, None).await,
@@ -5821,7 +5829,14 @@ fn doctor_engine_retention(
     let keep =
         blazar_runtime::engine::effective_keep_tags(d).unwrap_or(blazar_runtime::engine::KEEP_TAGS);
     let mut over: Vec<String> = Vec::new();
-    for kind in ["llamacpp", "mistralrs", "sglang", "sdcpp", "whisper"] {
+    for kind in [
+        "llamacpp",
+        "mistralrs",
+        "sglang",
+        "vllm",
+        "sdcpp",
+        "whisper",
+    ] {
         let n = engines.iter().filter(|e| e.kind.as_str() == kind).count();
         if n > keep {
             over.push(format!("{kind}: {n} > {keep}"));
@@ -7909,6 +7924,36 @@ async fn live_sglang_currency(active: &str) -> Check {
     }
 }
 
+async fn live_vllm_currency(active: &str) -> Check {
+    let installed_version = active.trim_start_matches("vllm-");
+    match blazar_runtime::engine::vllm_install::pypi_latest_vllm().await {
+        Ok(latest) => {
+            let (inst, want) = (
+                blazar_runtime::engine::sglang_install::version_tuple(installed_version),
+                blazar_runtime::engine::sglang_install::version_tuple(&latest),
+            );
+            if inst >= want {
+                Check::ok(
+                    "engine currency",
+                    format!("up to date ({active}, vllm pip lane)"),
+                )
+            } else {
+                Check::warn(
+                    "engine currency",
+                    format!(
+                        "{latest} available on PyPI (active: {active}) - run: \
+                         blazar engine update --kind vllm {latest}"
+                    ),
+                )
+            }
+        }
+        Err(e) => Check::warn(
+            "engine currency",
+            format!("{active} (vllm pip lane) - PyPI check failed ({e:#}); offline?"),
+        ),
+    }
+}
+
 async fn live_mlx_currency(active: &str) -> Check {
     let installed_version = active.trim_start_matches("mlx-");
     match blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm().await {
@@ -8234,6 +8279,7 @@ fn doctor_versions_name(kind: EngineKind) -> &'static str {
         EngineKind::LlamaCpp => "versions llamacpp",
         EngineKind::MistralRs => "versions mistralrs",
         EngineKind::Sglang => "versions sglang",
+        EngineKind::Vllm => "versions vllm",
         EngineKind::SdCpp => "versions sdcpp",
         EngineKind::Mlx => "versions mlx",
         EngineKind::Whisper => "versions whisper",
@@ -8255,6 +8301,7 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
         EngineKind::LlamaCpp,
         EngineKind::MistralRs,
         EngineKind::Sglang,
+        EngineKind::Vllm,
         EngineKind::SdCpp,
         EngineKind::Mlx,
         // Whisper has its own dedicated currency check; piper and
@@ -8327,6 +8374,7 @@ async fn doctor_engine_versions(d: &BlazarDirs, active_kind: Option<EngineKind>)
         }
         let check = match kind {
             EngineKind::Sglang => live_sglang_currency(&judged.tag).await,
+            EngineKind::Vllm => live_vllm_currency(&judged.tag).await,
             EngineKind::Mlx => live_mlx_currency(&judged.tag).await,
             EngineKind::MistralRs => live_mistralrs_currency(&judged.tag).await,
             EngineKind::SdCpp => live_sdcpp_currency(d, &judged.tag).await,
@@ -8392,6 +8440,9 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
         EngineKind::Sglang => blazar_runtime::engine::sglang_install::pypi_latest_sglang()
             .await
             .ok(),
+        EngineKind::Vllm => blazar_runtime::engine::vllm_install::pypi_latest_vllm()
+            .await
+            .ok(),
         EngineKind::Mlx => blazar_runtime::engine::mlx_install::pypi_latest_mlx_lm()
             .await
             .ok(),
@@ -8418,7 +8469,10 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
                 // never reach this GitHub-releases block; listed so a
                 // future EngineKind is a compile error here until it
                 // picks a source.
-                EngineKind::Sglang | EngineKind::Mlx | EngineKind::OpenAiHost => {
+                EngineKind::Sglang
+                | EngineKind::Mlx
+                | EngineKind::OpenAiHost
+                | EngineKind::Vllm => {
                     unreachable!("pip lanes resolve in their own arms above")
                 }
                 EngineKind::Kokoro => {
@@ -9693,6 +9747,9 @@ async fn serve() -> Result<()> {
         blazar_core::engine_kind::EngineKind::Sglang => {
             Arc::new(blazar_runtime::SglangEngine::with_env(manifest, engine_env))
         }
+        blazar_core::engine_kind::EngineKind::Vllm => {
+            Arc::new(blazar_runtime::VllmEngine::with_env(manifest, engine_env))
+        }
         blazar_core::engine_kind::EngineKind::Mlx => {
             Arc::new(blazar_runtime::MlxEngine::with_env(manifest, engine_env))
         }
@@ -9725,6 +9782,7 @@ async fn serve() -> Result<()> {
                 blazar_core::engine_kind::EngineKind::LlamaCpp
                 | blazar_core::engine_kind::EngineKind::MistralRs
                 | blazar_core::engine_kind::EngineKind::Sglang
+                | blazar_core::engine_kind::EngineKind::Vllm
                 | blazar_core::engine_kind::EngineKind::SdCpp
                 | blazar_core::engine_kind::EngineKind::Mlx
                 | blazar_core::engine_kind::EngineKind::OpenAiHost => {
@@ -19906,6 +19964,15 @@ fn mlx_hint_families() -> Vec<&'static str> {
     ]
 }
 
+/// vLLM knob-hint family lines - same lockstep contract as the sglang
+/// family: every `VllmTuning` field appears exactly once, example values
+/// survive `Config::from_toml` validation, comments carry no ` = `.
+fn vllm_hint_families() -> Vec<&'static str> {
+    vec![
+        "gpu_memory_utilization = 0.85    # fraction of GPU memory vllm may claim; lower it when sharing the GPU",
+    ]
+}
+
 fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag: &str) -> String {
     use blazar_core::engine_kind::EngineKind;
     let mut out: Vec<String> = vec![format!(
@@ -19915,6 +19982,7 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
         EngineKind::LlamaCpp => "llama-server",
         EngineKind::MistralRs => "mistral.rs",
         EngineKind::Sglang => "sglang",
+        EngineKind::Vllm => "vllm",
         EngineKind::Mlx => "mlx-lm",
         EngineKind::OpenAiHost => "litert-lm",
         EngineKind::SdCpp => "sd-server",
@@ -19949,6 +20017,10 @@ fn knob_hint_block(model: &str, kind: blazar_core::engine_kind::EngineKind, tag:
     } else {
         let table_families = match kind {
             EngineKind::Sglang => Some(("sglang", sglang_hint_families())),
+            // vLLM lane knobs ride the [vllm] table (VllmTuning): GPU
+            // memory fraction first - the shared-GPU pin; the profile
+            // compiler owns context/sequence caps from the model rows.
+            EngineKind::Vllm => Some(("vllm", vllm_hint_families())),
             EngineKind::MistralRs => Some((
                 "mistralrs",
                 vec![
@@ -20666,6 +20738,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 match engine_kind {
                     EngineKind::LlamaCpp => engine_update(&d, tag, no_gate, check).await?,
                     EngineKind::Sglang => engine_update_sglang(&d, tag, check).await?,
+                    EngineKind::Vllm => engine_update_vllm(&d, tag, check).await?,
                     EngineKind::Mlx => engine_update_mlx(&d, tag, check).await?,
                     EngineKind::MistralRs => engine_update_mistralrs(&d, tag, check).await?,
                     EngineKind::SdCpp => engine_update_sdcpp(&d, tag, check).await?,
@@ -20991,6 +21064,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                      llama.cpp         GGUF files - blazar engine update (prebuilt) or blazar engine build cuda (source)\n  \
                      --kind mistralrs  HF safetensors dirs - prebuilt mistral.rs server\n  \
                      --kind sglang     HF safetensors dirs - pip venv (Linux + CUDA/ROCm)\n  \
+                     --kind vllm       HF safetensors dirs - pip venv, throughput-first (Linux + CUDA)\n  \
                      --kind mlx        MLX quant dirs (mlx-community) - pip venv (CUDA linux + Apple Silicon)\n  \
                      --kind sdcpp      diffusion GGUF component sets - prebuilt sd-server (Vulkan/CPU/Metal)\n  \
                      --kind whisper    audio transcription/translation - prebuilt whisper-server (CPU)\n  \
@@ -21013,6 +21087,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                     engine_install_mistralrs(&d, tag).await?;
                 }
                 EngineKind::Sglang => engine_install_sglang(&d, tag, &with).await?,
+                EngineKind::Vllm => engine_install_vllm(&d, tag, &with).await?,
                 EngineKind::Mlx => {
                     if !with.is_empty() {
                         return Err(anyhow!(
@@ -21745,7 +21820,7 @@ async fn engine_changelog(d: &BlazarDirs, kind: &str, max: usize) -> Result<()> 
         EngineKind::Whisper => blazar_runtime::engine::gh::WHISPER_REPO,
         EngineKind::Piper => blazar_runtime::engine::gh::PIPER_REPO,
         EngineKind::Kokoro => blazar_runtime::engine::gh::KOKORO_ONNX_REPO,
-        EngineKind::Sglang | EngineKind::Mlx | EngineKind::OpenAiHost => {
+        EngineKind::Sglang | EngineKind::Mlx | EngineKind::OpenAiHost | EngineKind::Vllm => {
             anyhow::bail!(
                 "the {kind} lane versions from PyPI, not GitHub releases - \
                  `blazar engine update --kind {kind} --check` reports its currency"
@@ -21933,6 +22008,134 @@ async fn engine_install_sglang(
         dim_line("next: pull a safetensors model (e.g. blazar pull Qwen/Qwen2.5-0.5B-Instruct)")
     );
     restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
+    Ok(())
+}
+
+/// `blazar engine install --kind vllm [version] [--with SPEC]...` -
+/// pip venv lane (Linux + CUDA), the same shape as the sglang lane.
+/// Multi-GB download: torch rides the venv. The F7 decode-regression
+/// gate is llama-server-only: skipped, and SAID so - llama-bench cannot
+/// drive a vllm child.
+async fn engine_install_vllm(
+    d: &BlazarDirs,
+    version: Option<String>,
+    with: &[String],
+) -> Result<()> {
+    let mgr = local_engine_manager(d)?;
+    let prior_active = Store::open(d)?.active_engine()?.map(|r| r.tag);
+    let extras_note = if with.is_empty() {
+        String::new()
+    } else {
+        format!(" + {} extra pkg(s)", with.len())
+    };
+    if let Some(v) = &version {
+        println!(
+            "{}",
+            dim_line(&format!(
+                "installing vllm {v}{extras_note} (pip venv lane - multi-GB download incl. torch)"
+            ))
+        );
+    } else {
+        println!(
+            "{}",
+            dim_line(&format!(
+                "installing vllm{extras_note} (pip venv lane - multi-GB download incl. torch)"
+            ))
+        );
+    }
+    let row = mgr.install_vllm(version.as_deref(), with).await?;
+    let m: blazar_runtime::Manifest = serde_json::from_str(&row.manifest)?;
+    println!(
+        "engine {} active ({} flags probed, build {})",
+        row.tag,
+        m.flags.len(),
+        m.build_number
+    );
+    println!(
+        "{}",
+        dim_line("note: decode-regression gate is llama-server-only - skipped for vllm engines")
+    );
+    // Same one-build-per-lane contract as the llama-server update: the
+    // superseded vllm venvs (multi-GB each) are freed on a successful
+    // install/activate.
+    for (tag, bytes) in mgr.prune_siblings(EngineKind::Vllm.as_str(), &row.tag)? {
+        // fs sizes fit i64
+        #[allow(clippy::cast_possible_wrap)]
+        let freed = bytes as i64;
+        println!(
+            "removed superseded engine {} (freed {})",
+            tag,
+            humansize(freed)
+        );
+    }
+    println!(
+        "{}",
+        dim_line("next: pull a safetensors model (e.g. blazar pull Qwen/Qwen2.5-0.5B-Instruct)")
+    );
+    restart_daemon_if_active_changed(prior_active, row.active.then(|| row.tag.clone())).await;
+    Ok(())
+}
+
+/// `engine update --kind vllm [version]` - explicit version installs
+/// directly; bare call resolves the `PyPI` latest and installs it, the
+/// same lane semantics as sglang. `--check` stays a dry-run currency
+/// report.
+async fn engine_update_vllm(d: &BlazarDirs, version: Option<String>, check: bool) -> Result<()> {
+    if version.is_some() && !check {
+        return engine_install_vllm(d, version, &[]).await;
+    }
+    if check && let Some(v) = &version {
+        println!("--check ignores the version pin (drop --check to install vllm {v})");
+    }
+    let store = Store::open(d)?;
+    let installed = store
+        .list_engines()?
+        .into_iter()
+        .filter(|e| e.kind == EngineKind::Vllm)
+        .max_by_key(|e| {
+            blazar_runtime::engine::sglang_install::version_tuple(e.tag.trim_start_matches("vllm-"))
+                .unwrap_or((0, 0, 0))
+        })
+        .map(|e| e.tag.trim_start_matches("vllm-").to_string());
+    let Some(installed) = installed else {
+        return Err(anyhow!(
+            "no vllm engine installed - `blazar engine install --kind vllm` first"
+        ));
+    };
+    let latest = match blazar_runtime::engine::vllm_install::pypi_latest_vllm().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("vllm {installed} installed; cannot check PyPI right now: {e:#}");
+            return Ok(());
+        }
+    };
+    match (
+        blazar_runtime::engine::sglang_install::version_tuple(&installed),
+        blazar_runtime::engine::sglang_install::version_tuple(&latest),
+    ) {
+        (Some(a), Some(b)) if b > a => {
+            if check {
+                println!(
+                    "{}",
+                    dim_line(&format!(
+                        "dry-run: vllm {installed} installed; {latest} is available on PyPI."
+                    ))
+                );
+            } else {
+                println!("vllm {installed} installed; updating to {latest} from PyPI.");
+                engine_install_vllm(d, Some(latest), &[]).await?;
+            }
+        }
+        _ => {
+            if check {
+                println!(
+                    "{}",
+                    dim_line("dry-run: nothing installed, nothing written")
+                );
+            }
+            println!("vllm {installed} is current (PyPI latest: {latest}).");
+        }
+    }
     Ok(())
 }
 
@@ -22406,6 +22609,7 @@ async fn engine_update_all(d: &BlazarDirs, no_gate: bool, check: bool) -> Result
         let result = match kind {
             EngineKind::LlamaCpp => engine_update(d, None, no_gate, check).await,
             EngineKind::Sglang => engine_update_sglang(d, None, check).await,
+            EngineKind::Vllm => engine_update_vllm(d, None, check).await,
             EngineKind::Mlx => engine_update_mlx(d, None, check).await,
             EngineKind::MistralRs => engine_update_mistralrs(d, None, check).await,
             EngineKind::SdCpp => engine_update_sdcpp(d, None, check).await,
@@ -26363,7 +26567,8 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                     }
                     None => Err(anyhow!(
                         "unknown config key: {key} (tuning knobs live under \
-                         [sglang], [mistralrs] and [model_overrides.<model>])"
+                         [sglang], [vllm], [mistralrs], [mlx] and \
+                         [model_overrides.<model>])"
                     )),
                 };
             }

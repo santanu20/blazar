@@ -52,11 +52,11 @@ Blazar is a **local AI gateway and runtime orchestrator** in one Rust binary. Ap
                     │ Engine lifecycle  │
                     └─────────┬─────────┘
                               │
-      ┌───────────┬───────────┴───────────┬───────────┐
-      │           │           │           │           │
-        llama.cpp  mistral.rs    SGLang        MLX
-      │           │           │           │           │
-      └────────────── Text / Embeddings ──────────────┘
+      ┌───────────┬───────────┴───────────┬───────────┬───────────┐
+      │           │           │           │           │           │
+        llama.cpp  mistral.rs  SGLang      vLLM        MLX
+      │           │           │           │           │           │
+      └─────────────────── Text / Embeddings ──────────────────┘
                               │
                  ┌────────────┼─────────────┐
                  │            │             │
@@ -72,7 +72,7 @@ The engines still perform inference. **Blazar is the control plane around them**
 | If you need | Blazar provides |
 |---|---|
 | Apps speaking OpenAI, Ollama, **and** Anthropic | All three dialects natively, one gateway |
-| Different models on different runtimes | Capability-aware lanes across llama.cpp, mistral.rs, SGLang, MLX, sd.cpp, whisper.cpp, piper, Kokoro, LiteRT-LM |
+| Different models on different runtimes | Capability-aware lanes across llama.cpp, mistral.rs, SGLang, vLLM, MLX, sd.cpp, whisper.cpp, piper, Kokoro, LiteRT-LM |
 | GPU memory and context under control | VRAM/KV fit planning, slots, admission, co-residency, lifecycle |
 | Long work that survives restarts | Durable jobs, request cancel/interrupt, restart-safe response chains (SQLite) |
 | Engines that update without breaking | Side-by-side versioned installs, regression gates, rollback |
@@ -223,6 +223,7 @@ If you only need one model, one runtime, and one process, a direct engine server
 | **llama.cpp** | Mainstream local text serving | GGUF and quantized local models |
 | **mistral.rs** | Alternative text runtime | Supported GGUF and safetensors models |
 | **SGLang** | Safetensors-oriented serving | AWQ, GPTQ, FP8 safetensors models |
+| **vLLM** | Throughput-first OpenAI-native serving | HF safetensors directories (PagedAttention) |
 | **MLX** | Apple-Silicon and CUDA-backed serving | MLX quantized model directories (mlx-community) |
 | **stable-diffusion.cpp** | Media generation | Diffusion images and video |
 | **whisper.cpp** | Speech recognition | Transcription and translation |
@@ -478,7 +479,7 @@ This README is the product entry point; depth lives in dedicated documents. The 
 
 Blazar is an orchestration layer built on upstream open-source projects:
 
-- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) | [SGLang](https://github.com/sgl-project/sglang) | [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | [piper](https://github.com/rhasspy/piper) | [Kokoro](https://github.com/hexgrad/kokoro) (neural TTS voices via kokoro-onnx) | [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)
+- Inference runtimes: [llama.cpp](https://github.com/ggml-org/llama.cpp) | [mistral.rs](https://github.com/EricLBuehler/mistral.rs) | [SGLang](https://github.com/sgl-project/sglang) | [vLLM](https://github.com/vllm-project/vllm) | [MLX](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) | [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | [piper](https://github.com/rhasspy/piper) | [Kokoro](https://github.com/hexgrad/kokoro) (neural TTS voices via kokoro-onnx) | [LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)
 - Models and architectures: [Silero VAD](https://github.com/snakers4/silero-vad) (speech detection for streaming audio) | [ModernBERT](https://github.com/AnswerDotAI/modernbert) (the System One decision-model family rides ModernBERT-architecture GGUFs)
 
 Those projects provide the inference runtimes. Model weights remain subject to their publishers' licenses and distribution terms.

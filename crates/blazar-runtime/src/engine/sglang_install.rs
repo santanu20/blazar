@@ -122,13 +122,10 @@ pub(crate) async fn run_streaming(
     for t in tasks {
         let _ = t.await;
     }
-    let status = tokio::time::timeout(
-        std::time::Duration::from_secs(SGLANG_INSTALL_TIMEOUT_SECS),
-        child.wait(),
-    )
-    .await
-    .with_context(|| format!("{what} exceeded {timeout_secs}s"))?
-    .with_context(|| format!("wait {what}"))?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), child.wait())
+        .await
+        .with_context(|| format!("{what} exceeded {timeout_secs}s"))?
+        .with_context(|| format!("wait {what}"))?;
     if !status.success() {
         anyhow::bail!("{what} exited {status}");
     }
@@ -416,7 +413,7 @@ fn wrapper_script(
 /// PTX), and the compilation runtime. Empty when `cuda` is not a
 /// `X.Y[.Z]` numeric line (cpu-only torch or an unexpected shape):
 /// there is nothing coherent to pin against.
-fn torch_cuda_pin_specs(cuda: &str) -> Vec<String> {
+pub(crate) fn torch_cuda_pin_specs(cuda: &str) -> Vec<String> {
     let mut parts = cuda.trim().split('.');
     let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
         return Vec::new();
@@ -436,10 +433,11 @@ fn torch_cuda_pin_specs(cuda: &str) -> Vec<String> {
 }
 
 /// Re-resolve the CUDA compiler dists onto torch's own CUDA line after
-/// the sglang install (see the call site for the defect this prevents).
+/// a venv-lane install (sglang, vllm - see the call sites for the defect
+/// this prevents).
 /// A cpu-only/unreadable torch build skips the pin with a warning - the
 /// JIT has no bundled compiler to keep coherent in that case.
-async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<()> {
+pub(crate) async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<()> {
     let probe = tokio::process::Command::new(venv_python)
         .arg("-c")
         .arg("import torch; print(torch.version.cuda or '')")
@@ -493,7 +491,7 @@ async fn pin_jit_compiler_to_torch(venv_python: &Path, use_uv: bool) -> Result<(
 /// import while the compiler sat one directory over (live incident
 /// 2026-09-27: sglang-0.5.19 + torch 2.13 cu13 wheels, spawn 502s from
 /// `cuda_home is None` and a rope JIT death).
-fn bundled_cuda_toolkit_root(venv: &Path) -> Option<PathBuf> {
+pub(crate) fn bundled_cuda_toolkit_root(venv: &Path) -> Option<PathBuf> {
     let lib = std::fs::read_dir(venv.join("lib")).ok()?;
     let python_dir = lib
         .filter_map(std::result::Result::ok)
@@ -547,7 +545,7 @@ fn bundled_cuda_toolkit_root(venv: &Path) -> Option<PathBuf> {
 /// toolkit carries: `lib64 -> lib` and `libcudart.so -> libcudart.so.N`.
 /// Best-effort with a warn: failure leaves the deterministic JIT link
 /// error visible at spawn instead of masking it here.
-fn ensure_dev_toolkit_layout(root: &Path) {
+pub(crate) fn ensure_dev_toolkit_layout(root: &Path) {
     #[cfg(unix)]
     {
         let lib = root.join("lib");

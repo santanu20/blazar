@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 268 fields, 0 dead
+## Config (top-level keys) - 269 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -271,6 +271,7 @@ token quality are surfaced as drift.
 | whisper_vad_min_speech_duration_ms | - | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1081`; recipe preset `:1388` |
 | whisper_vad_min_silence_duration_ms | - | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1084`; recipe preset `:1389` |
 | mlx | MlxTuning::default() | other + engine-argv | `crates/blazar-core/src/profile.rs:4239` in `compile_mlx` (per-model override merged via `MlxTuning::effective`) |
+| vllm | VllmTuning::default() | other + engine-argv | `crates/blazar-core/src/profile.rs:4899` in `compile_vllm` (per-model override merged via `VllmTuning::effective`; forked at `:289` in `compile`) |
 | sdcpp_control_net | - | engine-argv | `crates/blazar-core/src/profile.rs:3477` (knob table -> `--control-net`) |
 | sdcpp_ip_adapter | - | engine-argv | `crates/blazar-core/src/profile.rs:3482` (-> `--ip-adapters`) |
 | sdcpp_clip_vision | - | engine-argv | `crates/blazar-core/src/profile.rs:3487` (-> `--clip-vision`) |
@@ -426,7 +427,7 @@ token quality are surfaced as drift.
 | enable_tf32_matmul | - | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
 
-## ModelOverride ([models."name"]) - 48 fields, 0 dead
+## ModelOverride ([models."name"]) - 49 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -479,6 +480,7 @@ token quality are surfaced as drift.
 | warm_on_pull | - | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs:6036` in effective `warm_on_pull` (per-model wins) |
 | tensor_split | - | engine-argv + runtime/gateway | `crates/blazar-core/src/config.rs` in `effective_tensor_split` (per-model wins; empty = inherit global; also feeds the auto tensor-split stand-down gates in `crates/blazar-runtime/src/supervisor.rs`) |
 | mlx | - | engine-argv | `crates/blazar-core/src/profile.rs:4239` in `compile_mlx` (`MlxTuning::effective(input.overlay.mlx.as_ref(), &input.config.mlx)`) |
+| vllm | - | engine-argv | `crates/blazar-core/src/profile.rs:4899` in `compile_vllm` (`VllmTuning::effective(input.overlay.vllm.as_ref(), &input.config.vllm)`) |
 
 ## SamplerDefaults ([sampler]) - 18 fields, 0 dead
 

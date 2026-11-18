@@ -7724,6 +7724,33 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
             "soft_skip": [],
             "note": "extra_args surface is flag-validated per mlx-lm build - spine asserted only",
         }
+    if kind == "vllm":
+        # VllmTuning: the profile compiler ALWAYS emits
+        # --gpu-memory-utilization (upstream default 0.90 starves GPU
+        # co-tenants). The validate box shares one 12 GiB card with a
+        # co-tenant daemon, so the cell pins the co-tenant-safe 0.3 -
+        # also a live proof that the knob reaches the child argv
+        # verbatim. override ctx maps to --max-model-len (exact pair,
+        # same posture as the other safetensors lanes), and the
+        # served-model-name pin must carry the gateway's ':' -> '--'
+        # sanitization (a bare ':' name would 404 divergent-model
+        # requests downstream).
+        return {
+            "cfg": {"vllm": {"gpu_memory_utilization": 0.3}},
+            "override": {"ctx": 8192},
+            "pairs": [
+                ("--max-model-len", "8192"),
+                ("--gpu-memory-utilization", "0.3"),
+                (
+                    "--served-model-name",
+                    str(model_row.get("name") or "").replace(":", "--"),
+                ),
+            ],
+            "presence": [],
+            "soft_pairs": [],
+            "soft_skip": [],
+            "note": "",
+        }
     # llamacpp: the full knob matrix is phase knobs_argv's lane. ctx is
     # pinned (same posture as every other text lane) so the tool
     # battery's accumulated retry context cannot outrun the row's
@@ -8590,11 +8617,15 @@ def phase_engines() -> None:
         t for t, k in kinds_by_tag.items() if k == "mistralrs" and t != "v0.9.5"
     )
     mrs_pin = mrs_tags[-1] if mrs_tags else "v0.9.5"
+    # One picker call feeds both safetensors-dir lanes (sglang, vllm):
+    # the same HF directory fixture serves either child.
+    sf_row = _eng_pick_safetensors_dir(rows, tools_pass)
     text_lanes = [
         # (kind, pin value written into model_overrides, model row, load budget s)
         ("llamacpp", None, gguf, 300),
         ("mistralrs", mrs_pin, gguf, 300),
-        ("sglang", "sglang", _eng_pick_safetensors_dir(rows, tools_pass), 420),
+        ("sglang", "sglang", sf_row, 420),
+        ("vllm", "vllm", sf_row, 420),
         ("mlx", "mlx", _eng_pick_mlx(rows, tools_pass), 300),
     ]
     try:
@@ -8718,7 +8749,23 @@ def phase_engines() -> None:
                     done and "data:" in collected,
                     collected[-160:].replace("\n", " "),
                 )
-                _eng_tool_battery(kind, model)
+                if kind == "vllm":
+                    # vLLM's OpenAI server refuses tool requests unless
+                    # launched with --enable-auto-tool-choice + a parser
+                    # (hermes/qwen/etc.), and the v0 lane compiles none
+                    # of those flags yet - the forced-choice battery
+                    # would probe a surface the child honestly refuses.
+                    # Tool calling certifies in the incremental vllm
+                    # wave (flag + parser + battery together).
+                    boundary(
+                        ph,
+                        "tool battery",
+                        "vllm tool calling (--enable-auto-tool-choice + "
+                        "parser) is the incremental-certification wave - "
+                        "v0 lane ships plain chat, json_schema, SSE",
+                    )
+                else:
+                    _eng_tool_battery(kind, model)
                 if kind == "llamacpp":
                     _eng_forced_choice_note(kind, model)
                 _eng_no_tools_clean(kind, model)
