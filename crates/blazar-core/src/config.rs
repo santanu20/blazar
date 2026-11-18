@@ -6835,6 +6835,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unit__capability_lane_auto_install__disabled_by_default() {
+        assert!(
+            !Config::default().capability_lane_auto_install,
+            "building third-party engine source must require explicit opt-in"
+        );
+    }
+
+    #[test]
     fn unit__boot_extra_args__structure_validated_and_reserved_deferred_to_compile() {
         // Config layer enforces shape only (non-empty trimmed tokens,
         // flag-first); engine pins + manifest gating are the profile
