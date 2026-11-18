@@ -7135,7 +7135,7 @@ impl Supervisor {
                             let argv_snapshot = argv.clone();
                             let endpoint = endpoint.clone();
                             let secret = auth.as_ref().map(|a| a.secret.clone());
-                            let _task = tokio::spawn(async move {
+                            tokio::spawn(async move {
                                 warm_peg_child(
                                     &model_name,
                                     &argv_snapshot,
@@ -7715,7 +7715,7 @@ drop them from rpc_servers in config.toml",
         let registry_url = cfg.capability_registry_url.clone();
         let architecture = arch.to_string();
         let selected_lane = lane_id.to_string();
-        tokio::spawn(async move {
+        let _task = tokio::spawn(async move {
             let _permit = permit;
             let result = async {
                 let token = std::env::var("GH_TOKEN")
