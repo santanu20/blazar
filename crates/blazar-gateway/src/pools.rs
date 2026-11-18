@@ -535,6 +535,64 @@ pub fn windows_from_persisted(
     (req, hits)
 }
 
+/// Local-member model strings across every pool (deduped) - the
+/// candidates whose affinity entries die when that model's row
+/// unloads. Remote members are out of scope: a peer's eviction is
+/// invisible here, and the TTL (120 s) reaps those entries anyway.
+#[must_use]
+pub fn local_member_strings(pools: &[ModelPool]) -> Vec<String> {
+    let mut out: Vec<String> = pools
+        .iter()
+        .flat_map(|p| p.members.iter().filter(|m| m.peer == "local"))
+        .map(|m| m.model.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Drop affinity openers whose recorded member is one of `owned`
+/// (local member strings that resolved to the evicted row). Pure
+/// filter over a cloned snapshot - callers pass the lock's contents.
+#[must_use]
+#[allow(clippy::implicit_hasher)] // mirrors the AppState map type verbatim
+pub fn affinity_keys_dropping_for(
+    entries: &HashMap<String, (String, std::time::Instant)>,
+    owned: &[String],
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(_, (eff, _))| owned.iter().any(|m| m == eff))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Notify pool affinity that a local model row just unloaded: every
+/// opener steered toward a member of that row loses its bonus - the
+/// KV cache that made the member preferable is gone. Store resolution
+/// runs BEFORE taking the affinity lock (no lock inversion).
+pub fn on_model_evicted(state: &crate::state::AppState, row: &str) {
+    let candidates = local_member_strings(&state.cfg().model_pools);
+    let owned: Vec<String> = state
+        .with_store(|s| {
+            candidates
+                .iter()
+                .filter(|m| crate::proxy::resolve_model(s, m).is_ok_and(|r| r.name == row))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if owned.is_empty() {
+        return;
+    }
+    if let Ok(mut aff) = state.pools_affinity.lock() {
+        let drop_keys = affinity_keys_dropping_for(&aff, &owned);
+        for k in drop_keys {
+            aff.remove(&k);
+        }
+    }
+}
+
 /// Key under which a member's [`MemberOps`] live.
 #[must_use]
 pub fn ops_key(pool: &str, effective: &str) -> String {
@@ -2095,6 +2153,45 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(members[0].score.est_wait_ms, 1500);
+    }
+
+    /// Local-member collection: dedupes across pools and ignores
+    /// remote members - only local rows can be eviction-matched.
+    #[test]
+    fn unit__local_member_strings__local_only_and_deduped() {
+        let pools = vec![
+            ModelPool {
+                name: "a".into(),
+                strategy: PoolStrategy::Ordered,
+                members: vec![member("local", "m1"), member("far", "m1")],
+            },
+            ModelPool {
+                name: "b".into(),
+                strategy: PoolStrategy::Ordered,
+                members: vec![member("local", "m1"), member("local", "m2")],
+            },
+        ];
+        let got = local_member_strings(&pools);
+        assert_eq!(got, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    /// The eviction filter: only openers recorded against an owned
+    /// member string drop; everything else (other members, unowned
+    /// keys) survives untouched.
+    #[test]
+    fn unit__affinity_keys_dropping_for__owned_only() {
+        let now = Instant::now();
+        let mut entries = HashMap::new();
+        entries.insert("svc:h1".to_string(), ("m1".to_string(), now));
+        entries.insert("svc:h2".to_string(), ("far:m1".to_string(), now));
+        entries.insert("other:h3".to_string(), ("m1".to_string(), now));
+        let owned = vec!["m1".to_string()];
+        let mut drop_keys = affinity_keys_dropping_for(&entries, &owned);
+        drop_keys.sort();
+        assert_eq!(
+            drop_keys,
+            vec!["other:h3".to_string(), "svc:h1".to_string()]
+        );
     }
 
     /// The decay blend itself: fresh observations pass through, the

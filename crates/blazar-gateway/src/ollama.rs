@@ -1091,11 +1091,14 @@ async fn unload_ping(state: &Arc<AppState>, model: &str, chat_shape: bool) -> Re
             std::time::Duration::from_secs(state.cfg().session_keep_secs),
         )
         .live;
-    if !pinned && let Err(e) = state.sup.evict_model(&row.name).await {
-        tracing::warn!(
-            "idle-recycle evict failed for {}: {e}; idle evictor will retry",
-            row.name
-        );
+    if !pinned {
+        match state.sup.evict_model(&row.name).await {
+            Ok(()) => crate::pools::on_model_evicted(state, &row.name),
+            Err(e) => tracing::warn!(
+                "idle-recycle evict failed for {}: {e}; idle evictor will retry",
+                row.name
+            ),
+        }
     }
     let body = if chat_shape {
         serde_json::json!({
@@ -1777,11 +1780,13 @@ pub async fn chat(
                         std::time::Duration::from_secs(state2.cfg().session_keep_secs),
                     )
                     .live
-                && let Err(e) = state2.sup.evict_model(&model_name).await
             {
-                tracing::warn!(
-                    "keep-alive-0 evict failed for {model_name}: {e}; idle evictor will retry"
-                );
+                match state2.sup.evict_model(&model_name).await {
+                    Ok(()) => crate::pools::on_model_evicted(&state2, &model_name),
+                    Err(e) => tracing::warn!(
+                        "keep-alive-0 evict failed for {model_name}: {e}; idle evictor will retry"
+                    ),
+                }
             }
             resp
         })
@@ -4032,7 +4037,10 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
         .send()
         .await
         {
-            Ok(r) if r.status().is_success() => axum::Json(json!({"status": "ok"})).into_response(),
+            Ok(r) if r.status().is_success() => {
+                crate::pools::on_model_evicted(&state, &key);
+                axum::Json(json!({"status": "ok"})).into_response()
+            }
             Ok(r) => {
                 let code = r.status().as_u16();
                 let text = r.text().await.unwrap_or_default();
@@ -4042,7 +4050,10 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
         };
     }
     match state.sup.evict_model(&key).await {
-        Ok(()) => axum::Json(json!({"status": "ok"})).into_response(),
+        Ok(()) => {
+            crate::pools::on_model_evicted(&state, &key);
+            axum::Json(json!({"status": "ok"})).into_response()
+        }
         Err(e) => api_error(404, &e.to_string()),
     }
 }
@@ -4082,12 +4093,15 @@ async fn evict_unresolved(state: &Arc<AppState>, model: &str, store_msg: &str) -
     });
     if let Some(base) = live_base {
         return match state.sup.evict_model(&base).await {
-            Ok(()) => axum::Json(json!({
-                "status": "ok",
-                "lane": "supervised",
-                "model": base,
-            }))
-            .into_response(),
+            Ok(()) => {
+                crate::pools::on_model_evicted(state, &base);
+                axum::Json(json!({
+                    "status": "ok",
+                    "lane": "supervised",
+                    "model": base,
+                }))
+                .into_response()
+            }
             Err(e) => api_error(500, &format!("evict {base}: {e}")),
         };
     }

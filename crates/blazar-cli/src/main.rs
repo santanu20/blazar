@@ -14150,9 +14150,10 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
     match action {
         Some(PoolAction::Status {
             json,
+            prom,
             watch,
             interval_secs,
-        }) => pool_status(json, watch, interval_secs).await,
+        }) => pool_status(json, prom, watch, interval_secs).await,
         Some(PoolAction::Watch { interval_secs }) => pool_watch(interval_secs).await,
         Some(PoolAction::Drain {
             pool,
@@ -14214,8 +14215,13 @@ async fn pool_cmd(action: Option<PoolAction>) -> Result<()> {
 /// pool's current decision, member states (drained/pinned/down,
 /// warm/cold), affinity steering, and local engine residency, from
 /// `GET /api/pools` + `GET /api/ps`.
-async fn pool_status(json: bool, watch: bool, interval_secs: u64) -> Result<()> {
+async fn pool_status(json: bool, prom: bool, watch: bool, interval_secs: u64) -> Result<()> {
     let base = ensure_daemon().await?;
+    if prom {
+        let (pools, ps) = status_fetch(&base).await?;
+        print!("{}", render_prom(&pools, ps.as_ref()));
+        return Ok(());
+    }
     if json {
         // Raw JSON is a one-shot dump; watching bytes stream is curl's
         // job, not a card renderer's. The stamp lets a scraper tell a
@@ -14276,6 +14282,81 @@ async fn pool_status(json: bool, watch: bool, interval_secs: u64) -> Result<()> 
     let (pools, ps) = status_fetch(&base).await?;
     render_status_card(&pools, ps.as_ref());
     Ok(())
+}
+
+/// Prometheus text exposition of the fleet status: one gauge family
+/// per pool (member/down/drained/pinned counts, steering totals and
+/// rolling rate, affinity keys) plus per-member health and the engine
+/// residency panel. Label values are escaped defensively; anything
+/// the daemon did not report is simply omitted (Prometheus treats a
+/// missing series as "unknown", which is the honest answer).
+fn render_prom(pools: &serde_json::Value, ps: Option<&serde_json::Value>) -> String {
+    fn esc(v: &str) -> String {
+        v.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+    let mut out = String::new();
+    let empty = serde_json::json!([]);
+    let pool_list = pools["pools"]
+        .as_array()
+        .unwrap_or(empty.as_array().unwrap());
+    for p in pool_list {
+        let name = p["model"].as_str().unwrap_or("unknown");
+        let strategy = p["pool"]["strategy"].as_str().unwrap_or("unknown");
+        let members = p["pool"]["members"].as_array().cloned().unwrap_or_default();
+        let (down, drained, pinned): (u64, u64, u64) =
+            members.iter().fold((0, 0, 0), |(d, dr, pn), m| {
+                (
+                    d + u64::from(m["down"].as_bool().unwrap_or(false)),
+                    dr + u64::from(m["drained"].as_bool().unwrap_or(false)),
+                    pn + u64::from(m["pinned"].as_bool().unwrap_or(false)),
+                )
+            });
+        let labels = format!(r#"pool="{}",strategy="{}""#, esc(name), esc(strategy));
+        let _ = writeln!(
+            out,
+            "# HELP blazar_pool_members Configured members per pool.\n# TYPE blazar_pool_members gauge\nblazar_pool_members{{{labels}}} {}\n\n# HELP blazar_pool_members_unhealthy Members currently down, drained or pinned.\n# TYPE blazar_pool_members_unhealthy gauge\nblazar_pool_members_down{{{labels}}} {down}\nblazar_pool_members_drained{{{labels}}} {drained}\nblazar_pool_members_pinned{{{labels}}} {pinned}\n\n# HELP blazar_pool_steer_requests_total Pool requests routed since daemon start.\n# TYPE blazar_pool_steer_requests_total counter\nblazar_pool_steer_requests_total{{pool=\"{}\"}} {}\n\n# HELP blazar_pool_steer_hits_total Requests steered to the member holding their opener's prefix KV.\n# TYPE blazar_pool_steer_hits_total counter\nblazar_pool_steer_hits_total{{pool=\"{}\"}} {}\n\n# HELP blazar_pool_steer_hit_rate_percent Rolling steering hit rate over the daemon-side window.\n# TYPE blazar_pool_steer_hit_rate_percent gauge\nblazar_pool_steer_hit_rate_percent{{pool=\"{}\"}} {}\n\n# HELP blazar_pool_affinity_live_keys Live cache-affinity opener keys.\n# TYPE blazar_pool_affinity_live_keys gauge\nblazar_pool_affinity_live_keys{{pool=\"{}\"}} {}\n",
+            members.len(),
+            esc(name),
+            p["pool"]["affinity"]["requests"].as_u64().unwrap_or(0),
+            esc(name),
+            members
+                .iter()
+                .map(|m| m["affinity_hits"].as_u64().unwrap_or(0))
+                .sum::<u64>(),
+            esc(name),
+            p["pool"]["affinity"]["hit_rate_pct"]
+                .as_f64()
+                .unwrap_or(0.0),
+            esc(name),
+            p["pool"]["affinity"]["live_keys"].as_u64().unwrap_or(0),
+        );
+        for m in &members {
+            let member = m["effective"].as_str().unwrap_or("unknown");
+            let mlabels = format!(r#"pool="{}",member="{}""#, esc(name), esc(member));
+            if m["down"].as_bool().unwrap_or(false) {
+                let _ = writeln!(
+                    out,
+                    "# TYPE blazar_pool_member_down gauge\nblazar_pool_member_down{{{mlabels}}} 1\nblazar_pool_member_retry_in_secs{{{mlabels}}} {}\n",
+                    m["retry_in_secs"].as_u64().unwrap_or(0),
+                );
+            }
+        }
+    }
+    if let Some(ps) = ps {
+        let models = ps["models"].as_array().cloned().unwrap_or_default();
+        let in_flight: u64 = models
+            .iter()
+            .map(|m| m["blazar_in_flight"].as_u64().unwrap_or(0))
+            .sum();
+        let _ = writeln!(
+            out,
+            "\n# HELP blazar_engines_resident Resident engine instances.\n# TYPE blazar_engines_resident gauge\nblazar_engines_resident {}\n\n# HELP blazar_in_flight Requests currently generating across engines.\n# TYPE blazar_in_flight gauge\nblazar_in_flight {in_flight}\n",
+            models.len(),
+        );
+    }
+    out
 }
 
 /// Fetch both status panels: the pools rollup (required) and the ps
@@ -15356,6 +15437,11 @@ enum PoolAction {
         /// Print the raw pools + ps JSON instead of the card
         #[arg(long)]
         json: bool,
+        /// Print the fleet status as Prometheus text exposition
+        /// (gauges per pool/member + engine residency) for a
+        /// node_exporter-style textfile or a curl | grep pipeline
+        #[arg(long, conflicts_with = "json")]
+        prom: bool,
         /// Keep refreshing the card until Ctrl-C (like `pool watch`,
         /// but over the whole fleet view)
         #[arg(long)]
@@ -30583,6 +30669,40 @@ mod tests {
         let row = out2.lines().nth(1).unwrap();
         assert!(row.contains("имя-модели-очень-длинное"));
         assert!(row.contains("..."), "oversized arch must cap: {row}");
+    }
+
+    #[test]
+    fn unit__render_prom__emits_pool_and_engine_series() {
+        let pools = serde_json::json!({
+            "pools": [{
+                "model": "svc",
+                "pool": {
+                    "strategy": "Adaptive",
+                    "members": [
+                        {"effective": "m1", "down": false, "drained": false,
+                         "pinned": false, "affinity_hits": 2},
+                        {"effective": "far:m1", "down": true, "drained": false,
+                         "pinned": false, "affinity_hits": 0,
+                         "retry_in_secs": 8}
+                    ],
+                    "affinity": {"requests": 4, "hit_rate_pct": 50.0,
+                                 "live_keys": 1}
+                },
+                "decision": {"target": "m1", "reason": "r"}
+            }]
+        });
+        let ps = serde_json::json!({
+            "models": [{"name": "m1", "blazar_in_flight": 1}]
+        });
+        let text = render_prom(&pools, Some(&ps));
+        assert!(text.contains(r#"blazar_pool_members{pool="svc",strategy="Adaptive"} 2"#));
+        assert!(text.contains(r#"blazar_pool_members_down{pool="svc",strategy="Adaptive"} 1"#));
+        assert!(text.contains(r#"blazar_pool_steer_requests_total{pool="svc"} 4"#));
+        assert!(text.contains(r#"blazar_pool_steer_hits_total{pool="svc"} 2"#));
+        assert!(text.contains(r#"blazar_pool_steer_hit_rate_percent{pool="svc"} 50"#));
+        assert!(text.contains(r#"blazar_pool_member_retry_in_secs{pool="svc",member="far:m1"} 8"#));
+        assert!(text.contains("blazar_engines_resident 1"));
+        assert!(text.contains("blazar_in_flight 1"));
     }
 
     #[test]
