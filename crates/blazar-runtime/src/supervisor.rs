@@ -2366,6 +2366,16 @@ pub struct Supervisor {
     /// written into the user's config behind their back (an explicit
     /// `model_overrides.<model>.engine` pin always wins over this map).
     capability_pins: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Architectures currently being installed from the curated registry.
+    /// Shared with detached build tasks so concurrent model requests cannot
+    /// queue duplicate compiles for the same architecture.
+    auto_installing_arches: Arc<DashMap<String, ()>>,
+    /// Failed auto-builds are cooled down per architecture to prevent every
+    /// subsequent request from launching the same known-broken compile.
+    auto_install_failures: Arc<DashMap<String, Instant>>,
+    /// Only one registry-triggered source build runs at a time. Each build
+    /// is also capped to four compiler jobs by EngineManager.
+    auto_install_semaphore: Arc<tokio::sync::Semaphore>,
     pub config: ConfigHandle,
     /// (`mtime_ms`, size) of the config file at the last APPLIED reload.
     /// Shared by the watcher and the manual endpoint so a file saved
@@ -2739,6 +2749,9 @@ impl Supervisor {
             ubatch_gov: DashMap::new(),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
+            auto_installing_arches: Arc::new(DashMap::new()),
+            auto_install_failures: Arc::new(DashMap::new()),
+            auto_install_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             measured: std::sync::Mutex::new(MeasuredTick::default()),
             census_cache: std::sync::Mutex::new(None),
             autotune_advise_at: std::sync::Mutex::new(None),
@@ -7404,8 +7417,18 @@ impl Supervisor {
                     // Registry offer (bounded, fail-open): a curated lane
                     // published for exactly this architecture turns the
                     // dead-end into an actionable install command.
-                    if let Some(offer) = self.registry_offer(&arch).await {
+                    if let Some(lane) = self.registry_offer(&arch).await {
+                        let offer = Self::format_lane_offer(&lane);
                         let _ = write!(msg, "\n{offer}");
+                        // Never override a model's explicit engine pin. The
+                        // auto-install feature is intentionally opt-in and
+                        // only consumes lanes advertised by this registry.
+                        if !forced_lane && overlay.engine.is_none()
+                            && let Some(started) =
+                                self.schedule_curated_auto_install(&arch, &lane.id)
+                        {
+                            let _ = write!(msg, "\n{started}");
+                        }
                     }
                 }
                 return Err(SupervisionError::EngineCrashed(msg));
@@ -7612,7 +7635,10 @@ drop them from rpc_servers in config.toml",
     /// Ask the capability registry for a curated lane serving `arch`
     /// (bounded by the fetch's own timeout, fail-open on every error -
     /// an unreachable registry must never delay or fail a spawn).
-    async fn registry_offer(&self, arch: &str) -> Option<String> {
+    async fn registry_offer(
+        &self,
+        arch: &str,
+    ) -> Option<crate::engine::capability_registry::RegistryLane> {
         let url = crate::engine::capability_registry::resolve_registry_url(
             self.cfg().capability_registry_url.as_deref(),
         )?;
@@ -7626,13 +7652,123 @@ drop them from rpc_servers in config.toml",
         };
         let lane = crate::engine::capability_registry::offers_for_arch(&lanes, arch)
             .into_iter()
-            .next()?;
+            .next()?
+            .clone();
         tracing::warn!(
             architecture = %arch,
             lane = %lane.id,
             "capability registry offers a curated lane for this architecture"
         );
-        Some(Self::format_lane_offer(lane))
+        Some(lane)
+    }
+
+    /// Schedule one opt-in registry build after a real unknown-architecture
+    /// crash. This never delays the request's failure response: clients are
+    /// told to retry after the detached build has finished. Registry data is
+    /// re-fetched and validated by EngineManager immediately before checkout.
+    fn schedule_curated_auto_install(&self, arch: &str, lane_id: &str) -> Option<String> {
+        let cfg = self.cfg();
+        if !cfg.capability_lane_auto_install {
+            return None;
+        }
+
+        if self.auto_installing_arches.contains_key(arch) {
+            return Some(format!(
+                "automatic installation for architecture '{arch}' is already running; retry after it completes"
+            ));
+        }
+        if self
+            .auto_install_failures
+            .get(arch)
+            .is_some_and(|failed_at| failed_at.elapsed() < Duration::from_secs(600))
+        {
+            return Some(format!(
+                "automatic installation for architecture '{arch}' recently failed; inspect daemon logs or retry explicitly with 'blazar engine install --lane {lane_id}'"
+            ));
+        }
+        let permit = match Arc::clone(&self.auto_install_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Some(
+                    "another automatic engine build is running; this architecture was not queued - retry after that build completes"
+                        .to_string(),
+                );
+            }
+        };
+        match self.auto_installing_arches.entry(arch.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                drop(permit);
+                return Some(format!(
+                    "automatic installation for architecture '{arch}' is already running; retry after it completes"
+                ));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(());
+            }
+        }
+
+        let active = Arc::clone(&self.auto_installing_arches);
+        let failures = Arc::clone(&self.auto_install_failures);
+        let dirs = self.dirs.clone();
+        let bus = self.bus.clone();
+        let registry_url = cfg.capability_registry_url.clone();
+        let architecture = arch.to_string();
+        let selected_lane = lane_id.to_string();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = async {
+                let token = std::env::var("GH_TOKEN")
+                    .ok()
+                    .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+                let gh = crate::engine::gh::GhClient::new(token)?;
+                let manager = crate::engine::EngineManager {
+                    dirs,
+                    gh,
+                    bus,
+                    asset_override: "auto".to_string(),
+                };
+                let mut progress = |line: &str| {
+                    tracing::info!(
+                        architecture = %architecture,
+                        lane = %selected_lane,
+                        "{line}"
+                    );
+                };
+                manager
+                    .install_curated_lane_for_arch(
+                        &architecture,
+                        &selected_lane,
+                        registry_url.as_deref(),
+                        &mut progress,
+                    )
+                    .await
+            }
+            .await;
+            match result {
+                Ok(row) => {
+                    failures.remove(&architecture);
+                    tracing::info!(
+                        architecture = %architecture,
+                        lane = %selected_lane,
+                        engine = %row.tag,
+                        "curated capability lane installed; retry the model request to route through it"
+                    );
+                }
+                Err(error) => {
+                    failures.insert(architecture.clone(), Instant::now());
+                    tracing::warn!(
+                        architecture = %architecture,
+                        lane = %selected_lane,
+                        error = %error,
+                        "automatic curated capability-lane installation failed; use the explicit engine install command or inspect the build logs"
+                    );
+                }
+            }
+            active.remove(&architecture);
+        });
+        Some(format!(
+            "automatic installation of curated lane '{lane_id}' for architecture '{arch}' started in the background; this request is not held open - retry after the build completes"
+        ))
     }
 
     /// Teaching line for a registry lane that advertises a missing
