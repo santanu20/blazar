@@ -7425,6 +7425,8 @@ impl Supervisor {
                         // only consumes lanes advertised by this registry.
                         if !forced_lane
                             && overlay.engine.is_none()
+                            && self.cfg().engine_routing.mode
+                                == blazar_core::config::RoutingMode::Auto
                             && let Some(started) =
                                 self.schedule_curated_auto_install(&arch, &lane.id)
                         {
