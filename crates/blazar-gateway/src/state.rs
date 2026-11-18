@@ -313,10 +313,17 @@ pub struct AppState {
         >,
     >,
     /// Timestamped steering hits per pool - the numerator of the
-    /// rolling rate, same window and cap as `pools_req_window`.
+    /// rolling rate, same window and cap as `pools_req_window`. Each
+    /// event carries the member it steered to, so per-member trends
+    /// split out of the same events.
+    #[allow(clippy::type_complexity)]
+    // one tagged deque; a type alias would hide the member-tag shape
     pub pools_hit_window: std::sync::Arc<
         std::sync::Mutex<
-            std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+            std::collections::HashMap<
+                String,
+                std::collections::VecDeque<(std::time::Instant, String)>,
+            >,
         >,
     >,
     /// E4 audit: line sender (`None` = audit off; no request-path tax

@@ -104,6 +104,76 @@ pub(crate) fn window_count(
     q.len() as u64
 }
 
+/// Record one member-tagged steering hit (same pruning and cap as
+/// [`window_push`]; the tag enables per-member trend splits).
+pub(crate) fn window_push_tagged(
+    map: &mut std::collections::HashMap<String, std::collections::VecDeque<(Instant, String)>>,
+    pool: &str,
+    member: &str,
+    now: Instant,
+) {
+    let q = map.entry(pool.to_string()).or_default();
+    q.push_back((now, member.to_string()));
+    while let Some((front, _)) = q.front()
+        && now.duration_since(*front) >= STEER_WINDOW
+    {
+        q.pop_front();
+    }
+    while q.len() > STEER_WINDOW_CAP {
+        q.pop_front();
+    }
+}
+
+/// Live tagged-event count for a pool's rolling window (prunes by the
+/// event timestamp, ignores the member tag).
+pub(crate) fn window_count_tagged(
+    map: &mut std::collections::HashMap<String, std::collections::VecDeque<(Instant, String)>>,
+    pool: &str,
+    now: Instant,
+) -> u64 {
+    let Some(q) = map.get_mut(pool) else { return 0 };
+    while let Some((front, _)) = q.front()
+        && now.duration_since(*front) >= STEER_WINDOW
+    {
+        q.pop_front();
+    }
+    q.len() as u64
+}
+
+/// Per-member steering hit history: the same 15-bucket slicing as
+/// [`window_history`] but counting only events steered to `member`.
+/// Unknown members (or none yet) read as all zeros.
+#[allow(clippy::cast_possible_truncation)] // bucket index math, always < 15
+pub(crate) fn member_hit_history(
+    hit_map: &mut std::collections::HashMap<String, std::collections::VecDeque<(Instant, String)>>,
+    pool: &str,
+    member: &str,
+    now: Instant,
+) -> Vec<u64> {
+    let bucket_secs = STEER_WINDOW.as_secs() / STEER_HISTORY_BUCKETS;
+    let mut out = vec![0u64; STEER_HISTORY_BUCKETS as usize];
+    let Some(q) = hit_map.get_mut(pool) else {
+        return out;
+    };
+    while let Some((front, _)) = q.front()
+        && now.duration_since(*front) >= STEER_WINDOW
+    {
+        q.pop_front();
+    }
+    for (t, m) in q.iter() {
+        if m != member {
+            continue;
+        }
+        let elapsed = now.duration_since(*t).as_secs();
+        if let Some(idx) = (STEER_HISTORY_BUCKETS - 1).checked_sub(elapsed / bucket_secs.max(1))
+            && let Some(slot) = out.get_mut(idx as usize)
+        {
+            *slot += 1;
+        }
+    }
+    out
+}
+
 /// Per-bucket steering history for one pool: the rolling window sliced
 /// into [`STEER_HISTORY_BUCKETS`] equal spans (20s each), oldest
 /// bucket first, as `(requests, hits)` counts. This is what the CLI
@@ -112,43 +182,63 @@ pub(crate) fn window_count(
 #[allow(clippy::cast_possible_truncation)] // bucket index math, always < 15
 pub(crate) fn window_history(
     req_map: &mut std::collections::HashMap<String, std::collections::VecDeque<Instant>>,
-    hit_map: &mut std::collections::HashMap<String, std::collections::VecDeque<Instant>>,
+    hit_map: &mut std::collections::HashMap<String, std::collections::VecDeque<(Instant, String)>>,
     pool: &str,
     now: Instant,
 ) -> Vec<(u64, u64)> {
     let bucket_secs = STEER_WINDOW.as_secs() / STEER_HISTORY_BUCKETS;
     let mut out = vec![(0u64, 0u64); STEER_HISTORY_BUCKETS as usize];
-    let bucketize = |q: &mut std::collections::VecDeque<Instant>,
-                     slot: &mut [(u64, u64)],
-                     hits: bool| {
-        while let Some(front) = q.front()
-            && now.duration_since(*front) >= STEER_WINDOW
-        {
-            q.pop_front();
-        }
-        for t in q.iter() {
-            let elapsed = now.duration_since(*t).as_secs();
-            // Newest events land in the LAST bucket; anything older
-            // than the window (only possible for a caller-built queue,
-            // pruning keeps real ones clean) is skipped, not wrapped.
-            if let Some(idx) = (STEER_HISTORY_BUCKETS - 1).checked_sub(elapsed / bucket_secs.max(1))
-                && let Some(slot) = slot.get_mut(idx as usize)
+    {
+        if let Some(q) = req_map.get_mut(pool) {
+            while let Some(front) = q.front()
+                && now.duration_since(*front) >= STEER_WINDOW
             {
-                if hits {
-                    slot.1 += 1;
-                } else {
+                q.pop_front();
+            }
+            for t in q.iter() {
+                let elapsed = now.duration_since(*t).as_secs();
+                // Newest events land in the LAST bucket; anything older
+                // than the window (only possible for a caller-built queue,
+                // pruning keeps real ones clean) is skipped, not wrapped.
+                if let Some(idx) =
+                    (STEER_HISTORY_BUCKETS - 1).checked_sub(elapsed / bucket_secs.max(1))
+                    && let Some(slot) = out.get_mut(idx as usize)
+                {
                     slot.0 += 1;
                 }
             }
         }
-    };
-    if let Some(q) = req_map.get_mut(pool) {
-        bucketize(q, &mut out, false);
     }
-    if let Some(q) = hit_map.get_mut(pool) {
-        bucketize(q, &mut out, true);
-    }
+    bucketize_hits(hit_map, pool, now, bucket_secs, &mut out);
     out
+}
+
+/// Hit half of [`window_history`]: member-tagged events, counted
+/// member-agnostically so the pool trend stays the sum of its parts.
+#[allow(clippy::cast_possible_truncation)] // bucket index math, always < 15
+fn bucketize_hits(
+    hit_map: &mut std::collections::HashMap<String, std::collections::VecDeque<(Instant, String)>>,
+    pool: &str,
+    now: Instant,
+    bucket_secs: u64,
+    out: &mut [(u64, u64)],
+) {
+    let Some(q) = hit_map.get_mut(pool) else {
+        return;
+    };
+    while let Some((front, _)) = q.front()
+        && now.duration_since(*front) >= STEER_WINDOW
+    {
+        q.pop_front();
+    }
+    for (t, _) in q.iter() {
+        let elapsed = now.duration_since(*t).as_secs();
+        if let Some(idx) = (STEER_HISTORY_BUCKETS - 1).checked_sub(elapsed / bucket_secs.max(1))
+            && let Some(slot) = out.get_mut(idx as usize)
+        {
+            slot.1 += 1;
+        }
+    }
 }
 /// Bound on tracked prompt prefixes per gateway (memory hygiene);
 /// expired entries are dropped first, a still-full map is cleared.
@@ -854,7 +944,7 @@ pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option
             *hits.entry(ops_key(&pool.name, &effective)).or_insert(0) += 1;
         }
         if let Ok(mut win) = state.pools_hit_window.lock() {
-            window_push(&mut win, &pool.name, Instant::now());
+            window_push_tagged(&mut win, &pool.name, &effective, Instant::now());
         }
     }
     let rewritten = remotes::rewrite_model(body.clone(), &effective);
@@ -922,10 +1012,9 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
         .pools_req_window
         .lock()
         .map_or(0, |mut w| window_count(&mut w, &pool.name, steer_now));
-    let window_hits = state
-        .pools_hit_window
-        .lock()
-        .map_or(0, |mut w| window_count(&mut w, &pool.name, steer_now));
+    let window_hits = state.pools_hit_window.lock().map_or(0, |mut w| {
+        window_count_tagged(&mut w, &pool.name, steer_now)
+    });
     let steer_rate = if window_req > 0 {
         #[allow(clippy::cast_precision_loss)] // advisory percent, 0.1 resolution
         let pct = window_hits as f64 / window_req as f64 * 100.0;
@@ -935,20 +1024,40 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
     };
     // Sparkline history: the same rolling window sliced into equal
     // buckets (oldest first). Fixed lock order (requests, then hits)
-    // - this is the only site that holds both guards.
-    let history: Vec<serde_json::Value> =
-        match (state.pools_req_window.lock(), state.pools_hit_window.lock()) {
-            (Ok(mut reqs), Ok(mut hits)) => {
-                window_history(&mut reqs, &mut hits, &pool.name, steer_now)
-                    .into_iter()
-                    .map(|(reqs, hits)| serde_json::json!({ "reqs": reqs, "hits": hits }))
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+    // - this is the only site that holds both guards. The per-member
+    // hit trends come out of the same dual-lock so each member's
+    // `hit_history` slices only its own steering events.
+    let (history, member_trends): (
+        Vec<serde_json::Value>,
+        std::collections::HashMap<String, Vec<u64>>,
+    ) = match (state.pools_req_window.lock(), state.pools_hit_window.lock()) {
+        (Ok(mut reqs), Ok(mut hits)) => {
+            let history = window_history(&mut reqs, &mut hits, &pool.name, steer_now)
+                .into_iter()
+                .map(|(reqs, hits)| serde_json::json!({ "reqs": reqs, "hits": hits }))
+                .collect();
+            let trends = members
+                .iter()
+                .map(|m| {
+                    (
+                        m.effective.clone(),
+                        member_hit_history(&mut hits, &pool.name, &m.effective, steer_now),
+                    )
+                })
+                .collect();
+            (history, trends)
+        }
+        _ => (Vec::new(), std::collections::HashMap::new()),
+    };
     let member_lines: Vec<serde_json::Value> = members
         .iter()
         .map(|m| {
+            // Per-member trend ships only when this member actually
+            // steered something in the window - silent members keep
+            // the payload lean.
+            let hit_history = member_trends
+                .get(&m.effective)
+                .filter(|h| h.iter().any(|&n| n > 0));
             serde_json::json!({
                 "peer": pool.members[m.idx].peer,
                 "model": pool.members[m.idx].model,
@@ -971,6 +1080,7 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
                     .get(&ops_key(&pool.name, &m.effective))
                     .copied()
                     .unwrap_or(0),
+                "hit_history": hit_history,
                 "affinity_freshest_ms": affinity_live
                     .iter()
                     .filter(|(eff, _)| *eff == m.effective)
@@ -2003,9 +2113,12 @@ mod tests {
         );
         hits.insert(
             "svc".to_string(),
-            [age(STEER_WINDOW.as_secs() + 50), age(25)]
-                .into_iter()
-                .collect(),
+            [
+                (age(STEER_WINDOW.as_secs() + 50), "m1".to_string()),
+                (age(25), "far:m1".to_string()),
+            ]
+            .into_iter()
+            .collect(),
         );
         let h = window_history(&mut reqs, &mut hits, "svc", now);
         assert_eq!(h.len(), STEER_HISTORY_BUCKETS as usize);
@@ -2024,6 +2137,15 @@ mod tests {
         // Unknown pool: fifteen silent buckets, no panic.
         let silent = window_history(&mut reqs, &mut hits, "nonesuch", now);
         assert!(silent.iter().all(|&(r, x)| r == 0 && x == 0));
+
+        // Per-member split: the same events bucket per member, so the
+        // pool trend is exactly the sum of its member trends.
+        let m1 = member_hit_history(&mut hits, "svc", "m1", now);
+        let far = member_hit_history(&mut hits, "svc", "far:m1", now);
+        assert!(m1.iter().all(|&n| n == 0), "m1 steered nothing here");
+        assert_eq!(far[prev], 1, "the age-25 hit belongs to far:m1 alone");
+        let unknown = member_hit_history(&mut hits, "svc", "ghost", now);
+        assert!(unknown.iter().all(|&n| n == 0));
     }
 
     /// `find()` is exact-match and prefix-safe.

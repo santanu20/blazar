@@ -875,6 +875,11 @@ async fn client__model_pool__local_member_stamps_service_ewma() {
         (Some(2), Some(1)),
         "newest bucket holds both routed chats and the one steering hit: {route}"
     );
+    let member_hist = route["pool"]["members"][0]["hit_history"].as_array();
+    assert!(
+        member_hist.is_some_and(|h| h.len() == 15 && h[14].as_u64() == Some(1)),
+        "the steered-to member carries its own per-member trend with the hit in the newest bucket: {route}"
+    );
     assert!(
         route["pool"]["members"][0]["service_ms"]
             .as_u64()

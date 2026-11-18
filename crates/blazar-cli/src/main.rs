@@ -14235,13 +14235,42 @@ async fn pool_status(json: bool, watch: bool, interval_secs: u64) -> Result<()> 
         return Ok(());
     }
     if watch {
-        let interval = std::time::Duration::from_secs(interval_secs.max(1));
-        println!("refreshing every {interval_secs}s - Ctrl-C to stop");
+        let base_interval = interval_secs.max(1);
+        println!("refreshing every {base_interval}s - Ctrl-C to stop");
         loop {
             let (pools, ps) = status_fetch(&base).await?;
             print!("\x1b[2J\x1b[1;1H");
             render_status_card(&pools, ps.as_ref());
-            tokio::time::sleep(interval).await;
+            // Pressure fast-lane: live traffic or an unhealthy member
+            // is exactly when a stale card misleads - drop to 1s until
+            // it clears, else honor the configured cadence. The
+            // effective rate rides the card so the operator can see
+            // the lane change.
+            let in_flight = ps
+                .as_ref()
+                .and_then(|p| p["models"].as_array())
+                .map_or(0, |rows| {
+                    rows.iter()
+                        .map(|r| r["blazar_in_flight"].as_u64().unwrap_or(0))
+                        .sum::<u64>()
+                });
+            let unhealthy = pools["pools"].as_array().is_some_and(|list| {
+                list.iter().any(|p| {
+                    p["pool"]["members"].as_array().is_some_and(|ms| {
+                        ms.iter().any(|m| {
+                            m["down"].as_bool().unwrap_or(false)
+                                || m["drained"].as_bool().unwrap_or(false)
+                        })
+                    })
+                })
+            });
+            let effective = if in_flight > 0 || unhealthy {
+                1
+            } else {
+                base_interval
+            };
+            println!("(refreshing every {effective}s)");
+            tokio::time::sleep(std::time::Duration::from_secs(effective)).await;
         }
     }
     let (pools, ps) = status_fetch(&base).await?;
@@ -14361,9 +14390,51 @@ fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>)
             if !blocks.is_empty() {
                 println!("    trend   {blocks}");
             }
+            // Per-member steering trends: the same window split by the
+            // member each request actually steered to (the server
+            // omits members that steered nothing in-window). These are
+            // volume-scaled, not rate-scaled - a tall bar means
+            // "traffic landed on this member".
+            for m in &members {
+                let Some(hist) = m["hit_history"].as_array() else {
+                    continue;
+                };
+                let max = hist
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .max()
+                    .unwrap_or(0);
+                let blocks: String = hist
+                    .iter()
+                    .map(|b| member_cell(b.as_u64().unwrap_or(0), max))
+                    .collect();
+                println!(
+                    "    trend   {} {blocks}",
+                    m["effective"].as_str().unwrap_or("?")
+                );
+            }
         }
     }
 }
+
+/// One sparkline cell for a per-member hit bucket: volume-scaled to
+/// the member's own busiest bucket; a quiet bucket is a gap dot.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)] // advisory glyph pick
+fn member_cell(count: u64, max: u64) -> char {
+    if count == 0 || max == 0 {
+        return '\u{00b7}'; // middle dot: no traffic landed here
+    }
+    SPARK_LEVELS[(((count as f64 / max as f64) * 7.0).round() as usize).min(7)]
+}
+
+/// Shared 8-level block scale for sparkline glyphs (low to high).
+const SPARK_LEVELS: [char; 8] = [
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+];
 
 /// One sparkline cell for a steering-history bucket: the 8-level
 /// block scale for a measured rate, a middle dot for a quiet bucket
@@ -14378,11 +14449,7 @@ fn sparkline_cell(reqs: u64, hits: u64) -> char {
         return '\u{00b7}'; // middle dot: quiet bucket
     }
     let ratio = hits as f64 / reqs as f64;
-    let levels = [
-        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
-        '\u{2588}',
-    ];
-    levels[((ratio * 7.0).round() as usize).min(7)]
+    SPARK_LEVELS[((ratio * 7.0).round() as usize).min(7)]
 }
 
 /// Fetch `GET /api/pools` (admin bearer attaches once keys exist) and
