@@ -7135,7 +7135,7 @@ impl Supervisor {
                             let argv_snapshot = argv.clone();
                             let endpoint = endpoint.clone();
                             let secret = auth.as_ref().map(|a| a.secret.clone());
-                            tokio::spawn(async move {
+                            let _task = tokio::spawn(async move {
                                 warm_peg_child(
                                     &model_name,
                                     &argv_snapshot,
@@ -7666,6 +7666,7 @@ drop them from rpc_servers in config.toml",
     /// crash. This never delays the request's failure response: clients are
     /// told to retry after the detached build has finished. Registry data is
     /// re-fetched and validated by EngineManager immediately before checkout.
+    #[allow(clippy::too_many_lines)] // one bounded detached-task lifecycle, kept next to its scheduling policy
     fn schedule_curated_auto_install(&self, arch: &str, lane_id: &str) -> Option<String> {
         let cfg = self.cfg();
         if !cfg.capability_lane_auto_install {
@@ -7746,7 +7747,7 @@ drop them from rpc_servers in config.toml",
             .await;
             match result {
                 Ok(row) => {
-                    failures.remove(&architecture);
+                    let _ = failures.remove(&architecture);
                     tracing::info!(
                         architecture = %architecture,
                         lane = %selected_lane,
@@ -7764,7 +7765,7 @@ drop them from rpc_servers in config.toml",
                     );
                 }
             }
-            active.remove(&architecture);
+            let _ = active.remove(&architecture);
         });
         Some(format!(
             "automatic installation of curated lane '{lane_id}' for architecture '{arch}' started in the background; this request is not held open - retry after the build completes"
