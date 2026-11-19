@@ -327,6 +327,10 @@ pub enum CodecLane {
     /// block files back into a slot-save bank the llama.cpp server
     /// restores natively.
     VllmToLlamaCpp,
+    /// mlx-lm lane -> vLLM HF lane: reads an official mlx-lm
+    /// `--prompt-cache-file` safetensors export and lands it in the vLLM
+    /// fs tier.
+    MlxToVllm,
 }
 
 impl CodecLane {
@@ -336,6 +340,7 @@ impl CodecLane {
         match self {
             Self::LlamaCppToVllm => "llama.cpp -> vllm",
             Self::VllmToLlamaCpp => "vllm -> llama.cpp",
+            Self::MlxToVllm => "mlx -> vllm",
         }
     }
 }
@@ -347,10 +352,447 @@ impl CodecLane {
 #[must_use]
 pub fn admitted_pairs(cfg: &TranslationSection) -> Vec<CodecLane> {
     if cfg.enabled {
-        vec![CodecLane::LlamaCppToVllm, CodecLane::VllmToLlamaCpp]
+        vec![
+            CodecLane::LlamaCppToVllm,
+            CodecLane::VllmToLlamaCpp,
+            CodecLane::MlxToVllm,
+        ]
     } else {
         Vec::new()
     }
+}
+
+/// What the mlx-lm cache reader found, for reporting and provenance.
+#[derive(Debug)]
+pub struct MlxCacheReport {
+    /// Exact model path recorded in the file metadata (`0.model`).
+    pub model_path: Option<String>,
+    /// Number of per-layer caches found (tensor tree `{i}.0`/`{i}.1`).
+    pub layers: u32,
+    /// Used token count (the per-layer `offset` scalars, `{i}.2`).
+    pub cells: u32,
+    /// Element dtype of the stored tensors, `f16` or `bf16`.
+    pub source_dtype: &'static str,
+    /// Whether rows were numerically converted bf16 -> f16 on the way in.
+    pub converted_to_f16: bool,
+}
+
+/// Decode one little-endian bf16 pair into an f32.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// Convert an f32 to IEEE 754 binary16 bits (round-to-nearest-even).
+/// Works entirely in the integer bit domain so every rounding step is
+/// exact by construction. Returns `None` when the value cannot be
+/// represented (|v| > 65504, or NaN/inf) - the caller refuses instead of
+/// emitting corrupt rows.
+fn f32_to_f16_bits(v: f32) -> Option<u16> {
+    if !v.is_finite() {
+        return None;
+    }
+    let abs = v.abs();
+    if abs > 65504.0 {
+        return None;
+    }
+    let sign = if v.is_sign_negative() { 1u16 << 15 } else { 0 };
+    let bits = abs.to_bits();
+    let exp = ((bits >> 23) & 0xFF).cast_signed() - 127; // unbiased exponent
+    let mant = bits & 0x7F_FFFF; // 23-bit mantissa
+    if exp >= -14 {
+        // Normal f16: keep 10 mantissa bits, round-to-nearest-even on the
+        // 13 dropped bits. The +0x0FFF (one below half) plus the kept LSB
+        // implements the tie rule: ties round to an even kept mantissa.
+        let e = u32::try_from(exp + 15).ok()?;
+        let rounded = mant + 0x0FFF + ((mant >> 13) & 1);
+        let e = if rounded > 0x7F_FFFF { e + 1 } else { e };
+        if e >= 0x1F {
+            // Rounded past 65504 (max f16); the caller refuses.
+            return None;
+        }
+        let frac = (rounded >> 13) & 0x3FF;
+        return Some(sign | u16::try_from((e << 10) | frac).ok()?);
+    }
+    // Subnormal f16 territory: quantum is 2^-24, so the full significand
+    // (implicit one included) shifted right by -(exp+1) lands in quanta.
+    if exp < -25 {
+        // Strictly below half a quantum even at max significand.
+        return Some(sign);
+    }
+    let sig = (1u32 << 23) | mant;
+    let shift = u32::try_from(-14 - exp + 13).ok()?;
+    let q = sig >> shift;
+    let dropped = sig & ((1u32 << shift) - 1);
+    let half = 1u32 << (shift - 1);
+    let mut q = q;
+    if dropped > half || (dropped == half && (q & 1) == 1) {
+        q += 1;
+    }
+    if q >= 0x400 {
+        // Rounded up to the smallest normal (2^-14).
+        return Some(sign | 0x0400);
+    }
+    Some(sign | u16::try_from(q).ok()?)
+}
+
+/// Convert a bf16 row to f16 bytes, refusing values f16 cannot hold.
+fn bf16_row_to_f16(src: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(src.len());
+    for pair in src.as_chunks::<2>().0 {
+        let bits = u16::from_le_bytes(*pair);
+        let f = bf16_to_f32(bits);
+        let h = f32_to_f16_bits(f).ok_or_else(|| {
+            format!(
+                "value {f} overflows the f16 range the sink stores - the \
+                 prefix was computed in a dtype the target lane cannot hold"
+            )
+        })?;
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Read an mlx-lm `--prompt-cache-file` export (safetensors written by
+/// `mlx_lm`'s `save_prompt_cache`) into a carrier. The file records the
+/// model path and per-layer `(keys, values, offset)` states; tensors are
+/// `[1, n_kv_heads, capacity, head_dim]` where capacity is padded to the
+/// cache step (256) and the per-layer offset scalar carries the used
+/// length. Token ids are NOT stored - the caller supplies them and the
+/// count must equal the used length exactly.
+/// Read the safetensors header of an mlx-lm prompt-cache file and the
+/// byte offset where tensor data starts.
+fn mlx_header(bytes: &[u8]) -> Result<(serde_json::Value, usize), String> {
+    if bytes.len() < 8 {
+        return Err("mlx cache file is too short to be a safetensors archive".into());
+    }
+    let header_len = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+        .map_err(|_| "mlx cache header length exceeds the addressable size".to_string())?;
+    let data_start = 8 + header_len;
+    if data_start > bytes.len() {
+        return Err("mlx cache header length exceeds the file".into());
+    }
+    let header: serde_json::Value = serde_json::from_slice(&bytes[8..data_start])
+        .map_err(|e| format!("mlx cache header is not valid json: {e}"))?;
+    Ok((header, data_start))
+}
+
+/// Resolve one tensor entry: (heads, seq, dim, byte range, dtype).
+fn mlx_shape_of(
+    tensors: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<(u32, u32, u32, u64, u64, &'static str), String> {
+    let t = tensors
+        .get(name)
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| format!("mlx cache tensor {name} missing"))?;
+    let dtype = t
+        .get("dtype")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("mlx cache tensor {name} has no dtype"))?;
+    let dtype: &'static str = match dtype {
+        "F16" => "f16",
+        "BF16" => "bf16",
+        other => {
+            return Err(format!(
+                "mlx cache tensor {name} is {other} - only f16 and bf16 \
+                 KV exports are admitted"
+            ));
+        }
+    };
+    let shape = t
+        .get("shape")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("mlx cache tensor {name} has no shape"))?;
+    if shape.len() != 4 {
+        return Err(format!(
+            "mlx cache tensor {name} is not a [1, heads, seq, dim] state"
+        ));
+    }
+    let dims: Vec<u64> = shape.iter().filter_map(serde_json::Value::as_u64).collect();
+    if dims.len() != 4 || dims[0] != 1 {
+        return Err(format!(
+            "mlx cache tensor {name} shape must be [1, heads, seq, dim]"
+        ));
+    }
+    let offsets = t
+        .get("data_offsets")
+        .and_then(|v| v.as_array())
+        .and_then(|a| {
+            let s = a.first()?.as_u64()?;
+            let e = a.get(1)?.as_u64()?;
+            Some((s, e))
+        })
+        .ok_or_else(|| format!("mlx cache tensor {name} has no data offsets"))?;
+    let dim = |i: usize| {
+        u32::try_from(dims[i]).map_err(|_| format!("mlx cache tensor {name} dimension too large"))
+    };
+    Ok((dim(1)?, dim(2)?, dim(3)?, offsets.0, offsets.1, dtype))
+}
+
+/// Walk the per-layer `{i}.2` offset scalars; every layer must agree on
+/// the used token count (the plain `KVCache` invariant).
+fn mlx_used_cells(
+    tensors: &serde_json::Map<String, serde_json::Value>,
+    bytes: &[u8],
+    data_start: usize,
+    layers: u32,
+    cap: u32,
+) -> Result<u32, String> {
+    let mut cells: Option<i64> = None;
+    for i in 0..layers {
+        let t = tensors
+            .get(&format!("{i}.2"))
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| format!("mlx cache offset scalar {i}.2 missing"))?;
+        let dtype = t.get("dtype").and_then(|v| v.as_str()).unwrap_or("");
+        if dtype != "I32" {
+            return Err(format!(
+                "mlx cache offset scalar {i}.2 is {dtype:?} - expected the \
+                 plain KVCache i32 offset"
+            ));
+        }
+        let (s, e) = t
+            .get("data_offsets")
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                let s = a.first()?.as_u64()?;
+                let e = a.get(1)?.as_u64()?;
+                Some((s, e))
+            })
+            .ok_or_else(|| format!("mlx cache offset scalar {i}.2 has no offsets"))?;
+        if e - s != 4 {
+            return Err(format!("mlx cache offset scalar {i}.2 is not 4 bytes"));
+        }
+        let start = data_start + usize::try_from(s).unwrap_or(usize::MAX);
+        let raw = bytes
+            .get(start..start + 4)
+            .ok_or("mlx cache offset scalar out of bounds")?;
+        let value = i32::from_le_bytes(raw.try_into().unwrap());
+        if value < 0 {
+            return Err(format!(
+                "mlx cache layer {i} offset is negative - the file is corrupt"
+            ));
+        }
+        match cells {
+            None => cells = Some(i64::from(value)),
+            Some(prev) if prev == i64::from(value) => {}
+            Some(prev) => {
+                return Err(format!(
+                    "mlx cache layer offsets disagree ({prev} vs {value}) - \
+                     the file is corrupt"
+                ));
+            }
+        }
+    }
+    let cells = u32::try_from(cells.unwrap_or(0))
+        .map_err(|_| "mlx cache used length is absurd".to_string())?;
+    if cells == 0 || cells > cap {
+        return Err(format!(
+            "mlx cache used length {cells} is outside its capacity {cap}"
+        ));
+    }
+    Ok(cells)
+}
+
+/// Gather mlx [1, heads, capacity, dim] tensor pairs into the carrier's
+/// layer-major token rows, converting bf16 to f16 when needed.
+struct MlxGather<'a> {
+    tensors: &'a serde_json::Map<String, serde_json::Value>,
+    bytes: &'a [u8],
+    data_start: usize,
+    layers: u32,
+    kv_heads: u32,
+    cap: u32,
+    head_dim: u32,
+    cells: u32,
+    row_bytes: usize,
+    converted: bool,
+    k_dtype: &'static str,
+    k_off: u64,
+    k_end: u64,
+    v_off: u64,
+    v_end: u64,
+}
+
+fn mlx_gather_rows(g: &MlxGather<'_>) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let MlxGather {
+        tensors,
+        bytes,
+        data_start,
+        layers,
+        kv_heads,
+        cap,
+        head_dim,
+        cells,
+        row_bytes,
+        converted,
+        k_dtype,
+        k_off,
+        k_end,
+        v_off,
+        v_end,
+    } = g;
+    let (layers, kv_heads, cap, head_dim, cells) = (*layers, *kv_heads, *cap, *head_dim, *cells);
+    let (row_bytes, converted, k_dtype) = (*row_bytes, *converted, *k_dtype);
+    let (data_start, k_off, k_end, v_off, v_end) = (*data_start, *k_off, *k_end, *v_off, *v_end);
+    let slice = |off: u64, end: u64| -> Result<&[u8], String> {
+        let s = data_start + usize::try_from(off).unwrap_or(usize::MAX);
+        let e = data_start + usize::try_from(end).unwrap_or(usize::MAX);
+        bytes
+            .get(s..e)
+            .ok_or_else(|| "mlx cache tensor data out of bounds".to_string())
+    };
+    let k0 = slice(k_off, k_end)?;
+    let v0 = slice(v_off, v_end)?;
+    let tensor_bytes = row_bytes.saturating_mul(usize::try_from(cap).unwrap_or(usize::MAX));
+    if k0.len() != tensor_bytes || v0.len() != tensor_bytes {
+        return Err("mlx cache tensor byte length disagrees with its shape".into());
+    }
+    let mut k_rows = vec![0u8; layers as usize * cells as usize * row_bytes];
+    let mut v_rows = k_rows.clone();
+    let head_bytes = head_dim as usize * 2;
+    for i in 0..layers {
+        // Shapes were validated on layer 0; later layers only need their
+        // data offsets (plus the dtype consistency check below).
+        let (_, _, _, ko, ke, kd) = mlx_shape_of(tensors, &format!("{i}.0"))?;
+        if kd != k_dtype {
+            return Err("mlx cache layers mix dtypes".into());
+        }
+        let (_, _, _, vo, ve, _) = mlx_shape_of(tensors, &format!("{i}.1"))?;
+        let k = slice(ko, ke)?;
+        let v = slice(vo, ve)?;
+        let layer_base = i as usize * cells as usize * row_bytes;
+        for t in 0..cells as usize {
+            let row_base = layer_base + t * row_bytes;
+            for h in 0..kv_heads as usize {
+                let src = (h * cap as usize + t) * head_bytes;
+                let dst = row_base + h * head_bytes;
+                if converted {
+                    k_rows[dst..dst + head_bytes]
+                        .copy_from_slice(&bf16_row_to_f16(&k[src..src + head_bytes])?);
+                    v_rows[dst..dst + head_bytes]
+                        .copy_from_slice(&bf16_row_to_f16(&v[src..src + head_bytes])?);
+                } else {
+                    k_rows[dst..dst + head_bytes].copy_from_slice(&k[src..src + head_bytes]);
+                    v_rows[dst..dst + head_bytes].copy_from_slice(&v[src..src + head_bytes]);
+                }
+            }
+        }
+    }
+    Ok((k_rows, v_rows))
+}
+
+pub fn mlx_cache_to_carrier(
+    bytes: &[u8],
+    tokens: &[u32],
+) -> Result<(KvCarrier, MlxCacheReport), String> {
+    let (header, data_start) = mlx_header(bytes)?;
+    let tensors = header
+        .as_object()
+        .ok_or("mlx cache header must be an object")?;
+    let metadata = tensors
+        .get("__metadata__")
+        .and_then(|m| m.as_object())
+        .ok_or("mlx cache file carries no metadata - was it written by mlx_lm cache_prompt?")?;
+    let model_path = metadata
+        .get("0.model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    // Contiguous per-layer states {i}.0 (K), {i}.1 (V), {i}.2 (offset).
+    let mut layers: u32 = 0;
+    loop {
+        if tensors.contains_key(&format!("{layers}.0"))
+            && tensors.contains_key(&format!("{layers}.1"))
+            && tensors.contains_key(&format!("{layers}.2"))
+        {
+            layers += 1;
+        } else {
+            break;
+        }
+    }
+    if layers == 0 {
+        return Err("mlx cache has no per-layer (K, V, offset) states".into());
+    }
+    for i in 0..layers {
+        let class = metadata
+            .get(&format!("1.{i}"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if class != "KVCache" {
+            return Err(format!(
+                "mlx cache layer {i} is a {class:?} cache - only plain \
+                 mlx-lm KVCache exports are admitted (rotating/quantized \
+                 variants carry state the interchange does not model)"
+            ));
+        }
+    }
+
+    let (kv_heads, cap, head_dim, k_off, k_end, k_dtype) = mlx_shape_of(tensors, "0.0")?;
+    let (_, cap_v, _, v_off, v_end, _) = mlx_shape_of(tensors, "0.1")?;
+    if cap != cap_v {
+        return Err("mlx cache K and V capacity disagree".into());
+    }
+    let row_bytes = usize::try_from(
+        kv_heads
+            .checked_mul(head_dim)
+            .and_then(|e| e.checked_mul(2))
+            .ok_or("mlx cache geometry overflows")?,
+    )
+    .map_err(|_| "mlx cache row size exceeds the addressable size".to_string())?;
+
+    let cells = mlx_used_cells(tensors, bytes, data_start, layers, cap)?;
+    if tokens.len() != cells as usize {
+        return Err(format!(
+            "token file carries {} ids but the cache holds {cells} tokens - \
+             supply exactly the tokenization of the cached prompt",
+            tokens.len()
+        ));
+    }
+
+    let source_dtype: &'static str = if k_dtype == "f16" { "f16" } else { "bf16" };
+    let converted = source_dtype == "bf16";
+
+    let (k_rows, v_rows) = mlx_gather_rows(&MlxGather {
+        tensors,
+        bytes,
+        data_start,
+        layers,
+        kv_heads,
+        cap,
+        head_dim,
+        cells,
+        row_bytes,
+        converted,
+        k_dtype,
+        k_off,
+        k_end,
+        v_off,
+        v_end,
+    })?;
+
+    let carrier = KvCarrier {
+        tokens: tokens.to_vec(),
+        cells,
+        geometry: RepackGeometry {
+            layers,
+            kv_heads,
+            head_dim,
+        },
+        dtype: KV_DTYPE_F16,
+        block_tokens: 64,
+        attention_layout: LLAMACPP_LAYOUT,
+        k_rows,
+        v_rows,
+    };
+    let report = MlxCacheReport {
+        model_path,
+        layers,
+        cells,
+        source_dtype,
+        converted_to_f16: converted,
+    };
+    Ok((carrier, report))
 }
 
 #[cfg(test)]
@@ -444,7 +886,11 @@ mod tests {
         };
         assert_eq!(
             admitted_pairs(&on),
-            vec![CodecLane::LlamaCppToVllm, CodecLane::VllmToLlamaCpp]
+            vec![
+                CodecLane::LlamaCppToVllm,
+                CodecLane::VllmToLlamaCpp,
+                CodecLane::MlxToVllm
+            ]
         );
         assert_eq!(CodecLane::LlamaCppToVllm.pair_name(), "llama.cpp -> vllm");
         assert_eq!(CodecLane::VllmToLlamaCpp.pair_name(), "vllm -> llama.cpp");
@@ -538,5 +984,300 @@ mod tests {
         let tokens: Vec<u32> = (0..128).collect();
         let err = vllm_tier_to_carrier(dir.path(), &spec, &tokens, &geo()).unwrap_err();
         assert!(err.contains("never offloaded"), "{err}");
+    }
+
+    // ---- mlx codec tests -------------------------------------------------
+
+    fn bf16_bits(v: f32) -> u16 {
+        // Truncate the f32 mantissa - exact for the round values tests use.
+        (v.to_bits() >> 16) as u16
+    }
+
+    /// Build a synthetic mlx-lm prompt-cache file: header JSON +
+    /// `{i}.0`/`{i}.1` tensors `[1, heads, cap, dim]` + `{i}.2` offset
+    /// scalars, mirroring `save_prompt_cache` on mlx-lm 0.32.x.
+    struct MlxFixture<'a> {
+        layers: u32,
+        heads: u32,
+        cap: u32,
+        dim: u32,
+        cells: u32,
+        bf16: bool,
+        model_path: &'a str,
+        class_override: Option<&'a str>,
+    }
+
+    fn mlx_file(f: &MlxFixture) -> Vec<u8> {
+        let (layers, heads, cap, dim, cells, bf16, model_path, class_override) = (
+            f.layers,
+            f.heads,
+            f.cap,
+            f.dim,
+            f.cells,
+            f.bf16,
+            f.model_path,
+            f.class_override,
+        );
+        let head_bytes = dim as usize * 2;
+        let tensor_bytes = cap as usize * heads as usize * head_bytes;
+        let mut tensors = serde_json::Map::new();
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("0.model".into(), model_path.into());
+        metadata.insert(
+            "0.tokenizer_config".into(),
+            "{\"trust_remote_code\":false}".into(),
+        );
+        let mut cursor = 0usize;
+        for i in 0..layers {
+            metadata.insert(format!("1.{i}"), class_override.unwrap_or("KVCache").into());
+            for (leg, _fill) in [(".0", 0x11u8), (".1", 0x22u8)] {
+                let name = format!("{i}{leg}");
+                let start = cursor;
+                cursor += tensor_bytes;
+                tensors.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "dtype": if bf16 { "BF16" } else { "F16" },
+                        "shape": [1, heads, cap, dim],
+                        "data_offsets": [start, cursor],
+                    }),
+                );
+            }
+            let name = format!("{i}.2");
+            let start = cursor;
+            cursor += 4;
+            tensors.insert(
+                name,
+                serde_json::json!({
+                    "dtype": "I32",
+                    "shape": [],
+                    "data_offsets": [start, cursor],
+                }),
+            );
+        }
+        let mut header = serde_json::Map::new();
+        header.insert("__metadata__".to_string(), metadata.into());
+        for (k, v) in tensors {
+            header.insert(k, v);
+        }
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut out = Vec::with_capacity(8 + header_bytes.len() + cursor);
+        out.extend_from_slice(&u64::try_from(header_bytes.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        // Layer data: per head, per token, `dim` elements. Values encode the
+        // coordinates so byte-gathering is assertable: value = (h+1) + t/10.
+        for _ in 0..layers {
+            for fill in [0x11u8, 0x22u8] {
+                for _ in 0..(cap * heads) {
+                    for _ in 0..dim {
+                        if bf16 {
+                            out.extend_from_slice(&[0, 0]);
+                        } else {
+                            out.push(fill);
+                            out.push(0);
+                        }
+                    }
+                }
+            }
+            out.extend_from_slice(&cells.cast_signed().to_le_bytes());
+        }
+        if bf16 {
+            // Rewrite the bf16 payloads with real values (second pass):
+            // rebuild data region for layers, tokens, heads.
+            let data_start = out.len() - cursor;
+            let mut w = data_start;
+            for _ in 0..layers {
+                for _leg in 0..2 {
+                    for h in 0..heads {
+                        for t in 0..cap {
+                            for _d in 0..dim {
+                                let v = f32::from(u16::try_from(h + 1).unwrap())
+                                    + f32::from(u16::try_from(t).unwrap()) / 10.0;
+                                let bits = bf16_bits(v).to_le_bytes();
+                                out[w] = bits[0];
+                                out[w + 1] = bits[1];
+                                w += 2;
+                            }
+                        }
+                    }
+                }
+                w += 4; // offset scalar
+            }
+        }
+        out
+    }
+
+    fn f16_of(v: f32) -> u16 {
+        f32_to_f16_bits(v).unwrap()
+    }
+
+    #[test]
+    fn unit__f32_to_f16__pins_the_ieee_boundary_vectors() {
+        assert_eq!(f16_of(0.0), 0x0000);
+        assert_eq!(f16_of(-0.0), 0x8000);
+        assert_eq!(f16_of(1.0), 0x3C00);
+        assert_eq!(f16_of(-2.5), 0xC100);
+        assert_eq!(f16_of(65504.0), 0x7BFF);
+        assert_eq!(f16_of(0.5), 0x3800);
+        // Round-to-nearest-even at the dropped-mantissa midpoint.
+        assert_eq!(f16_of(1.0 + 2.0f32.powi(-11)), 0x3C00); // exact tie rounds to even
+        assert_eq!(f16_of(2048.0 + 1.0), 0x6800); // 2049 ties to even -> 2048
+        // Subnormals.
+        assert_eq!(f16_of(2.0f32.powi(-24)), 0x0001);
+        assert_eq!(f16_of(3.0 * 2.0f32.powi(-24)), 0x0003);
+        assert_eq!(f16_of(2.0f32.powi(-25)), 0x0000); // below half-quantum
+        assert_eq!(f16_of(3.0 * 2.0f32.powi(-25)), 0x0002); // tie -> even
+        // Refusals.
+        assert!(f32_to_f16_bits(65505.0).is_none());
+        assert!(f32_to_f16_bits(f32::INFINITY).is_none());
+        assert!(f32_to_f16_bits(f32::NAN).is_none());
+    }
+
+    #[test]
+    fn unit__mlx_codec__parses_a_synthetic_f16_cache_without_conversion() {
+        // 2 layers, 2 heads, dim 4, capacity 8, 5 used cells.
+        let file = mlx_file(&MlxFixture {
+            layers: 2,
+            heads: 2,
+            cap: 8,
+            dim: 4,
+            cells: 5,
+            bf16: false,
+            model_path: "/models/qwen.d",
+            class_override: None,
+        });
+        let tokens: Vec<u32> = (0..5).collect();
+        let (carrier, report) = mlx_cache_to_carrier(&file, &tokens).unwrap();
+        assert_eq!(report.layers, 2);
+        assert_eq!(report.cells, 5);
+        assert_eq!(report.source_dtype, "f16");
+        assert!(!report.converted_to_f16);
+        assert_eq!(report.model_path.as_deref(), Some("/models/qwen.d"));
+        assert_eq!(carrier.cells, 5);
+        assert_eq!(carrier.geometry.layers, 2);
+        assert_eq!(carrier.geometry.kv_heads, 2);
+        assert_eq!(carrier.geometry.head_dim, 4);
+        let row = 2 * 4 * 2; // heads * dim * 2 bytes
+        assert_eq!(carrier.k_rows.len(), 2 * 5 * row);
+        // F16 rows pass through untouched: token 0 of layer 0 is the first
+        // `row` bytes, K fill 0x11.
+        assert!(carrier.k_rows[..row].iter().step_by(2).all(|&b| b == 0x11));
+        assert!(carrier.v_rows[..row].iter().step_by(2).all(|&b| b == 0x22));
+    }
+
+    #[test]
+    fn unit__mlx_codec__converts_bf16_rows_and_gathers_heads_per_token() {
+        // bf16 fill: value = (h+1) + t/10 per element.
+        let file = mlx_file(&MlxFixture {
+            layers: 2,
+            heads: 2,
+            cap: 8,
+            dim: 4,
+            cells: 2,
+            bf16: true,
+            model_path: "/models/qwen.d",
+            class_override: None,
+        });
+        let tokens: Vec<u32> = (0..2).collect();
+        let (carrier, report) = mlx_cache_to_carrier(&file, &tokens).unwrap();
+        assert_eq!(report.source_dtype, "bf16");
+        assert!(report.converted_to_f16);
+        // Layer 0, token 0, head 0: value 1.0 for all 4 dims -> f16 0x3C00 LE.
+        assert_eq!(
+            &carrier.k_rows[0..8],
+            &[0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C]
+        );
+        // Head 1 of the same token: value 2.0 -> 0x4000.
+        let row = 2 * 4 * 2;
+        let head1: Vec<u8> = [0x00u8, 0x40].repeat(4);
+        assert_eq!(&carrier.k_rows[8..16], &head1[..]);
+        // V rows carry the same values (bf16 fill ignores the leg constant).
+        assert_eq!(
+            &carrier.v_rows[0..8],
+            &[0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C]
+        );
+        assert_eq!(row, 16);
+    }
+
+    #[test]
+    fn unit__mlx_codec__roundtrips_into_the_vllm_tier_writer() {
+        // 64 cells so the carrier floors to exactly one full block.
+        let file = mlx_file(&MlxFixture {
+            layers: 2,
+            heads: 2,
+            cap: 128,
+            dim: 4,
+            cells: 64,
+            bf16: true,
+            model_path: "/models/qwen.d",
+            class_override: None,
+        });
+        let tokens: Vec<u32> = (1000..1064).collect();
+        let (carrier, _report) = mlx_cache_to_carrier(&file, &tokens).unwrap();
+        let dir = std::env::temp_dir().join("mlx-tier-roundtrip");
+        let spec = VllmFsSpec {
+            model_name: "/models/qwen.d".into(),
+            tokens_per_hash: 64,
+            blocks_per_file: 1,
+            canonical_format: "v1-nhd".into(),
+        };
+        let outcome = carrier_into_vllm_tier(&carrier, &spec, &dir).unwrap();
+        assert_eq!(outcome.blocks_written, 1);
+        let none = super::vllm_none_hash();
+        let hash = super::vllm_block_hash(none, &carrier.tokens[..64]);
+        let hex = hex::encode(hash);
+        let rel = VllmFsSpec::block_rel_path(&hex, 0);
+        let rank = spec.rank_dir(&dir);
+        let block = dir.join(&rank).join(&rel);
+        let page = std::fs::read(block).unwrap();
+        let _ = page.len();
+        // layers(2) * heads(2) * tokens(64) * (K|V fused 8 B) = 2048 bytes.
+        assert_eq!(page.len(), 2 * 2 * 64 * 2 * 4 * 2);
+        assert_eq!(outcome.tail_tokens_dropped, 0);
+    }
+
+    #[test]
+    fn unit__mlx_codec__refuses_variant_classes_and_mismatched_inputs() {
+        let tokens: Vec<u32> = (0..5).collect();
+        // RotatingKVCache class metadata.
+        let file = mlx_file(&MlxFixture {
+            layers: 2,
+            heads: 2,
+            cap: 8,
+            dim: 4,
+            cells: 5,
+            bf16: false,
+            model_path: "/m",
+            class_override: Some("RotatingKVCache"),
+        });
+        let err = mlx_cache_to_carrier(&file, &tokens).unwrap_err();
+        assert!(err.contains("RotatingKVCache"), "{err}");
+        // Token count mismatch.
+        let file = mlx_file(&MlxFixture {
+            layers: 2,
+            heads: 2,
+            cap: 8,
+            dim: 4,
+            cells: 5,
+            bf16: false,
+            model_path: "/m",
+            class_override: None,
+        });
+        let err = mlx_cache_to_carrier(&file, &[0u32; 3]).unwrap_err();
+        assert!(err.contains("holds 5 tokens"), "{err}");
+        // No metadata at all.
+        let mut bare = mlx_file(&MlxFixture {
+            layers: 1,
+            heads: 1,
+            cap: 4,
+            dim: 2,
+            cells: 2,
+            bf16: false,
+            model_path: "/m",
+            class_override: None,
+        });
+        bare.truncate(8 + 2); // header claims more than remains
+        let err = mlx_cache_to_carrier(&bare, &[0u32; 2]).unwrap_err();
+        assert!(!err.is_empty());
     }
 }
