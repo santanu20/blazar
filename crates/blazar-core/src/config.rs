@@ -661,11 +661,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_registry_url: Option<String>,
     /// Allow a failed llama.cpp GGUF load to trigger a background build
-    /// of a matching immutable, curator-approved capability lane. Off by
-    /// default: this compiles third-party source and can consume substantial
-    /// CPU, disk, and build time. Only active entries in the configured
-    /// capability registry are eligible; arbitrary GitHub discovery is
-    /// never performed.
+    /// of a matching immutable, curator-approved capability lane. On by
+    /// default: only active entries in the configured capability registry
+    /// are eligible (arbitrary GitHub discovery is never performed), but
+    /// this compiles third-party source and can consume substantial CPU,
+    /// disk, and build time - set `capability_lane_auto_install = false`
+    /// to opt out.
     #[serde(default)]
     pub capability_lane_auto_install: bool,
     /// Curated fork lanes this many days past supersede are deleted
@@ -4113,7 +4114,7 @@ impl Default for Config {
             whisper_vad_min_silence_duration_ms: None,
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
-            capability_lane_auto_install: false,
+            capability_lane_auto_install: true,
             fork_retire_days: default_fork_retire_days(),
             keep_tags: default_keep_tags(),
             semantic_cache: SemanticCacheConfig::default(),
@@ -7148,11 +7149,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unit__capability_lane_auto_install__disabled_by_default() {
+    fn unit__capability_lane_auto_install__enabled_by_default() {
         assert!(
-            !Config::default().capability_lane_auto_install,
-            "building third-party engine source must require explicit opt-in"
+            Config::default().capability_lane_auto_install,
+            "curated-lane rescue is the default experience; registry-only scope bounds it"
         );
+    }
+
+    #[test]
+    fn unit__capability_lane_auto_install__explicit_opt_out_overrides_default() {
+        let cfg: Config = toml::from_str("capability_lane_auto_install = false").unwrap();
+        assert!(!cfg.capability_lane_auto_install);
     }
 
     #[test]
