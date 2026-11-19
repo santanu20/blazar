@@ -759,11 +759,7 @@ impl EngineManager {
     /// Clone (or take) the source tree, configure, build, install, probe,
     /// activate. The build tree is a tempfile - torn down on every exit
     /// path (Drop), success or failure.
-    pub async fn build_and_install<F>(
-        &self,
-        opts: &BuildOpts,
-        on_line: &mut F,
-    ) -> Result<EngineRow>
+    pub async fn build_and_install<F>(&self, opts: &BuildOpts, on_line: &mut F) -> Result<EngineRow>
     where
         F: FnMut(&str) + ?Sized,
     {
@@ -1360,13 +1356,16 @@ async fn git_remote_slug(tc: &Toolchain, dir: &Path) -> Option<String> {
 /// siblings in `build/bin` (verified live: the 17 KiB thin binaries
 /// resolve them via an `$ORIGIN` rpath, so the whole directory must
 /// travel together, symlink chains included).
-fn install_built_binaries(
+fn install_built_binaries<F>(
     dirs: &BlazarDirs,
     bld: &Path,
     engine_tag: &str,
     rpc: bool,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<(PathBuf, String)> {
+    on_line: &mut F,
+) -> Result<(PathBuf, String)>
+where
+    F: FnMut(&str) + ?Sized,
+{
     let dir = dirs.engines_dir().join(engine_tag);
     // The caller retires any existing copy first (rollback-safe swap);
     // merging into a live dir would leave stale files behind.

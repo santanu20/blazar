@@ -406,7 +406,15 @@ async fn integration__curated_build__rejects_registry_arch_not_present_in_pinned
     };
     std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
 
+    // Mirror the production caller: curated lanes build from a Fork
+    // source (pinned SHA, no b-tag currency), so the flow reaches the
+    // architecture-mining rejection instead of the upstream tag gate.
     let mut o = opts(BuildBackend::Cpu, "capability-test");
+    o.source = blazar_runtime::engine::build::BuildSource::Fork {
+        repo: "acme/llama.cpp".into(),
+        ref_sha: "7c81a9f0".repeat(5),
+        base_ref: None,
+    };
     o.source_dir = Some(source_tree(tmp.path()));
     o.toolchain = Some(tc);
     o.trust = blazar_runtime::engine::manifest::TrustTier::Curated;
