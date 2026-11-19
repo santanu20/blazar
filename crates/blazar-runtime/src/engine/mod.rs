@@ -1023,7 +1023,7 @@ impl EngineManager {
     /// This entry point re-fetches the configured registry, requires an exact
     /// active lane-id + architecture match, builds from the immutable SHA,
     /// and stamps the result as Curated. The source-mined architecture set
-    /// is checked before CMake runs.
+    /// is checked before `CMake` runs.
     ///
     /// Background callers should bound concurrency and keep the build off the
     /// request path. The generated fork is additive and never replaces the

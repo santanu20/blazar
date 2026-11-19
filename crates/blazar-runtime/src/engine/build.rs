@@ -768,7 +768,7 @@ impl EngineManager {
 
     /// Curated registry build variant. Unlike an ordinary user build, it
     /// requires the source-mined architecture set to contain the registry's
-    /// requested architecture before CMake runs.
+    /// requested architecture before `CMake` runs.
     pub async fn build_and_install_for_arch<F>(
         &self,
         opts: &BuildOpts,
@@ -881,6 +881,10 @@ impl EngineManager {
     /// install pass (the live failure of 2026-09-09). Returns the
     /// installed digest, the retired old dir (for the caller's
     /// register/discard decision), and the lane identity.
+    // Eight inputs mirror the release-lane build contract (toolchain,
+    // options, identity, CUDA facts, the curated-lane architecture gate
+    // and the progress callback); grouping them would hide that parity.
+    #[allow(clippy::too_many_arguments)]
     async fn compile_source_lane<F>(
         &self,
         tc: &Toolchain,
@@ -1664,6 +1668,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn unit__cmake_args__cuda_vs_cpu() {
         let cuda = cmake_configure_args(
             BuildBackend::Cuda,

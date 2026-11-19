@@ -2374,7 +2374,7 @@ pub struct Supervisor {
     /// subsequent request from launching the same known-broken compile.
     auto_install_failures: Arc<DashMap<String, Instant>>,
     /// Only one registry-triggered source build runs at a time. Each build
-    /// is also capped to four compiler jobs by EngineManager.
+    /// is also capped to four compiler jobs by `EngineManager`.
     auto_install_semaphore: Arc<tokio::sync::Semaphore>,
     pub config: ConfigHandle,
     /// (`mtime_ms`, size) of the config file at the last APPLIED reload.
@@ -7668,7 +7668,7 @@ drop them from rpc_servers in config.toml",
     /// Schedule one opt-in registry build after a real unknown-architecture
     /// crash. This never delays the request's failure response: clients are
     /// told to retry after the detached build has finished. Registry data is
-    /// re-fetched and validated by EngineManager immediately before checkout.
+    /// re-fetched and validated by `EngineManager` immediately before checkout.
     #[allow(clippy::too_many_lines)] // one bounded detached-task lifecycle, kept next to its scheduling policy
     fn schedule_curated_auto_install(&self, arch: &str, lane_id: &str) -> Option<String> {
         let cfg = self.cfg();
@@ -7690,14 +7690,13 @@ drop them from rpc_servers in config.toml",
                 "automatic installation for architecture '{arch}' recently failed; inspect daemon logs or retry explicitly with 'blazar engine install --lane {lane_id}'"
             ));
         }
-        let permit = match Arc::clone(&self.auto_install_semaphore).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                return Some(
-                    "another automatic engine build is running; this architecture was not queued - retry after that build completes"
-                        .to_string(),
-                );
-            }
+        // A second concurrent auto-build is rejected outright (never
+        // queued) - the message tells the client to retry later.
+        let Ok(permit) = Arc::clone(&self.auto_install_semaphore).try_acquire_owned() else {
+            return Some(
+                "another automatic engine build is running; this architecture was not queued - retry after that build completes"
+                    .to_string(),
+            );
         };
         match self.auto_installing_arches.entry(arch.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(_) => {

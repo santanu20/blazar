@@ -422,7 +422,7 @@ async fn integration__curated_build__rejects_registry_arch_not_present_in_pinned
     let mut lines = Vec::new();
     let err = manager(&dirs)
         .build_and_install_for_arch(&o, "not_in_pinned_source", &mut |line| {
-            lines.push(line.to_string())
+            lines.push(line.to_string());
         })
         .await
         .unwrap_err()
