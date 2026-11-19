@@ -5897,6 +5897,35 @@ async fn e2e__failover_chain__anthropic_lane_local_targets_only() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// Cross-platform MCP stub plumbing for the e2e suite. Unix legs run
+/// `sh -c <script>` directly; Windows legs run the same logic as a
+/// PowerShell script riding the `BLZ_PS` env var (`Invoke-Expression`)
+/// so no script text ever crosses argv quoting. Returns the command
+/// vector plus the env map the `McpServer` stub should carry.
+fn mcp_stub_command(
+    sh_script: &str,
+    ps_script: &str,
+) -> (Vec<String>, std::collections::HashMap<String, String>) {
+    if cfg!(windows) {
+        let mut env = std::collections::HashMap::new();
+        env.insert("BLZ_PS".to_string(), ps_script.to_string());
+        (
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Invoke-Expression $env:BLZ_PS".into(),
+            ],
+            env,
+        )
+    } else {
+        (
+            vec!["sh".into(), "-c".into(), sh_script.into()],
+            std::collections::HashMap::new(),
+        )
+    }
+}
+
 /// Per-key MCP server allowlist: a key scoped to specific servers is
 /// refused (403, pre-spawn) for any other server, while its own
 /// selector engages the server process. Marker files prove the spawn
@@ -5917,11 +5946,18 @@ async fn e2e__mcp__per_key_server_allowlist_gates_the_tool_loop() {
     // fast on stdout EOF without a 20s initialize timeout.
     let stub = |name: &str| {
         let path = marker(name).to_string_lossy().into_owned();
+        let (command, mut env) = mcp_stub_command(
+            &format!("touch {path}; exit 0"),
+            "New-Item -ItemType File -Force -Path $env:BLZ_MARKER | Out-Null",
+        );
+        if cfg!(windows) {
+            env.insert("BLZ_MARKER".into(), path);
+        }
         McpServer {
             name: name.into(),
-            command: vec!["sh".into(), "-c".into(), format!("touch {path}; exit 0")],
+            command,
             url: None,
-            env: std::collections::HashMap::new(),
+            env,
             timeout_secs: 30,
             env_clear: false,
             allowed_env: Vec::new(),
@@ -6022,6 +6058,7 @@ async fn e2e__mcp__per_key_tool_allowlist_injection_and_execute_gates() {
 
     // Stdio MCP speaker: newline JSON-RPC, echoes request ids, lists
     // two tools, answers any tools/call with "tool-ok:<tool-name>".
+    // The sh/PowerShell pair below must stay behavior-identical.
     fn mcp_fs_clone() -> blazar_core::config::McpServer {
         let speaker = r#"
 while IFS= read -r line; do
@@ -6037,11 +6074,30 @@ while IFS= read -r line; do
   esac
 done
 "#;
+        let ps_speaker = r#"
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  $id = ''
+  if ($line -match '"id":(\d+)') { $id = $Matches[1] }
+  if ($line -match '"method":"initialize"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fs","version":"1"}}}')
+  } elseif ($line -match '"method":"tools/list"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"read_file","description":"read","inputSchema":{"type":"object"}},{"name":"write_file","description":"write","inputSchema":{"type":"object"}}]}}')
+  } elseif ($line -match '"method":"tools/call"') {
+    $tool = ''
+    if ($line -match '"name":"([a-z_]+)"') { $tool = $Matches[1] }
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"tool-ok:' + $tool + '"}]}}')
+  }
+  [Console]::Out.Flush()
+}
+"#;
+        let (command, env) = mcp_stub_command(speaker, ps_speaker);
         blazar_core::config::McpServer {
             name: "fs".into(),
-            command: vec!["sh".into(), "-c".into(), speaker.into()],
+            command,
             url: None,
-            env: std::collections::HashMap::new(),
+            env,
             timeout_secs: 30,
             env_clear: false,
             allowed_env: Vec::new(),
@@ -6159,6 +6215,21 @@ while IFS= read -r line; do
   esac
 done
 "#;
+    let ps_speaker = r#"
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  $id = ''
+  if ($line -match '"id":(\d+)') { $id = $Matches[1] }
+  if ($line -match '"method":"initialize"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fs","version":"1"}}}')
+  } elseif ($line -match '"method":"tools/list"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"read_file","description":"read","inputSchema":{"type":"object"}}]}}')
+  }
+  [Console]::Out.Flush()
+}
+"#;
+    let (command, env) = mcp_stub_command(speaker, ps_speaker);
     let cfg = Config {
         keys: vec![ApiKey {
             name: "caller".into(),
@@ -6169,9 +6240,9 @@ done
         }],
         mcp: vec![McpServer {
             name: "fs".into(),
-            command: vec!["sh".into(), "-c".into(), speaker.into()],
+            command,
             url: None,
-            env: std::collections::HashMap::new(),
+            env,
             timeout_secs: 30,
             env_clear: false,
             allowed_env: Vec::new(),
