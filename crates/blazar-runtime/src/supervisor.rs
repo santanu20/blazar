@@ -2386,6 +2386,12 @@ pub struct Supervisor {
     pub bus: EventBus,
     pub hardware: Hardware,
     pub engine: Arc<dyn Engine>,
+    /// Shared cross-engine KV daemon lane (`[kv.lmcache]`): lazy child
+    /// ensured before any LMcache-flagged engine spawn, idle-reaped
+    /// when the last consumer instance leaves, torn down on daemon
+    /// shutdown. Engine infrastructure like the children map - owned
+    /// here, not by the gateway.
+    pub(crate) lmcache: std::sync::Arc<crate::lmcache::LmcacheRuntime>,
     instances: DashMap<String, Arc<Instance>>,
     /// Automatic fleet membership: workers announced via
     /// `blazar rpc worker --join` (gateway `/api/fleet/*` routes write
@@ -2766,6 +2772,7 @@ impl Supervisor {
             bus,
             hardware,
             engine,
+            lmcache: std::sync::Arc::new(crate::lmcache::LmcacheRuntime::new()),
             instances: DashMap::new(),
             evicting: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             fleet: crate::fleet::FleetRegistry::default(),
@@ -6996,6 +7003,21 @@ impl Supervisor {
             for w in &profile.warnings {
                 tracing::warn!(model = name, "profile: {w}");
             }
+            // Shared KV daemon lane: an LMCache-flagged profile dials
+            // the daemon at child boot - ensure it (and the sglang
+            // client YAML) exists BEFORE the spawn, else the child's
+            // first dial races the daemon's healthcheck window.
+            if crate::lmcache::argv_dials_lmcache(engine.kind(), &profile.argv) {
+                let cfg = self.cfg();
+                self.lmcache
+                    .ensure(
+                        &cfg.kv.lmcache,
+                        &self.dirs.data_dir,
+                        &self.dirs.engines_dir(),
+                    )
+                    .await
+                    .map_err(|e| SupervisionError::spawn_failure(&e))?;
+            }
             let mut argv = engine.build_argv(&model, &profile, &endpoint);
             if let Some(a) = &auth {
                 argv.extend(a.argv.iter().cloned());
@@ -8246,10 +8268,12 @@ drop them from rpc_servers in config.toml",
         // Same protocol as the save sweep, through the same
         // engine-neutral connector; logging here remains the
         // truth-check policy (n_restored is the injection count).
+        let cfg = self.cfg();
         let connector = crate::kv::registry::connector_for(
             kind,
             auth.map(str::to_string),
-            self.cfg().router.then(|| key.to_string()),
+            cfg.router.then(|| key.to_string()),
+            cfg.kv.lmcache.enabled && cfg.sglang.lmcache.enabled,
         );
         match connector
             .import_prefix(crate::kv::KvImportRequest {
@@ -8369,10 +8393,12 @@ drop them from rpc_servers in config.toml",
             // budgeting and identity manifests stay here (the
             // connector owns the protocol, the supervisor the policy).
             let (client, base) = child_dial(&inst.endpoint);
+            let cfg = self.cfg();
             let connector = crate::kv::registry::connector_for(
                 inst.kind,
                 inst.auth.clone(),
-                self.cfg().router.then(|| inst.name.clone()),
+                cfg.router.then(|| inst.name.clone()),
+                cfg.kv.lmcache.enabled && cfg.sglang.lmcache.enabled,
             );
             let (saved, ok) = match connector
                 .export_prefix(crate::kv::KvExportRequest {
@@ -8495,7 +8521,24 @@ drop them from rpc_servers in config.toml",
         for n in names {
             self.evict(&n).await?;
         }
+        // Shared KV daemon dies with the fleet it served - the L1 pool
+        // is pinned RAM and must not outlive the supervisor.
+        self.lmcache.shutdown().await;
         Ok(())
+    }
+
+    /// Daemon idle gate: the same argv predicate that armed the spawn
+    /// hook decides liveness here, so the reap can neither strand a
+    /// consumer nor hold the pinned L1 pool past the last one. Budget
+    /// rides the operator's engine idle knob (`idle_timeout_secs`).
+    async fn reap_lmcache_daemon(&self) {
+        let consumers = self
+            .instances
+            .iter()
+            .filter(|e| crate::lmcache::argv_dials_lmcache(e.value().kind, &e.value().argv))
+            .count();
+        let budget = std::time::Duration::from_secs(self.cfg().idle_timeout_secs);
+        self.lmcache.reap_idle(budget, consumers).await;
     }
 
     /// Reaper: implements the ladder (Ready->Sleeping at `idle_sleep_secs`,
@@ -8510,6 +8553,7 @@ drop them from rpc_servers in config.toml",
                 ticker.tick().await;
                 mgr.reap_dead_children().await;
                 mgr.reap_once().await;
+                mgr.reap_lmcache_daemon().await;
             }
         })
     }

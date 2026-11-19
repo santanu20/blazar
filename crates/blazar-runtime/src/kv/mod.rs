@@ -166,7 +166,22 @@ impl VllmOffloadIo {
 pub enum KvConnector {
     LlamaCpp(LlamaCppSlotIo),
     Vllm(VllmOffloadIo),
+    /// sglang lane opted into the shared `[kv.lmcache]` daemon: the
+    /// store is real (prefixes restore across engine instances of the
+    /// same lane - verified by `cached_tokens` on a fresh child) but
+    /// daemon-mediated - no gateway-commanded transfer exists.
+    SglangLmcache(SglangLmcacheIo),
     Unsupported(&'static str),
+}
+
+/// Marker IO for the sglang `LMCache` lane: every method teaches - the
+/// daemon owns the protocol, the gateway only owns its lifecycle.
+pub struct SglangLmcacheIo;
+
+impl SglangLmcacheIo {
+    pub const TRANSFER_TEACHING: &'static str = "sglang LMCache transfers are daemon-mediated ([kv.lmcache]) - the \
+         gateway commands none; prefix reuse happens across instances of the \
+         same engine lane through the shared daemon";
 }
 
 impl KvConnector {
@@ -194,6 +209,19 @@ impl KvConnector {
                 cross_process: true,
                 supported_formats: vec!["vllm-offload-fs ([vllm.kv_offload])".into()],
             },
+            Self::SglangLmcache(_) => KvCapabilities {
+                // The shared daemon store: prefixes persist and cross
+                // engine instances of the lane (the entire point of
+                // the lane, verified via cached_tokens on a fresh
+                // child) - but the gateway cannot command individual
+                // transfers, only the daemon lifecycle.
+                export: false,
+                import: false,
+                persistent: true,
+                prefix_blocks: true,
+                cross_process: true,
+                supported_formats: vec!["lmcache-mp ([kv.lmcache] + sglang.lmcache)".into()],
+            },
             Self::Unsupported(_) => KvCapabilities {
                 export: false,
                 import: false,
@@ -211,6 +239,9 @@ impl KvConnector {
             Self::Vllm(_) => Err(KvError::Unsupported(
                 VllmOffloadIo::TRANSFER_TEACHING.into(),
             )),
+            Self::SglangLmcache(_) => Err(KvError::Unsupported(
+                SglangLmcacheIo::TRANSFER_TEACHING.into(),
+            )),
             Self::Unsupported(why) => Err(KvError::Unsupported((*why).to_string())),
         }
     }
@@ -220,6 +251,9 @@ impl KvConnector {
             Self::LlamaCpp(io) => io.import_prefix(req).await,
             Self::Vllm(_) => Err(KvError::Unsupported(
                 VllmOffloadIo::TRANSFER_TEACHING.into(),
+            )),
+            Self::SglangLmcache(_) => Err(KvError::Unsupported(
+                SglangLmcacheIo::TRANSFER_TEACHING.into(),
             )),
             Self::Unsupported(why) => Err(KvError::Unsupported((*why).to_string())),
         }

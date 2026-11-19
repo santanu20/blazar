@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 270 fields, 0 dead
+## Config (top-level keys) - 271 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -272,7 +272,8 @@ token quality are surfaced as drift.
 | whisper_vad_min_speech_duration_ms | - | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1081`; recipe preset `:1388` |
 | whisper_vad_min_silence_duration_ms | - | engine-argv + runtime/gateway | `crates/blazar-runtime/src/whisper.rs:1084`; recipe preset `:1389` |
 | mlx | MlxTuning::default() | other + engine-argv | `crates/blazar-core/src/profile.rs:4239` in `compile_mlx` (per-model override merged via `MlxTuning::effective`) |
-| vllm | VllmTuning::default() | other + engine-argv | `crates/blazar-core/src/profile.rs:4899` in `compile_vllm` (per-model override merged via `VllmTuning::effective`; forked at `:289` in `compile`; `[vllm.kv_offload]` gated emission at `:4960` - OffloadingConnector CPU+fs tiers, default root `<data_dir>/kv/vllm`) |
+| vllm | VllmTuning::default() | other + engine-argv | `crates/blazar-core/src/profile.rs:4899` in `compile_vllm` (per-model override merged via `VllmTuning::effective`; forked at `:289` in `compile`; `[vllm.kv_offload]` gated emission at `:4957` - `offload` connector = OffloadingConnector CPU+fs tiers, default root `<data_dir>/kv/vllm`; the `lmcache` connector choice is refused in `VllmKvOffload::validate` until upstream ships a cross-layout converter) |
+| kv | KvSection::default() | runtime + engine-argv | `crates/blazar-core/src/config.rs` in `Config::validate` (sglang lane opt-in requires `[kv.lmcache] enabled`); `crates/blazar-runtime/src/lmcache.rs` in `LmcacheRuntime::ensure`/`reap_idle` (lazy `lmcache server` child, fingerprint respawn, idle reap on the reaper loop); `crates/blazar-core/src/profile.rs` in `push_sglang_lmcache` (client YAML path emission) |
 | sdcpp_control_net | - | engine-argv | `crates/blazar-core/src/profile.rs:3477` (knob table -> `--control-net`) |
 | sdcpp_ip_adapter | - | engine-argv | `crates/blazar-core/src/profile.rs:3482` (-> `--ip-adapters`) |
 | sdcpp_clip_vision | - | engine-argv | `crates/blazar-core/src/profile.rs:3487` (-> `--clip-vision`) |
@@ -332,7 +333,7 @@ token quality are surfaced as drift.
 | calibration_file | - | engine-argv | `crates/blazar-core/src/profile.rs:3128` (calibration prompts feeding imatrix generation); hint block `crates/blazar-cli/src/main.rs:13890` |
 | isq_organization | - | engine-argv | `crates/blazar-core/src/profile.rs:3138` (`default` or `moqe` weight organization); hint block `crates/blazar-cli/src/main.rs:13891` |
 
-## SglangTuning ([sglang]) - 90 fields, 0 dead
+## SglangTuning ([sglang]) - 91 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -357,6 +358,7 @@ token quality are surfaced as drift.
 | hicache_enable | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
 | hicache_ratio | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
 | hicache_size | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
+| lmcache | SglangLmcache::default() | engine-argv + runtime | `crates/blazar-core/src/profile.rs:5603` in `push_sglang_lmcache` (emits `--enable-lmcache --lmcache-config-file <data_dir>/kv/lmcache/sglang.yaml`; gates: spec XOR, dp=1, daemon on); `crates/blazar-runtime/src/supervisor.rs` spawn hook dials `argv_dials_lmcache` to ensure the daemon |
 | metrics | - | other + runtime/gateway + cli + engine-argv + gateway-http | `crates/blazar-core/examples/slots_probe.rs:63` in `main`; `crates/blazar-runtime/tests/supervisor.rs:147` in `integration__ensure_ready__health_and_argv_flags`; `crates/blazar-runtime/tests/tuner.rs:110` in `all_flags`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block`; `blazar-core/src/profile.rs:499` in `the`; `crates/blazar-core/src/profile.rs:2649` in `ensure_batch_flag`; `crates/blazar-gateway/src/lib.rs:428` in `router`; `crates/blazar-gateway/src/lib.rs:1168` in `well_known` |
 | skip_warmup | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block` |
 | torch_compile | - | cli + engine-argv | `crates/blazar-cli/src/main.rs:18676` in `knob_hint_block`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang` |

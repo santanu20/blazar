@@ -741,6 +741,9 @@ pub struct Config {
     /// explicitly (explicit user pin always wins over the ladder).
     #[serde(default)]
     pub sglang: SglangTuning,
+    /// Cross-engine KV sharing (`[kv]` section)
+    #[serde(default)]
+    pub kv: KvSection,
     /// mlx engine tuning knobs (global defaults; per-model
     /// `model_overrides.<name>.mlx` replaces this whole struct when
     /// present). Every field maps 1:1 to a `mlx_lm.server` flag and is
@@ -2151,6 +2154,10 @@ pub struct SglangTuning {
     /// enable-priority-scheduling"); `validate` enforces it here so
     /// the config fails fast before any spawn.
     pub enable_priority_scheduling: Option<bool>,
+    /// Cross-engine KV sharing opt-in for this lane (requires
+    /// `[kv.lmcache] enabled`)
+    #[serde(default)]
+    pub lmcache: SglangLmcache,
 }
 
 /// vllm `serve` tuning knobs. All-`Option` on purpose: `None` never
@@ -2197,6 +2204,162 @@ pub struct VllmKvOffload {
     /// `<data_dir>/kv/vllm` so the store survives engine reinstalls
     /// (the per-engine cache directory does not).
     pub root_dir: Option<std::path::PathBuf>,
+    /// Which connector the offload talks to: vLLM's built-in
+    /// `OffloadingConnector` (`offload`, the default) or the shared
+    /// `LMCache` daemon (`lmcache`). The `lmcache` choice is currently
+    /// refused at validation - upstream ships no cross-layout
+    /// converter for the vllm lane yet (see `VllmKvOffload::validate`).
+    #[serde(default)]
+    pub connector: KvConnectorChoice,
+}
+
+/// Which backend a vLLM lane's KV offload talks to: the engine's
+/// built-in connector (digest-keyed filesystem store, `offload`) or
+/// the shared `LMCache` daemon (`lmcache`). The choice is per-spawn
+/// exclusive - the compiler emits exactly one connector's flags.
+/// `lmcache` is refused for now: `LMCache` cannot serve the vllm lane
+/// correctly (no cross-layout converter; stores are
+/// eviction-triggered), so validation teaches the default instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvConnectorChoice {
+    /// vLLM's built-in `OffloadingConnector` (the default).
+    #[default]
+    Offload,
+    /// `LMCache`'s multi-process connector against the shared daemon
+    /// (currently refused - see `VllmKvOffload::validate`).
+    Lmcache,
+}
+
+/// `[kv]`: cross-engine KV-sharing domain configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvSection {
+    /// The shared `LMCache` daemon every `LMCache`-enabled lane dials.
+    #[serde(default)]
+    pub lmcache: LmcacheDaemon,
+}
+
+/// The standalone `lmcache server` owning the shared KV store: one
+/// daemon, many engines - a prefix computed by one engine restores
+/// into another whenever the model identity matches. Supervised as a
+/// lazy child by the runtime when any lane opts in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LmcacheDaemon {
+    /// Master switch: `false` (the default) keeps the whole shared
+    /// domain off; lane-level `LMCache` opt-ins then fail validation.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Daemon listen host - also the host lanes dial.
+    #[serde(default = "default_lmcache_host")]
+    pub host: String,
+    /// Daemon listen port - also the port lanes dial.
+    #[serde(default = "default_lmcache_port")]
+    pub port: u16,
+    /// Health/API frontend port (`--http-host` is pinned to loopback:
+    /// only the supervisor healthcheck dials it; engines ride the MP
+    /// port above). Distinct knob from `port` because the HTTP
+    /// frontend is a different listener with a different lifecycle.
+    #[serde(default = "default_lmcache_http_port")]
+    pub http_port: u16,
+    /// Daemon L1 (CPU) pool size in GiB.
+    #[serde(default = "default_lmcache_l1_gb")]
+    pub l1_size_gb: u32,
+    /// Daemon eviction policy name.
+    #[serde(default = "default_lmcache_eviction")]
+    pub eviction_policy: String,
+}
+
+fn default_lmcache_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_lmcache_port() -> u16 {
+    5556
+}
+
+fn default_lmcache_http_port() -> u16 {
+    8765
+}
+
+fn default_lmcache_l1_gb() -> u32 {
+    4
+}
+
+fn default_lmcache_eviction() -> String {
+    "LRU".into()
+}
+
+impl Default for LmcacheDaemon {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_lmcache_host(),
+            port: default_lmcache_port(),
+            http_port: default_lmcache_http_port(),
+            l1_size_gb: default_lmcache_l1_gb(),
+            eviction_policy: default_lmcache_eviction(),
+        }
+    }
+}
+
+impl LmcacheDaemon {
+    /// Eviction policies the daemon CLI accepts (`--eviction-policy`
+    /// choices, lmcache 0.5.7): a typo would kill the daemon at boot
+    /// with an argparse error, so it dies here with the fix instead.
+    pub const EVICTION_POLICIES: [&str; 4] = ["LRU", "ARC", "IsolatedLRU", "noop"];
+
+    /// Local sanity checks; cross-section gating (lane opt-ins require
+    /// `enabled`) lives in [`Config::validate`] where both sections are
+    /// visible.
+    pub fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        if self.host.trim().is_empty() {
+            return Err(CoreError::Config(format!(
+                "{where_}.host must not be empty - it is both the daemon bind \
+                 and the host every LMCache lane dials"
+            )));
+        }
+        if self.port == 0 {
+            return Err(CoreError::Config(format!(
+                "{where_}.port must be a real port (1..=65535), not 0 - the \
+                 daemon cannot report an OS-assigned port back to blazar"
+            )));
+        }
+        if self.http_port == 0 {
+            return Err(CoreError::Config(format!(
+                "{where_}.http_port must be a real port (1..=65535), not 0 - \
+                 the healthcheck frontend cannot report an OS-assigned port \
+                 back to blazar"
+            )));
+        }
+        if !(1..=64).contains(&self.l1_size_gb) {
+            return Err(CoreError::Config(format!(
+                "{where_}.l1_size_gb must be 1..=64 (GiB), got {}",
+                self.l1_size_gb
+            )));
+        }
+        if !Self::EVICTION_POLICIES.contains(&self.eviction_policy.as_str()) {
+            return Err(CoreError::Config(format!(
+                "{where_}.eviction_policy must be one of {} (daemon \
+                 --eviction-policy choices), got {:?}",
+                Self::EVICTION_POLICIES.join(", "),
+                self.eviction_policy
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `[sglang.lmcache]`: per-lane opt-in to the shared cross-engine KV
+/// domain. Emits `--enable-lmcache --lmcache-config-file <yaml>` with a
+/// generated config pointing at the `[kv.lmcache]` daemon.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SglangLmcache {
+    /// Master switch for this lane's `LMCache` integration.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 fn default_vllm_kv_cpu_gib() -> u32 {
@@ -2209,12 +2372,29 @@ impl Default for VllmKvOffload {
             enabled: false,
             cpu_bytes_gib: default_vllm_kv_cpu_gib(),
             root_dir: None,
+            connector: KvConnectorChoice::default(),
         }
     }
 }
 
 impl VllmKvOffload {
     fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        // The vllm lane cannot ride the shared daemon yet. LMCache
+        // (verified on 0.5.8rc1 + vllm 0.34.0) ships no cross-layout
+        // converter: vllm would reuse sglang-layout blocks as garbage
+        // (56 token-major layer tensors vs 28 fused page-64 groups),
+        // and vllm-side stores only fire under eviction pressure. The
+        // choice is refused on every leg (global + model_overrides)
+        // until upstream closes the gap; the built-in
+        // `OffloadingConnector` stays the lane's persistent tier.
+        if self.enabled && self.connector == KvConnectorChoice::Lmcache {
+            return Err(CoreError::Config(format!(
+                "{where_}.connector = \"lmcache\" is not available on the vllm lane yet - \
+                 the backing daemon ships no cross-layout converter (reused blocks read as \
+                 garbage) and vllm-side stores are eviction-triggered; keep the default \
+                 \"offload\" connector (built-in persistent tier)"
+            )));
+        }
         if !(1..=64).contains(&self.cpu_bytes_gib) {
             return Err(CoreError::Config(format!(
                 "{where_}.cpu_bytes_gib must be 1..=64 (GiB), got {}",
@@ -2268,6 +2448,18 @@ impl SglangTuning {
         self.validate_scalar_ranges(where_)?;
         self.validate_choice_fields(where_)?;
         self.validate_count_floors(where_)?;
+        // Engine-level exclusivity (sglang 0.5.23 memory args):
+        // --enable-lmcache and --enable-hierarchical-cache are mutually
+        // exclusive flags - the child dies at argv parse. Both live in
+        // this struct so the gate covers the global section and every
+        // model_overrides leg through the same `validate`.
+        if self.lmcache.enabled && self.hicache_enable == Some(true) {
+            return Err(CoreError::Config(format!(
+                "{where_}.lmcache.enabled and {where_}.hicache_enable are \
+                 mutually exclusive - sglang accepts --enable-lmcache XOR \
+                 --enable-hierarchical-cache, never both"
+            )));
+        }
         Ok(())
     }
 
@@ -3894,6 +4086,7 @@ impl Default for Config {
             sglang: SglangTuning::default(),
             mlx: MlxTuning::default(),
             vllm: VllmTuning::default(),
+            kv: KvSection::default(),
             spec: "auto".to_string(),
             spec_autopull: false,
             spec_auto_ngram: true,
@@ -5562,9 +5755,30 @@ impl Config {
         self.mistralrs.validate("mistralrs")?;
         self.mlx.validate("mlx")?;
         self.vllm.validate("vllm")?;
+        self.kv.lmcache.validate("kv.lmcache")?;
+        // The sglang LMCache opt-in is only meaningful when the shared
+        // daemon exists - reject it at parse time with the fix in the
+        // message instead of at spawn time. (The vllm connector choice
+        // is refused inside VllmKvOffload::validate regardless of the
+        // daemon: upstream has no cross-layout converter yet.)
+        if !self.kv.lmcache.enabled && self.sglang.lmcache.enabled {
+            return Err(CoreError::Config(
+                "sglang.lmcache.enabled requires [kv.lmcache] enabled - the shared daemon owns the store"
+                    .into(),
+            ));
+        }
         for (name, o) in &self.model_overrides {
             if let Some(t) = &o.sglang {
                 t.validate(&format!("model_overrides.{name}.sglang"))?;
+                // Same daemon gate as the global sglang leg: an overlay
+                // cannot smuggle an LMCache lane in while the shared
+                // daemon is off.
+                if t.lmcache.enabled && !self.kv.lmcache.enabled {
+                    return Err(CoreError::Config(format!(
+                        "model_overrides.{name}.sglang.lmcache.enabled requires \
+                         [kv.lmcache] enabled - the shared daemon owns the store"
+                    )));
+                }
             }
             if let Some(t) = &o.mistralrs {
                 t.validate(&format!("model_overrides.{name}.mistralrs"))?;
@@ -7502,6 +7716,210 @@ mod tests {
         for (name, tuning, needle) in cases {
             let err = tuning.validate("sglang").expect_err(name).to_string();
             assert!(err.contains(needle), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn unit__lmcache_daemon__defaults_match_the_documented_surface() {
+        // The defaults ARE the daemon contract the runtime spawns with:
+        // loopback bind, MP port 5556 (one off upstream's own 5555
+        // default so the daemon never collides with a hand-run
+        // `lmcache server`), loopback healthcheck frontend on 8765, a
+        // 4 GiB L1 pool and LRU eviction. Everything off by default.
+        let d = LmcacheDaemon::default();
+        assert!(!d.enabled);
+        assert_eq!(d.host, "127.0.0.1");
+        assert_eq!(d.port, 5556);
+        assert_eq!(d.http_port, 8765);
+        assert_eq!(d.l1_size_gb, 4);
+        assert_eq!(d.eviction_policy, "LRU");
+        d.validate("kv.lmcache").unwrap();
+        assert!(!KvSection::default().lmcache.enabled);
+    }
+
+    #[test]
+    fn unit__lmcache_daemon__validate_rejects_daemon_killing_knobs() {
+        // Every bad knob here would kill the daemon at boot (argparse
+        // or bind failure) - validate must name it with the fix.
+        let cases: &[(&str, LmcacheDaemon, &str)] = &[
+            (
+                "blank host",
+                LmcacheDaemon {
+                    host: "  ".into(),
+                    ..Default::default()
+                },
+                "kv.lmcache.host must not be empty",
+            ),
+            (
+                "MP port 0",
+                LmcacheDaemon {
+                    port: 0,
+                    ..Default::default()
+                },
+                "kv.lmcache.port must be a real port",
+            ),
+            (
+                "healthcheck port 0",
+                LmcacheDaemon {
+                    http_port: 0,
+                    ..Default::default()
+                },
+                "kv.lmcache.http_port must be a real port",
+            ),
+            (
+                "zero L1 pool",
+                LmcacheDaemon {
+                    l1_size_gb: 0,
+                    ..Default::default()
+                },
+                "kv.lmcache.l1_size_gb must be 1..=64",
+            ),
+            (
+                "oversized L1 pool",
+                LmcacheDaemon {
+                    l1_size_gb: 65,
+                    ..Default::default()
+                },
+                "kv.lmcache.l1_size_gb must be 1..=64",
+            ),
+            (
+                "eviction typo",
+                LmcacheDaemon {
+                    eviction_policy: "lru".into(),
+                    ..Default::default()
+                },
+                "kv.lmcache.eviction_policy must be one of LRU, ARC",
+            ),
+        ];
+        for (name, daemon, needle) in cases {
+            let err = daemon.validate("kv.lmcache").expect_err(name).to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+        // Every documented policy name is accepted, including the
+        // case-sensitive compound ones.
+        for policy in LmcacheDaemon::EVICTION_POLICIES {
+            LmcacheDaemon {
+                eviction_policy: policy.into(),
+                ..Default::default()
+            }
+            .validate("kv.lmcache")
+            .unwrap_or_else(|e| panic!("policy {policy} must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn unit__config__lmcache_lane_optins_gated_on_the_shared_daemon() {
+        // The vllm connector choice is refused outright (upstream has
+        // no cross-layout converter), daemon on or off; the sglang
+        // lane needs the shared daemon enabled - both legs and the
+        // model_overrides smuggle path die at parse time with the fix
+        // in the message.
+        for daemon_on in [false, true] {
+            let err = Config {
+                kv: KvSection {
+                    lmcache: LmcacheDaemon {
+                        enabled: daemon_on,
+                        ..Default::default()
+                    },
+                },
+                vllm: VllmTuning {
+                    kv_offload: VllmKvOffload {
+                        enabled: true,
+                        connector: KvConnectorChoice::Lmcache,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .validate()
+            .expect_err("vllm leg")
+            .to_string();
+            assert!(
+                err.contains("not available on the vllm lane")
+                    && err.contains("\"offload\" connector"),
+                "daemon_on={daemon_on}: {err}"
+            );
+        }
+
+        let sglang_leg = Config {
+            sglang: SglangTuning {
+                lmcache: SglangLmcache { enabled: true },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = sglang_leg.validate().expect_err("sglang leg").to_string();
+        assert!(
+            err.contains("sglang.lmcache.enabled requires [kv.lmcache] enabled"),
+            "{err}"
+        );
+
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert(
+            "m1".to_string(),
+            ModelOverride {
+                sglang: Some(SglangTuning {
+                    lmcache: SglangLmcache { enabled: true },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let overlay_leg = Config {
+            model_overrides: overrides,
+            ..Default::default()
+        };
+        let err = overlay_leg.validate().expect_err("overlay leg").to_string();
+        assert!(
+            err.contains("model_overrides.m1.sglang.lmcache.enabled requires [kv.lmcache] enabled"),
+            "{err}"
+        );
+
+        // With the daemon on, the sglang lane validates - that is the
+        // whole point of the gate, not a blanket ban.
+        Config {
+            kv: KvSection {
+                lmcache: LmcacheDaemon {
+                    enabled: true,
+                    ..Default::default()
+                },
+            },
+            sglang: SglangTuning {
+                lmcache: SglangLmcache { enabled: true },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_or_else(|e| panic!("sglang lane on the shared daemon must validate: {e}"));
+    }
+
+    #[test]
+    fn unit__sglang_tuning__lmcache_and_hicache_are_exclusive() {
+        // Upstream 0.5.23 rejects --enable-lmcache together with
+        // --enable-hierarchical-cache at engine boot; the same XOR
+        // fires earlier here for the global lane and every override.
+        for where_ in ["sglang", "model_overrides.m1.sglang"] {
+            let err = SglangTuning {
+                lmcache: SglangLmcache { enabled: true },
+                hicache_enable: Some(true),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(
+                err.contains("lmcache.enabled and") && err.contains("hicache_enable"),
+                "{where_}: {err}"
+            );
+            // LMCache alone (radix cache stays on by default) is fine.
+            SglangTuning {
+                lmcache: SglangLmcache { enabled: true },
+                ..Default::default()
+            }
+            .validate(where_)
+            .unwrap_or_else(|e| panic!("{where_}: lmcache alone must validate: {e}"));
         }
     }
 

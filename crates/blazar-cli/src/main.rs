@@ -19897,6 +19897,7 @@ fn sglang_hint_families() -> Vec<&'static str> {
         "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
         "cuda_graph_backend_prefill = \"breakable\"    # full|breakable|disabled - disabled unsticks laptop prefill capture",
         "max_total_tokens = 4096    hicache_enable = false    hicache_ratio = 2.0    hicache_size = 0    is_embedding = false",
+        "lmcache = { enabled = false }    # persistent cross-instance KV reuse via the [kv.lmcache] daemon (same engine lane)",
         "hicache_storage_backend = \"\"    # L3 tier (0.5.23+): file|mooncake|hf3fs|... under hicache_enable; write_back/buffer_only variants need it",
         "hicache_write_policy = \"\"    hicache_io_backend = \"\"    hicache_host_memory_mode = \"\"",
         "hicache_storage_extra_config = \"\"    # JSON object string forwarded to the backend factory",
@@ -19969,6 +19970,7 @@ fn vllm_hint_families() -> Vec<&'static str> {
     vec![
         "gpu_memory_utilization = 0.85    # fraction of GPU memory vllm may claim; lower it when sharing the GPU",
         "[vllm.kv_offload]                # persistent KV reuse: enabled = true, cpu_bytes_gib (default 2), root_dir (default <data>/kv/vllm)",
+        "[vllm.kv_offload.connector]      # offload (built-in fs tier; lmcache is refused on this lane until upstream ships a cross-layout converter)",
     ]
 }
 
@@ -24031,7 +24033,12 @@ fn local_engine_manager(d: &BlazarDirs) -> Result<EngineManager> {
     let token = std::env::var("GH_TOKEN").ok();
     // Engine-asset downloads honor the same speed cap as model pulls
     // (config file or BLAZAR_DOWNLOAD_SPEED_LIMIT_MB; 0 = unlimited).
-    let limit = config()?.download_speed_limit_mb;
+    // The cap is read from the CALLER's dirs, not the ambient user
+    // config - a temp-dir flow must not inherit whatever
+    // ~/.config/blazar happens to carry.
+    let limit = Config::load(d)
+        .map_err(|e| anyhow!("{e}"))?
+        .download_speed_limit_mb;
     let gh = GhClient::new(token)?.with_download_speed_limit(limit);
     Ok(EngineManager {
         dirs: d.clone(),

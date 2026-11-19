@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Config, DEFAULT_CACHE_RAM_MB, MmprojPolicy, ModelOverride};
+use crate::config::{Config, DEFAULT_CACHE_RAM_MB, KvConnectorChoice, MmprojPolicy, ModelOverride};
 use crate::config::{MistralrsTuning, MlxTuning, SglangTuning, VllmTuning};
 use crate::gguf::GgufMeta;
 use crate::hardware::GpuInfo;
@@ -4955,21 +4955,40 @@ fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
     // configuration (model, block size, parallelism, dtype): a
     // different config writes a different tree and reads nothing back.
     if tun.kv_offload.enabled {
-        let root = tun.kv_offload.root_dir.as_ref().map_or_else(
-            || format!("{}/kv/vllm", input.data_dir.trim_end_matches('/')),
-            |p| p.to_string_lossy().into_owned(),
-        );
-        let kv_cfg = serde_json::json!({
-            "kv_connector": "OffloadingConnector",
-            "kv_role": "kv_both",
-            "kv_connector_extra_config": {
-                "spec_name": "TieringOffloadingSpec",
-                "cpu_bytes_to_use": u64::from(tun.kv_offload.cpu_bytes_gib) * 1024 * 1024 * 1024,
-                "secondary_tiers": [ { "type": "fs", "root_dir": root } ],
-            },
-        });
-        argv.push("--kv-transfer-config".to_string());
-        argv.push(kv_cfg.to_string());
+        match tun.kv_offload.connector {
+            KvConnectorChoice::Offload => {
+                let root = tun.kv_offload.root_dir.as_ref().map_or_else(
+                    || format!("{}/kv/vllm", input.data_dir.trim_end_matches('/')),
+                    |p| p.to_string_lossy().into_owned(),
+                );
+                let kv_cfg = serde_json::json!({
+                    "kv_connector": "OffloadingConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {
+                        "spec_name": "TieringOffloadingSpec",
+                        "cpu_bytes_to_use": u64::from(tun.kv_offload.cpu_bytes_gib) * 1024 * 1024 * 1024,
+                        "secondary_tiers": [ { "type": "fs", "root_dir": root } ],
+                    },
+                });
+                argv.push("--kv-transfer-config".to_string());
+                argv.push(kv_cfg.to_string());
+            }
+            // Defense in depth: config validation refuses this choice
+            // before compilation ever sees it (upstream LMCache has no
+            // cross-layout converter for the vllm lane - reused blocks
+            // read as garbage). The compiler arm stays a hard error so
+            // a smuggled overlay can never dial the daemon from vllm.
+            KvConnectorChoice::Lmcache => {
+                return Err(
+                    "vllm.kv_offload.connector = \"lmcache\" is not available on the \
+                     vllm lane yet - the backing daemon ships no cross-layout converter \
+                     (reused blocks read as garbage) and vllm-side stores are \
+                     eviction-triggered; keep the default \"offload\" connector \
+                     (built-in persistent tier)"
+                        .into(),
+                );
+            }
+        }
     }
 
     // User extra_args ride after the knobs: on a repeat flag the later
@@ -5071,6 +5090,10 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
 
     // HiCache viability gates refuse impossible host-RAM tiers.
     push_sglang_hicache(input, &tun, &mut argv, &mut warnings)?;
+    // Cross-engine shared KV opt-in: gates live here because the spec
+    // verdict is spawn-resolved (governor tiers) and parallel sizes may
+    // ride overlays - parse-time validation cannot see either.
+    push_sglang_lmcache(input, &tun, spec.engaged, &mut argv)?;
     push_sglang_disagg(input, &tun, &mut argv, &mut warnings);
     push_sglang_pdmux(input, &tun, &mut argv, &mut warnings);
     push_sglang_fused_kernels(input, &tun, &mut argv, &mut warnings);
@@ -5550,6 +5573,59 @@ fn push_sglang_scheduler_observability(
             warnings,
         );
     }
+}
+
+/// Cross-engine shared KV opt-in: emit `--enable-lmcache` plus the
+/// generated client YAML path the supervisor's daemon lane writes
+/// (`<data_dir>/kv/lmcache/sglang.yaml` holding `{mp_host, mp_port}`
+/// pointing at the `[kv.lmcache]` daemon). The two upstream
+/// exclusivities a parse-time check cannot see are gates here: the
+/// spec verdict resolves per spawn (tier order: per-request, overlay,
+/// governor, config) and parallel sizes may ride overlays.
+/// `Config::validate` already rejects the hicache overlap and the
+/// daemon-off leg.
+fn push_sglang_lmcache(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    spec_engaged: bool,
+    argv: &mut Vec<String>,
+) -> Result<(), String> {
+    if !tun.lmcache.enabled {
+        return Ok(());
+    }
+    if spec_engaged {
+        return Err(
+            "sglang.lmcache.enabled cannot combine with an engaged speculative \
+             decoder - upstream rejects --enable-lmcache under speculative \
+             decoding; pin spec = \"off\" for this model or drop the lmcache opt-in"
+                .into(),
+        );
+    }
+    let dp = tun.dp_size.unwrap_or(1);
+    let attn_dp = tun.attn_dp_size.unwrap_or(1);
+    if dp > 1 || attn_dp > 1 {
+        return Err(format!(
+            "sglang.lmcache.enabled requires dp_size = 1 and attn_dp_size = 1 \
+             (got {dp}/{attn_dp}) - upstream rejects --enable-lmcache under \
+             data/attention parallelism"
+        ));
+    }
+    let daemon = &input.config.kv.lmcache;
+    if !daemon.enabled {
+        return Err(
+            "sglang.lmcache.enabled requires [kv.lmcache] enabled - the shared \
+             daemon owns the store"
+                .into(),
+        );
+    }
+    let cfg_path = format!(
+        "{}/kv/lmcache/sglang.yaml",
+        input.data_dir.trim_end_matches('/')
+    );
+    argv.push("--enable-lmcache".to_string());
+    argv.push("--lmcache-config-file".to_string());
+    argv.push(cfg_path);
+    Ok(())
 }
 
 /// `HiCache` (KV tiering to host RAM) - opt-in, with structural viability
@@ -20653,6 +20729,7 @@ mod tests {
                 enabled: true,
                 cpu_bytes_gib: 3,
                 root_dir: None,
+                connector: crate::config::KvConnectorChoice::default(),
             },
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
@@ -20695,6 +20772,7 @@ mod tests {
                 enabled: true,
                 cpu_bytes_gib: 2,
                 root_dir: Some("/store/kv-custom".into()),
+                connector: crate::config::KvConnectorChoice::default(),
             },
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
@@ -20714,6 +20792,144 @@ mod tests {
         // shell), and carries no NUL/newline that would corrupt it.
         assert!(!p.argv[idx + 1].contains('\n'));
         assert!(!p.argv[idx + 1].contains('\0'));
+    }
+
+    #[test]
+    fn unit__vllm_compile__lmcache_connector_is_refused_not_emitted() {
+        // Defense-in-depth mirror of the Config gate: the compiler
+        // cannot assume validate() ran (programmatic callers), so the
+        // lmcache choice refuses here too - even with the daemon
+        // enabled - instead of emitting a connector that would reuse
+        // foreign-layout blocks as garbage (no upstream converter).
+        let cfg = Config {
+            kv: crate::config::KvSection {
+                lmcache: crate::config::LmcacheDaemon {
+                    enabled: true,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            gpu_memory_utilization: None,
+            kv_offload: crate::config::VllmKvOffload {
+                enabled: true,
+                connector: crate::config::KvConnectorChoice::Lmcache,
+                ..Default::default()
+            },
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("not available on the vllm lane") && err.contains("\"offload\" connector"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__sglang_compile__lmcache_emits_flag_pair_with_generated_yaml() {
+        // Daemon on + lane opt-in: --enable-lmcache plus the generated
+        // client YAML under the data dir (the supervisor's daemon lane
+        // writes {mp_host, mp_port} there before the child boots).
+        let cfg = Config {
+            kv: crate::config::KvSection {
+                lmcache: crate::config::LmcacheDaemon {
+                    enabled: true,
+                    ..Default::default()
+                },
+            },
+            sglang: SglangTuning {
+                lmcache: crate::config::SglangLmcache { enabled: true },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let idx = p
+            .argv
+            .iter()
+            .position(|a| a == "--enable-lmcache")
+            .expect("lmcache flag emitted");
+        assert_eq!(p.argv[idx + 1], "--lmcache-config-file");
+        assert_eq!(
+            p.argv[idx + 2],
+            "/tmp/blazar-test-data/kv/lmcache/sglang.yaml",
+            "client config path is data-dir rooted: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang_compile__lmcache_gates_spec_parallelism_and_daemon() {
+        // Three upstream exclusivities Config::validate cannot see:
+        // spec engagement resolves per spawn, parallel sizes may ride
+        // overlays, and the daemon gate is mirrored for programmatic
+        // callers. Each refuses with the fix in the message.
+        let daemon_on = || Config {
+            kv: crate::config::KvSection {
+                lmcache: crate::config::LmcacheDaemon {
+                    enabled: true,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        };
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+
+        // Engaged speculative decoder (draft-free NGRAM counts): the
+        // XOR upstream enforces at boot.
+        let cfg = Config {
+            sglang: SglangTuning {
+                lmcache: crate::config::SglangLmcache { enabled: true },
+                spec_algorithm: Some("ngram".into()),
+                ..Default::default()
+            },
+            ..daemon_on()
+        };
+        let inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("cannot combine with an engaged speculative decoder")
+                && err.contains("pin spec = \"off\""),
+            "{err}"
+        );
+
+        // Data/attention parallelism: upstream rejects --enable-lmcache
+        // under dp > 1.
+        let cfg = Config {
+            sglang: SglangTuning {
+                lmcache: crate::config::SglangLmcache { enabled: true },
+                dp_size: Some(2),
+                ..Default::default()
+            },
+            ..daemon_on()
+        };
+        let inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("requires dp_size = 1 and attn_dp_size = 1"),
+            "{err}"
+        );
+
+        // Daemon off: same teaching as the Config gate, for callers
+        // that build a Config programmatically.
+        let cfg = Config {
+            sglang: SglangTuning {
+                lmcache: crate::config::SglangLmcache { enabled: true },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("requires [kv.lmcache] enabled"), "{err}");
     }
 
     #[test]
