@@ -1280,6 +1280,11 @@ enum RegistryCmd {
         /// Base64 raw public key (default: the compiled-in anchor)
         #[arg(long)]
         pubkey: Option<String>,
+        /// File holding the base64 raw public key (e.g. the shipped
+        /// `registry/capability-lanes.pub`) - offline/air-gapped checks
+        /// without config or the compiled-in anchor
+        #[arg(long, conflicts_with = "pubkey")]
+        pubkey_file: Option<String>,
     },
 }
 
@@ -24093,12 +24098,30 @@ fn registry_cmd(cmd: RegistryCmd) -> Result<()> {
                 ))
             );
         }
-        RegistryCmd::Verify { file, sig, pubkey } => {
+        RegistryCmd::Verify {
+            file,
+            sig,
+            pubkey,
+            pubkey_file,
+        } => {
             let sig_path = sig.unwrap_or_else(|| format!("{file}.sig"));
             let body = std::fs::read(&file).with_context(|| format!("read {file}"))?;
             let sig_b64 =
                 std::fs::read_to_string(&sig_path).with_context(|| format!("read {sig_path}"))?;
-            match reg::effective_pubkey(pubkey.as_deref())
+            // An explicit key source (inline or file) replaces the anchor;
+            // a file that cannot be read fails the check outright rather
+            // than silently falling back to the embedded key.
+            let pinned = match (pubkey, pubkey_file) {
+                (Some(pk), None) => Some(pk),
+                (None, Some(path)) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("read {path}"))?
+                        .trim()
+                        .to_string(),
+                ),
+                _ => None,
+            };
+            match reg::effective_pubkey(pinned.as_deref())
                 .map_err(|e| anyhow!("{e}"))
                 .and_then(|pk| {
                     reg::verify_registry_signature(&body, sig_b64.trim(), &pk)
@@ -24107,7 +24130,7 @@ fn registry_cmd(cmd: RegistryCmd) -> Result<()> {
                 Ok(()) => {
                     println!(
                         "OK: {file} verifies against {} signature {sig_path}",
-                        if pubkey.is_some() {
+                        if pinned.is_some() {
                             "the given public key"
                         } else {
                             "the embedded blazar key"
