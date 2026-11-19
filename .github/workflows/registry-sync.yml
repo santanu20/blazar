@@ -1,0 +1,87 @@
+name: registry-sync
+
+# Weekly health pass over registry/capability-lanes.json:
+#   - every pinned commit must still exist upstream (a fork force-push
+#     once orphaned the instella-moe pin)
+#   - every advertised architecture must still be declared by the
+#     pinned fork tree and must NOT have graduated into llama.cpp
+#     mainline
+#   - discovery: open upstream architecture PRs with GGUF circulation
+#     are proposed as new rows for maintainer review
+# Findings land in one rolling "registry-sync report" issue that this
+# workflow creates once and keeps updating - never auto-commits the
+# registry (it is a trust anchor).
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: registry-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe registry rows (liveness / graduation / wire names)
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          python scripts/registry_sync.py --check 2>&1 | tee probe.log
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Discovery scan (proposals for maintainer review)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/registry_sync.py --propose 2>&1 | tee propose.log || true
+
+      - name: Publish rolling report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBE_STATUS: ${{ steps.probe.outputs.status }}
+        run: |
+          title="registry-sync report"
+          body_file=report.md
+          {
+            echo "## registry-sync report (\`$(date -u +%F)\`)"
+            echo
+            if [ "$PROBE_STATUS" = "0" ]; then
+              echo "**Registry health: OK** - all lanes verified, no drift."
+            else
+              echo "**Registry health: DRIFT DETECTED** - rows need maintainer action."
+            fi
+            echo
+            echo "### Lane verification"
+            echo '```'
+            cat probe.log
+            echo '```'
+            echo
+            echo "### Discovery proposals (review required - nothing is auto-applied)"
+            echo '```markdown'
+            cat propose.log
+            echo '```'
+          } > "$body_file"
+          existing=$(gh issue list --search "in:title \"$title\"" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$body_file"
+          else
+            gh issue create --title "$title" --label registry-sync --body-file "$body_file" || \
+              gh issue create --title "$title" --body-file "$body_file"
+          fi
+
+      - name: Fail the workflow on drift
+        if: steps.probe.outputs.status != '0'
+        run: |
+          echo "registry drift detected - see the registry-sync report issue"
+          exit 1
