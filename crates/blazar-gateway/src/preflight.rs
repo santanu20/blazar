@@ -611,6 +611,8 @@ mod tests {
 
     fn meta(layers: u64, heads: u64, kv: u64, emb: u64) -> GgufMeta {
         GgufMeta {
+            base_model_id: None,
+            file_type: None,
             architecture: "qwen3".into(),
             block_count: Some(layers),
             head_count: Some(heads),

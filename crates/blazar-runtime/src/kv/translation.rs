@@ -447,6 +447,7 @@ mod tests {
     #[test]
     fn unit__translation__lane_constructors_carry_the_live_registered_constants() {
         let gguf = GgufMeta {
+            base_model_id: None,
             block_count: Some(28),
             head_count: Some(12),
             head_count_kv: Some(2),
@@ -521,6 +522,7 @@ mod tests {
     #[test]
     fn unit__translation__gguf_identity_uses_honest_embedded_markers() {
         let meta = GgufMeta {
+            base_model_id: None,
             rope_fingerprint: Some("freq_base=10000000;scaling=yarn,factor=4".into()),
             ..GgufMeta::default()
         };

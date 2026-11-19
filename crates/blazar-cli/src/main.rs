@@ -707,6 +707,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SessionCmd,
     },
+    /// Cross-engine KV import: repack a llama.cpp session bank into
+    /// vLLM's persistent filesystem KV tier, so the provenance-matching
+    /// HF model resumes the banked prefix on its next vllm spawn
+    /// (observed as `cached_tokens` on the first same-prefix request).
+    /// Offline command - reads banks and writes tier files directly,
+    /// no daemon needed.
+    Kv {
+        #[command(subcommand)]
+        cmd: KvCmd,
+    },
     /// Run a ggml RPC worker: expose this machine's GPUs to a remote
     /// gateway's `rpc_servers` (distributed llama.cpp inference -
     /// weights and KV split across local + remote devices in
@@ -860,6 +870,23 @@ enum SessionCmd {
     List {
         /// Model whose checkpoints to list
         model: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KvCmd {
+    /// Import a llama.cpp slot bank into vLLM's persistent KV tier
+    Import {
+        /// GGUF model name (store row) whose bank to import
+        #[arg(long)]
+        from: String,
+        /// HF-dir model name (store row) whose vLLM tier receives the blocks
+        #[arg(long)]
+        to: String,
+        /// Explicit bank file (default: newest bank under the from-model's
+        /// sessions directory)
+        #[arg(long)]
+        bank: Option<String>,
     },
 }
 
@@ -1387,6 +1414,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         "Engine & Config",
         &[
             "engine",
+            "kv",
             "rpc",
             "config",
             "keys",
@@ -2663,6 +2691,7 @@ blazar mmproj <model> <mmproj.gguf path>"
         Cmd::Signout => cloud_refusal("signout", ""),
         Cmd::Logout => cloud_refusal("logout", ""),
         Cmd::Session { cmd } => session_cmd(cmd).await,
+        Cmd::Kv { cmd } => Ok(kv_cmd(cmd)?),
         Cmd::Rpc { cmd } => rpc_cmd(cmd).await,
         Cmd::Doctor { flat, json, fix } => doctor(flat, json, fix).await,
         Cmd::ModelDoctor { model, json } => model_doctor_cmd(&model, json).await,
@@ -4032,6 +4061,196 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
     Ok(())
 }
 
+fn kv_cmd(cmd: KvCmd) -> Result<()> {
+    match cmd {
+        KvCmd::Import { from, to, bank } => kv_import_cmd(&dirs(), &from, &to, bank.as_deref()),
+    }
+}
+
+/// Offline import: llama.cpp session bank -> vLLM fs KV tier. Every gate
+/// teaches on refusal; nothing is written until all of them pass.
+fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Result<()> {
+    let cfg = config()?;
+    anyhow::ensure!(
+        cfg.kv.translation.enabled,
+        "kv import is gated on [kv.translation] enabled = true - the knob keeps cross-engine KV admission explicit"
+    );
+    let store = Store::open(d)?;
+    let rows = store.list_models()?;
+    let from_row = rows.iter().find(|r| r.name == from).ok_or_else(|| {
+        anyhow!("no model named {from:?} in the store - `blazar models` lists names")
+    })?;
+    let to_row = rows.iter().find(|r| r.name == to).ok_or_else(|| {
+        anyhow!("no model named {to:?} in the store - `blazar models` lists names")
+    })?;
+    let gguf_path = std::path::PathBuf::from(&from_row.path);
+    anyhow::ensure!(
+        gguf_path.is_file(),
+        "model {from:?} is not a GGUF file ({})",
+        from_row.path
+    );
+    let hf_dir = std::path::PathBuf::from(&to_row.path);
+    anyhow::ensure!(
+        hf_dir.join("config.json").is_file(),
+        "model {to:?} is not an HF directory ({})",
+        to_row.path
+    );
+
+    let gguf_buf = std::fs::read(&gguf_path)?;
+    let (meta, _) = blazar_core::gguf::parse_metadata(&gguf_buf)?;
+    let hf_meta = blazar_core::hfmeta::read_hf_config(&hf_dir)?;
+
+    let geo = kv_import_gates(&cfg, &meta, &hf_meta, to_row)?;
+
+    let bank_path = match bank {
+        Some(p) => std::path::PathBuf::from(p),
+        None => discover_newest_bank(&d.data_dir, from).ok_or_else(|| {
+            anyhow!(
+                "no session bank for {from:?} under {} - serve it on the llama.cpp lane and let a session bank land, or pass --bank <file>",
+                d.data_dir.join("sessions").display()
+            )
+        })?,
+    };
+    let bank_buf = std::fs::read(&bank_path)?;
+    let parsed = blazar_runtime::kv::repack::parse_slot_save(&bank_buf, &geo)
+        .map_err(|e| anyhow!("bank {:#?}: {e}", bank_path.display()))?;
+
+    // The spec must mirror what compile_vllm's spawn folds into the tier
+    // identity: the HF dir path string, block size 64, one block per file,
+    // flash-attn canonical layout. A drift here reads nothing back
+    // (fail-cold), never corrupts.
+    let spec = blazar_runtime::kv::repack::VllmFsSpec {
+        model_name: to_row.path.clone(),
+        tokens_per_hash: 64,
+        blocks_per_file: 1,
+        canonical_format: "v1-nhd".into(),
+    };
+    let root = d.data_dir.join("kv").join("vllm");
+    let outcome = blazar_runtime::kv::repack::repack_into_fs_tier(&parsed, &geo, &spec, &root)
+        .map_err(|e| anyhow!("kv import: {e}"))?;
+    println!(
+        "imported {} block(s) ({} tokens each) from {:#?}",
+        outcome.blocks_written,
+        outcome.block_tokens,
+        bank_path.display()
+    );
+    if outcome.tail_tokens_dropped > 0 {
+        println!(
+            "  dropped {} tail token(s) - vLLM stores full {}-token blocks only",
+            outcome.tail_tokens_dropped, outcome.block_tokens
+        );
+    }
+    println!("  tier: {:#?}", spec.rank_dir(&root).display());
+    println!(
+        "  next same-prefix request on the vllm lane reports cached_tokens (prefix restore, not recompute)"
+    );
+    Ok(())
+}
+
+/// Gate order for an import: weights, rope, lane-layout policy - each
+/// refuses with the fix in the message before anything touches the tier
+/// directory. Returns the cross-checked geometry the repack walks against.
+fn kv_import_gates(
+    cfg: &blazar_core::config::Config,
+    meta: &blazar_core::gguf::GgufMeta,
+    hf_meta: &blazar_core::hfmeta::HfMeta,
+    to_row: &blazar_core::store::ModelRow,
+) -> Result<blazar_runtime::kv::repack::RepackGeometry> {
+    let hf_repo = if to_row.repo.is_empty() {
+        to_row.name.as_str()
+    } else {
+        to_row.repo.as_str()
+    };
+    blazar_runtime::kv::repack::provenance_gate(
+        meta.file_type,
+        meta.base_model_id.as_deref(),
+        hf_repo,
+    )
+    .map_err(|e| anyhow!("kv import: {e}"))?;
+    blazar_runtime::kv::repack::rope_gate(
+        meta.rope_fingerprint.as_deref(),
+        hf_meta.rope_fingerprint.as_deref(),
+    )
+    .map_err(|e| anyhow!("kv import: {e}"))?;
+
+    let geo = repack_geometry(meta).ok_or_else(|| {
+        anyhow!("GGUF lacks full KV geometry (block_count / head_count_kv / head dimension) - cannot cross-check the bank")
+    })?;
+    let registry = blazar_runtime::kv::translation::builtin_registry(&cfg.kv.translation);
+    let (llamacpp_layout, vllm_layout) = (
+        blazar_runtime::kv::translation::llamacpp_kv_layout(meta),
+        blazar_runtime::kv::translation::vllm_kv_layout(hf_meta, 64),
+    );
+    let (Some(llamacpp_layout), Some(vllm_layout)) = (llamacpp_layout, vllm_layout) else {
+        anyhow::bail!(
+            "KV geometry incomplete on one side of the pair - cannot verdict the lane pair"
+        );
+    };
+    if let blazar_core::kv::KvCompatibility::Incompatible { reason } =
+        blazar_runtime::kv::translation::translation_verdict(
+            &llamacpp_layout,
+            &vllm_layout,
+            &registry,
+        )
+    {
+        anyhow::bail!("kv import: lane pair refused - {reason}");
+    }
+    Ok(geo)
+}
+
+/// Bank cross-check geometry from GGUF metadata, mirroring
+/// `llamacpp_kv_layout` (loop architectures multiply `block_count`).
+fn repack_geometry(
+    meta: &blazar_core::gguf::GgufMeta,
+) -> Option<blazar_runtime::kv::repack::RepackGeometry> {
+    let loops = meta.num_loops.unwrap_or(1);
+    let layers = u32::try_from(meta.block_count?).ok()?.saturating_mul(loops);
+    let kv_heads = u32::try_from(meta.head_count_kv.or(meta.head_count)?).ok()?;
+    let head_dim = u32::try_from(meta.derived_head_dim()?).ok()?;
+    Some(blazar_runtime::kv::repack::RepackGeometry {
+        layers,
+        kv_heads,
+        head_dim,
+    })
+}
+
+/// Newest non-manifest file under `<data>/sessions/<model>-*/`. Session
+/// banks land next to a `.identity.json` manifest; those and dotfiles are
+/// skipped. One unreadable entry never aborts the scan.
+fn discover_newest_bank(data_dir: &std::path::Path, model: &str) -> Option<std::path::PathBuf> {
+    let sessions = data_dir.join("sessions");
+    let prefix = format!("{model}-");
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for dir in std::fs::read_dir(&sessions).ok()?.flatten() {
+        if !dir.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let name = f.file_name().to_string_lossy().to_string();
+            if name.starts_with('.')
+                || std::path::Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
+                continue;
+            }
+            let Ok(md) = f.metadata() else {
+                continue;
+            };
+            let Ok(mtime) = md.modified() else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                best = Some((mtime, f.path()));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// One doctor check row: name, status word, detail line.
 #[derive(Debug)]
 struct Check {
@@ -4866,6 +5085,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_bench_receipts(&d));
     checks.extend(doctor_kv_budget(&d));
     checks.extend(doctor_kv_translation(&d));
+    checks.extend(doctor_kv_import(&d));
     checks.extend(doctor_mmproj_pairing(&d));
     checks.extend(doctor_sentinel(&d));
     checks.extend(doctor_runtime(&d));
@@ -6564,6 +6784,86 @@ fn kv_translation_rows(
     out
 }
 
+fn doctor_kv_import(d: &BlazarDirs) -> Vec<Check> {
+    let Ok(store) = Store::open(d) else {
+        return vec![]; // store failure is already reported by the kv budget rows
+    };
+    let Ok(rows) = store.list_models() else {
+        return vec![];
+    };
+    let Ok(cfg) = config() else {
+        return vec![];
+    };
+    kv_import_rows(&rows, &cfg, &d.data_dir)
+        .into_iter()
+        .map(|(name, detail)| Check::ok("kv import", format!("{name}: {detail}")))
+        .collect()
+}
+
+/// Pure readiness scan behind the doctor row: which GGUF models carry a
+/// lossless, provenance-provable twin HF row (i.e. `kv import` would
+/// pass its gates right now, given a bank).
+fn kv_import_rows(
+    rows: &[blazar_core::store::ModelRow],
+    cfg: &Config,
+    data_dir: &std::path::Path,
+) -> Vec<(String, String)> {
+    let hf_targets: Vec<&blazar_core::store::ModelRow> = rows
+        .iter()
+        .filter(|r| std::path::Path::new(&r.path).join("config.json").is_file())
+        .collect();
+    let mut out = Vec::new();
+    for row in rows {
+        let path = std::path::Path::new(&row.path);
+        if !path.is_file() || path.extension().is_some_and(|e| e != "gguf") {
+            continue; // HF dirs / sidecars are import targets, never sources
+        }
+        let Ok(buf) = std::fs::read(path) else {
+            continue; // unreadable GGUF is reported by the models checks
+        };
+        let Ok((meta, _)) = blazar_core::gguf::parse_metadata(&buf) else {
+            continue;
+        };
+        let Some(base) = meta.base_model_id.clone() else {
+            continue; // import itself teaches the gguf-set-metadata fix
+        };
+        let Some(twin) = hf_targets.iter().copied().find(|t| {
+            let repo = if t.repo.is_empty() {
+                t.name.as_str()
+            } else {
+                t.repo.as_str()
+            };
+            blazar_runtime::kv::repack::provenance_gate(meta.file_type, Some(&base), repo).is_ok()
+        }) else {
+            continue;
+        };
+        let bank = if discover_newest_bank(data_dir, &row.name).is_some() {
+            "bank present"
+        } else {
+            "bank pending (serve on the llama.cpp lane)"
+        };
+        let knob = if cfg.kv.translation.enabled {
+            ""
+        } else {
+            " (gated on [kv.translation] enabled)"
+        };
+        out.push((
+            row.name.clone(),
+            format!(
+                "-> {}: import ready, {bank}{knob} (blazar kv import --from {} --to {})",
+                twin.name, row.name, twin.name
+            ),
+        ));
+    }
+    if out.is_empty() {
+        out.push((
+            "(none)".to_string(),
+            "no GGUF/HF twin pair passes the provenance gates - nothing importable yet".to_string(),
+        ));
+    }
+    out
+}
+
 fn doctor_mmproj_pairing(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
@@ -6881,6 +7181,57 @@ mod doctor_tests {
             on[0].1.contains("no bridge is wired"),
             "two-layer honesty in the table: {}",
             on[0].1
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_import_rows__unresolvable_models_report_none_honestly() {
+        // A GGUF row whose file does not exist and an HF row: neither can
+        // pass provenance, so the scan reports the honest empty verdict
+        // instead of guessing a pair.
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![
+            blazar_core::store::ModelRow {
+                name: "some-gguf".into(),
+                repo: String::new(),
+                quant: String::new(),
+                path: dir.path().join("missing.gguf").display().to_string(),
+                bytes: 0,
+                sha256: None,
+                mmproj_path: None,
+                components: Vec::new(),
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            },
+            blazar_core::store::ModelRow {
+                name: "hf-twin".into(),
+                repo: "Qwen/Qwen2.5-1.5B-Instruct".into(),
+                quant: String::new(),
+                path: dir.path().display().to_string(),
+                bytes: 0,
+                sha256: None,
+                mmproj_path: None,
+                components: Vec::new(),
+                shards: 1,
+                arch: None,
+                params: None,
+                ctx_train: None,
+                pulled_at: 0,
+                last_used_at: 0,
+            },
+        ];
+        let out = kv_import_rows(&rows, &Config::default(), dir.path());
+        assert_eq!(out.len(), 1, "exactly the honest empty row: {out:?}");
+        assert!(
+            out[0].0 == "(none)" && out[0].1.contains("provenance gates"),
+            "empty scan names why: {} | {}",
+            out[0].0,
+            out[0].1
         );
     }
 

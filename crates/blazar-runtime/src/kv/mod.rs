@@ -8,6 +8,7 @@
 
 pub mod compatibility;
 pub mod registry;
+pub mod repack;
 pub mod translation;
 
 use blazar_core::kv::{KvCapabilities, KvError};

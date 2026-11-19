@@ -9204,6 +9204,8 @@ mod tests {
 
     fn meta() -> GgufMeta {
         GgufMeta {
+            base_model_id: None,
+            file_type: None,
             architecture: "qwen3".into(),
             name: Some("x".into()),
             basename: None,
@@ -9233,6 +9235,8 @@ mod tests {
 
     fn meta_with_mtp(layers: u64) -> GgufMeta {
         GgufMeta {
+            base_model_id: None,
+            file_type: None,
             mtp_layers: Some(layers),
             ..meta()
         }
@@ -9244,6 +9248,8 @@ mod tests {
     /// live qwen3.5-9b store header (256/256).
     fn meta_mla() -> GgufMeta {
         GgufMeta {
+            base_model_id: None,
+            file_type: None,
             architecture: "qwen35".into(),
             key_length: Some(256),
             value_length: Some(256),
@@ -9946,6 +9952,8 @@ mod tests {
             ..Config::default()
         };
         let m = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             architecture: "qwen35".into(),
             ..meta()
         };
@@ -11523,6 +11531,8 @@ mod tests {
         };
         let hw = gpu_hw(6_000, 13_674, 8);
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(131_072),
             ..meta()
         };
@@ -11564,6 +11574,8 @@ mod tests {
         };
         let hw = gpu_hw(6_000, 13_674, 8);
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(131_072),
             ..meta()
         };
@@ -12106,6 +12118,8 @@ mod tests {
         };
         let hw = gpu_hw(8_400, 13_674, 8);
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(131_072),
             ..meta()
         };
@@ -12137,6 +12151,8 @@ mod tests {
         };
         let hw = gpu_hw(8_400, 13_674, 8);
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(131_072),
             ..meta()
         };
@@ -12172,6 +12188,8 @@ mod tests {
         };
         let hw = gpu_hw(8_400, 13_674, 8);
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(32_768),
             ..meta_mla()
         };
@@ -12485,6 +12503,8 @@ mod tests {
         };
         let hw = gpu_hw(24_000, 32_000, 8);
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             expert_count: Some(128),
             ..meta()
         };
@@ -13539,6 +13559,8 @@ mod tests {
         // auto_slots_capacity path; a small model keeps the small
         // card's budget math away from the resident-weight floor.
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(131_072),
             ..meta()
         };
@@ -13576,6 +13598,8 @@ mod tests {
         // slots the host budget proves safe. Box geometry: 8 GiB card,
         // 5366 MiB weights, kv/slot @8192 = 448 MiB, train 262144.
         let g = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             context_length: Some(262_144),
             ..meta()
         };
@@ -15203,6 +15227,8 @@ mod tests {
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
         let draft = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             block_count: Some(2),
             ..meta()
         };
@@ -15228,6 +15254,8 @@ mod tests {
         let hw = gpu_hw(24_000, 64_000, 8);
         let g = meta();
         let draft = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             block_count: Some(2),
             ..meta()
         };
@@ -21000,6 +21028,8 @@ mod tests {
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let gguf = GgufMeta {
+            base_model_id: None,
+            file_type: None,
             architecture: "Qwen2ForCausalLM".into(),
             ..meta()
         };

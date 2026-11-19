@@ -572,6 +572,8 @@ fn gpu4_hw(vram_mib: u64, ram_mib: u64) -> Hardware {
 
 fn gguf_meta() -> GgufMeta {
     GgufMeta {
+        base_model_id: None,
+        file_type: None,
         architecture: "qwen3".into(),
         name: Some("x".into()),
         basename: Some("Qwen_Qwen3.5".into()),
@@ -602,6 +604,8 @@ fn gguf_meta() -> GgufMeta {
 /// Embedding-class GGUF: drives the `--embeddings`/pooling profile rules.
 fn embedding_gguf_meta() -> GgufMeta {
     GgufMeta {
+        base_model_id: None,
+        file_type: None,
         pooling_type: Some(1),
         ..gguf_meta()
     }

@@ -75,6 +75,17 @@ pub struct GgufMeta {
     pub quantized_by: Option<String>,
     /// `general.version` - upstream version string.
     pub general_version: Option<String>,
+    /// `general.file_type` - container quantization class (GGUF
+    /// `LLAMA_FTYPE` enum). The cross-engine KV import admits only
+    /// lossless classes (`f32`/`f16`/`bf16`): any quantized value means
+    /// the GGUF weights are numerically distinct from the HF source and
+    /// cache bytes computed from them never transfer honestly.
+    pub file_type: Option<u64>,
+    /// `general.base_model_id` - the upstream HF repo id the converter or
+    /// packager stamped into the container. The cross-engine KV import's
+    /// provenance gate reads this explicit key (never a basename+size
+    /// recombination, which is ambiguous between model variants).
+    pub base_model_id: Option<String>,
     /// `{arch}.pooling_type` - present only on embedding-class models
     /// (bert/nomic-bert/...). Drives the `--embeddings` profile rule so
     /// `/v1/embeddings` works without manual flags.
@@ -730,6 +741,8 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         size_label: find_str("general.size_label"),
         quantized_by: find_str("general.quantized_by"),
         general_version: find_str("general.version"),
+        file_type: get("general.file_type".to_string()),
+        base_model_id: find_str("general.base_model_id"),
         block_count: get(format!("{arch}.block_count")),
         context_length: get(format!("{arch}.context_length")),
         expert_count: get(format!("{arch}.expert_count")),
@@ -1155,6 +1168,7 @@ mod tests {
     #[test]
     fn unit__gguf_swa_token_sum__scalar_window_needs_interval() {
         let mut meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(32),
             sliding_window: Some(512),
             ..GgufMeta::default()
@@ -1173,6 +1187,7 @@ mod tests {
     #[test]
     fn unit__gguf_swa_token_sum__per_layer_array_elementwise() {
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(4),
             sliding_window_per_layer: Some(vec![0, 512, 0, 512]),
             ..GgufMeta::default()
@@ -1184,6 +1199,7 @@ mod tests {
     #[test]
     fn unit__gguf_swa_token_sum__array_length_mismatch_is_ambiguous() {
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(8),
             sliding_window_per_layer: Some(vec![512; 4]),
             ..GgufMeta::default()
@@ -1218,6 +1234,7 @@ mod tests {
     fn unit__kv_f16_bytes__classic_shape_matches_legacy_formula() {
         // No MLA widths, no SWA: 2 * blocks * kv_heads * head_dim * ctx * 2.
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(32),
             head_count: Some(32),
             head_count_kv: Some(8),
@@ -1235,6 +1252,7 @@ mod tests {
         // DeepSeek2-flavored: kv_heads=1, explicit K/V latents wider and
         // narrower than the derived head_dim - both are loader truth.
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(2),
             head_count: Some(16),
             head_count_kv: Some(1),
@@ -1250,6 +1268,7 @@ mod tests {
     #[test]
     fn unit__kv_f16_bytes__hybrid_swa_shrinks_cache_provably() {
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(32),
             head_count: Some(16),
             head_count_kv: Some(4),
@@ -1268,6 +1287,7 @@ mod tests {
     fn unit__kv_f16_bytes__missing_geometry_is_none() {
         assert_eq!(GgufMeta::default().kv_f16_bytes(4096), None);
         let no_dim = GgufMeta {
+            base_model_id: None,
             block_count: Some(32),
             head_count_kv: Some(8),
             ..GgufMeta::default()
@@ -1278,6 +1298,7 @@ mod tests {
     #[test]
     fn unit__lint__complete_geometry_is_silent() {
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(32),
             context_length: Some(32_768),
             head_count: Some(32),
@@ -1300,6 +1321,7 @@ mod tests {
     #[test]
     fn unit__lint__swa_array_length_mismatch_warns() {
         let meta = GgufMeta {
+            base_model_id: None,
             block_count: Some(4),
             context_length: Some(4096),
             head_count: Some(16),
@@ -1430,6 +1452,8 @@ mod tests {
 
     fn hybrid_kv_meta(arch: &str, blocks: u32) -> GgufMeta {
         GgufMeta {
+            base_model_id: None,
+            file_type: None,
             architecture: arch.into(),
             block_count: Some(u64::from(blocks)),
             head_count: Some(16),

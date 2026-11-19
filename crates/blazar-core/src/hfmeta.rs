@@ -703,6 +703,7 @@ mod tests {
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__model_meta__context_length_both_lanes() {
         let g = GgufMeta {
+            base_model_id: None,
             architecture: "llama".into(),
             context_length: Some(8192),
             ..Default::default()
