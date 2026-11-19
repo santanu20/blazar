@@ -4115,6 +4115,27 @@ fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Re
     let parsed = blazar_runtime::kv::repack::parse_slot_save(&bank_buf, &geo)
         .map_err(|e| anyhow!("bank {:#?}: {e}", bank_path.display()))?;
 
+    // Route through the interchange carrier: the codec registry admits the
+    // llama.cpp -> vllm pair only under [kv.translation], and the carrier
+    // write is byte-identical to the direct repack (pinned by unit test).
+    let pairs = blazar_runtime::kv::interchange::admitted_pairs(&cfg.kv.translation);
+    if !pairs.contains(&blazar_runtime::kv::interchange::CodecLane::LlamaCppToVllm) {
+        let known = pairs
+            .iter()
+            .map(|p| p.pair_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let known = if known.is_empty() {
+            "none".into()
+        } else {
+            known
+        };
+        anyhow::bail!(
+            "the llama.cpp -> vllm codec pair is not admitted - [kv.translation] enabled admits it (admitted pairs: {known})"
+        );
+    }
+    let carrier = blazar_runtime::kv::interchange::KvCarrier::from_slot_bank(parsed, geo);
+
     // The spec must mirror what compile_vllm's spawn folds into the tier
     // identity: the HF dir path string, block size 64, one block per file,
     // flash-attn canonical layout. A drift here reads nothing back
@@ -4126,7 +4147,7 @@ fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Re
         canonical_format: "v1-nhd".into(),
     };
     let root = d.data_dir.join("kv").join("vllm");
-    let outcome = blazar_runtime::kv::repack::repack_into_fs_tier(&parsed, &geo, &spec, &root)
+    let outcome = blazar_runtime::kv::interchange::carrier_into_vllm_tier(&carrier, &spec, &root)
         .map_err(|e| anyhow!("kv import: {e}"))?;
     println!(
         "imported {} block(s) ({} tokens each) from {:#?}",

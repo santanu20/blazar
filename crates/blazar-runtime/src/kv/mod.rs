@@ -7,6 +7,7 @@
 //! fall back to cold prefill, never to a simulated transfer.
 
 pub mod compatibility;
+pub mod interchange;
 pub mod registry;
 pub mod repack;
 pub mod translation;
