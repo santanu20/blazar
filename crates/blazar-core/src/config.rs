@@ -2238,6 +2238,47 @@ pub struct KvSection {
     /// The shared `LMCache` daemon every `LMCache`-enabled lane dials.
     #[serde(default)]
     pub lmcache: LmcacheDaemon,
+    /// Layout-translation policy: which built-in KV layout converters
+    /// may be admitted when two lanes lay the same model's cache out
+    /// differently. Off by default - `Exact`-match sharing only.
+    #[serde(default)]
+    pub translation: TranslationSection,
+}
+
+/// `[kv.translation]`: KV layout-converter admission. The converters
+/// are typed built-ins (never plugins): each carries a proven
+/// eligibility predicate, and the verdict layer composes at most two
+/// of them. `allow = []` (the default) admits EVERY built-in when
+/// `enabled = true` - the list exists to narrow, not to enumerate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranslationSection {
+    /// Master switch: `false` (the default) keeps the converter
+    /// registry empty, so cross-layout pairs report `Incompatible`
+    /// with a pointer here instead of a silent maybe.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Built-in converter ids to admit (`defuse`, `repage`). Empty
+    /// (the default) admits all; unknown ids fail validation with the
+    /// known set spelled out.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl TranslationSection {
+    /// Validate against the built-in converter contract: every id in
+    /// `allow` must name a built-in converter.
+    pub fn validate(&self) -> Result<(), String> {
+        for id in &self.allow {
+            if !crate::kv::KV_TRANSLATION_CONVERTERS.contains(&id.as_str()) {
+                return Err(format!(
+                    "kv.translation.allow: unknown converter {id:?} - known built-ins: {}",
+                    crate::kv::KV_TRANSLATION_CONVERTERS.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The standalone `lmcache server` owning the shared KV store: one
@@ -5756,6 +5797,7 @@ impl Config {
         self.mlx.validate("mlx")?;
         self.vllm.validate("vllm")?;
         self.kv.lmcache.validate("kv.lmcache")?;
+        self.kv.translation.validate().map_err(CoreError::Config)?;
         // The sglang LMCache opt-in is only meaningful when the shared
         // daemon exists - reject it at parse time with the fix in the
         // message instead of at spawn time. (The vllm connector choice
@@ -7821,6 +7863,7 @@ mod tests {
                         enabled: daemon_on,
                         ..Default::default()
                     },
+                    translation: TranslationSection::default(),
                 },
                 vllm: VllmTuning {
                     kv_offload: VllmKvOffload {
@@ -7884,6 +7927,7 @@ mod tests {
                     enabled: true,
                     ..Default::default()
                 },
+                translation: TranslationSection::default(),
             },
             sglang: SglangTuning {
                 lmcache: SglangLmcache { enabled: true },
@@ -7921,6 +7965,62 @@ mod tests {
             .validate(where_)
             .unwrap_or_else(|e| panic!("{where_}: lmcache alone must validate: {e}"));
         }
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__translation_section__allow_admits_only_known_builtins() {
+        // Defaults: knob off, nothing admitted - valid.
+        assert!(TranslationSection::default().validate().is_ok());
+        // On with an empty allow list = every built-in - valid.
+        assert!(
+            TranslationSection {
+                enabled: true,
+                allow: vec![]
+            }
+            .validate()
+            .is_ok()
+        );
+        // Narrowed to a known id - valid.
+        assert!(
+            TranslationSection {
+                enabled: true,
+                allow: vec!["repage".into()]
+            }
+            .validate()
+            .is_ok()
+        );
+        // Unknown id: the error teaches the known set.
+        let err = TranslationSection {
+            enabled: true,
+            allow: vec!["gqa-split".into()],
+        }
+        .validate()
+        .expect_err("unknown converter must fail validation");
+        assert!(
+            err.contains("unknown converter") && err.contains("defuse, repage"),
+            "{err}"
+        );
+        // And Config::validate propagates the section error.
+        let mut cfg = Config::default();
+        cfg.kv.translation.allow = vec!["bogus".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__kv_translation__parses_from_toml_and_defaults_off() {
+        let cfg =
+            Config::from_toml("[kv]\n[kv.translation]\nenabled = true\nallow = [\"defuse\"]\n")
+                .expect("kv.translation stanza must parse");
+        assert!(cfg.kv.translation.enabled);
+        assert_eq!(cfg.kv.translation.allow, vec!["defuse".to_string()]);
+        // Absent stanza: the whole translation surface stays off.
+        let bare = Config::from_toml("").expect("bare config must parse");
+        assert!(!bare.kv.translation.enabled);
+        assert!(bare.kv.translation.allow.is_empty());
     }
 
     #[test]

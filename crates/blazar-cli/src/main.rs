@@ -4865,6 +4865,7 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_sglang_fit(&d));
     checks.extend(doctor_bench_receipts(&d));
     checks.extend(doctor_kv_budget(&d));
+    checks.extend(doctor_kv_translation(&d));
     checks.extend(doctor_mmproj_pairing(&d));
     checks.extend(doctor_sentinel(&d));
     checks.extend(doctor_runtime(&d));
@@ -5346,6 +5347,7 @@ fn doctor_group(name: &str) -> &'static str {
         | "engine retention"
         | "sglang fit"
         | "kv budget llamacpp"
+        | "kv translation"
         | "kv budget mistralrs"
         | "kv budget mlx"
         | "whisper lane"
@@ -6473,6 +6475,95 @@ fn doctor_kv_budget(d: &BlazarDirs) -> Vec<Check> {
 /// so serving through blazar is unaffected - this row teaches the
 /// raw-engine user. One aggregated warn (never per-row): a busy models
 /// dir must not flood the report.
+/// Cross-lane KV translation verdicts: for every local HF-dir model,
+/// what happens to its cache between the modeled lanes (sglang<->vllm).
+/// GGUF models serve through llama.cpp only - one modeled lane means no
+/// pair to translate. Two layers of honesty: the verdict names the
+/// converter chain, and a `Transformable` verdict explicitly says no
+/// data-plane bridge runs yet (transfers stay engine-internal).
+fn doctor_kv_translation(d: &BlazarDirs) -> Vec<Check> {
+    let Ok(store) = Store::open(d) else {
+        return vec![]; // store failure is already reported by the kv budget rows
+    };
+    let Ok(rows) = store.list_models() else {
+        return vec![];
+    };
+    let Ok(cfg) = config() else {
+        return vec![]; // config failure is reported by the config check
+    };
+    kv_translation_rows(&rows, &cfg)
+        .into_iter()
+        .map(|(name, detail)| Check::ok("kv translation", format!("{name}: {detail}")))
+        .collect()
+}
+
+/// Pure verdict builder behind the doctor row: one `(model, detail)`
+/// per local HF-dir model, so the policy is unit-testable without the
+/// ambient user config (fleet truth the interactive doctor reads).
+fn kv_translation_rows(
+    rows: &[blazar_core::store::ModelRow],
+    cfg: &Config,
+) -> Vec<(String, String)> {
+    let registry: Vec<blazar_runtime::kv::compatibility::LayoutConverter> =
+        blazar_runtime::kv::translation::builtin_registry(&cfg.kv.translation)
+            .into_iter()
+            .map(|b| blazar_runtime::kv::compatibility::LayoutConverter {
+                id: b.id().to_owned(),
+            })
+            .collect();
+    let sglang_page = u32::try_from(cfg.sglang.page_size.unwrap_or(1)).unwrap_or(1);
+    let mut out = Vec::new();
+    for row in rows {
+        let dir = std::path::Path::new(&row.path);
+        if !dir.join("config.json").is_file() {
+            continue; // GGUF / diffusion / sidecar rows: no modeled lane pair
+        }
+        let Some(identity) =
+            blazar_runtime::kv::translation::hf_kv_identity(dir, row.sha256.as_deref())
+        else {
+            out.push((
+                row.name.clone(),
+                "identity incomplete (model digest, tokenizer.json, or rope fingerprint missing) - cross-lane sharing stays Exact-only"
+                    .to_string(),
+            ));
+            continue;
+        };
+        let Ok(meta) = blazar_core::hfmeta::read_hf_config(dir) else {
+            continue;
+        };
+        let (Some(sglang), Some(vllm)) = (
+            blazar_runtime::kv::translation::sglang_kv_layout(&meta, sglang_page),
+            blazar_runtime::kv::translation::vllm_kv_layout(&meta, 64),
+        ) else {
+            out.push((
+                row.name.clone(),
+                "KV geometry absent from config.json - no layout verdict".to_string(),
+            ));
+            continue;
+        };
+        let verdict = blazar_runtime::kv::compatibility::compatibility(
+            &identity, &sglang, &identity, &vllm, &registry,
+        );
+        let detail = match &verdict {
+            blazar_core::kv::KvCompatibility::Exact => "sglang<->vllm: Exact".to_string(),
+            blazar_core::kv::KvCompatibility::Transformable { converter_id } => format!(
+                "sglang<->vllm: Transformable via {converter_id} - no bridge is wired for this converter yet, transfers stay engine-internal"
+            ),
+            blazar_core::kv::KvCompatibility::Incompatible { reason } => {
+                format!("sglang<->vllm: {reason}")
+            }
+        };
+        out.push((row.name.clone(), detail));
+    }
+    if out.is_empty() {
+        out.push((
+            "(none)".to_string(),
+            "no local HF-dir models - no cross-lane pair to verdict".to_string(),
+        ));
+    }
+    out
+}
+
 fn doctor_mmproj_pairing(d: &BlazarDirs) -> Vec<Check> {
     let mut out = Vec::new();
     let Ok(store) = Store::open(d) else {
@@ -6737,6 +6828,60 @@ mod doctor_tests {
         assert!(set.contains("--a") && set.contains("--b"));
         assert_eq!(manifest_flag_set("not json at all").len(), 0);
         assert_eq!(manifest_flag_set(r#"{"tag":"x","no_flags":true}"#).len(), 0);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_translation_rows__verdict_table_over_a_fake_hf_model_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures":["Qwen2ForCausalLM"],"num_hidden_layers":28,
+                "num_key_value_heads":2,"hidden_size":1536,"num_attention_heads":12,
+                "rope_theta": 1000000.0}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), r#"{"version":"1"}"#).unwrap();
+        let rows = vec![blazar_core::store::ModelRow {
+            name: "qwen2.5-1.5b-instruct".into(),
+            repo: String::new(),
+            quant: String::new(),
+            path: dir.path().display().to_string(),
+            bytes: 0,
+            sha256: Some("abc123".into()),
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        }];
+        // Knob off: the verdict teaches the gate instead of guessing -
+        // the pair is layout-different and nothing is admitted.
+        let off = kv_translation_rows(&rows, &Config::default());
+        assert_eq!(off.len(), 1, "one row per local HF-dir model: {off:?}");
+        assert!(
+            off[0].1.contains("[kv.translation]"),
+            "knob-off row teaches the opt-in: {}",
+            off[0].1
+        );
+        // Knob on: the same geometry composes defuse+repage and says
+        // plainly that no data-plane bridge exists yet.
+        let mut cfg = Config::default();
+        cfg.kv.translation.enabled = true;
+        let on = kv_translation_rows(&rows, &cfg);
+        assert!(
+            on[0].1.contains("Transformable via defuse+repage"),
+            "composed chain verdict: {}",
+            on[0].1
+        );
+        assert!(
+            on[0].1.contains("no bridge is wired"),
+            "two-layer honesty in the table: {}",
+            on[0].1
+        );
     }
 
     #[test]

@@ -9,9 +9,11 @@
 
 use blazar_core::kv::{KvCompatibility, KvLayout, KvModelIdentity};
 
-/// Registered layout converters, keyed by an id that later waves can
-/// resolve to an implementation. Empty registry = only `Exact` ever
-/// fires; that is the honest v1 posture.
+use super::translation::BuiltInConverter;
+
+/// Registered layout converters, keyed by the id config validation
+/// admits (`defuse`, `repage`). An empty registry = only `Exact` ever
+/// fires; that is the knob-off posture of `[kv.translation]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutConverter {
     pub id: String,
@@ -71,26 +73,28 @@ pub fn compatibility(
     if saved_layout == target_layout {
         return KvCompatibility::Exact;
     }
-    if let Some(conv) = converters.first() {
-        // A registered converter claims it can bridge these layouts.
-        KvCompatibility::Transformable {
-            converter_id: conv.id.clone(),
-        }
-    } else {
-        KvCompatibility::Incompatible {
+    let builtin: Vec<BuiltInConverter> = converters
+        .iter()
+        .filter_map(|c| BuiltInConverter::from_id(&c.id))
+        .collect();
+    if builtin.is_empty() {
+        return KvCompatibility::Incompatible {
             reason: format!(
-                "layout differs ({}x{}x{} {} vs {}x{}x{} {}) and no converter is registered",
+                "layout differs ({}x{}x{} {} tpb={} vs {}x{}x{} {} tpb={}) and no converter is admitted - [kv.translation] enabled admits the built-in defuse/repage pair",
                 saved_layout.layers,
                 saved_layout.kv_heads,
                 saved_layout.head_dim,
                 saved_layout.attention_layout,
+                saved_layout.block_tokens,
                 target_layout.layers,
                 target_layout.kv_heads,
                 target_layout.head_dim,
                 target_layout.attention_layout,
+                target_layout.block_tokens,
             ),
-        }
+        };
     }
+    super::translation::translation_verdict(saved_layout, target_layout, &builtin)
 }
 
 #[cfg(test)]
@@ -163,28 +167,90 @@ mod tests {
         );
     }
 
+    fn reblocked(heads: u32, tpb: u32) -> KvLayout {
+        KvLayout {
+            layers: 24,
+            kv_heads: heads,
+            head_dim: 128,
+            key_dtype: "f16".into(),
+            value_dtype: "f16".into(),
+            block_tokens: tpb,
+            tensor_parallel: 1,
+            pipeline_parallel: 1,
+            attention_layout: "k-major".into(),
+        }
+    }
+
     #[test]
     // suite convention: unit__scenario__expected (6b)
     #[allow(non_snake_case)]
-    fn unit__compatibility__layout_gap_needs_a_registered_converter() {
-        let no_conv = compatibility(&ident("m"), &layout(8), &ident("m"), &layout(4), &[]);
-        assert!(
-            matches!(no_conv, KvCompatibility::Incompatible { reason } if reason.contains("no converter"))
+    fn unit__compatibility__layout_gap_needs_an_admitted_eligible_converter() {
+        // Knob off (empty registry): the teaching names [kv.translation].
+        let off = compatibility(
+            &ident("m"),
+            &reblocked(8, 1),
+            &ident("m"),
+            &reblocked(8, 64),
+            &[],
         );
-        let conv = compatibility(
+        assert!(
+            matches!(off, KvCompatibility::Incompatible { reason } if reason.contains("no converter is admitted")
+                && reason.contains("[kv.translation]"))
+        );
+        // Admitted + eligible (pure reblocking delta): Transformable.
+        let on = compatibility(
             &ident("m"),
-            &layout(8),
+            &reblocked(8, 1),
             &ident("m"),
-            &layout(4),
+            &reblocked(8, 64),
+            &[LayoutConverter {
+                id: "repage".into(),
+            }],
+        );
+        assert_eq!(
+            on,
+            KvCompatibility::Transformable {
+                converter_id: "repage".into()
+            }
+        );
+        // Unknown ids resolve to nothing - never guessed at.
+        let unknown = compatibility(
+            &ident("m"),
+            &reblocked(8, 1),
+            &ident("m"),
+            &reblocked(8, 64),
             &[LayoutConverter {
                 id: "gqa-split".into(),
             }],
         );
-        assert_eq!(
-            conv,
-            KvCompatibility::Transformable {
-                converter_id: "gqa-split".into()
-            }
+        assert!(
+            matches!(unknown, KvCompatibility::Incompatible { reason } if reason.contains("no converter is admitted"))
+        );
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__compatibility__geometry_gap_stays_incompatible_even_with_converters() {
+        // Head-count deltas change the arithmetic of attention - the
+        // old placeholder fired Transformable for this pair; the real
+        // policy refuses it no matter what is admitted.
+        let c = compatibility(
+            &ident("m"),
+            &reblocked(8, 32),
+            &ident("m"),
+            &reblocked(4, 32),
+            &[
+                LayoutConverter {
+                    id: "defuse".into(),
+                },
+                LayoutConverter {
+                    id: "repage".into(),
+                },
+            ],
+        );
+        assert!(
+            matches!(c, KvCompatibility::Incompatible { reason } if reason.contains("tensor geometry"))
         );
     }
 }

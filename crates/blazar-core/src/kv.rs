@@ -13,6 +13,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Built-in KV layout-converter ids, in canonical chain order (a
+/// layout needing both applies `defuse` first, then `repage`). Config
+/// validation admits only these; the runtime resolves each id to its
+/// eligibility predicate and (in later waves) a data-plane bridge.
+pub const KV_TRANSLATION_CONVERTERS: &[&str] = &["defuse", "repage"];
+
 /// Everything that must match for two engines to agree they computed
 /// the same key/value tensors for a shared prefix.
 ///

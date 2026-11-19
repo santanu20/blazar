@@ -9,6 +9,7 @@
 //! (`head_dim` from `hidden_size / num_attention_heads`) mirrors HF loader
 //! semantics and `GgufMeta::derived_head_dim()`.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -53,6 +54,11 @@ pub struct HfMeta {
     /// need their processor artifact (`preprocessor_config.json`) at engine
     /// load time; `text_config` alone is NOT a tower declaration.
     pub vision_tower: bool,
+    /// `RoPE` positional fingerprint (`rope_theta` plus `rope_scaling`'s
+    /// type/factor when declared). Cached positions are only
+    /// interchangeable between rope-identical caches, so KV identity
+    /// treats this as mandatory.
+    pub rope_fingerprint: Option<String>,
     pub kv: KvGeom,
 }
 
@@ -209,6 +215,8 @@ pub fn read_hf_config(dir: &Path) -> CoreResult<HfMeta> {
         }
     });
 
+    let rope_fingerprint = rope_fingerprint_of(&v);
+
     Ok(HfMeta {
         architecture,
         ctx_train: u64_of_text_config(&v, "max_position_embeddings"),
@@ -223,12 +231,36 @@ pub fn read_hf_config(dir: &Path) -> CoreResult<HfMeta> {
         vision_tower: ["vision_config", "image_config"]
             .iter()
             .any(|k| v.get(*k).is_some_and(Value::is_object)),
+        rope_fingerprint,
         kv: KvGeom {
             layers: kv_layers,
             kv_heads,
             head_dim,
         },
     })
+}
+
+/// `RoPE` positional fingerprint from a parsed `config.json`: `rope_theta`
+/// (mandatory for the fingerprint to exist) plus `rope_scaling`'s
+/// `rope_type`/`type` and `factor` when a scaling scheme is declared.
+/// Numbers render through `f64` so identical values always fingerprint
+/// identically.
+fn rope_fingerprint_of(v: &Value) -> Option<String> {
+    let as_f64 = |x: &Value| x.as_f64();
+    let theta = v.get("rope_theta").and_then(as_f64)?;
+    let scaling = v.get("rope_scaling").filter(|s| s.is_object());
+    let scheme = scaling
+        .and_then(|s| s.get("rope_type").or_else(|| s.get("type")))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty() && *t != "none");
+    let mut fp = format!("freq_base={theta}");
+    if let Some(scheme) = scheme {
+        let _ = write!(fp, ";scaling={scheme}");
+        if let Some(factor) = scaling.and_then(|s| s.get("factor")).and_then(as_f64) {
+            let _ = write!(fp, ",factor={factor}");
+        }
+    }
+    Some(fp)
 }
 
 /// Fallback-only snapshot of `quantization_config.quant_method` values

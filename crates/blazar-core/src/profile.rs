@@ -9227,6 +9227,7 @@ mod tests {
             chat_template: None,
             mtp_layers: None,
             num_loops: None,
+            rope_fingerprint: None,
         }
     }
 
@@ -18010,6 +18011,7 @@ mod tests {
             quant_bits: None,
             quant_method: None,
             vision_tower: false,
+            rope_fingerprint: None,
             kv: crate::hfmeta::KvGeom {
                 layers: Some(28),
                 kv_heads: Some(2),
@@ -18317,6 +18319,7 @@ mod tests {
             quant_bits: None,
             quant_method: None,
             vision_tower: false,
+            rope_fingerprint: None,
             kv: crate::hfmeta::KvGeom {
                 layers: Some(28),
                 kv_heads: Some(2),
@@ -20807,6 +20810,7 @@ mod tests {
                     enabled: true,
                     ..Default::default()
                 },
+                translation: crate::config::TranslationSection::default(),
             },
             ..Default::default()
         };
@@ -20840,6 +20844,7 @@ mod tests {
                     enabled: true,
                     ..Default::default()
                 },
+                translation: crate::config::TranslationSection::default(),
             },
             sglang: SglangTuning {
                 lmcache: crate::config::SglangLmcache { enabled: true },
@@ -20877,6 +20882,7 @@ mod tests {
                     enabled: true,
                     ..Default::default()
                 },
+                translation: crate::config::TranslationSection::default(),
             },
             ..Default::default()
         };

@@ -7,6 +7,7 @@
 //! the profile compiler and `blazar fit` consume. Anything absent stays
 //! `None` - downstream rules must skip-with-warning, never estimate.
 
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::Path;
 
@@ -97,6 +98,11 @@ pub struct GgufMeta {
     /// dense per-block token math scales with it - per-layer arrays
     /// (recurrent/swa) count physical layers and stay unscaled.
     pub num_loops: Option<u32>,
+    /// `RoPE` positional fingerprint (`{arch}.rope.freq_base` plus
+    /// `{arch}.rope.scaling.type`/`factor` when present). Cached
+    /// positions are only interchangeable between rope-identical
+    /// caches, so KV identity treats this as mandatory.
+    pub rope_fingerprint: Option<String>,
 }
 
 /// Architectures whose every layer is recurrent (no ctx-growing KV at all).
@@ -749,9 +755,35 @@ pub fn parse_metadata(buf: &[u8]) -> CoreResult<(GgufMeta, usize)> {
         mtp_layers: get(format!("{arch}.n_predict_layers"))
             .filter(|&n| n > 0)
             .or_else(|| get(format!("{arch}.nextn_predict_layers")).filter(|&n| n > 0)),
+        rope_fingerprint: rope_fingerprint(&kvs, &arch),
         architecture: arch,
     };
     Ok((meta, meta_end))
+}
+
+/// `RoPE` positional fingerprint from `{arch}.rope.freq_base` (mandatory
+/// for the fingerprint to exist) plus `{arch}.rope.scaling.type` and
+/// `.factor` when the file declares a scaling scheme. Floats render
+/// through `f64` so identical values always fingerprint identically.
+fn rope_fingerprint(kvs: &[(String, GgufValue)], arch: &str) -> Option<String> {
+    let as_f64 = |v: &GgufValue| match v {
+        GgufValue::F32(f) => Some(f64::from(*f)),
+        GgufValue::F64(f) => Some(*f),
+        _ => None,
+    };
+    let find = |field: &str| kvs.iter().find(|(k, _)| k == field).map(|(_, v)| v);
+    let base = find(&format!("{arch}.rope.freq_base")).and_then(as_f64)?;
+    let scaling = find(&format!("{arch}.rope.scaling.type"))
+        .and_then(GgufValue::as_str)
+        .filter(|t| !t.is_empty() && *t != "none");
+    let mut fp = format!("freq_base={base}");
+    if let Some(scheme) = scaling {
+        let _ = write!(fp, ";scaling={scheme}");
+        if let Some(factor) = find(&format!("{arch}.rope.scaling.factor")).and_then(as_f64) {
+            let _ = write!(fp, ",factor={factor}");
+        }
+    }
+    Some(fp)
 }
 
 /// Concatenate template text from every known template KV. String and

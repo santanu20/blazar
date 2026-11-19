@@ -595,6 +595,7 @@ fn gguf_meta() -> GgufMeta {
         chat_template: None,
         mtp_layers: None,
         num_loops: None,
+        rope_fingerprint: None,
     }
 }
 
@@ -614,6 +615,7 @@ fn hf_meta() -> HfMeta {
         quant_bits: None,
         quant_method: None,
         vision_tower: false,
+        rope_fingerprint: None,
         kv: KvGeom {
             layers: Some(28),
             kv_heads: Some(2),
