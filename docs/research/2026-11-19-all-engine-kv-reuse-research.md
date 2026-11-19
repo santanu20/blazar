@@ -275,3 +275,31 @@ further to build here.
 nixl/flexkv/seaweedfs/tensorcast/aibrix/eic/umbp backends; only the plain file
 backend is writable without external infrastructure, and it is the one blazar
 replicates. Codec work is pinned per installed lane version by construction.
+
+## Reliability-sweep live validation (2026-11-19, post-`2004ccd`)
+
+All three shipped fixes of the cleanup wave were re-proven live on this box
+after the wave landed:
+
+- **Import hashing**: re-importing `gemma3-270m.gguf` under a fresh name
+  produced a store row whose `sha256` equals the file's known digest
+  (`735af213…f7a2`) exactly - computed by the importer itself, zero-copy
+  hardlink. The session-identity gate no longer has a NULL-hash hole on
+  locally imported models.
+- **vLLM /dev/shm orphan sweep**: a planted `vllm_offload_fakeleak.mmap` was
+  removed by the daemon-shutdown sweep with the INFO receipt
+  (`removed orphaned vllm offload mmap(s) from /dev/shm freed=1`); the
+  in-use protection (scan of `/proc/*/fd`) left foreign files untouched.
+- **Warm-peg redial + child receipts at INFO**: full vllm -> stage -> mlx
+  replay (Kestrel prefix through the gateway): zero `respawning lane`
+  events (the pre-fix churn that duplicated children and killed the
+  generation thread), a single healthy wrapper child, and
+  `[blazar] preloaded 320 tokens into the mlx prompt cache` surfaced at
+  INFO through the child-log promotion. Same-prefix reply sane in 7.3 s.
+
+**Known issue found during teardown (fix pending)**: `blazar stop` reports
+the stop but leaves `run/blazar.pid` in place. A fast subsequent start
+(systemd `Restart=always`) reads the stale pidfile, liveness-checks the
+dying pid, and exits 3 - and `RestartPreventExitStatus=3` then keeps the
+daemon down until a human removes the file. Recovered manually on this
+box; the fix is to delete the pidfile after a verified stop.
