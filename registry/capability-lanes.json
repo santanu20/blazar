@@ -2,7 +2,7 @@
   {
     "id": "instella-moe",
     "repo": "csabakecskemeti/llama.cpp",
-    "ref_sha": "7a3c74eb0b5e58bc8cc3949f416fbc2b3959774c",
+    "ref_sha": "e90a9ad690643e49eec368e12f6b4f9f7f197801",
     "upstream_pr": 26467,
     "architectures": [
       "instella-moe"
