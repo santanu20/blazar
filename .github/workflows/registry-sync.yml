@@ -1,6 +1,8 @@
 name: registry-sync
 
 # Weekly health pass over registry/capability-lanes.json:
+#   - the ed25519 signature must verify against the committed public
+#     key (a hand-edited or unsigned registry fails closed here)
 #   - every pinned commit must still exist upstream (a fork force-push
 #     once orphaned the instella-moe pin)
 #   - every advertised architecture must still be declared by the
@@ -31,12 +33,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Probe registry rows (liveness / graduation / wire names)
+      - name: Install verify dependency (PyNaCl)
+        run: pip install pynacl
+
+      - name: Probe registry rows (signature / liveness / graduation)
         id: probe
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
+          # --verify runs first and fails the step outright on a bad or
+          # missing signature - probing content whose authenticity is in
+          # doubt would only launder it.
+          python scripts/registry_sync.py --verify 2>&1 | tee verify.log
           python scripts/registry_sync.py --check 2>&1 | tee probe.log
           echo "status=$?" >> "$GITHUB_OUTPUT"
 
@@ -64,7 +73,7 @@ jobs:
             echo
             echo "### Lane verification"
             echo '```'
-            cat probe.log
+            cat verify.log probe.log
             echo '```'
             echo
             echo "### Discovery proposals (review required - nothing is auto-applied)"

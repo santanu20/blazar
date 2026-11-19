@@ -7438,14 +7438,26 @@ impl Supervisor {
                     );
                     // Registry offer (bounded, fail-open): a curated lane
                     // published for exactly this architecture turns the
-                    // dead-end into an actionable install command.
-                    if let Some(lane) = self.registry_offer(&arch).await {
+                    // dead-end into an actionable install command. The
+                    // signature state rides along: only a verified
+                    // registry may feed the automatic build pipeline.
+                    if let Some((lane, sig_state)) = self.registry_offer(&arch).await {
                         let offer = Self::format_lane_offer(&lane);
                         let _ = write!(msg, "\n{offer}");
+                        if sig_state != crate::engine::capability_registry::SignatureState::Verified
+                        {
+                            let _ = write!(
+                                msg,
+                                "\n(registry {} - automatic install is refused; manual install \
+                                 with `blazar engine install --lane {}` still works)",
+                                sig_state.as_str(),
+                                lane.id
+                            );
+                        }
                         // Never override a model's explicit engine pin. The
-                        // auto-install feature is intentionally opt-in and
-                        // only consumes lanes advertised by this registry.
-                        if !forced_lane
+                        // auto-install feature only consumes lanes whose
+                        // registry signature verified.
+                        else if !forced_lane
                             && overlay.engine.is_none()
                             && self.cfg().engine_routing.mode
                                 == blazar_core::config::RoutingMode::Auto
@@ -7660,16 +7672,28 @@ drop them from rpc_servers in config.toml",
     /// Ask the capability registry for a curated lane serving `arch`
     /// (bounded by the fetch's own timeout, fail-open on every error -
     /// an unreachable registry must never delay or fail a spawn).
+    /// Returns the lane plus its signature state: unsigned or
+    /// invalid-signature registries may still be installed manually,
+    /// but never feed the automatic build pipeline.
     async fn registry_offer(
         &self,
         arch: &str,
-    ) -> Option<crate::engine::capability_registry::RegistryLane> {
+    ) -> Option<(
+        crate::engine::capability_registry::RegistryLane,
+        crate::engine::capability_registry::SignatureState,
+    )> {
         let url = crate::engine::capability_registry::resolve_registry_url(
             self.cfg().capability_registry_url.as_deref(),
         )?;
         let client = crate::engine::capability_registry::http();
-        let lanes = match crate::engine::capability_registry::fetch(client, &url).await {
-            Ok(lanes) => lanes,
+        let (lanes, sig_state) = match crate::engine::capability_registry::fetch_verified(
+            client,
+            &url,
+            self.cfg().capability_registry_pubkey.as_deref(),
+        )
+        .await
+        {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::debug!(error = %e, "capability registry unreachable - skipping offer");
                 return None;
@@ -7682,9 +7706,10 @@ drop them from rpc_servers in config.toml",
         tracing::warn!(
             architecture = %arch,
             lane = %lane.id,
+            signature = sig_state.as_str(),
             "capability registry offers a curated lane for this architecture"
         );
-        Some(lane)
+        Some((lane, sig_state))
     }
 
     /// Schedule one opt-in registry build after a real unknown-architecture
@@ -7737,6 +7762,7 @@ drop them from rpc_servers in config.toml",
         let dirs = self.dirs.clone();
         let bus = self.bus.clone();
         let registry_url = cfg.capability_registry_url.clone();
+        let registry_pubkey = cfg.capability_registry_pubkey.clone();
         let architecture = arch.to_string();
         let selected_lane = lane_id.to_string();
         let _task = tokio::spawn(async move {
@@ -7764,6 +7790,11 @@ drop them from rpc_servers in config.toml",
                         &architecture,
                         &selected_lane,
                         registry_url.as_deref(),
+                        registry_pubkey.as_deref(),
+                        // Automated path: an unverified re-fetch refuses
+                        // the build (the offer-side gate already skipped
+                        // unsigned registries; this closes the swap window).
+                        true,
                         &mut progress,
                     )
                     .await

@@ -1033,6 +1033,8 @@ impl EngineManager {
         architecture: &str,
         lane_id: &str,
         registry_url: Option<&str>,
+        pubkey_config: Option<&str>,
+        require_verified: bool,
         on_line: &mut F,
     ) -> Result<EngineRow> {
         anyhow::ensure!(
@@ -1042,7 +1044,29 @@ impl EngineManager {
         anyhow::ensure!(!lane_id.trim().is_empty(), "lane id must not be empty");
         let url = capability_registry::resolve_registry_url(registry_url)
             .ok_or_else(|| anyhow!("capability registry is disabled"))?;
-        let lanes = capability_registry::fetch(capability_registry::http(), &url).await?;
+        let (lanes, sig_state) =
+            capability_registry::fetch_verified(capability_registry::http(), &url, pubkey_config)
+                .await?;
+        if sig_state != capability_registry::SignatureState::Verified {
+            if require_verified {
+                // The automated path re-validates here on purpose: the
+                // signature could have changed between the offer-side
+                // gate and this build. Automation never builds from
+                // unproven content.
+                anyhow::bail!(
+                    "capability registry signature is {} - refusing the automatic install \
+                     (manual install with `blazar engine install --lane {lane_id}` still works)",
+                    sig_state.as_str()
+                );
+            }
+            // Manual install stays allowed (the user typed the command);
+            // the state is surfaced so the choice is informed.
+            on_line(&format!(
+                "warning: registry signature is {} - lane pins were NOT proven against the \
+                 blazar signing key; proceeding because the install was requested manually",
+                sig_state.as_str()
+            ));
+        }
         let lane = capability_registry::offers_for_arch(&lanes, architecture)
             .into_iter()
             .find(|candidate| candidate.id == lane_id)

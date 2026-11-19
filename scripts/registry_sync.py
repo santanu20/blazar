@@ -16,10 +16,18 @@ Two modes:
             be retired). Exits non-zero on any drift.
 
   --propose Discovery. Scans open ggml-org/llama.cpp pull requests for
-            architecture additions, probes each PR head for a real
-            LLM_ARCH_* delta versus mainline, checks that GGUF builds
-            of the architecture circulate on Hugging Face, and emits
-            proposed rows as JSON + Markdown for maintainer review.
+             architecture additions, probes each PR head for a real
+             LLM_ARCH_* delta versus mainline, checks that GGUF builds
+             of the architecture circulate on Hugging Face, and emits
+             proposed rows as JSON + Markdown for maintainer review.
+
+  --verify  Signature gate. Checks the registry's ed25519 signature
+            (registry/capability-lanes.json.sig) against the committed
+            public key (registry/capability-lanes.pub) - the same pair
+            `blazar registry sign` produces and the embedded runtime
+            key verifies against. Exits non-zero when the signature is
+            missing or does not verify, so a CI gate fails closed the
+            moment a hand-edited (or unsigned) registry slips in.
 
 Both modes are read-only with respect to the repository.
 """
@@ -27,6 +35,8 @@ Both modes are read-only with respect to the repository.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -246,6 +256,61 @@ def cmd_propose() -> int:
     return 0
 
 
+def cmd_verify(registry_path: str) -> int:
+    """Fail-closed ed25519 signature check of the registry file."""
+    try:
+        # PyNaCl is the only non-stdlib dependency this script has, and
+        # only this mode needs it - import lazily so --check/--propose
+        # keep working in minimal CI images.
+        from nacl.exceptions import BadSignatureError
+        from nacl.signing import VerifyKey
+    except ImportError:
+        print(
+            "verify: PyNaCl is required for signature checks - pip install pynacl",
+            file=sys.stderr,
+        )
+        return 1
+
+    sig_path = registry_path + ".sig"
+    pub_path = os.path.join(os.path.dirname(registry_path), "capability-lanes.pub")
+    for path in (registry_path, sig_path, pub_path):
+        if not os.path.isfile(path):
+            print(
+                f"verify: missing {path} - the registry must ship as a signed pair",
+                file=sys.stderr,
+            )
+            return 1
+
+    with open(registry_path, "rb") as fh:
+        body = fh.read()
+    with open(sig_path) as fh:
+        sig_b64 = fh.read().strip()
+    with open(pub_path) as fh:
+        pub_b64 = fh.read().strip()
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+        pub = base64.b64decode(pub_b64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        print(
+            f"verify: signature/public-key files must be pure base64: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        VerifyKey(pub).verify(body, sig)
+    except BadSignatureError:
+        print(
+            "verify: registry signature does NOT verify against"
+            " capability-lanes.pub - re-sign with"
+            " `blazar registry sign` after review",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"verify: {registry_path} signature OK")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -263,10 +328,17 @@ def main() -> int:
         action="store_true",
         help="scan open upstream PRs for lane candidates",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="check the registry's ed25519 signature (fail-closed)",
+    )
     args = parser.parse_args()
-    if not (args.check or args.propose):
-        parser.error("choose --check and/or --propose")
+    if not (args.check or args.propose or args.verify):
+        parser.error("choose --check, --propose and/or --verify")
     rc = 0
+    if args.verify:
+        rc |= cmd_verify(args.registry)
     if args.check:
         rc |= cmd_check(args.registry)
     if args.propose:

@@ -32,6 +32,12 @@ tar = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Registry signing: ed25519 verify (auto-install gate) and keygen/sign
+# for the `blazar registry` CLI. Same ring 0.17 the workspace already
+# carries as rustls's crypto provider - declaring it direct adds no new
+# code to the build, just the signature API surface.
+ring = "0.17"
+base64 = "0.23"
 tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

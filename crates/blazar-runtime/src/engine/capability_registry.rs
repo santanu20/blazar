@@ -212,6 +212,174 @@ pub fn resolve_registry_url(configured: Option<&str>) -> Option<String> {
     }
 }
 
+/// Compiled-in trust anchor: the base64 of the raw 32-byte ed25519
+/// public key that signs `registry/capability-lanes.json`. Auto-install
+/// only consumes registry content whose ed25519 signature verifies
+/// against this key (or an explicit user override). Empty string would
+/// mean "no shipped anchor" - the key below is the real one; the
+/// matching private key never enters the repository.
+pub const EMBEDDED_REGISTRY_PUBKEY_B64: &str = "WnTgolleCcVJEMo0hjvywAS5PsKJZIGh0d8ETBdx+Xw=";
+
+/// Outcome of checking a fetched registry document against its
+/// published signature. This is a gate on *automation only* - unsigned
+/// or invalid registries still parse and can be installed manually
+/// (warn-but-proceed); the daemon just refuses to build from them
+/// unattended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureState {
+    /// Signature at `<registry-url>.sig` verified against the effective
+    /// ed25519 public key.
+    Verified,
+    /// No signature published (`.sig` absent or unreachable). The
+    /// document is intact as served, but its origin is unproven.
+    Unsigned,
+    /// A signature is published but does not verify, or the effective
+    /// public key is malformed. Treated as untrusted, not as fatal.
+    Invalid,
+}
+
+impl SignatureState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unsigned => "unsigned",
+            Self::Invalid => "invalid-signature",
+        }
+    }
+}
+
+/// The effective verification key: an explicit config pin wins over
+/// the compiled-in anchor (mirrors the URL override - a user hosting
+/// their own registry signs it with their own key). `None` means the
+/// configured value is malformed base64 or not 32 bytes, which callers
+/// surface as [`SignatureState::Invalid`] rather than silently
+/// skipping verification.
+pub fn effective_pubkey(configured: Option<&str>) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let b64 = configured.unwrap_or(EMBEDDED_REGISTRY_PUBKEY_B64);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("capability_registry_pubkey is not valid base64: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "capability_registry_pubkey must decode to 32 bytes (raw ed25519 public key), got {}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Verify a registry document against its detached signature with the
+/// given raw ed25519 public key.
+pub fn verify_registry_signature(body: &[u8], sig_b64: &str, pubkey: &[u8]) -> Result<(), String> {
+    use base64::Engine as _;
+    use ring::signature::UnparsedPublicKey;
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64.trim())
+        .map_err(|e| format!("registry .sig is not valid base64: {e}"))?;
+    let key = UnparsedPublicKey::new(&ring::signature::ED25519, pubkey);
+    key.verify(body, &sig)
+        .map_err(|e| format!("registry signature does not verify: {e}"))
+}
+
+/// Fetch + parse the registry and report its signature state. The
+/// registry document itself must fetch (a registry that cannot be
+/// fetched has no offer to gate); only the signature leg is
+/// soft-failing. Every fetch logs the document's sha256 so an operator
+/// can correlate what the daemon saw with what the signer signed.
+pub async fn fetch_verified(
+    client: &reqwest::Client,
+    url: &str,
+    pubkey_config: Option<&str>,
+) -> Result<(Vec<RegistryLane>, SignatureState)> {
+    let mut resp = client
+        .get(url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("capability registry fetch failed: {url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("capability registry {url} answered HTTP {}", resp.status());
+    }
+    let body = read_body_bounded(&mut resp, url, MAX_BODY_BYTES, "capability registry").await?;
+    let lanes = parse_registry(&body)?;
+
+    let digest = {
+        use sha2::Digest as _;
+        let mut h = sha2::Sha256::new();
+        h.update(body.as_bytes());
+        hex::encode(h.finalize())
+    };
+
+    let state = match effective_pubkey(pubkey_config) {
+        Ok(pk) => match fetch_signature(client, url).await {
+            Ok(sig_b64) => {
+                if verify_registry_signature(body.as_bytes(), &sig_b64, &pk).is_ok() {
+                    SignatureState::Verified
+                } else {
+                    tracing::warn!(
+                        registry_sha256 = %digest,
+                        "capability registry signature INVALID - auto-install refused, manual install still possible"
+                    );
+                    SignatureState::Invalid
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "capability registry has no verifiable signature");
+                SignatureState::Unsigned
+            }
+        },
+        Err(e) => {
+            tracing::warn!("{e} - treating the registry as untrusted");
+            SignatureState::Invalid
+        }
+    };
+    if state == SignatureState::Verified {
+        tracing::debug!(registry_sha256 = %digest, "capability registry signature verified");
+    }
+    Ok((lanes, state))
+}
+
+/// Best-effort fetch of the detached signature at `<url>.sig`. Any
+/// transport failure or non-200 maps to `Err` (unsigned).
+async fn fetch_signature(client: &reqwest::Client, url: &str) -> Result<String> {
+    let sig_url = format!("{url}.sig");
+    let mut resp = client
+        .get(&sig_url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("signature fetch failed: {sig_url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("signature {sig_url} answered HTTP {}", resp.status());
+    }
+    read_body_bounded(&mut resp, &sig_url, 8192, "registry signature").await
+}
+
+/// Generate a fresh ed25519 signing pair. Returns
+/// `(pkcs8_private_key_der, raw_public_key_32b)` - callers encode.
+pub fn registry_keygen() -> Result<(Vec<u8>, Vec<u8>)> {
+    use ring::signature::KeyPair as _;
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|e| anyhow::anyhow!("ed25519 keygen failed: {e}"))?;
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .map_err(|e| anyhow::anyhow!("generated key rejected by its own parser: {e}"))?;
+    Ok((pkcs8.as_ref().to_vec(), pair.public_key().as_ref().to_vec()))
+}
+
+/// Sign a registry document with a PKCS8 (DER) private key, returning
+/// the raw 64-byte ed25519 signature.
+pub fn registry_sign(body: &[u8], pkcs8_der: &[u8]) -> Result<Vec<u8>> {
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8_der).map_err(|e| {
+        anyhow::anyhow!(
+            "private key is not a PKCS8 ed25519 key in the form `blazar registry keygen` prints (openssl genpkey emits a version-0 document this parser does not accept): {e}"
+        )
+    })?;
+    Ok(pair.sign(body).as_ref().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +546,209 @@ mod tests {
         assert_eq!(lane.status, LaneStatus::Active);
         let text = serde_json::to_string(&LaneStatus::Retired).unwrap();
         assert_eq!(text, "\"retired\"");
+    }
+}
+
+#[cfg(test)]
+mod sign_tests {
+    use super::*;
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__registry_keygen_sign_verify__roundtrip_and_openssl_key_parse() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // 1. ring-generated pair roundtrips through our own API.
+        let (pkcs8, raw_pk) = registry_keygen().expect("keygen");
+        assert_eq!(raw_pk.len(), 32);
+        let body = br#"{"lanes":[]}"#;
+        let sig = registry_sign(body, &pkcs8).expect("sign generated key");
+        assert_eq!(sig.len(), 64);
+        let sig_b64 = b64.encode(&sig);
+        assert!(verify_registry_signature(body, &sig_b64, &raw_pk).is_ok());
+
+        // 2. openssl genpkey emits a version-0/no-public-key PKCS8 that
+        //    ring's ed25519 template structurally rejects; the teaching
+        //    must point the operator at `blazar registry keygen`.
+        let openssl_der_hex = "302e020100300506032b657004220420c762152167c796efddcc4aef4c60020dace465e49e35f6a3729c6f6a4d8eb905";
+        let der = hex::decode(openssl_der_hex).expect("fixture hex");
+        let rejected = registry_sign(body, &der).expect_err("openssl form must be refused");
+        assert!(
+            rejected.to_string().contains("blazar registry keygen"),
+            "rejection must teach the supported key form: {rejected}"
+        );
+
+        // 3. a signature from a different key must not verify.
+        let (other_pkcs8, other_pk) = registry_keygen().expect("second keygen");
+        // Two keygens must yield distinct keys, or pinning would be theater.
+        assert_ne!(other_pk, effective_pubkey(None).expect("embedded key"));
+        let _ = other_pkcs8;
+        let foreign_sig = b64.encode(registry_sign(body, &other_pkcs8).expect("sign second key"));
+        assert!(
+            verify_registry_signature(body, &foreign_sig, &raw_pk).is_err(),
+            "a signature from a different key must not verify"
+        );
+    }
+
+    /// Minimal parseable registry document local to this module - the
+    /// signature legs below exercise `fetch_verified`, not the parser
+    /// (the parser has its own battery in `mod tests`).
+    fn tiny_registry_json() -> String {
+        r#"[
+            {
+                "id": "tiny-fork",
+                "repo": "acme/llama.cpp",
+                "ref_sha": "7c81a9f06111c2d3f4e5a6b7c8d9e0f1a2b3c4d5",
+                "architectures": ["tiny"],
+                "backends": ["cuda"]
+            }
+        ]"#
+        .to_string()
+    }
+
+    #[tokio::test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    async fn unit__fetch_verified__correct_signature_reports_verified() {
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (pkcs8, raw_pk) = registry_keygen().expect("keygen");
+        let body = tiny_registry_json();
+        let sig_b64 = base64::engine::general_purpose::STANDARD
+            .encode(registry_sign(body.as_bytes(), &pkcs8).expect("sign"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/reg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/reg.json.sig"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sig_b64))
+            .mount(&server)
+            .await;
+
+        // The pair is freshly generated, so the PIN (not the embedded
+        // anchor) is the key that must verify it - the same layering a
+        // self-hosted registry configures.
+        let pinned = base64::engine::general_purpose::STANDARD.encode(&raw_pk);
+        let (lanes, state) =
+            fetch_verified(http(), &format!("{}/reg.json", server.uri()), Some(&pinned))
+                .await
+                .expect("fetch_verified succeeds");
+        assert_eq!(state, SignatureState::Verified);
+        assert_eq!(lanes[0].id, "tiny-fork");
+    }
+
+    #[tokio::test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    async fn unit__fetch_verified__missing_signature_leg_is_unsigned() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // registry present, .sig absent (wiremock 404s unmatched paths).
+        Mock::given(method("GET"))
+            .and(path("/reg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tiny_registry_json()))
+            .mount(&server)
+            .await;
+
+        let (lanes, state) = fetch_verified(http(), &format!("{}/reg.json", server.uri()), None)
+            .await
+            .expect("registry body must still parse");
+        assert_eq!(
+            state,
+            SignatureState::Unsigned,
+            "absent .sig is unsigned, not a transport error"
+        );
+        assert_eq!(lanes.len(), 1);
+    }
+
+    #[tokio::test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    async fn unit__fetch_verified__tampered_body_is_invalid() {
+        use base64::Engine as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (pkcs8, raw_pk) = registry_keygen().expect("keygen");
+        // sign the ORIGINAL body, serve a TAMPERED one (ref_sha flipped):
+        // the detached signature must not validate against edited bytes.
+        // The signer's own key is pinned so the ONLY failure cause is
+        // the tamper, not a key mismatch.
+        let original = tiny_registry_json();
+        let sig_b64 = base64::engine::general_purpose::STANDARD
+            .encode(registry_sign(original.as_bytes(), &pkcs8).expect("sign"));
+        let tampered = original.replace("7c81a9f0", "00000000");
+        let pinned = base64::engine::general_purpose::STANDARD.encode(&raw_pk);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/reg.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tampered))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/reg.json.sig"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sig_b64))
+            .mount(&server)
+            .await;
+
+        let (lanes, state) =
+            fetch_verified(http(), &format!("{}/reg.json", server.uri()), Some(&pinned))
+                .await
+                .expect("fetch itself succeeds; the verdict carries the refusal");
+        assert_eq!(state, SignatureState::Invalid);
+        assert_eq!(
+            lanes.len(),
+            1,
+            "lanes are still returned - the gate refuses automation, not parsing"
+        );
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__effective_pubkey__layers_and_rejects_malformed_pins() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // default: the embedded production key, raw 32 bytes.
+        let embedded = effective_pubkey(None).expect("embedded key decodes");
+        assert_eq!(
+            embedded,
+            b64.decode(EMBEDDED_REGISTRY_PUBKEY_B64)
+                .expect("const decodes")
+        );
+
+        // a config pin replaces the embedded key.
+        let (other_pkcs8, other_pk) = registry_keygen().expect("keygen");
+        let _ = other_pkcs8;
+        let pinned = effective_pubkey(Some(&b64.encode(&other_pk))).expect("pinned key accepted");
+        assert_eq!(pinned, other_pk);
+
+        // malformed pins fail closed with teaching, never fall back to
+        // the embedded key (a typo must not silently re-trust upstream).
+        // Note "A"*43 + "=" is shape-VALID (decodes to 32 zero bytes) -
+        // a zero key is nonsense, but its shape is the key's shape.
+        for bad in [
+            "!!not-base64!!",        // not base64 at all
+            "AAAA",                  // decodes to 3 bytes
+            "A".repeat(44).as_str(), // decodes to 33 bytes (wrong length)
+        ] {
+            let err = effective_pubkey(Some(bad)).expect_err("malformed pin must be rejected");
+            assert!(
+                err.contains("capability_registry_pubkey"),
+                "error names the knob: {err}"
+            );
+        }
     }
 }

@@ -666,9 +666,20 @@ pub struct Config {
     /// are eligible (arbitrary GitHub discovery is never performed), but
     /// this compiles third-party source and can consume substantial CPU,
     /// disk, and build time - set `capability_lane_auto_install = false`
-    /// to opt out.
+    /// to opt out. Additionally, a registry only feeds auto-install when
+    /// its ed25519 signature verifies (see `capability_registry_pubkey`);
+    /// unsigned registries offer manual installs only.
     #[serde(default)]
     pub capability_lane_auto_install: bool,
+    /// Verification key for the capability registry: base64 of the raw
+    /// 32-byte ed25519 public key checked against the signature at
+    /// `<registry-url>.sig`. `None` = the compiled-in blazar anchor.
+    /// Set this when self-hosting a registry (sign it with your own
+    /// key via `blazar registry keygen` / `blazar registry sign`).
+    /// A malformed value fails config validation - verification is
+    /// never silently skipped for a configured key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_registry_pubkey: Option<String>,
     /// Curated fork lanes this many days past supersede are deleted
     /// automatically (mainline covers their architectures; the source
     /// artifacts can always be rebuilt via the registry). 0 = never
@@ -4114,6 +4125,7 @@ impl Default for Config {
             whisper_vad_min_silence_duration_ms: None,
             sdcpp_qwen_prefix_cache_type: None,
             capability_registry_url: None,
+            capability_registry_pubkey: None,
             capability_lane_auto_install: true,
             fork_retire_days: default_fork_retire_days(),
             keep_tags: default_keep_tags(),
@@ -5809,6 +5821,27 @@ impl Config {
                 "sglang.lmcache.enabled requires [kv.lmcache] enabled - the shared daemon owns the store"
                     .into(),
             ));
+        }
+        // Early shape gate for the registry verification key: base64 of
+        // a raw 32-byte ed25519 public key is exactly 44 standard-base64
+        // chars with one trailing '='. The cryptographic decode happens
+        // at the fetch site (runtime) - this catches config typos at
+        // load time with the expected shape spelled out.
+        if let Some(key) = &self.capability_registry_pubkey {
+            let k = key.trim();
+            let shape = k.len() == 44
+                && k.ends_with('=')
+                && !k[..43].ends_with('=')
+                && k[..43]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/');
+            if !shape {
+                return Err(CoreError::Config(
+                    "capability_registry_pubkey must be base64 of a raw 32-byte ed25519 public key \
+                     (44 chars, one trailing '='; generate one with `blazar registry keygen`)"
+                        .into(),
+                ));
+            }
         }
         for (name, o) in &self.model_overrides {
             if let Some(t) = &o.sglang {
@@ -8028,6 +8061,40 @@ mod tests {
         let bare = Config::from_toml("").expect("bare config must parse");
         assert!(!bare.kv.translation.enabled);
         assert!(bare.kv.translation.allow.is_empty());
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__capability_registry_pubkey__shape_gated_at_load_not_fetch() {
+        // Absent by default: the compiled-in key anchors verification.
+        assert!(Config::default().capability_registry_pubkey.is_none());
+
+        // A well-formed 44-char raw-key pin (real shape, decodes to 32
+        // bytes at the fetch site) passes load-time validation.
+        let good = Config::from_toml(
+            "capability_registry_pubkey = \"WnTgolleCcVJEMo0hjvywAS5PsKJZIGh0d8ETBdx+Xw=\"",
+        )
+        .expect("well-formed pubkey pin must parse");
+        assert!(good.validate().is_ok());
+
+        // Typos fail at config load (from_toml parses + validates in
+        // one step) with the shape spelled out, not at fetch time in a
+        // running daemon.
+        for bad in [
+            "AAAA",                                          // too short
+            "WnTgolleCcVJEMo0hjvywAS5PsKJZIGh0d8ETBdx+Xw",   // 43 chars, missing '='
+            "WnTgolleCcVJEMo0hjvywAS5PsKJZIGh0d8ETBdx+Xw==", // double padding
+            "not!base64!key!with!symbols!padding!to!44!x==", // charset
+        ] {
+            let err = Config::from_toml(&format!("capability_registry_pubkey = \"{bad}\""))
+                .expect_err("malformed pubkey pin must fail at config load");
+            assert!(
+                err.to_string().contains("capability_registry_pubkey")
+                    && err.to_string().contains("blazar registry keygen"),
+                "teaching names the knob and the generator: {err}"
+            );
+        }
     }
 
     #[test]

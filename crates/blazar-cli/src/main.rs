@@ -535,6 +535,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: LoraCmd,
     },
+    /// Capability-registry signing tools (keygen / sign / verify -
+    /// ed25519 detached signatures over the lane catalog)
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
+    },
     /// Search Hugging Face model repos (words joined; omit to browse popular)
     Search {
         /// Search query (words joined); omit to browse popular models
@@ -1245,6 +1251,38 @@ enum EngineCmd {
     },
 }
 
+/// `blazar registry` subcommands: maintain the signature chain that
+/// gates automatic capability-lane installs. keygen makes a fresh
+/// pair, sign produces the detached `.sig` published next to the
+/// catalog, verify checks a file against a signature + public key
+/// (exit 0/1 - CI-friendly).
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// Generate a fresh ed25519 signing pair; prints the base64
+    /// PKCS8 private key (KEEP SECRET) and the base64 raw public key
+    Keygen,
+    /// Sign a registry catalog with a PKCS8 (base64 DER) private key;
+    /// prints the base64 signature for `<file>.sig`
+    Sign {
+        /// Registry JSON file to sign
+        file: String,
+        /// Base64 PKCS8 DER private key (or `BLAZAR_REGISTRY_PRIVKEY`)
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Verify a signed file (default: embedded key + `<file>.sig`)
+    Verify {
+        /// File that was signed
+        file: String,
+        /// Signature file (default `<file>.sig`)
+        #[arg(long)]
+        sig: Option<String>,
+        /// Base64 raw public key (default: the compiled-in anchor)
+        #[arg(long)]
+        pubkey: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum LoraCmd {
     Add {
@@ -1415,6 +1453,7 @@ const HELP_GROUPS: &[(&str, &[&str])] = &[
         &[
             "engine",
             "kv",
+            "registry",
             "rpc",
             "config",
             "keys",
@@ -2574,6 +2613,7 @@ blazar mmproj <model> <mmproj.gguf path>"
         // tail dispatch keeps every OS under the stack-growth budget.
         Cmd::Engine { cmd } => Box::pin(engine_cmd(cmd)).await,
         Cmd::Lora { cmd } => lora_cmd(cmd).await,
+        Cmd::Registry { cmd } => registry_cmd(cmd),
         Cmd::Search {
             query,
             format,
@@ -24004,6 +24044,86 @@ fn engine_recommend_cmd(model: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `blazar registry keygen|sign|verify` - the signing side of the
+/// capability-registry trust chain. The daemon side (auto-install gate)
+/// lives in the runtime; these commands exist so curators and CI can
+/// produce and check the artifacts without ad-hoc openssl recipes.
+fn registry_cmd(cmd: RegistryCmd) -> Result<()> {
+    use base64::Engine as _;
+    use blazar_runtime::engine::capability_registry as reg;
+    match cmd {
+        RegistryCmd::Keygen => {
+            let (pkcs8, public) = reg::registry_keygen()?;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            println!("private key (PKCS8 DER, base64 - KEEP SECRET, never commit):");
+            println!("{}", b64.encode(pkcs8));
+            println!("public key (raw 32B, base64 - publish as the registry .pub / config pin):");
+            println!("{}", b64.encode(public));
+            println!(
+                "{}",
+                dim_line(
+                    "sign with: blazar registry sign <registry.json> --key <private-key> \
+                     (or export BLAZAR_REGISTRY_PRIVKEY)"
+                )
+            );
+        }
+        RegistryCmd::Sign { file, key } => {
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let key_b64 = key
+                .or_else(|| std::env::var("BLAZAR_REGISTRY_PRIVKEY").ok())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no private key: pass --key <base64 PKCS8> or set BLAZAR_REGISTRY_PRIVKEY"
+                    )
+                })?;
+            let pkcs8 = b64
+                .decode(key_b64.trim())
+                .map_err(|e| anyhow!("private key is not valid base64: {e}"))?;
+            let body = std::fs::read(&file).with_context(|| format!("read {file}"))?;
+            // A catalog that does not parse is a sign of a broken edit -
+            // refuse to produce a valid signature over garbage.
+            reg::parse_registry(std::str::from_utf8(&body).context("registry file is not UTF-8")?)?;
+            let sig = reg::registry_sign(&body, &pkcs8)?;
+            println!("{}", b64.encode(sig));
+            println!(
+                "{}",
+                dim_line(&format!(
+                    "publish this as {file}.sig next to the catalog (verify: blazar \
+                     registry verify {file} --sig {file}.sig)"
+                ))
+            );
+        }
+        RegistryCmd::Verify { file, sig, pubkey } => {
+            let sig_path = sig.unwrap_or_else(|| format!("{file}.sig"));
+            let body = std::fs::read(&file).with_context(|| format!("read {file}"))?;
+            let sig_b64 =
+                std::fs::read_to_string(&sig_path).with_context(|| format!("read {sig_path}"))?;
+            match reg::effective_pubkey(pubkey.as_deref())
+                .map_err(|e| anyhow!("{e}"))
+                .and_then(|pk| {
+                    reg::verify_registry_signature(&body, sig_b64.trim(), &pk)
+                        .map_err(|e| anyhow!("{e}"))
+                }) {
+                Ok(()) => {
+                    println!(
+                        "OK: {file} verifies against {} signature {sig_path}",
+                        if pubkey.is_some() {
+                            "the given public key"
+                        } else {
+                            "the embedded blazar key"
+                        }
+                    );
+                }
+                Err(e) => {
+                    println!("FAIL: {file} does not verify ({e})");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
     use blazar_runtime::engine::capability_registry as reg;
     let cfg = config()?;
@@ -24017,7 +24137,12 @@ async fn engine_offers(arch: Option<&str>, json: bool) -> Result<()> {
         "{}",
         dim_line(&format!("querying capability registry {url}"))
     );
-    let lanes = reg::fetch(reg::http(), &url).await?;
+    let (lanes, sig_state) =
+        reg::fetch_verified(reg::http(), &url, cfg.capability_registry_pubkey.as_deref()).await?;
+    println!(
+        "{}",
+        dim_line(&format!("registry signature: {}", sig_state.as_str()))
+    );
     let selected: Vec<&reg::RegistryLane> = match arch {
         Some(a) => reg::offers_for_arch(&lanes, a),
         None => lanes.iter().collect(),
@@ -24084,7 +24209,17 @@ async fn engine_install_lane(d: &BlazarDirs, lane_id: &str, backend: Option<&str
         "{}",
         dim_line(&format!("querying capability registry {url}"))
     );
-    let lanes = reg::fetch(reg::http(), &url).await?;
+    let (lanes, sig_state) =
+        reg::fetch_verified(reg::http(), &url, cfg.capability_registry_pubkey.as_deref()).await?;
+    if sig_state != reg::SignatureState::Verified {
+        // Manual install proceeds, but never silently: the operator
+        // typed the command and deserves to know the pins are unproven.
+        println!(
+            "warning: registry signature is {} - lane pins were NOT proven against the \
+             blazar signing key; proceeding because the install was requested manually",
+            sig_state.as_str()
+        );
+    }
     let lane = lanes.iter().find(|l| l.id == lane_id).ok_or_else(|| {
         anyhow!("no registry lane {lane_id:?} - `blazar engine offers` lists the catalog")
     })?;

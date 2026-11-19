@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 271 fields, 0 dead
+## Config (top-level keys) - 272 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -100,6 +100,7 @@ token quality are surfaced as drift.
 | whisper_idle_secs | default_whisper_idle_secs() | gateway-http | `crates/blazar-gateway/src/whisper.rs:1519` in `audio_capabilities`; `crates/blazar-gateway/src/state.rs:50` in `new` |
 | capability_registry_url | None | runtime/gateway + cli | `crates/blazar-runtime/src/engine/capability_registry.rs:115` in `read_body_bounded`; `crates/blazar-runtime/src/supervisor.rs:7230` in `registry_offer`; `crates/blazar-cli/src/main.rs:22050` in `engine_offers`; `crates/blazar-cli/src/main.rs:22050` in `engine_offers` |
 | capability_lane_auto_install | true | runtime/gateway | `crates/blazar-runtime/src/supervisor.rs` in `schedule_curated_auto_install` (registry-only background source build after an unsupported architecture failure) |
+| capability_registry_pubkey | None | runtime/gateway | `crates/blazar-runtime/src/engine/capability_registry.rs:259` in `effective_pubkey` (config pin wins over the compiled-in anchor; shape-gated in `crates/blazar-core/src/config.rs` `Config::validate`) |
 | fork_retire_days | default_fork_retire_days() | runtime/gateway + cli | `crates/blazar-runtime/src/engine/mod.rs:3216` in `refresh_supersede_state`; `crates/blazar-runtime/src/engine/mod.rs:3216` in `refresh_supersede_state`; `crates/blazar-cli/src/main.rs:21739` in `refresh_after_lane_change`; `crates/blazar-cli/src/main.rs:22120` in `engine_install_lane` |
 | keep_tags | default_keep_tags() (= DEFAULT_KEEP_TAGS, 2) | runtime + cli | `blazar-runtime/src/engine/mod.rs` in `effective_keep_tags` (validated read at prune time); consumed by `EngineManager::prune`, `whisper.rs`/`piper.rs` `prune`, `main.rs` `doctor_engine_retention` |
 | semantic_cache | SemanticCacheConfig::default() | gateway-http | `crates/blazar-gateway/src/lib.rs:1168` in `well_known`; `crates/blazar-gateway/src/lib.rs:1168` in `well_known` |
