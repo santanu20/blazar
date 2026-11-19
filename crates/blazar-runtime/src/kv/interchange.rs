@@ -10,7 +10,7 @@
 //! rows are stored in. Provenance/rope/geometry gates run at codec entry -
 //! a carrier never exists for a pair those gates refuse.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use blazar_core::config::TranslationSection;
 
@@ -335,6 +335,8 @@ pub enum CodecLane {
     /// stages an mlx-lm prompt-cache file the supervisor's spawn wrapper
     /// pre-loads into the mlx server's LRU.
     VllmToMlx,
+    SglangToVllm,
+    VllmToSglang,
 }
 
 impl CodecLane {
@@ -346,6 +348,8 @@ impl CodecLane {
             Self::VllmToLlamaCpp => "vllm -> llama.cpp",
             Self::MlxToVllm => "mlx -> vllm",
             Self::VllmToMlx => "vllm -> mlx",
+            Self::SglangToVllm => "sglang -> vllm",
+            Self::VllmToSglang => "vllm -> sglang",
         }
     }
 }
@@ -362,6 +366,8 @@ pub fn admitted_pairs(cfg: &TranslationSection) -> Vec<CodecLane> {
             CodecLane::VllmToLlamaCpp,
             CodecLane::MlxToVllm,
             CodecLane::VllmToMlx,
+            CodecLane::SglangToVllm,
+            CodecLane::VllmToSglang,
         ]
     } else {
         Vec::new()
@@ -1008,6 +1014,218 @@ fn dtype_upper(dtype: &str) -> &'static str {
     if dtype == "bf16" { "BF16" } else { "F16" }
 }
 
+// ---------------------------------------------------------------------------
+// sglang HiCache L3 file backend (0.5.23) - page-hash-addressed import/export
+//
+// The engine's file backend names every stored page after its radix page
+// hash: SHA-256 over the parent page digest (raw 32 bytes, absent for the
+// first page) followed by the page's token ids as little-endian u32 words,
+// chained per page. Files land as `{hash}_{model-dashes}_{tp_rank}_{tp_size}.bin`
+// (tp=1/pp=1 spawns) holding the raw page-unified object: axes
+// (head_group, layer, K|V, page_token, head_in_group, head_dim) with K=0, V=1.
+
+/// One page digest of the sglang hash chain (native ext semantics, byte-exact).
+#[must_use]
+pub fn sglang_page_hash(parent: Option<[u8; 32]>, page_tokens: &[u32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    if let Some(p) = parent {
+        hasher.update(p);
+    }
+    for t in page_tokens {
+        hasher.update(t.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// Naming inputs for the sglang file backend on a tp=1/pp=1 spawn.
+pub struct SglangPageSpec {
+    /// The `--model` argv value with slashes joined by dashes, as the engine embeds it.
+    pub model_name: String,
+}
+
+impl SglangPageSpec {
+    #[must_use]
+    pub fn model_name_of(model_path: &str) -> String {
+        model_path.replace('/', "-")
+    }
+    /// tp=1/pp=1 suffix: `_{model}_{tp_rank}_{tp_size}`.
+    #[must_use]
+    pub fn config_suffix(&self) -> String {
+        format!("_{}_1_1", self.model_name)
+    }
+    fn page_path(&self, dir: &Path, hash_hex: &str) -> PathBuf {
+        dir.join(format!("{hash_hex}{}.bin", self.config_suffix()))
+    }
+}
+
+/// Report of a sglang page walk, mirroring [`TierReadReport`].
+pub type SglangPageReport = TierReadReport;
+
+fn sglang_object_bytes(geo: &RepackGeometry, page: usize) -> Result<usize, String> {
+    geo.layers
+        .checked_mul(geo.kv_heads)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| usize::try_from(v).ok())
+        .and_then(|v| v.checked_mul(page))
+        .and_then(|v| v.checked_mul(geo.head_dim as usize))
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| "page object size overflows".to_string())
+}
+
+/// Read chained page files back into a carrier. Walks full pages only and
+/// stops at the first missing file (the tier never stored the tail).
+pub fn sglang_pages_to_carrier(
+    storage_dir: &Path,
+    spec: &SglangPageSpec,
+    tokens: &[u32],
+    geo: &RepackGeometry,
+    page_tokens: u32,
+) -> Result<(KvCarrier, SglangPageReport), String> {
+    let page = usize::try_from(page_tokens).map_err(|_| "page tokens overflow".to_string())?;
+    if tokens.len() < page {
+        return Err(format!(
+            "the tokens cover {} of the {page_tokens} tokens a page holds - the file tier stores full pages only",
+            tokens.len()
+        ));
+    }
+    let full_pages = tokens.len() / page;
+    let head_bytes = geo.head_dim as usize * 2;
+    let row_bytes = geo.kv_heads as usize * head_bytes;
+    let object_bytes = sglang_object_bytes(geo, page)?;
+    let layers = geo.layers as usize;
+    let mut parent: Option<[u8; 32]> = None;
+    // allocate at the full-walk stride up front so layer-major offsets never
+    // shift as pages arrive, then truncate to what the walk actually read
+    let stride_cells = full_pages * page;
+    let row_volume = layers * stride_cells * row_bytes;
+    let mut k_rows = vec![0u8; row_volume];
+    let mut v_rows = vec![0u8; row_volume];
+    let mut blocks_read = 0usize;
+    for b in 0..full_pages {
+        let digest = sglang_page_hash(parent, &tokens[b * page..(b + 1) * page]);
+        let path = spec.page_path(storage_dir, &hex::encode(digest));
+        let Ok(object) = std::fs::read(&path) else {
+            if blocks_read == 0 {
+                return Err(format!(
+                    "no page file for the first page under {} - the sglang lane never wrote this prefix",
+                    storage_dir.display()
+                ));
+            }
+            break;
+        };
+        if object.len() != object_bytes {
+            return Err(format!(
+                "page object for block {b} holds {} bytes, expected {object_bytes} - different tensor geometry or engine version",
+                object.len()
+            ));
+        }
+        for l in 0..layers {
+            for t in 0..page {
+                for h in 0..geo.kv_heads as usize {
+                    // axes (head_group, layer, K|V, page_token, head_in_group=1, head_dim)
+                    let k_base = ((h * layers + l) * 2 * page + t) * head_bytes;
+                    let v_base = ((h * layers + l) * 2 * page + page + t) * head_bytes;
+                    let dst =
+                        l * stride_cells * row_bytes + (b * page + t) * row_bytes + h * head_bytes;
+                    k_rows[dst..dst + head_bytes]
+                        .copy_from_slice(&object[k_base..k_base + head_bytes]);
+                    v_rows[dst..dst + head_bytes]
+                        .copy_from_slice(&object[v_base..v_base + head_bytes]);
+                }
+            }
+        }
+        parent = Some(digest);
+        blocks_read += 1;
+    }
+    let cells = blocks_read * page;
+    let keep = layers * cells * row_bytes;
+    k_rows.truncate(keep);
+    v_rows.truncate(keep);
+    let report = SglangPageReport {
+        blocks_read: u32::try_from(blocks_read).unwrap_or(u32::MAX),
+        block_tokens: page_tokens,
+        blocks_missing: u32::try_from(full_pages - blocks_read).unwrap_or(u32::MAX),
+    };
+    let carrier = KvCarrier {
+        tokens: tokens[..cells].to_vec(),
+        cells: u32::try_from(cells).map_err(|_| "cell count overflows".to_string())?,
+        geometry: RepackGeometry {
+            layers: geo.layers,
+            kv_heads: geo.kv_heads,
+            head_dim: geo.head_dim,
+        },
+        dtype: KV_DTYPE_F16,
+        block_tokens: page_tokens,
+        attention_layout: VLLM_LAYOUT,
+        k_rows,
+        v_rows,
+    };
+    Ok((carrier, report))
+}
+
+/// Outcome of writing carrier rows out as chained page files.
+#[derive(Debug)]
+pub struct SglangWriteReport {
+    pub blocks_written: u32,
+    pub block_tokens: u32,
+    pub storage_dir: PathBuf,
+}
+
+/// Write a carrier into the sglang file backend: per full page, interleave
+/// rows into the page-unified object and store it under its chained hash.
+pub fn carrier_to_sglang_pages(
+    carrier: &KvCarrier,
+    spec: &SglangPageSpec,
+    storage_dir: &Path,
+    page_tokens: u32,
+) -> Result<SglangWriteReport, String> {
+    let page = usize::try_from(page_tokens).map_err(|_| "page tokens overflow".to_string())?;
+    let full_pages = (carrier.cells as usize) / page;
+    if full_pages == 0 {
+        return Err(format!(
+            "the carrier holds {} tokens - under one full {page_tokens}-token page, and the file tier stores full pages only",
+            carrier.cells
+        ));
+    }
+    std::fs::create_dir_all(storage_dir)
+        .map_err(|e| format!("create {}: {e}", storage_dir.display()))?;
+    let head_bytes = carrier.geometry.head_dim as usize * 2;
+    let row_bytes = carrier.geometry.kv_heads as usize * head_bytes;
+    let object_bytes = sglang_object_bytes(&carrier.geometry, page)?;
+    let layers = carrier.geometry.layers as usize;
+    let total_cells = carrier.cells as usize;
+    let mut parent: Option<[u8; 32]> = None;
+    for b in 0..full_pages {
+        let digest = sglang_page_hash(parent, &carrier.tokens[b * page..(b + 1) * page]);
+        let mut object = vec![0u8; object_bytes];
+        for l in 0..layers {
+            for t in 0..page {
+                for h in 0..carrier.geometry.kv_heads as usize {
+                    let k_base = ((h * layers + l) * 2 * page + t) * head_bytes;
+                    let v_base = ((h * layers + l) * 2 * page + page + t) * head_bytes;
+                    let src =
+                        l * total_cells * row_bytes + (b * page + t) * row_bytes + h * head_bytes;
+                    object[k_base..k_base + head_bytes]
+                        .copy_from_slice(&carrier.k_rows[src..src + head_bytes]);
+                    object[v_base..v_base + head_bytes]
+                        .copy_from_slice(&carrier.v_rows[src..src + head_bytes]);
+                }
+            }
+        }
+        let path = spec.page_path(storage_dir, &hex::encode(digest));
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, &object).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+        parent = Some(digest);
+    }
+    Ok(SglangWriteReport {
+        blocks_written: u32::try_from(full_pages).unwrap_or(u32::MAX),
+        block_tokens: page_tokens,
+        storage_dir: storage_dir.to_path_buf(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
@@ -1103,7 +1321,9 @@ mod tests {
                 CodecLane::LlamaCppToVllm,
                 CodecLane::VllmToLlamaCpp,
                 CodecLane::MlxToVllm,
-                CodecLane::VllmToMlx
+                CodecLane::VllmToMlx,
+                CodecLane::SglangToVllm,
+                CodecLane::VllmToSglang
             ]
         );
         assert_eq!(CodecLane::LlamaCppToVllm.pair_name(), "llama.cpp -> vllm");
@@ -1566,5 +1786,115 @@ mod tests {
         let (_, report) =
             carrier_to_mlx_cache(&carrier, "/models/qwen", "bfloat16").expect("stage");
         assert_eq!(report.capacity, 512);
+    }
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__sglang_page_hash__pins_the_native_extension_golden_vectors() {
+        // vectors generated through sglang 0.5.23's own native hash extension
+        let t1: Vec<u32> = (1000..1064).collect();
+        let h1 = sglang_page_hash(None, &t1);
+        assert_eq!(
+            hex::encode(h1),
+            "5202e60f6130ac4d1a719da4699af7be8be6db2720efe114f00388ae4df4ba1f"
+        );
+        let t2: Vec<u32> = (2000..2128).collect();
+        let p0 = sglang_page_hash(None, &t2[..64]);
+        assert_eq!(
+            hex::encode(p0),
+            "514bb5fa54d1b42dce09995f07b8f1ad36c67c4fa5b116c85814d173d27b0760"
+        );
+        let p1 = sglang_page_hash(Some(p0), &t2[64..]);
+        assert_eq!(
+            hex::encode(p1),
+            "9b9a66563db02f172bba272f3cf8b099f2b541749c13e8ebf496b382d3aeb05e"
+        );
+        let part = sglang_page_hash(None, &[5, 6, 7]);
+        assert_eq!(
+            hex::encode(part),
+            "2e4c4603cb0dea8636f8e802bfa0f24caef5f9943377f91d89fd6fbd9577cd1c"
+        );
+    }
+
+    fn sglang_geo() -> RepackGeometry {
+        RepackGeometry {
+            layers: 2,
+            kv_heads: 2,
+            head_dim: 4,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__sglang_codec__suffix_and_names_follow_the_model_path() {
+        let name = SglangPageSpec::model_name_of("/home/u/models/qwen.d");
+        assert_eq!(name, "-home-u-models-qwen.d");
+        let spec = SglangPageSpec { model_name: name };
+        assert_eq!(spec.config_suffix(), "_-home-u-models-qwen.d_1_1");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__sglang_codec__write_read_roundtrip_restores_the_carrier() {
+        // 128 tokens, geometry 2L x 2H x 4D (row 16B): two full 64-token pages
+        let dir = tempfile::tempdir().unwrap();
+        let geo = sglang_geo();
+        let bank = bank();
+        let carrier = KvCarrier::from_slot_bank(bank.clone(), sglang_geo());
+        let spec = SglangPageSpec {
+            model_name: "qwen-test".into(),
+        };
+        let w = carrier_to_sglang_pages(&carrier, &spec, dir.path(), 64).unwrap();
+        assert_eq!(w.blocks_written, 2);
+        let tokens: Vec<u32> = bank
+            .tokens
+            .iter()
+            .map(|t| u32::try_from(*t).unwrap())
+            .collect();
+        let (restored, report) =
+            sglang_pages_to_carrier(dir.path(), &spec, &tokens, &geo, 64).unwrap();
+        assert_eq!(report.blocks_read, 2);
+        assert_eq!(report.blocks_missing, 0);
+        assert_eq!(restored.cells, carrier.cells);
+        assert_eq!(restored.k_rows, carrier.k_rows);
+        assert_eq!(restored.v_rows, carrier.v_rows);
+        // two page files exist, addressed by the chained hashes
+        let h0 = hex::encode(sglang_page_hash(None, &tokens[..64]));
+        assert!(dir.path().join(format!("{h0}_qwen-test_1_1.bin")).is_file());
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__sglang_codec__stops_at_missing_pages_and_refuses_short_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SglangPageSpec {
+            model_name: "qwen-test".into(),
+        };
+        // nothing written: first page missing -> teaching error
+        let err =
+            sglang_pages_to_carrier(dir.path(), &spec, &[7; 64], &sglang_geo(), 64).unwrap_err();
+        assert!(err.contains("never wrote this prefix"), "{err}");
+        // short prompt: under one page
+        let err =
+            sglang_pages_to_carrier(dir.path(), &spec, &[1, 2, 3], &sglang_geo(), 64).unwrap_err();
+        assert!(err.contains("full pages only"), "{err}");
+        // write one page of 128 tokens then delete the second file: partial walk
+        let bank = bank();
+        let carrier = KvCarrier::from_slot_bank(bank.clone(), sglang_geo());
+        carrier_to_sglang_pages(&carrier, &spec, dir.path(), 64).unwrap();
+        let tokens: Vec<u32> = bank
+            .tokens
+            .iter()
+            .map(|t| u32::try_from(*t).unwrap())
+            .collect();
+        let h1 = hex::encode(sglang_page_hash(
+            Some(sglang_page_hash(None, &tokens[..64])),
+            &tokens[64..],
+        ));
+        std::fs::remove_file(dir.path().join(format!("{h1}_qwen-test_1_1.bin"))).unwrap();
+        let (partial, report) =
+            sglang_pages_to_carrier(dir.path(), &spec, &tokens, &sglang_geo(), 64).unwrap();
+        assert_eq!(report.blocks_read, 1);
+        assert_eq!(report.blocks_missing, 1);
+        assert_eq!(partial.cells, 64);
     }
 }

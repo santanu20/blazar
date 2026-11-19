@@ -211,3 +211,67 @@ health checks pass on bind, and the empty-stream-then-404 signature is
 generation-thread death, not a bind race. The preload line itself surfaces
 at `tracing` DEBUG (spawn pipes child output there); usage receipts require
 non-stream requests (streaming `include_usage` returns null on this build).
+
+## Wave E (2026-11-19): sglang HiCache L3 codec - format-verified, live leg hardware-gated
+
+**Key format (installed sglang 0.5.23 = ground truth).** The hierarchical-cache
+file backend writes one object per radix page: filename
+`{page_hash}_{model_name}_{tp_rank}_{tp_size}.bin` (model path with `/` -> `-`;
+pp/cp suffixes only when > 1; blazar spawns tp=1/pp=1), under
+`SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` / `extra_config["file_storage_path"]`
+/ `/tmp/hicache`. The page hash chain is `SHA-256(parent_digest_32B || page
+tokens as u32-LE)` - no length prefix, no separators; page 0 has no parent
+(unnamespaced default; the optional namespace seed is not emitted by any blazar
+knob); a partial final page hashes only its own tokens. The payload is the raw
+page-unified pool object, MHA axes `(head_group, layer, K|V, page, head_in_group,
+head_dim)` with K=0/V=1 - for qwen2.5-1.5b (28 layers, 2 KV heads, 128 head dim)
+exactly 1,835,008 bytes, the same byte volume as a vLLM page, which makes the
+two codecs symmetric.
+
+**Hash goldens (generated through sglang's own native extension, no server
+boot).** `get_hash_str(tokens, None, 64)` from `sglang.srt.mem_cache.utils`
+(the JIT-compiled `cpp_utils/hash_binding.cpp`, `-lcrypto`):
+
+- tokens 1000..1064 -> `5202e60f6130ac4d...df4ba1f`
+- tokens 2000..2128 -> page 0 `514bb5fa54d1b42d...27b0760`, page 1 (chained)
+  `9b9a66563db02f17...3aeb05e`
+- tokens [5, 6, 7] (partial) -> `2e4c4603cb0dea86...577cd1c`
+
+The Rust replica pins all four vectors as unit tests.
+
+**Why the live engine leg is blocked on this host (receipts).** Three manual
+boot attempts of `sglang.launch_server --enable-hierarchical-cache` on this
+13.7 GiB-RAM box, all fatal: (1) flashinfer 0.7.2 pure-wheel JIT died on system
+nvcc 12.0 (`--compress-mode=size` unknown) - fixed by installing the
+`flashinfer-jit-cache{,-sm*}==0.7.2+cu130` wheel family from
+flashinfer.ai/whl/cu130 (no `--no-deps`: the sm-variant wheels are deps) and
+wiping `~/.cache/sglang/.cache/flashinfer`; (2) `No host memory is left for
+HiCache after the 10 GiB reserve` even in `buffer_only` with `--hicache-size
+1`; (3) `Requesting 1.00 GB but only have -6.83 GB free` from the host pool
+allocator. Root cause: `pool_host/base.py:28`
+`HICACHE_HOST_MEMORY_RESERVE_BYTES = 10 * 1024**3` - a hard, env-free constant
+counted against psutil "available" memory; any host with under ~14 GiB
+available cannot boot hicache in ANY mode. Blazar's own hicache RAM gate
+(`SGLANG_HICACHE_HOST_RESERVE_MIB`) mirrors this constant and stays strict -
+loosening it would only move the failure into the engine. The codec therefore
+ships format-verified (source pins + native-ext hash goldens + round-trip
+unit tests); the live cross-engine receipt lands on the first host with ~14+
+GiB free RAM.
+
+**Dead code note.** The opt-in "unified" key scheme
+(`hicache_key_scheme.py`: msgspec `KVCacheNamespace`, `ukv1-<sha256[:16]>`
+digests) has zero importers in 0.5.23 - no server argument reaches it. A golden
+was still captured for it (`ukv1-326bbaeb9869dbf2` for the qwen namespace) in
+case upstream wires it; the codec targets the live default-key path instead.
+
+**Wave F confirmation (mistral.rs).** No codec, by design: `connector_for`
+already returns an honest `Unsupported` for the mistral.rs lane (no slot-bank
+protocol), and mistral.rs exposes no external KV surface to import into (the
+in-memory `prefix_cacher.rs` has no serialization path). The upstream-PR track
+(contributing save/load to prefix_cacher) remains the recorded path; nothing
+further to build here.
+
+**Storage zoo (pinning risk).** 0.5.23 ships file/mmap/shm/hf3fs/mooncake/
+nixl/flexkv/seaweedfs/tensorcast/aibrix/eic/umbp backends; only the plain file
+backend is writable without external infrastructure, and it is the one blazar
+replicates. Codec work is pinned per installed lane version by construction.

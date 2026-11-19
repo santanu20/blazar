@@ -912,6 +912,14 @@ enum KvCmd {
         /// spawn wrapper pre-loads
         #[arg(long)]
         stage_mlx: bool,
+        /// Read sglang `HiCache` L3 page files as the source lane
+        /// (both models HF directories; needs --tokens)
+        #[arg(long)]
+        from_sglang: bool,
+        /// Write sglang `HiCache` L3 page files as the sink lane
+        /// (both models HF directories; needs --tokens)
+        #[arg(long)]
+        to_sglang: bool,
     },
 }
 
@@ -4135,14 +4143,20 @@ fn kv_cmd(cmd: KvCmd) -> Result<()> {
             tokens,
             cache_file,
             stage_mlx,
+            from_sglang,
+            to_sglang,
         } => kv_import_cmd(
             &dirs(),
             &from,
             &to,
-            bank.as_deref(),
-            tokens.as_deref(),
-            cache_file.as_deref(),
-            stage_mlx,
+            &KvImportOpts {
+                bank,
+                tokens,
+                cache_file,
+                stage_mlx,
+                from_sglang,
+                to_sglang,
+            },
         ),
     }
 }
@@ -4355,6 +4369,214 @@ fn kv_stage_layout_gates(
     Ok(())
 }
 
+/// sglang -> vllm import: read `HiCache` L3 page files the sglang lane wrote
+/// (hash-chained per 64-token page, named after the serving model path) into
+/// the carrier and repack them into the vllm FS tier.
+#[allow(clippy::too_many_arguments)]
+fn kv_import_from_sglang(
+    d: &BlazarDirs,
+    cfg: &blazar_core::config::Config,
+    from_row: &blazar_core::store::ModelRow,
+    to_row: &blazar_core::store::ModelRow,
+    tokens: &str,
+) -> Result<()> {
+    use blazar_runtime::kv::interchange as bkic;
+
+    anyhow::ensure!(
+        bkic::admitted_pairs(&cfg.kv.translation).contains(&bkic::CodecLane::SglangToVllm),
+        "the sglang -> vllm lane is not admitted - [kv.translation] enabled admits it"
+    );
+    anyhow::ensure!(
+        from_row.path == to_row.path,
+        "sglang HiCache pages only transfer onto the same weights: {}?={} - the bytes are only honest against the exact model",
+        from_row.path,
+        to_row.path
+    );
+    let ids = reverse_precheck(cfg, tokens)?;
+    let hf_meta = blazar_core::hfmeta::read_hf_config(std::path::Path::new(&from_row.path))
+        .map_err(|e| anyhow!("cannot read the HF config at {}: {e}", from_row.path))?;
+    let layers = u32::try_from(hf_meta.kv.layers.unwrap_or(0))
+        .ok()
+        .filter(|v| *v > 0);
+    let kv_heads = u32::try_from(hf_meta.kv.kv_heads.unwrap_or(0))
+        .ok()
+        .filter(|v| *v > 0);
+    let head_dim = u32::try_from(hf_meta.kv.head_dim.unwrap_or(0))
+        .ok()
+        .filter(|v| *v > 0);
+    let (Some(layers), Some(kv_heads), Some(head_dim)) = (layers, kv_heads, head_dim) else {
+        anyhow::bail!(
+            "the HF config at {} does not pin the tensor geometry (layers/kv_heads/head_dim) - cross-lane reuse stays Exact-only",
+            from_row.path
+        );
+    };
+    let geo = blazar_runtime::kv::repack::RepackGeometry {
+        layers,
+        kv_heads,
+        head_dim,
+    };
+    let page_tokens: u32 = 64;
+    let saved = blazar_runtime::kv::translation::sglang_kv_layout(&hf_meta, page_tokens)
+        .ok_or_else(|| anyhow!("the HF config does not pin the sglang lane geometry"))?;
+    let target = blazar_runtime::kv::translation::vllm_kv_layout(&hf_meta, page_tokens)
+        .ok_or_else(|| anyhow!("the HF config does not pin the vllm lane geometry"))?;
+    if let blazar_core::kv::KvCompatibility::Incompatible { reason } =
+        blazar_runtime::kv::translation::translation_verdict(
+            &saved,
+            &target,
+            &blazar_runtime::kv::translation::builtin_registry(&cfg.kv.translation),
+        )
+    {
+        anyhow::bail!("lane pair refused: {reason}");
+    }
+    let spec = bkic::SglangPageSpec {
+        model_name: bkic::SglangPageSpec::model_name_of(&from_row.path),
+    };
+    let storage_dir = sglang_hicache_dir(d, cfg);
+    let (carrier, report) =
+        bkic::sglang_pages_to_carrier(&storage_dir, &spec, &ids, &geo, page_tokens)
+            .map_err(|e| anyhow!("sglang HiCache read failed: {e}"))?;
+    anyhow::ensure!(
+        report.blocks_read > 0,
+        "no HiCache page files matched this prefix in {} - the sglang lane never wrote it ([sglang] hicache_enable + a matching --hicache-storage-backend-extra-config file_storage_path)",
+        storage_dir.display()
+    );
+    let tier_spec = blazar_runtime::kv::repack::VllmFsSpec {
+        model_name: to_row.path.clone(),
+        tokens_per_hash: page_tokens,
+        blocks_per_file: 1,
+        canonical_format: "v1-nhd".into(),
+    };
+    let outcome = bkic::carrier_into_vllm_tier(&carrier, &tier_spec, &d.data_dir.join("kv/vllm"))
+        .map_err(|e| anyhow!("vllm tier write failed: {e}"))?;
+    println!(
+        "sglang HiCache imported: {} layer(s) x {} token(s) from {} block(s) read",
+        geo.layers, carrier.cells, report.blocks_read
+    );
+    if report.blocks_missing > 0 {
+        println!(
+            "note: {} later page(s) were never written by the engine - the import covers the first {} token(s) only",
+            report.blocks_missing, carrier.cells
+        );
+    }
+    println!(
+        "vllm tier now holds {} block(s) x {} token(s) across {} file(s)",
+        outcome.blocks_written,
+        outcome.block_tokens,
+        outcome.files.len()
+    );
+    println!("the next same-prefix request on the vllm lane reports cached_tokens");
+    Ok(())
+}
+
+/// vllm -> sglang import: read the vllm FS tier into the carrier and write
+/// `HiCache` L3 page files the sglang lane will find by its own hash chain.
+fn kv_import_to_sglang(
+    d: &BlazarDirs,
+    cfg: &blazar_core::config::Config,
+    from_row: &blazar_core::store::ModelRow,
+    to_row: &blazar_core::store::ModelRow,
+    tokens: &str,
+) -> Result<()> {
+    use blazar_runtime::kv::interchange as bkic;
+
+    anyhow::ensure!(
+        bkic::admitted_pairs(&cfg.kv.translation).contains(&bkic::CodecLane::VllmToSglang),
+        "the vllm -> sglang lane is not admitted - [kv.translation] enabled admits it"
+    );
+    anyhow::ensure!(
+        from_row.path == to_row.path,
+        "sglang HiCache pages only transfer onto the same weights: {}?={} - the bytes are only honest against the exact model",
+        from_row.path,
+        to_row.path
+    );
+    let ids = reverse_precheck(cfg, tokens)?;
+    let hf_meta = blazar_core::hfmeta::read_hf_config(std::path::Path::new(&from_row.path))
+        .map_err(|e| anyhow!("cannot read the HF config at {}: {e}", from_row.path))?;
+    let layers = u32::try_from(hf_meta.kv.layers.unwrap_or(0))
+        .ok()
+        .filter(|v| *v > 0);
+    let kv_heads = u32::try_from(hf_meta.kv.kv_heads.unwrap_or(0))
+        .ok()
+        .filter(|v| *v > 0);
+    let head_dim = u32::try_from(hf_meta.kv.head_dim.unwrap_or(0))
+        .ok()
+        .filter(|v| *v > 0);
+    let (Some(layers), Some(kv_heads), Some(head_dim)) = (layers, kv_heads, head_dim) else {
+        anyhow::bail!(
+            "the HF config at {} does not pin the tensor geometry (layers/kv_heads/head_dim) - cross-lane reuse stays Exact-only",
+            from_row.path
+        );
+    };
+    let geo = blazar_runtime::kv::repack::RepackGeometry {
+        layers,
+        kv_heads,
+        head_dim,
+    };
+    let page_tokens: u32 = 64;
+    let saved = blazar_runtime::kv::translation::vllm_kv_layout(&hf_meta, page_tokens)
+        .ok_or_else(|| anyhow!("the HF config does not pin the vllm lane geometry"))?;
+    let target = blazar_runtime::kv::translation::sglang_kv_layout(&hf_meta, page_tokens)
+        .ok_or_else(|| anyhow!("the HF config does not pin the sglang lane geometry"))?;
+    if let blazar_core::kv::KvCompatibility::Incompatible { reason } =
+        blazar_runtime::kv::translation::translation_verdict(
+            &saved,
+            &target,
+            &blazar_runtime::kv::translation::builtin_registry(&cfg.kv.translation),
+        )
+    {
+        anyhow::bail!("lane pair refused: {reason}");
+    }
+    let tier_spec = blazar_runtime::kv::repack::VllmFsSpec {
+        model_name: from_row.path.clone(),
+        tokens_per_hash: page_tokens,
+        blocks_per_file: 1,
+        canonical_format: "v1-nhd".into(),
+    };
+    let (carrier, report) =
+        bkic::vllm_tier_to_carrier(&d.data_dir.join("kv/vllm"), &tier_spec, &ids, &geo)
+            .map_err(|e| anyhow!("vllm tier read failed: {e}"))?;
+    anyhow::ensure!(
+        report.blocks_read > 0,
+        "no vllm tier blocks matched this prefix - the lane never offloaded it ([vllm.kv_offload] enabled + a same-prefix request first)"
+    );
+    let spec = bkic::SglangPageSpec {
+        model_name: bkic::SglangPageSpec::model_name_of(&to_row.path),
+    };
+    let storage_dir = sglang_hicache_dir(d, cfg);
+    let outcome = bkic::carrier_to_sglang_pages(&carrier, &spec, &storage_dir, page_tokens)
+        .map_err(|e| anyhow!("sglang HiCache write failed: {e}"))?;
+    println!(
+        "sglang HiCache staged: {} block(s) x {} token(s) under {}",
+        outcome.blocks_written,
+        outcome.block_tokens,
+        storage_dir.display()
+    );
+    if report.blocks_missing > 0 {
+        println!(
+            "note: {} later block(s) were never offloaded by the engine - the stage covers the first {} token(s) only",
+            report.blocks_missing, carrier.cells
+        );
+    }
+    println!(
+        "the next same-prefix request on the sglang lane (hicache enabled, same file_storage_path) reads these pages"
+    );
+    Ok(())
+}
+
+/// Resolve the sglang `HiCache` file-backend storage dir: the lane's
+/// `[sglang] hicache_storage_extra_config` `file_storage_path` when set,
+/// else the blazar-managed default under the data dir.
+fn sglang_hicache_dir(d: &BlazarDirs, cfg: &blazar_core::config::Config) -> std::path::PathBuf {
+    if let Some(extra) = cfg.sglang.hicache_storage_extra_config.as_deref()
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(extra)
+        && let Some(p) = v.get("file_storage_path").and_then(|p| p.as_str())
+    {
+        return std::path::PathBuf::from(p);
+    }
+    d.data_dir.join("kv/sglang")
+}
+
 fn kv_import_stage_mlx(
     d: &BlazarDirs,
     cfg: &blazar_core::config::Config,
@@ -4555,28 +4777,9 @@ fn kv_import_mlx(
 
 /// Offline import: llama.cpp session bank -> vLLM fs KV tier. Every gate
 /// teaches on refusal; nothing is written until all of them pass.
-fn kv_import_cmd(
-    d: &BlazarDirs,
-    from: &str,
-    to: &str,
-    bank: Option<&str>,
-    tokens: Option<&str>,
-    cache_file: Option<&str>,
-    stage_mlx: bool,
-) -> Result<()> {
+fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, opts: &KvImportOpts) -> Result<()> {
     let cfg = config()?;
-    kv_import_with(
-        d,
-        &cfg,
-        from,
-        to,
-        &KvImportOpts {
-            bank: bank.map(str::to_string),
-            tokens: tokens.map(str::to_string),
-            cache_file: cache_file.map(str::to_string),
-            stage_mlx,
-        },
-    )
+    kv_import_with(d, &cfg, from, to, opts)
 }
 
 /// Testable core of `kv import`: the caller supplies the config so the
@@ -4590,6 +4793,8 @@ struct KvImportOpts {
     tokens: Option<String>,
     cache_file: Option<String>,
     stage_mlx: bool,
+    from_sglang: bool,
+    to_sglang: bool,
 }
 
 fn kv_import_with(
@@ -4603,6 +4808,8 @@ fn kv_import_with(
     let tokens = opts.tokens.as_deref();
     let cache_file = opts.cache_file.as_deref();
     let stage_mlx = opts.stage_mlx;
+    let from_sglang = opts.from_sglang;
+    let to_sglang = opts.to_sglang;
     anyhow::ensure!(
         cfg.kv.translation.enabled,
         "kv import is gated on [kv.translation] enabled = true - the knob keeps cross-engine KV admission explicit"
@@ -4640,6 +4847,30 @@ engine tokenizer's ids for the cached prefix as a JSON array"
         !(stage_mlx && cache_file.is_some()),
         "--stage-mlx and --cache-file are different mlx converters (vllm -> mlx staging vs mlx -> vllm export) - pass exactly one"
     );
+    let converter_flags = usize::from(from_sglang)
+        + usize::from(to_sglang)
+        + usize::from(stage_mlx)
+        + usize::from(cache_file.is_some());
+    anyhow::ensure!(
+        converter_flags <= 1,
+        "pass at most one converter flag (--from-sglang, --to-sglang, --stage-mlx, --cache-file)"
+    );
+    if from_is_hf && to_is_hf && from_sglang {
+        let tokens = tokens.ok_or_else(|| {
+            anyhow!(
+                "--tokens <file> is required when importing from the sglang lane: HiCache page files are hash-addressed by token ids and never store them - dump the engine tokenizer's ids for the cached prefix as a JSON array"
+            )
+        })?;
+        return kv_import_from_sglang(d, cfg, from_row, to_row, tokens);
+    }
+    if from_is_hf && to_is_hf && to_sglang {
+        let tokens = tokens.ok_or_else(|| {
+            anyhow!(
+                "--tokens <file> is required when importing to the sglang lane: the vllm tier is content-addressed by token ids and never stores them - dump the engine tokenizer's ids for the cached prefix as a JSON array"
+            )
+        })?;
+        return kv_import_to_sglang(d, cfg, from_row, to_row, tokens);
+    }
     if from_is_hf && to_is_hf && stage_mlx {
         let tokens = tokens.ok_or_else(|| {
             anyhow!(
@@ -8048,6 +8279,73 @@ mod doctor_tests {
         assert!(
             err.contains("--tokens") && err.contains("content-addressed"),
             "token-id teaching: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_import_with__sglang_lanes_teaches_their_requirements() {
+        let dir = tempfile::tempdir().unwrap();
+        let hf = dir.path().join("hf");
+        std::fs::create_dir_all(&hf).unwrap();
+        std::fs::write(hf.join("config.json"), "{}").unwrap();
+        let d = blazar_core::BlazarDirs {
+            config_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = blazar_core::store::Store::open(&d).unwrap();
+        let row = |name: &str, path: &str| blazar_core::store::ModelRow {
+            name: name.into(),
+            repo: String::new(),
+            quant: String::new(),
+            path: path.into(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        store
+            .upsert_model(&row("qwen-hf", hf.to_str().unwrap()))
+            .unwrap();
+        let mut cfg = blazar_core::config::Config::default();
+        cfg.kv.translation.enabled = true;
+        // both converter flags at once refuses
+        let err = kv_import_with(
+            &d,
+            &cfg,
+            "qwen-hf",
+            "qwen-hf",
+            &KvImportOpts {
+                from_sglang: true,
+                to_sglang: true,
+                ..KvImportOpts::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most one converter flag"), "{err}");
+        // missing tokens refuses with the hash-addressed teaching
+        let err = kv_import_with(
+            &d,
+            &cfg,
+            "qwen-hf",
+            "qwen-hf",
+            &KvImportOpts {
+                from_sglang: true,
+                ..KvImportOpts::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--tokens") && err.contains("never store them"),
+            "{err}"
         );
     }
 
