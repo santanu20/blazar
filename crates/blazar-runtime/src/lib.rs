@@ -41,6 +41,7 @@ pub mod registry;
 pub mod rpc_fleet;
 pub mod scan;
 pub mod sessionreg;
+pub mod shm_sweep;
 pub mod siglip;
 pub mod storage;
 pub mod supervisor;

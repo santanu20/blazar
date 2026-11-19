@@ -4568,13 +4568,22 @@ fn kv_import_to_sglang(
 /// `[sglang] hicache_storage_extra_config` `file_storage_path` when set,
 /// else the blazar-managed default under the data dir.
 fn sglang_hicache_dir(d: &BlazarDirs, cfg: &blazar_core::config::Config) -> std::path::PathBuf {
+    sglang_hicache_dir_of(&d.data_dir, cfg)
+}
+
+/// Pure half of [sglang_hicache_dir] over an explicit data dir, for
+/// scan-style callers (doctor rows) that hold no [BlazarDirs].
+fn sglang_hicache_dir_of(
+    data_dir: &std::path::Path,
+    cfg: &blazar_core::config::Config,
+) -> std::path::PathBuf {
     if let Some(extra) = cfg.sglang.hicache_storage_extra_config.as_deref()
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(extra)
         && let Some(p) = v.get("file_storage_path").and_then(|p| p.as_str())
     {
         return std::path::PathBuf::from(p);
     }
-    d.data_dir.join("kv/sglang")
+    data_dir.join("kv/sglang")
 }
 
 fn kv_import_stage_mlx(
@@ -7843,6 +7852,29 @@ fn kv_import_rows(
             ),
         ));
     }
+    // Non-GGUF converters key on the HF row itself; report what each
+    // HF-dir model already has staged so the lanes are discoverable.
+    for t in &hf_targets {
+        let stage_dir = blazar_runtime::kv::mlx_preload::stage_dir(data_dir, &t.name);
+        let stage = if blazar_runtime::kv::mlx_preload::stage_ready(&stage_dir) {
+            "mlx stage ready"
+        } else {
+            "mlx stage unset (blazar kv import --stage-mlx)"
+        };
+        let pages = std::fs::read_dir(sglang_hicache_dir_of(data_dir, cfg))
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                    .count()
+            })
+            .unwrap_or(0);
+        let sglang = if pages > 0 {
+            format!("{pages} sglang page(s) staged")
+        } else {
+            "sglang pages unset (blazar kv import --to-sglang)".to_string()
+        };
+        out.push((t.name.clone(), format!("interchange: {stage}; {sglang}")));
+    }
     if out.is_empty() {
         out.push((
             "(none)".to_string(),
@@ -8221,6 +8253,45 @@ mod doctor_tests {
             out[0].0,
             out[0].1
         );
+    }
+
+    /// Interchange rows surface per-HF-model lane readiness: a staged
+    /// mlx cache and present sglang pages read out as ready; absent
+    /// lanes teach the command that would populate them.
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_import_rows__reports_lane_interchange_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let hf = dir.path().join("hf");
+        std::fs::create_dir_all(&hf).unwrap();
+        std::fs::write(hf.join("config.json"), "{}").unwrap();
+        let stage = blazar_runtime::kv::mlx_preload::stage_dir(dir.path(), "m");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("cache.safetensors"), b"x").unwrap();
+        std::fs::write(stage.join("tokens.json"), b"[]").unwrap();
+        let sglang = dir.path().join("kv/sglang");
+        std::fs::create_dir_all(&sglang).unwrap();
+        std::fs::write(sglang.join("page.bin"), b"x").unwrap();
+        let row = blazar_core::store::ModelRow {
+            name: "m".to_string(),
+            repo: String::new(),
+            quant: String::new(),
+            path: hf.display().to_string(),
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        let rows = kv_import_rows(&[row], &Config::default(), dir.path());
+        let joined = format!("{rows:?}");
+        assert!(joined.contains("mlx stage ready"), "{joined:?}");
+        assert!(joined.contains("1 sglang page(s) staged"), "{joined:?}");
     }
 
     #[test]
@@ -10980,9 +11051,10 @@ struct OrphanFile {
     twin_of: Option<String>,
 }
 
-/// Content hash for orphan-twin detection (advisory display only; the
-/// store keeps authoritative hashes - this is a read-only comparison
-/// against files the rows already own).
+/// Content hash of a local file. Feeds two callers: orphan-twin
+/// detection (advisory display over files rows already own) and the
+/// import path, where the computed digest becomes the store row's
+/// authoritative sha256 (local files have no manifest to trust).
 fn file_sha256(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     use std::io::Read as _;
@@ -12303,7 +12375,10 @@ fn import(
         quant: derived_quant.clone(),
         path: dest.display().to_string(),
         bytes,
-        sha256: None,
+        // Bank restore and provenance gates key on the content hash;
+        // leaving it NULL silently refuses later session-bank restores
+        // (found live during the cross-engine proof legs).
+        sha256: file_sha256(&dest),
         mmproj_path: mmproj_dest.map(|p| p.display().to_string()),
         components: vec![],
         shards: 1,

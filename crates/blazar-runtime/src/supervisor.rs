@@ -846,32 +846,65 @@ async fn warm_peg_child(
     // Single probe first: drains the residual warmup queue (up to ~30s
     // on a cold venv+torch boot; generous bound so a slow-but-healthy
     // child is still pegged, not abandoned).
-    let mut single = client
-        .post(&url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(90));
-    if let Some(secret) = auth {
-        single = single.bearer_auth(secret);
-    }
-    match single.send().await {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => {
-            tracing::warn!(
-                target: "blazar::warmpeg",
-                model,
-                "warm-peg single probe HTTP {} - leaving warmup to the first request",
-                resp.status()
-            );
-            return;
+    // Late-binding children (mlx-class: several seconds between process
+    // start and first listen) REFUSE the early dial. Treating that as a
+    // failed peg publishes Ready before the child answers, and the first
+    // in-band request then respawns a second child into VRAM the first
+    // one still occupies (live receipt: wave-D mlx spawn churn). A
+    // connect refusal is instead evidence the bind is still pending:
+    // keep dialing against a short deadline so Ready means "answers".
+    let bind_deadline = std::time::Duration::from_secs(60);
+    // Unix-endpoint children bind their socket before spawn returns, so
+    // a refused UDS dial is a dead child, not a pending bind - only TCP
+    // endpoints (the late-bind class; pinned by the wave-D mlx receipt)
+    // earn the redial window. unit__warm_peg_sglang__unix_endpoint_noop_fast
+    // pins the fast-fail contract for UDS.
+    #[cfg(unix)]
+    let pending_bind = !matches!(endpoint, blazar_core::Endpoint::Unix { .. });
+    #[cfg(not(unix))]
+    let pending_bind = true;
+    let resp = loop {
+        let mut probe = client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(90));
+        if let Some(secret) = auth {
+            probe = probe.bearer_auth(secret);
         }
-        Err(e) => {
-            tracing::warn!(
-                target: "blazar::warmpeg",
-                model,
-                "warm-peg single probe failed: {e:#} - leaving warmup to the first request"
-            );
-            return;
+        match probe.send().await {
+            Ok(r) => break r,
+            // Connect-class only: an unbound port. Everything else
+            // (timeout past a healthy queue, DNS, TLS) keeps today's
+            // warn-and-continue contract. Unix endpoints are excluded:
+            // their children bind the socket before spawn returns, so a
+            // refused UDS dial is a dead child, not a pending bind
+            // (pinned by unit__warm_peg_sglang__unix_endpoint_noop_fast).
+            Err(e) if pending_bind && e.is_connect() && started.elapsed() < bind_deadline => {
+                tracing::debug!(
+                    target: "blazar::warmpeg",
+                    model,
+                    "child not bound yet ({e}) - redialing"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::warmpeg",
+                    model,
+                    "warm-peg single probe failed: {e:#} - leaving warmup to the first request"
+                );
+                return;
+            }
         }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(
+            target: "blazar::warmpeg",
+            model,
+            "warm-peg single probe HTTP {} - leaving warmup to the first request",
+            resp.status()
+        );
+        return;
     }
     let single_s = started.elapsed().as_secs_f32();
     // Concurrent peg: N in-flight completions at once so the bs=N
@@ -7011,6 +7044,13 @@ impl Supervisor {
             // engine side no-ops (plain shim spawn) when the wrapper is
             // absent, so a stale stage can never break a spawn.
             let mut spawn_env = spawn_env.clone();
+            if engine.kind() == blazar_core::engine_kind::EngineKind::Vllm {
+                // vLLM's offload connector allocates /dev/shm mmaps that
+                // crash-leak (2 GiB each, observed three deep after a
+                // debugging session); a full /dev/shm kills this spawn
+                // with "Insufficient space" before any teaching fires.
+                crate::shm_sweep::sweep_orphaned_offload_mmaps();
+            }
             if engine.kind() == blazar_core::engine_kind::EngineKind::Mlx {
                 let stage = crate::kv::mlx_preload::stage_dir(&self.dirs.data_dir, name);
                 if crate::kv::mlx_preload::stage_ready(&stage) {
@@ -8591,6 +8631,9 @@ drop them from rpc_servers in config.toml",
         // Shared KV daemon dies with the fleet it served - the L1 pool
         // is pinned RAM and must not outlive the supervisor.
         self.lmcache.shutdown().await;
+        // Children are reaped above; any offload mmap still in /dev/shm
+        // has no owner left and would outlive the daemon.
+        crate::shm_sweep::sweep_orphaned_offload_mmaps();
         Ok(())
     }
 

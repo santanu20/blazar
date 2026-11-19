@@ -2005,7 +2005,14 @@ async fn pipe_logs<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
             Ok(_) => {
                 let line = String::from_utf8_lossy(&raw);
                 let line = line.trim_end_matches(['\n', '\r']);
-                tracing::debug!(target: "blazar::engine", stream, "{line}");
+                if line.starts_with("[blazar]") {
+                    // Child-side blazar tooling (the mlx preload wrapper,
+                    // future codecs) reports outcomes through this pipe;
+                    // those receipts are user-visible, not chatter.
+                    tracing::info!(target: "blazar::engine", stream, "{line}");
+                } else {
+                    tracing::debug!(target: "blazar::engine", stream, "{line}");
+                }
                 if let Some(note) = classify_child_degrade(line) {
                     // Upstream prints these once per process at plain
                     // log level; at blazar they are user-visible degrades
