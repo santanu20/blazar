@@ -11899,6 +11899,33 @@ fn stop_outcome(
     }
 }
 
+/// Remove the pidfile after a verified quiet stop, but only while it
+/// still names the pid we stopped: a start that raced in since the
+/// grace-poll has stamped its own pid, and deleting that would orphan
+/// the new daemon's stop path. A daemon-side self-clean may already have
+/// removed it - missing file is success.
+fn remove_stale_pidfile(pidfile: &std::path::Path, stopped_pid: i32) {
+    let names_stopped_pid = std::fs::read_to_string(pidfile)
+        .ok()
+        .is_some_and(|s| s.trim().parse::<i32>() == Ok(stopped_pid));
+    if !names_stopped_pid {
+        return;
+    }
+    match std::fs::remove_file(pidfile) {
+        Ok(()) => println!(
+            "{}",
+            ok_line(&format!("pidfile cleared (pid {stopped_pid} stopped)"))
+        ),
+        // Nothing actionable from the CLI if the unlink is refused -
+        // the next start names the file and its manual-removal fix.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "blazar: could not remove {}: {e} - remove it before the next start",
+            pidfile.display()
+        ),
+    }
+}
+
 // One drain-and-classify sequence: signal, grace-poll the port,
 // re-read the pidfile, classify, report. The ordering IS the contract -
 // splitting it would hide the grace-window/pidfile-re-read dependency.
@@ -11981,10 +12008,17 @@ async fn stop() -> Result<()> {
 
     match stop_outcome(pid, term_hit_a_live_pid, port_quiet, pidfile_now) {
         StopOutcome::Stopped(p) => {
+            // The daemon dies without clearing its pidfile, and a fast
+            // restart (systemd Restart=always) then liveness-checks the
+            // dying pid, exits 3, and RestartPreventExitStatus keeps the
+            // service down - so the stopper clears it once the port is
+            // quiet (live finding, 2026-11-19).
+            remove_stale_pidfile(&pidfile, p);
             println!("{}", ok_line(&format!("daemon stopped (pid {p})")));
             Ok(())
         }
         StopOutcome::AlreadyStoppedStale(p) => {
+            remove_stale_pidfile(&pidfile, p);
             println!(
                 "{}",
                 ok_line(&format!(
@@ -28905,6 +28939,27 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    #[test]
+    fn unit__remove_stale_pidfile__clears_only_the_pid_we_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("blazar.pid");
+
+        // Still names the stopped pid -> removed.
+        std::fs::write(&pidfile, "123\n").unwrap();
+        remove_stale_pidfile(&pidfile, 123);
+        assert!(!pidfile.exists());
+
+        // A racing start stamped a fresh pid -> left alone.
+        std::fs::write(&pidfile, "999\n").unwrap();
+        remove_stale_pidfile(&pidfile, 123);
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), "999\n");
+
+        // Daemon cleaned up after itself -> missing file is a no-op.
+        std::fs::remove_file(&pidfile).unwrap();
+        remove_stale_pidfile(&pidfile, 123);
+        assert!(!pidfile.exists());
+    }
+
     use super::*;
 
     fn sd_target(
