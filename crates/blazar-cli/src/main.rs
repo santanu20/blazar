@@ -4571,8 +4571,8 @@ fn sglang_hicache_dir(d: &BlazarDirs, cfg: &blazar_core::config::Config) -> std:
     sglang_hicache_dir_of(&d.data_dir, cfg)
 }
 
-/// Pure half of [sglang_hicache_dir] over an explicit data dir, for
-/// scan-style callers (doctor rows) that hold no [BlazarDirs].
+/// Pure half of [`sglang_hicache_dir`] over an explicit data dir, for
+/// scan-style callers (doctor rows) that hold no [`BlazarDirs`].
 fn sglang_hicache_dir_of(
     data_dir: &std::path::Path,
     cfg: &blazar_core::config::Config,
@@ -7861,13 +7861,12 @@ fn kv_import_rows(
         } else {
             "mlx stage unset (blazar kv import --stage-mlx)"
         };
-        let pages = std::fs::read_dir(sglang_hicache_dir_of(data_dir, cfg))
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
-                    .count()
-            })
-            .unwrap_or(0);
+        // A missing/unreadable stage dir simply has no staged pages.
+        let pages = std::fs::read_dir(sglang_hicache_dir_of(data_dir, cfg)).map_or(0, |rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                .count()
+        });
         let sglang = if pages > 0 {
             format!("{pages} sglang page(s) staged")
         } else {

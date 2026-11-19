@@ -1826,10 +1826,10 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn unit__sglang_codec__suffix_and_names_follow_the_model_path() {
-        let name = SglangPageSpec::model_name_of("/home/u/models/qwen.d");
-        assert_eq!(name, "-home-u-models-qwen.d");
+        let name = SglangPageSpec::model_name_of("/t/models/qwen.d");
+        assert_eq!(name, "-t-models-qwen.d");
         let spec = SglangPageSpec { model_name: name };
-        assert_eq!(spec.config_suffix(), "_-home-u-models-qwen.d_1_1");
+        assert_eq!(spec.config_suffix(), "_-t-models-qwen.d_1_1");
     }
 
     #[test]

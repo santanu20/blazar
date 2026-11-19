@@ -794,6 +794,9 @@ fn warm_peg_served_model(argv: &[String]) -> Option<String> {
 /// cost lands where it belongs instead of on a random first request.
 /// Warn-and-continue: a failed peg never fails an otherwise healthy
 /// child - the next request pays the JIT instead.
+// One linear healthcheck ladder per argv shape; splitting it would
+// scatter the warn-and-continue contract this fn exists to keep whole.
+#[allow(clippy::too_many_lines)]
 async fn warm_peg_child(
     model: &str,
     argv: &[String],

@@ -1,6 +1,6 @@
-//! Crash-leak hygiene for vLLM's offload mmaps in `/dev/shm`.
+//! Crash-leak hygiene for `vLLM`'s offload mmaps in `/dev/shm`.
 //!
-//! The OffloadingConnector's CPU tier lives in shared memory
+//! The `OffloadingConnector`'s CPU tier lives in shared memory
 //! (`vllm_offload_*.mmap`, sized `cpu_bytes_gib`). A child that dies
 //! mid-flight - OOM, engine crash - leaves the file behind with no
 //! owner: leaks were observed live at 2 GiB per crash, three deep
