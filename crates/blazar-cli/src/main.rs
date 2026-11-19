@@ -1274,7 +1274,8 @@ enum RegistryCmd {
     Sign {
         /// Registry JSON file to sign
         file: String,
-        /// Base64 PKCS8 DER private key (or `BLAZAR_REGISTRY_PRIVKEY`)
+        /// Base64 PKCS8 DER private key (or `BLAZAR_REGISTRY_PRIVKEY`, or
+        /// the key file at `<config>/blazar/registry/signing-key`)
         #[arg(long)]
         key: Option<String>,
     },
@@ -24443,6 +24444,67 @@ fn engine_recommend_cmd(model: Option<&str>, json: bool) -> Result<()> {
 /// capability-registry trust chain. The daemon side (auto-install gate)
 /// lives in the runtime; these commands exist so curators and CI can
 /// produce and check the artifacts without ad-hoc openssl recipes.
+/// Canonical signing-key home: `<config>/blazar/registry/signing-key`.
+/// `registry sign` consults it after `--key` and `BLAZAR_REGISTRY_PRIVKEY`
+/// so the release machine's key survives reboots (a /tmp scratch key does
+/// not) and lives in a place the operator already backs up.
+fn signing_key_home() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|c| c.join("blazar").join("registry").join("signing-key"))
+}
+
+/// Key resolution for `registry sign`: explicit flag > environment > the
+/// canonical home file. Pure core over injected inputs so the order is
+/// unit-pinned; the unix leg refuses a group/world-readable key file - a
+/// signing key gates what auto-install compiles and runs, so it never
+/// sits somewhere other accounts can read.
+fn resolve_signing_key(
+    flag: Option<&str>,
+    env: Option<String>,
+    home: Option<&std::path::Path>,
+) -> Result<String, String> {
+    if let Some(k) = flag {
+        return Ok(k.to_string());
+    }
+    if let Some(k) = env {
+        return Ok(k);
+    }
+    let Some(path) = home else {
+        return Err(
+            "no private key: pass --key <base64 PKCS8>, set BLAZAR_REGISTRY_PRIVKEY, \
+             or store the keygen output at <config>/blazar/registry/signing-key"
+                .to_string(),
+        );
+    };
+    let key = std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "no private key: pass --key <base64 PKCS8>, set BLAZAR_REGISTRY_PRIVKEY, \
+                 or store the keygen output at {}",
+                path.display()
+            )
+        } else {
+            format!("{}: {e}", path.display())
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{} is group/world-readable (mode {:o}) - chmod 600 it; a signing \
+                 key gates what auto-install compiles and runs",
+                path.display(),
+                mode & 0o777
+            ));
+        }
+    }
+    Ok(key.trim().to_string())
+}
+
 fn registry_cmd(cmd: RegistryCmd) -> Result<()> {
     use base64::Engine as _;
     use blazar_runtime::engine::capability_registry as reg;
@@ -24454,23 +24516,26 @@ fn registry_cmd(cmd: RegistryCmd) -> Result<()> {
             println!("{}", b64.encode(pkcs8));
             println!("public key (raw 32B, base64 - publish as the registry .pub / config pin):");
             println!("{}", b64.encode(public));
+            let store_hint = signing_key_home().map_or_else(
+                || "<config>/blazar/registry/signing-key".to_string(),
+                |p| p.display().to_string(),
+            );
             println!(
                 "{}",
-                dim_line(
-                    "sign with: blazar registry sign <registry.json> --key <private-key> \
-                     (or export BLAZAR_REGISTRY_PRIVKEY)"
-                )
+                dim_line(&format!(
+                    "store the private half at {store_hint} (chmod 600) - \
+                     blazar registry sign picks it up automatically"
+                ))
             );
         }
         RegistryCmd::Sign { file, key } => {
             let b64 = base64::engine::general_purpose::STANDARD;
-            let key_b64 = key
-                .or_else(|| std::env::var("BLAZAR_REGISTRY_PRIVKEY").ok())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no private key: pass --key <base64 PKCS8> or set BLAZAR_REGISTRY_PRIVKEY"
-                    )
-                })?;
+            let key_b64 = resolve_signing_key(
+                key.as_deref(),
+                std::env::var("BLAZAR_REGISTRY_PRIVKEY").ok(),
+                signing_key_home().as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?;
             let pkcs8 = b64
                 .decode(key_b64.trim())
                 .map_err(|e| anyhow!("private key is not valid base64: {e}"))?;
@@ -34294,5 +34359,62 @@ engine = "sglang"
             !leaves.iter().any(|l| l == "struct" || l == "ModelOverride"),
             "serde type tokens must not leak as leaves: {leaves:?}"
         );
+    }
+
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__resolve_signing_key__flag_env_home_order_and_perms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = dir.path().join("signing-key");
+        std::fs::write(&key_file, "filekey\n").expect("write key file");
+        #[cfg(unix)]
+        {
+            // The perms gate below refuses group/world-readable key
+            // files; a test-box umask of 002 would make a fresh 664 file
+            // fail the positive leg, so pin 600 like the operator would.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 600");
+        }
+
+        // Explicit flag wins over environment and file.
+        assert_eq!(
+            resolve_signing_key(Some("flagkey"), Some("envkey".into()), Some(&key_file))
+                .expect("flag wins"),
+            "flagkey"
+        );
+        // Environment wins over the canonical file.
+        assert_eq!(
+            resolve_signing_key(None, Some("envkey".into()), Some(&key_file)).expect("env wins"),
+            "envkey"
+        );
+        // File leg trims trailing whitespace and supplies the key.
+        assert_eq!(
+            resolve_signing_key(None, None, Some(&key_file)).expect("file leg"),
+            "filekey"
+        );
+        // Nothing found: teaching names all three sources (the file leg
+        // prints the concrete path it looked at).
+        let missing = dir.path().join("missing-signing-key");
+        let err = resolve_signing_key(None, None, Some(&missing)).expect_err("missing file");
+        assert!(err.contains("--key"), "{err}");
+        assert!(err.contains("BLAZAR_REGISTRY_PRIVKEY"), "{err}");
+        assert!(err.contains("signing-key"), "{err}");
+        let no_home = resolve_signing_key(None, None, None).expect_err("no home");
+        assert!(no_home.contains("BLAZAR_REGISTRY_PRIVKEY"), "{no_home}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let loose = dir.path().join("loose-key");
+            std::fs::write(&loose, "filekey\n").expect("write loose key");
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod 644");
+            let err = resolve_signing_key(None, None, Some(&loose))
+                .expect_err("world-readable key must be refused");
+            assert!(err.contains("group/world-readable"), "{err}");
+            assert!(err.contains("chmod 600"), "{err}");
+        }
     }
 }
