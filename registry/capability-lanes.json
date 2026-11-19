@@ -54,5 +54,96 @@
     "status": "active",
     "note": "TurboQuant `dev` branch (MIT): turbo3/turbo4 WHT-rotated KV cache (~4.3x/3.8x compression, cache_type_k/v on this lane; ppl receipts in blazar-core kv-quant-quality.json) plus TQ3_1S/TQ4_1S weight quants, MTP-in-context (--mtp-head), EAGLE-3, DFlash, spec-chain and KV-streaming flags. cuda build verified locally (RTX 4070); metal/vulkan/hip per fork README. Two pinned-sha findings: qwen35-family + --embeddings aborts inside the fork's VRAM-fit probe (build_pooling ggml_abort; gemma3 verified OK; the spec draft-mtp argv itself is accepted when embeddings is absent); turbo KV at ctx 32768 dies silently on an 8GiB card (2/2, see bench-artifacts/20261107-turboquant-kv-quality). Based on an older mainline baseline: lacks 25 upstream archs (beam, clover_moe, deepseek41, ...) - keep an upstream lane installed alongside.",
     "added_at": 1794035418
+  },
+  {
+    "id": "raon1",
+    "repo": "asynclee/llama.cpp",
+    "ref_sha": "104e53881df18c86c0d6af0d90a28073749b0846",
+    "upstream_pr": 32200,
+    "architectures": [
+      "raon1nano",
+      "raon1"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "Raon-1 family ahead of mainline: raon1nano (Raon-1-nano) plus raon1 (Raon-1-mini-preview) in one tree; community GGUFs on HF include ablit/heretic quants"
+  },
+  {
+    "id": "zamba2",
+    "repo": "echo313unfolding/llama.cpp",
+    "ref_sha": "bd64979be1ddeceb7edc232e9e5ddf5132829785",
+    "upstream_pr": 21412,
+    "architectures": [
+      "zamba2"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "Zamba-2 hybrid Mamba-2/transformer architecture; GGUF quants of the 1.2B/2.7B instruct models circulate on HF"
+  },
+  {
+    "id": "hy-v4-flash",
+    "repo": "Little0o0/llama.cpp",
+    "ref_sha": "0a054d0b02454c998e068381d15f3f6615bdd987",
+    "upstream_pr": 32517,
+    "architectures": [
+      "hy_v4_flash"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "Hunyuan v4 'flash' dense variant (DeepSeek-V4.1-Flash GGUF mirrors on HF); PR is mergeable - expect graduation and lane retirement"
+  },
+  {
+    "id": "mpnet",
+    "repo": "Vertex-DS/llama.cpp",
+    "ref_sha": "4d0c1d691571db97c54f80485c00b360c8018977",
+    "upstream_pr": 21904,
+    "architectures": [
+      "mpnet"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "MPNet sentence-embedding models (paraphrase-multilingual-mpnet-base GGUFs) - serves the embeddings surface, not chat"
+  },
+  {
+    "id": "wedlm",
+    "repo": "feedseawave/llama.cpp",
+    "ref_sha": "bccbdbd129f033f710d51f4a48d948afa53f9d25",
+    "upstream_pr": 18731,
+    "architectures": [
+      "wedlm"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "WeDLM 8B instruct (single HF GGUF repo so far); kept for coverage, marginal demand"
+  },
+  {
+    "id": "domyn-edge",
+    "repo": "martin-cimmino/llama.cpp",
+    "ref_sha": "e7fb7e44389720f60100a534fc771b7b3ee16ca3",
+    "upstream_pr": 32559,
+    "architectures": [
+      "domyn-edge"
+    ],
+    "backends": [
+      "cpu",
+      "cuda"
+    ],
+    "status": "active",
+    "note": "Domyn Edge 4B on-device model; no public GGUFs yet - row staged so the lane is ready the day weights ship"
   }
 ]
