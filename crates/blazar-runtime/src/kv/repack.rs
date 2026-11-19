@@ -886,8 +886,13 @@ mod tests {
             canonical_format: "v1-nhd".into(),
         };
         let d = spec.rank_dir(Path::new("/kv"));
-        assert!(d.to_string_lossy().starts_with("/kv/_data_models_qwen.d_"));
-        assert!(d.to_string_lossy().ends_with("_r0"));
+        // rank_dir joins a real host directory, so the separator between
+        // root and name is platform-owned; assert on the separator-stable
+        // parts (parent identity + file name) instead of the joined literal.
+        assert_eq!(d.parent(), Some(Path::new("/kv")));
+        let name = d.file_name().expect("rank dir always has a name");
+        assert!(name.to_string_lossy().starts_with("_data_models_qwen.d_"));
+        assert!(name.to_string_lossy().ends_with("_r0"));
         assert_eq!(
             VllmFsSpec::block_rel_path("abcdef0123456789", 0),
             PathBuf::from("abc/de/abcdef0123456789_g0.bin")
