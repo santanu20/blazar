@@ -488,6 +488,10 @@ fn parse_section(cur: &mut Cursor, cell_ext: bool, row_bytes: usize) -> Result<R
 
 /// Parse a llama-server slot save into an import-ready bank, validating
 /// every length against `geo` (from GGUF metadata).
+// Binary slot-save grammar: magic/version/token header, per-stream cell
+// metadata, per-layer F16 rows, optional SCKP appendix - section for
+// section the mirror of the engine's writer.
+#[allow(clippy::too_many_lines)]
 pub fn parse_slot_save(buf: &[u8], geo: &RepackGeometry) -> Result<SlotSaveBank, String> {
     let mut cur = Cursor::new(buf);
     if cur.u32()? != SLOT_SAVE_MAGIC {
@@ -902,22 +906,27 @@ mod tests {
     /// Re-wrap a legacy synthetic bank's plain token list in the
     /// `server_tokens::serialize` envelope the engine actually writes:
     /// [-1 marker][state version 1][real count][real ids][media count 0].
-    fn with_serialized_tokens(legacy: Vec<u8>, version: i32, media_keys: u32) -> Vec<u8> {
-        let n = u32::from_le_bytes(legacy[8..12].try_into().unwrap()) as usize;
+    fn with_serialized_tokens(legacy: &[u8], version: i32, media_keys: u32) -> Vec<u8> {
+        let n = u32::from_le_bytes(legacy[8..12].try_into().unwrap());
+        // u32 -> usize only widens; keep byte math in usize for indexing.
+        let n_us = n as usize;
         let toks: Vec<i32> = (0..n)
-            .map(|i| i32::from_le_bytes(legacy[12 + 4 * i..16 + 4 * i].try_into().unwrap()))
+            .map(|i| {
+                let at = 12 + 4 * i as usize;
+                i32::from_le_bytes(legacy[at..at + 4].try_into().unwrap())
+            })
             .collect();
         let mut out = Vec::new();
         out.extend_from_slice(&legacy[..8]);
-        out.extend_from_slice(&((n + 4) as u32).to_le_bytes());
+        out.extend_from_slice(&(n + 4).to_le_bytes());
         out.extend_from_slice(&(-1i32).to_le_bytes());
         out.extend_from_slice(&version.to_le_bytes());
-        out.extend_from_slice(&(n as u32).to_le_bytes());
+        out.extend_from_slice(&n.to_le_bytes());
         for t in toks {
             out.extend_from_slice(&t.to_le_bytes());
         }
         out.extend_from_slice(&media_keys.to_le_bytes());
-        out.extend_from_slice(&legacy[12 + 4 * n..]);
+        out.extend_from_slice(&legacy[12 + 4 * n_us..]);
         out
     }
 
@@ -1232,7 +1241,7 @@ mod tests {
         let g = geo();
         let legacy = synthetic_bank(8, false);
         let expected = parse_slot_save(&legacy, &g).expect("legacy walk");
-        let serialized = with_serialized_tokens(legacy, 1, 0);
+        let serialized = with_serialized_tokens(&legacy, 1, 0);
         let bank = parse_slot_save(&serialized, &g).expect("serialized walk");
         assert_eq!(bank.tokens, expected.tokens);
         assert_eq!(bank.cells, expected.cells);
@@ -1244,10 +1253,10 @@ mod tests {
     #[test]
     fn unit__parse_slot_save__serialized_header_refuses_media_and_version_drift() {
         let g = geo();
-        let media = with_serialized_tokens(synthetic_bank(8, false), 1, 2);
+        let media = with_serialized_tokens(&synthetic_bank(8, false), 1, 2);
         let err = parse_slot_save(&media, &g).unwrap_err();
         assert!(err.contains("multimodal media chunks"), "{err}");
-        let drifted = with_serialized_tokens(synthetic_bank(8, false), 7, 0);
+        let drifted = with_serialized_tokens(&synthetic_bank(8, false), 7, 0);
         let err = parse_slot_save(&drifted, &g).unwrap_err();
         assert!(err.contains("serialization version 7"), "{err}");
     }
