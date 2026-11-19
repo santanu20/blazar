@@ -137,13 +137,13 @@
     "ref_sha": "e7fb7e44389720f60100a534fc771b7b3ee16ca3",
     "upstream_pr": 32559,
     "architectures": [
-      "domyn-edge"
+      "domynedge"
     ],
     "backends": [
       "cpu",
       "cuda"
     ],
     "status": "active",
-    "note": "Domyn Edge 4B on-device model; no public GGUFs yet - row staged so the lane is ready the day weights ship"
+    "note": "Domyn Edge 4B on-device model; no public GGUFs yet - row staged so the lane is ready the day weights ship. GGUF wire name is 'domynedge' (one word) per the fork's arch table."
   }
 ]
