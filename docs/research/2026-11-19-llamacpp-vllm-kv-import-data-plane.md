@@ -194,6 +194,34 @@ stamped `general.base_model_id = Qwen/Qwen2.5-1.5B-Instruct`) -> `qwen2.5-1.5b-i
   complete rollback.
 
 
+## Live findings - reverse direction (2026-11-19, wave B)
+
+- The reverse codec (`vllm -> llama.cpp`) reads the engine-written tier for
+  the Kestrel prefix (5 full blocks, 320 tokens; the 23-token tail is not a
+  full block and was never offloaded), repacks a slot-save bank, and the
+  restore gate accepts it end-to-end through the gateway:
+  `restored banked session _auto-16384 into slot 0 (320 tokens into slot KV)`.
+- **n_rot oracle**: the engine writes `n_rot_k = n_rot_v = 0` in slot saves
+  (post-RoPE rows carry no rotary dimension). A bank with `n_rot = head_dim`
+  is rejected at restore with a misleading `No available space` space error;
+  the same bytes with `0/0` restore cleanly (`n_restored: 320`). The codec
+  now writes zeros, pinned by a live A/B on a manual llama-server.
+- **Identity mirror rules** (root-caused from two skipped restores): the
+  manifest must carry the spawn's *resolved* values - pinned slots divide the
+  requested ctx across slots (pinned 2 x 16384 -> bank `_auto-8192`, manifest
+  ctx 8192), and auto slots (config 0) resolve against live VRAM at spawn
+  time, which no offline import can predict - the import refuses with a
+  pin-your-slots teaching instead of writing a bank the gate silently skips.
+- **Restore semantics on installed engines**: both llama.cpp builds here
+  (b12521-cuda and the sensenova fork) accept slot restores and inject KV,
+  then re-prefill the prompt anyway - verified with engine-native save files
+  (exact-prompt replay after a native restore still evaluates all tokens).
+  This is the restored-then-empty class the restore truth-check comment
+  already guards for. The import therefore ships data-plane-correct
+  (engine-accepted, full prefix injected); the prompt-eval warm-start payoff
+  is pending upstream behavior, symmetric to how the forward direction
+  needed vLLM's own loader to realize `cached_tokens`.
+
 ## Sources
 
 - llama.cpp b12360: `src/llama-kv-cache.cpp` (state_write:2233),

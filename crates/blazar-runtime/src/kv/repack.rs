@@ -274,7 +274,8 @@ pub struct RepackGeometry {
 
 impl RepackGeometry {
     /// Bytes in one F16 K (or V) row: `kv_heads * head_dim` elements.
-    fn row_bytes(&self) -> usize {
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
         self.kv_heads as usize * self.head_dim as usize * 2
     }
 }

@@ -881,18 +881,26 @@ enum SessionCmd {
 
 #[derive(Subcommand)]
 enum KvCmd {
-    /// Import a llama.cpp slot bank into vLLM's persistent KV tier
+    /// Import KV blocks across engine lanes (both directions)
     Import {
-        /// GGUF model name (store row) whose bank to import
+        /// Source model name (store row): GGUF model (llama.cpp bank
+        /// imports into the vllm tier) or HF-dir model (vllm tier reads
+        /// back into a llama.cpp bank)
         #[arg(long)]
         from: String,
-        /// HF-dir model name (store row) whose vLLM tier receives the blocks
+        /// Target model name (store row): the other side of the pair
         #[arg(long)]
         to: String,
         /// Explicit bank file (default: newest bank under the from-model's
-        /// sessions directory)
+        /// sessions directory; forward direction only)
         #[arg(long)]
         bank: Option<String>,
+        /// Token-id file (JSON array) - REQUIRED for the vllm -> llama.cpp
+        /// direction: the tier is content-addressed by token ids and never
+        /// stores them, so the importer needs the engine tokenizer's ids
+        /// to find the blocks
+        #[arg(long)]
+        tokens: Option<String>,
     },
 }
 
@@ -4108,14 +4116,39 @@ async fn session_cmd(cmd: SessionCmd) -> Result<()> {
 
 fn kv_cmd(cmd: KvCmd) -> Result<()> {
     match cmd {
-        KvCmd::Import { from, to, bank } => kv_import_cmd(&dirs(), &from, &to, bank.as_deref()),
+        KvCmd::Import {
+            from,
+            to,
+            bank,
+            tokens,
+        } => kv_import_cmd(&dirs(), &from, &to, bank.as_deref(), tokens.as_deref()),
     }
 }
 
 /// Offline import: llama.cpp session bank -> vLLM fs KV tier. Every gate
 /// teaches on refusal; nothing is written until all of them pass.
-fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Result<()> {
+fn kv_import_cmd(
+    d: &BlazarDirs,
+    from: &str,
+    to: &str,
+    bank: Option<&str>,
+    tokens: Option<&str>,
+) -> Result<()> {
     let cfg = config()?;
+    kv_import_with(d, &cfg, from, to, bank, tokens)
+}
+
+/// Testable core of `kv import`: the caller supplies the config so the
+/// gates run against a constructed one in tests, the ambient fleet
+/// config on the CLI.
+fn kv_import_with(
+    d: &BlazarDirs,
+    cfg: &blazar_core::config::Config,
+    from: &str,
+    to: &str,
+    bank: Option<&str>,
+    tokens: Option<&str>,
+) -> Result<()> {
     anyhow::ensure!(
         cfg.kv.translation.enabled,
         "kv import is gated on [kv.translation] enabled = true - the knob keeps cross-engine KV admission explicit"
@@ -4128,6 +4161,23 @@ fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Re
     let to_row = rows.iter().find(|r| r.name == to).ok_or_else(|| {
         anyhow!("no model named {to:?} in the store - `blazar models` lists names")
     })?;
+    // Direction detect: an HF source with a GGUF target runs the reverse
+    // codec (vllm tier -> llama.cpp bank); anything else is the forward
+    // lane, whose shape asserts follow.
+    if std::path::PathBuf::from(&from_row.path)
+        .join("config.json")
+        .is_file()
+        && std::path::PathBuf::from(&to_row.path).is_file()
+    {
+        let tokens = tokens.ok_or_else(|| {
+            anyhow!(
+                "--tokens <file> is required when importing from the vllm lane: \
+the tier is content-addressed by token ids and never stores them - dump the \
+engine tokenizer's ids for the cached prefix as a JSON array"
+            )
+        })?;
+        return kv_import_reverse(d, cfg, &store, from_row, to_row, tokens);
+    }
     let gguf_path = std::path::PathBuf::from(&from_row.path);
     anyhow::ensure!(
         gguf_path.is_file(),
@@ -4145,7 +4195,7 @@ fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Re
     let (meta, _) = blazar_core::gguf::parse_metadata(&gguf_buf)?;
     let hf_meta = blazar_core::hfmeta::read_hf_config(&hf_dir)?;
 
-    let geo = kv_import_gates(&cfg, &meta, &hf_meta, to_row)?;
+    let geo = kv_import_gates(cfg, &meta, &hf_meta, to_row)?;
 
     let bank_path = match bank {
         Some(p) => std::path::PathBuf::from(p),
@@ -4209,6 +4259,240 @@ fn kv_import_cmd(d: &BlazarDirs, from: &str, to: &str, bank: Option<&str>) -> Re
     println!("  tier: {:#?}", spec.rank_dir(&root).display());
     println!(
         "  next same-prefix request on the vllm lane reports cached_tokens (prefix restore, not recompute)"
+    );
+    Ok(())
+}
+
+/// Reverse import: vLLM fs KV tier -> llama.cpp session bank. The tier
+/// files are content-addressed by the request's token ids, so --tokens
+/// supplies them; gates mirror the forward lane (weights provenance, rope,
+/// lane-layout verdict) with the pair direction flipped, then the carrier
+/// round-trips into a slot-save bank the next llama.cpp spawn restores
+/// through the ordinary session-bank path (identity manifest included, so
+/// the restore gate accepts it natively).
+/// Mirrors the spawn site's manifest inputs (ctx/slots formulas), builds the
+/// restore identity, and writes the imported bank beside its manifest. The
+/// restore gate at spawn must find a byte-equivalent identity or the bank
+/// never loads - so the formulas here duplicate the profile compiler's by
+/// design, not by accident.
+fn write_reverse_bank(
+    d: &BlazarDirs,
+    cfg: &blazar_core::config::Config,
+    store: &Store,
+    to_row: &blazar_core::store::ModelRow,
+    meta: &blazar_core::gguf::GgufMeta,
+    bank_bytes: &[u8],
+    report: &blazar_runtime::kv::interchange::TierReadReport,
+) -> Result<()> {
+    let blazar_runtime::kv::interchange::TierReadReport {
+        blocks_read,
+        block_tokens,
+        ..
+    } = report;
+    let requested = cfg.overlay_for(&to_row.name).ctx.unwrap_or(cfg.default_ctx);
+    let extend = cfg.effective_ctx_extend(&to_row.name);
+    let ctx = match meta.context_length {
+        Some(train_raw) => {
+            let train = u32::try_from(train_raw).unwrap_or(u32::MAX);
+            let ceiling = if extend > 1.0 {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let stretched = (f64::from(train) * extend).floor().min(f64::from(u32::MAX)) as u64;
+                u32::try_from(stretched).unwrap_or(u32::MAX)
+            } else {
+                train
+            };
+            requested.min(ceiling)
+        }
+        None => requested,
+    };
+    // Slots mirror the profile compiler's resolve_slots: a pin (overlay or
+    // config, nonzero) divides the resolved ctx across slots and the
+    // manifest records the PER-SLOT ctx the spawn will carry; an auto 0
+    // resolves against live VRAM at spawn time, which no offline import
+    // can predict - refuse and teach the pin instead of writing a bank
+    // the restore gate would silently skip.
+    let slots = cfg.overlay_for(&to_row.name).slots.unwrap_or(cfg.slots);
+    anyhow::ensure!(
+        slots != 0,
+        "slots are auto for {:?} - auto sizing resolves against live VRAM at spawn time, so no          offline bank identity can match it; pin the slot count (model_overrides slots = N) and          re-run the import",
+        to_row.name
+    );
+    let ctx = ctx / slots.max(1);
+    let engine = store
+        .list_engines()?
+        .into_iter()
+        .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp && e.active)
+        .ok_or_else(|| {
+            anyhow!(
+                "no active llama.cpp engine in the store - the bank's restore gate needs the engine that will serve {to:?}; `blazar engine list` shows lanes",
+                to = to_row.name
+            )
+        })?;
+    let identity = blazar_core::session_identity::build_for_instance(
+        d,
+        cfg,
+        &to_row.name,
+        &engine.tag,
+        blazar_core::engine_kind::EngineKind::LlamaCpp,
+        ctx,
+        slots,
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "cannot establish the restore identity for {to:?} (unhashed weights or a missing engine row) - the bank would never restore; refusing to write it",
+            to = to_row.name
+        )
+    })?;
+
+    let dir = d
+        .sessions_dir()
+        .join(blazar_core::profile::path_safe(&to_row.name));
+    std::fs::create_dir_all(&dir)?;
+    let bank_file = dir.join(format!("_auto-{ctx}"));
+    anyhow::ensure!(
+        !bank_file.exists(),
+        "{:#?} already holds a session bank - evict the model first (its save sweep rewrites banks) or move the old bank aside; this import refuses to clobber it",
+        bank_file.display()
+    );
+    std::fs::write(&bank_file, bank_bytes)?;
+    blazar_core::session_identity::write_manifest(&bank_file, &identity)
+        .map_err(|e| anyhow!("manifest write beside {:#?}: {e}", bank_file.display()))?;
+    println!(
+        "imported {} block(s) x {} token(s) into {:#?}",
+        blocks_read,
+        block_tokens,
+        bank_file.display()
+    );
+    Ok(())
+}
+
+/// Gate order matters: the translation knob owns codec admission, then the
+/// token file must exist and be a non-empty id array - the tier is
+/// content-addressed by ids and never stores them.
+fn reverse_precheck(cfg: &blazar_core::config::Config, tokens_file: &str) -> Result<Vec<u32>> {
+    use blazar_runtime::kv::interchange as bkic;
+
+    let pairs = bkic::admitted_pairs(&cfg.kv.translation);
+    if !pairs.contains(&bkic::CodecLane::VllmToLlamaCpp) {
+        let known = pairs
+            .iter()
+            .map(|p| p.pair_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let known = if known.is_empty() {
+            "none".into()
+        } else {
+            known
+        };
+        anyhow::bail!(
+            "the vllm -> llama.cpp codec pair is not admitted - [kv.translation] enabled admits it (admitted pairs: {known})"
+        );
+    }
+
+    let tokens_raw = std::fs::read_to_string(tokens_file)
+        .map_err(|e| anyhow!("--tokens {tokens_file:?}: {e}"))?;
+    let ids: Vec<u32> = serde_json::from_str(&tokens_raw).map_err(|e| {
+        anyhow!("--tokens {tokens_file:?}: expected a JSON array of integer token ids ({e})")
+    })?;
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "--tokens {tokens_file:?}: the id array is empty - nothing to look up"
+    );
+    Ok(ids)
+}
+
+fn kv_import_reverse(
+    d: &BlazarDirs,
+    cfg: &blazar_core::config::Config,
+    store: &Store,
+    from_row: &blazar_core::store::ModelRow,
+    to_row: &blazar_core::store::ModelRow,
+    tokens_file: &str,
+) -> Result<()> {
+    use blazar_runtime::kv::interchange as bkic;
+
+    let ids = reverse_precheck(cfg, tokens_file)?;
+
+    let gguf_path = std::path::PathBuf::from(&to_row.path);
+    let gguf_buf = std::fs::read(&gguf_path)?;
+    let (meta, _) = blazar_core::gguf::parse_metadata(&gguf_buf)?;
+    let hf_dir = std::path::PathBuf::from(&from_row.path);
+    let hf_meta = blazar_core::hfmeta::read_hf_config(&hf_dir)?;
+
+    let hf_repo = if from_row.repo.is_empty() {
+        from_row.name.as_str()
+    } else {
+        from_row.repo.as_str()
+    };
+    blazar_runtime::kv::repack::provenance_gate(
+        meta.file_type,
+        meta.base_model_id.as_deref(),
+        hf_repo,
+    )
+    .map_err(|e| anyhow!("kv import: {e}"))?;
+    blazar_runtime::kv::repack::rope_gate(
+        meta.rope_fingerprint.as_deref(),
+        hf_meta.rope_fingerprint.as_deref(),
+    )
+    .map_err(|e| anyhow!("kv import: {e}"))?;
+    let geo = repack_geometry(&meta).ok_or_else(|| {
+        anyhow!("GGUF {to:?} lacks complete KV geometry (layers/kv heads/head dim) - nothing to walk the tier against", to = to_row.name)
+    })?;
+    let registry = blazar_runtime::kv::translation::builtin_registry(&cfg.kv.translation);
+    let (vllm_layout, llamacpp_layout) = (
+        blazar_runtime::kv::translation::vllm_kv_layout(&hf_meta, 64),
+        blazar_runtime::kv::translation::llamacpp_kv_layout(&meta),
+    );
+    let (Some(vllm_layout), Some(llamacpp_layout)) = (vllm_layout, llamacpp_layout) else {
+        anyhow::bail!(
+            "KV geometry incomplete on one side of the pair - cannot verdict the lane pair"
+        );
+    };
+    if let blazar_core::kv::KvCompatibility::Incompatible { reason } =
+        blazar_runtime::kv::translation::translation_verdict(
+            &vllm_layout,
+            &llamacpp_layout,
+            &registry,
+        )
+    {
+        anyhow::bail!("lane pair refused: {reason}");
+    }
+
+    // Tier identity = the vllm-side model path, exactly what compile_vllm
+    // folded into the FileMapper digest when the engine wrote the blocks.
+    let spec = blazar_runtime::kv::repack::VllmFsSpec {
+        model_name: from_row.path.clone(),
+        tokens_per_hash: 64,
+        blocks_per_file: 1,
+        canonical_format: "v1-nhd".into(),
+    };
+    let root = d.data_dir.join("kv").join("vllm");
+    let (carrier, report) = bkic::vllm_tier_to_carrier(&root, &spec, &ids, &geo)
+        .map_err(|e| anyhow!("kv import: {e}"))?;
+    anyhow::ensure!(
+        report.blocks_read > 0,
+        "the tier under {:#?} never offloaded this prefix - serve {from_name:?} on the vllm lane with [vllm.kv_offload] enabled and let the connector store blocks first",
+        root.display(),
+        from_name = from_row.name
+    );
+    let bank_bytes = bkic::carrier_to_slot_save(&carrier).map_err(|e| anyhow!("kv import: {e}"))?;
+
+    write_reverse_bank(d, cfg, store, to_row, &meta, &bank_bytes, &report)?;
+
+    if report.blocks_missing > 0 {
+        println!(
+            "  stopped at the first missing block - {} later block(s) absent from the tier (never offloaded); the bank covers the shorter prefix",
+            report.blocks_missing
+        );
+    }
+    if !cfg.session_bank {
+        println!(
+            "  note: session_bank is disabled - the spawn-time restore needs it enabled to warm-start from this bank"
+        );
+    }
+    println!(
+        "  next spawn of {:?} on the llama.cpp lane restores this bank before first use",
+        to_row.name
     );
     Ok(())
 }
@@ -7298,6 +7582,112 @@ mod doctor_tests {
             "empty scan names why: {} | {}",
             out[0].0,
             out[0].1
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_import_with__reverse_lane_demands_a_token_file() {
+        // HF source + GGUF target = the reverse lane; its gate order puts
+        // the token-id requirement before any file parse, because the
+        // tier cannot even be addressed without the ids.
+        let dir = tempfile::tempdir().unwrap();
+        let hf_dir = dir.path().join("hf");
+        std::fs::create_dir_all(&hf_dir).unwrap();
+        std::fs::write(hf_dir.join("config.json"), "{}").unwrap();
+        let gguf = dir.path().join("twin.gguf");
+        std::fs::write(&gguf, b"x").unwrap();
+        let d = blazar_core::BlazarDirs {
+            config_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = blazar_core::store::Store::open(&d).unwrap();
+        let row = |name: &str, path: String| blazar_core::store::ModelRow {
+            name: name.into(),
+            repo: String::new(),
+            quant: String::new(),
+            path,
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        store
+            .upsert_model(&row("hf-twin", hf_dir.display().to_string()))
+            .unwrap();
+        store
+            .upsert_model(&row("gguf-twin", gguf.display().to_string()))
+            .unwrap();
+        let mut cfg = Config::default();
+        cfg.kv.translation.enabled = true;
+        let err = kv_import_with(&d, &cfg, "hf-twin", "gguf-twin", None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--tokens") && err.contains("content-addressed"),
+            "token-id teaching: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_import_with__reverse_lane_stays_behind_the_translation_knob() {
+        // With the knob off the admission gate fires before the token
+        // read (tokens passed here would be read on the admitted path
+        // only), proving the reverse lane is registry-gated like the
+        // forward one.
+        let dir = tempfile::tempdir().unwrap();
+        let hf_dir = dir.path().join("hf");
+        std::fs::create_dir_all(&hf_dir).unwrap();
+        std::fs::write(hf_dir.join("config.json"), "{}").unwrap();
+        let gguf = dir.path().join("twin.gguf");
+        std::fs::write(&gguf, b"x").unwrap();
+        let d = blazar_core::BlazarDirs {
+            config_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = blazar_core::store::Store::open(&d).unwrap();
+        let row = |name: &str, path: String| blazar_core::store::ModelRow {
+            name: name.into(),
+            repo: String::new(),
+            quant: String::new(),
+            path,
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        store
+            .upsert_model(&row("hf-twin", hf_dir.display().to_string()))
+            .unwrap();
+        store
+            .upsert_model(&row("gguf-twin", gguf.display().to_string()))
+            .unwrap();
+        let err = kv_import_with(
+            &d,
+            &Config::default(),
+            "hf-twin",
+            "gguf-twin",
+            None,
+            Some("unused.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("[kv.translation]"),
+            "knob gate before everything: {err}"
         );
     }
 
