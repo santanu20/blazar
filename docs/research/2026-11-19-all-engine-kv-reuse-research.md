@@ -170,3 +170,44 @@ daemon, prod config snapshot/restore):
    same rank dir have different hashes (different template id chains) and were
    not involved. The loaded bytes were mlx-derived - the bf16->f16 RNE
    conversion and head-gather repack are byte-correct for a live engine.
+
+## Wave D: vllm -> mlx staged preload (shipped)
+
+The mlx import leg of the BKI matrix. The codec writes mlx-lm's own prompt
+cache format (reader in wave C, writer here): per-layer K/V tensors
+`[1, heads, capacity, head_dim]` head-major-capacity, `{i}.2` i32 used-offset
+scalars, the `0.model` / `1.{i}` / `2.{i}.*` metadata tree, capacity rounded
+to the 256-token allocation step, and f16 tier bytes converted to the
+weights-pinned cache dtype (bf16 RNE, pure-integer bit domain, overflow
+refused). Delivery is a *stage + preload*, not a serve-path write, because
+the mlx server keeps its prompt cache in memory only:
+
+- `blazar kv import --from X --to X --tokens ids.json --stage-mlx` writes
+  `<data_dir>/kv/mlx/<path-safe-model>/{cache.safetensors, tokens.json}`.
+- At mlx-lane spawn, if a stage exists, the supervisor materializes a
+  `mlx-server-preload` wrapper beside the engine shim and sets
+  `BLAZAR_MLX_STAGE` in the child env. The wrapper subclasses
+  `LRUPromptCache` (module-global lookup in `mlx_lm.server` makes the patch
+  legal), pre-loads the staged cache through mlx-lm's own
+  `load_prompt_cache`, and inserts it under the server's model-key tuple
+  `(model_path, adapter_path, draft_model_path)` with `cache_type="system"`
+  (the stickiest LRU class - assistant entries evict first).
+- The stage persists across spawns; deleting the directory disarms it. A
+  stale stage cannot break a spawn: without the env var the wrapper never
+  engages.
+
+Verified live (qwen2.5-1.5b-instruct): 320 of 342 prefix tokens (5 full
+tier blocks) staged as bf16, and the mlx lane served the first same-prefix
+request with `cached_tokens: 352` of 353 prompt tokens - the LRU trie entry
+exists only via the preload, so the hit is the staged KV grown by normal
+cache extension. Two live-proof findings shaped the wrapper: (1) mlx GPU
+arrays are stream-affine to the thread that creates them - loading the cache
+at import time (main thread) killed the generation thread on its first
+`mx.eval` ('There is no Stream(gpu, 0) in current thread'), so the wrapper
+defers `load_prompt_cache` into the generation thread by hooking
+`ResponseGenerator._generate` (first call loads+inserts, then proceeds);
+(2) `mlx_lm.server /v1/models` is an HF-cache scan, not the loaded model -
+health checks pass on bind, and the empty-stream-then-404 signature is
+generation-thread death, not a bind race. The preload line itself surfaces
+at `tracing` DEBUG (spawn pipes child output there); usage receipts require
+non-stream requests (streaming `include_usage` returns null on this build).

@@ -907,6 +907,11 @@ enum KvCmd {
         /// mlx -> vllm lane, where both models are HF directories
         #[arg(long)]
         cache_file: Option<String>,
+        /// Stage a vllm fs-tier prefix for the mlx lane (both models HF
+        /// directories) - writes the converted prompt cache the mlx
+        /// spawn wrapper pre-loads
+        #[arg(long)]
+        stage_mlx: bool,
     },
 }
 
@@ -4129,6 +4134,7 @@ fn kv_cmd(cmd: KvCmd) -> Result<()> {
             bank,
             tokens,
             cache_file,
+            stage_mlx,
         } => kv_import_cmd(
             &dirs(),
             &from,
@@ -4136,6 +4142,7 @@ fn kv_cmd(cmd: KvCmd) -> Result<()> {
             bank.as_deref(),
             tokens.as_deref(),
             cache_file.as_deref(),
+            stage_mlx,
         ),
     }
 }
@@ -4297,6 +4304,161 @@ fn kv_mlx_layout_gates(
     Ok(())
 }
 
+/// vllm -> mlx staging (`--stage-mlx`): the reverse of the mlx export
+/// codec. Reads the fs-tier blocks the vllm engine offloaded for this
+/// model, converts them through the carrier into an mlx-lm prompt-cache
+/// file, and parks it in the mlx stage area - the supervisor's spawn
+/// wrapper pre-loads it into the mlx server's LRU on the next spawn of
+/// this model (the mlx server keeps its cache purely in memory, so a
+/// staged file is the only injection point). Tokens come from the caller:
+/// the tier is content-addressed by ids and never stores them.
+/// Gate the vllm -> mlx stage lane against the HF metadata: geometry must be
+/// pinned by the config, and the PR4 verdict must admit the flipped layout
+/// pair (vllm fused-block-major saved, token-major separate-K/V target).
+fn kv_stage_layout_gates(
+    cfg: &blazar_core::config::Config,
+    hf_meta: &blazar_core::hfmeta::HfMeta,
+) -> Result<()> {
+    let geo_of = |v: Option<u64>| u32::try_from(v.unwrap_or(0)).ok().filter(|_| v.is_some());
+    let (Some(layers), Some(kv_heads), Some(head_dim)) = (
+        geo_of(hf_meta.kv.layers),
+        geo_of(hf_meta.kv.kv_heads),
+        geo_of(hf_meta.kv.head_dim),
+    ) else {
+        anyhow::bail!(
+            "the HF config does not pin the tensor geometry - cross-lane \
+             sharing stays Exact-only"
+        );
+    };
+    let saved_layout = blazar_runtime::kv::translation::vllm_kv_layout(hf_meta, 64)
+        .ok_or_else(|| anyhow!("cannot derive the vllm layout from the HF config"))?;
+    let target_layout = blazar_core::kv::KvLayout {
+        layers,
+        kv_heads,
+        head_dim,
+        key_dtype: blazar_runtime::kv::translation::KV_DTYPE_F16.into(),
+        value_dtype: blazar_runtime::kv::translation::KV_DTYPE_F16.into(),
+        block_tokens: 1,
+        tensor_parallel: 1,
+        pipeline_parallel: 1,
+        attention_layout: blazar_runtime::kv::translation::LLAMACPP_LAYOUT.into(),
+    };
+    if let blazar_core::kv::KvCompatibility::Incompatible { reason } =
+        blazar_runtime::kv::translation::translation_verdict(
+            &saved_layout,
+            &target_layout,
+            &blazar_runtime::kv::translation::builtin_registry(&cfg.kv.translation),
+        )
+    {
+        anyhow::bail!("lane pair refused: {reason}");
+    }
+    Ok(())
+}
+
+fn kv_import_stage_mlx(
+    d: &BlazarDirs,
+    cfg: &blazar_core::config::Config,
+    store: &Store,
+    from_row: &blazar_core::store::ModelRow,
+    to_row: &blazar_core::store::ModelRow,
+    tokens_file: &str,
+) -> Result<()> {
+    use blazar_runtime::kv::interchange as bkic;
+    use blazar_runtime::kv::mlx_preload;
+    let _ = store; // identity flows from the model rows; no bank write here
+    anyhow::ensure!(
+        bkic::admitted_pairs(&cfg.kv.translation).contains(&bkic::CodecLane::VllmToMlx),
+        "the vllm -> mlx stage lane is gated on [kv.translation] enabled = true"
+    );
+    anyhow::ensure!(
+        from_row.path == to_row.path,
+        "the stage moves bytes between lanes of the same model - {} and {} \
+name different directories",
+        from_row.path,
+        to_row.path
+    );
+    let tokens = reverse_precheck(cfg, tokens_file)?;
+    let hf_dir = std::path::PathBuf::from(&from_row.path);
+    let hf_meta = blazar_core::hfmeta::read_hf_config(&hf_dir)?;
+    kv_stage_layout_gates(cfg, &hf_meta)?;
+    let geo_of = |v: Option<u64>| u32::try_from(v.unwrap_or(0)).ok().filter(|_| v.is_some());
+    let geo = blazar_runtime::kv::repack::RepackGeometry {
+        layers: geo_of(hf_meta.kv.layers).unwrap_or_default(),
+        kv_heads: geo_of(hf_meta.kv.kv_heads).unwrap_or_default(),
+        head_dim: geo_of(hf_meta.kv.head_dim).unwrap_or_default(),
+    };
+    // Tier identity = the vllm-side model path the engine folded into the
+    // FileMapper digest when it wrote the blocks.
+    let spec = blazar_runtime::kv::repack::VllmFsSpec {
+        model_name: from_row.path.clone(),
+        tokens_per_hash: 64,
+        blocks_per_file: 1,
+        canonical_format: "v1-nhd".into(),
+    };
+    let root = d.data_dir.join("kv").join("vllm");
+    let (carrier, report) = bkic::vllm_tier_to_carrier(&root, &spec, &tokens, &geo)
+        .map_err(|e| anyhow!("kv import: {e}"))?;
+    anyhow::ensure!(
+        report.blocks_read > 0,
+        "the tier under {} never offloaded this prefix - serve {} on the \
+vllm lane with [vllm.kv_offload] enabled and let the connector store \
+blocks first",
+        root.display(),
+        from_row.name
+    );
+
+    // The mlx cache dtype mirrors the model weights (mlx-lm behavior).
+    let weights_dtype = hf_meta.dtype.as_deref().ok_or_else(|| {
+        anyhow!(
+            "the HF config under {} declares no dtype - the mlx cache \
+dtype follows the weights, so the stage refuses",
+            from_row.path
+        )
+    })?;
+    let (cache_bytes, stage_report) =
+        bkic::carrier_to_mlx_cache(&carrier, &from_row.path, weights_dtype)
+            .map_err(|e| anyhow!("mlx stage: {e}"))?;
+
+    let stage = mlx_preload::stage_dir(&d.data_dir, &to_row.name);
+    std::fs::create_dir_all(&stage)
+        .map_err(|e| anyhow!("cannot create stage dir {}: {e}", stage.display()))?;
+    let cache_path = stage.join(mlx_preload::CACHE_NAME);
+    std::fs::write(&cache_path, &cache_bytes)
+        .map_err(|e| anyhow!("cannot write {}: {e}", cache_path.display()))?;
+    let tokens_path = stage.join(mlx_preload::TOKENS_NAME);
+    // The cache holds full tier blocks only - the token claim must cover
+    // exactly the cached prefix or the server would fetch a 342-token
+    // position map over a 320-cell cache and skip the uncached tail.
+    let staged_tokens = &tokens[..stage_report.cells as usize];
+    let tokens_json = serde_json::to_vec(staged_tokens).map_err(|e| anyhow!("mlx stage: {e}"))?;
+    std::fs::write(&tokens_path, &tokens_json)
+        .map_err(|e| anyhow!("cannot write {}: {e}", tokens_path.display()))?;
+
+    println!(
+        "vllm tier staged for mlx: {} layer(s) x {} token(s) as {} \
+(capacity {}) from {} block(s) read",
+        stage_report.layers,
+        stage_report.cells,
+        stage_report.dtype,
+        stage_report.capacity,
+        report.blocks_read
+    );
+    if report.blocks_missing > 0 {
+        println!(
+            "  stopped at the first missing block - {} later block(s) absent \
+from the tier (never offloaded); the stage covers the shorter prefix",
+            report.blocks_missing
+        );
+    }
+    println!("stage: {}", stage.display());
+    println!(
+        "next mlx spawn of {} pre-loads {} token(s) through the spawn \
+wrapper - the stage persists across spawns; remove the directory to disarm",
+        to_row.name, stage_report.cells
+    );
+    Ok(())
+}
+
 /// mlx -> vllm import: read an mlx-lm prompt-cache export into a carrier
 /// and land it in the vLLM fs tier. Provenance is free here - the cache
 /// file remembers the exact model path it was built from, and the sink
@@ -4400,23 +4562,47 @@ fn kv_import_cmd(
     bank: Option<&str>,
     tokens: Option<&str>,
     cache_file: Option<&str>,
+    stage_mlx: bool,
 ) -> Result<()> {
     let cfg = config()?;
-    kv_import_with(d, &cfg, from, to, bank, tokens, cache_file)
+    kv_import_with(
+        d,
+        &cfg,
+        from,
+        to,
+        &KvImportOpts {
+            bank: bank.map(str::to_string),
+            tokens: tokens.map(str::to_string),
+            cache_file: cache_file.map(str::to_string),
+            stage_mlx,
+        },
+    )
 }
 
 /// Testable core of `kv import`: the caller supplies the config so the
 /// gates run against a constructed one in tests, the ambient fleet
 /// config on the CLI.
+/// Optional artifacts the kv import lanes consume - which combination is
+/// valid depends on the direction (see `kv_import_with`).
+#[derive(Default)]
+struct KvImportOpts {
+    bank: Option<String>,
+    tokens: Option<String>,
+    cache_file: Option<String>,
+    stage_mlx: bool,
+}
+
 fn kv_import_with(
     d: &BlazarDirs,
     cfg: &blazar_core::config::Config,
     from: &str,
     to: &str,
-    bank: Option<&str>,
-    tokens: Option<&str>,
-    cache_file: Option<&str>,
+    opts: &KvImportOpts,
 ) -> Result<()> {
+    let bank = opts.bank.as_deref();
+    let tokens = opts.tokens.as_deref();
+    let cache_file = opts.cache_file.as_deref();
+    let stage_mlx = opts.stage_mlx;
     anyhow::ensure!(
         cfg.kv.translation.enabled,
         "kv import is gated on [kv.translation] enabled = true - the knob keeps cross-engine KV admission explicit"
@@ -4450,13 +4636,22 @@ engine tokenizer's ids for the cached prefix as a JSON array"
         })?;
         return kv_import_reverse(d, cfg, &store, from_row, to_row, tokens);
     }
+    anyhow::ensure!(
+        !(stage_mlx && cache_file.is_some()),
+        "--stage-mlx and --cache-file are different mlx converters (vllm -> mlx staging vs mlx -> vllm export) - pass exactly one"
+    );
+    if from_is_hf && to_is_hf && stage_mlx {
+        let tokens = tokens.ok_or_else(|| {
+            anyhow!(
+                "--tokens <file> is required for the mlx stage lane: the vllm tier is content-addressed by token ids and never stores them - dump the engine tokenizer's ids for the cached prefix as a JSON array"
+            )
+        })?;
+        return kv_import_stage_mlx(d, cfg, &store, from_row, to_row, tokens);
+    }
     if from_is_hf && to_is_hf {
         let cache = cache_file.ok_or_else(|| {
             anyhow!(
-                "both models are HF directories - the only converter between \
-them is the mlx export codec, which needs --cache-file <mlx-lm \
---prompt-cache-file .safetensors> (run `mlx_lm.cache_prompt --model <dir> \
---prompt <text> --prompt-cache-file <f>` on the mlx lane first)"
+                "both models are HF directories - pass --cache-file <mlx-lm --prompt-cache-file .safetensors> for the mlx -> vllm export codec (run `mlx_lm.cache_prompt --model <dir> --prompt <text> --prompt-cache-file <f>` on the mlx lane first), or --stage-mlx to warm-start the mlx lane from the vllm tier"
             )
         })?;
         let tokens = tokens.ok_or_else(|| {
@@ -4469,9 +4664,8 @@ JSON array"
         return kv_import_mlx(d, cfg, from_row, to_row, cache, tokens);
     }
     anyhow::ensure!(
-        cache_file.is_none(),
-        "--cache-file only applies when both models are HF directories \
-(the mlx export codec)"
+        cache_file.is_none() && !stage_mlx,
+        "--cache-file and --stage-mlx only apply when both models are HF directories (the mlx converters)"
     );
     kv_import_forward(d, cfg, from_row, to_row, from, to, bank)
 }
@@ -7839,12 +8033,94 @@ mod doctor_tests {
             .unwrap();
         let mut cfg = Config::default();
         cfg.kv.translation.enabled = true;
-        let err = kv_import_with(&d, &cfg, "hf-twin", "gguf-twin", None, None, None)
-            .unwrap_err()
-            .to_string();
+        let err = kv_import_with(
+            &d,
+            &cfg,
+            "hf-twin",
+            "gguf-twin",
+            &KvImportOpts {
+                stage_mlx: false,
+                ..KvImportOpts::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("--tokens") && err.contains("content-addressed"),
             "token-id teaching: {err}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__kv_import_with__mlx_stage_lane_teaches_its_requirements() {
+        // The staged-preload lane reads the vllm fs tier, so it demands the
+        // token ids the tier never stores - and refuses being combined with
+        // the opposite (cache-file) mlx converter.
+        let dir = tempfile::tempdir().unwrap();
+        let hf_dir = dir.path().join("hf");
+        std::fs::create_dir_all(&hf_dir).unwrap();
+        std::fs::write(hf_dir.join("config.json"), "{}").unwrap();
+        let d = blazar_core::BlazarDirs {
+            config_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let store = blazar_core::store::Store::open(&d).unwrap();
+        let row = |name: &str, path: String| blazar_core::store::ModelRow {
+            name: name.into(),
+            repo: String::new(),
+            quant: String::new(),
+            path,
+            bytes: 0,
+            sha256: None,
+            mmproj_path: None,
+            components: Vec::new(),
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        };
+        let path = hf_dir.display().to_string();
+        store.upsert_model(&row("vllm-src", path.clone())).unwrap();
+        store.upsert_model(&row("mlx-dst", path)).unwrap();
+        let mut cfg = Config::default();
+        cfg.kv.translation.enabled = true;
+        let cache = dir.path().join("cache.safetensors");
+        std::fs::write(&cache, b"x").unwrap();
+        let err = kv_import_with(
+            &d,
+            &cfg,
+            "vllm-src",
+            "mlx-dst",
+            &KvImportOpts {
+                cache_file: Some(cache.to_str().unwrap().to_string()),
+                stage_mlx: true,
+                ..KvImportOpts::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exactly one"),
+            "converter exclusivity teaching: {err}"
+        );
+        let err = kv_import_with(
+            &d,
+            &cfg,
+            "vllm-src",
+            "mlx-dst",
+            &KvImportOpts {
+                stage_mlx: true,
+                ..KvImportOpts::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--tokens") && err.contains("content-addressed"),
+            "token teaching: {err}"
         );
     }
 
@@ -7884,9 +8160,18 @@ mod doctor_tests {
         store.upsert_model(&row("vllm-dst", path)).unwrap();
         let mut cfg = Config::default();
         cfg.kv.translation.enabled = true;
-        let err = kv_import_with(&d, &cfg, "mlx-src", "vllm-dst", None, None, None)
-            .unwrap_err()
-            .to_string();
+        let err = kv_import_with(
+            &d,
+            &cfg,
+            "mlx-src",
+            "vllm-dst",
+            &KvImportOpts {
+                stage_mlx: false,
+                ..KvImportOpts::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("mlx_lm.cache_prompt") && err.contains("--prompt-cache-file"),
             "cache-file teaching: {err}"
@@ -7898,9 +8183,11 @@ mod doctor_tests {
             &cfg,
             "mlx-src",
             "vllm-dst",
-            None,
-            None,
-            Some(cache.to_str().unwrap()),
+            &KvImportOpts {
+                cache_file: Some(cache.to_str().unwrap().to_string()),
+                stage_mlx: false,
+                ..KvImportOpts::default()
+            },
         )
         .unwrap_err()
         .to_string();
@@ -7955,9 +8242,10 @@ mod doctor_tests {
             &Config::default(),
             "hf-twin",
             "gguf-twin",
-            None,
-            Some("unused.json"),
-            None,
+            &KvImportOpts {
+                tokens: Some("unused.json".to_string()),
+                ..KvImportOpts::default()
+            },
         )
         .unwrap_err()
         .to_string();

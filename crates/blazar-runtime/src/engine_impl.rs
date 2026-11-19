@@ -1768,7 +1768,31 @@ impl Engine for MlxEngine {
         }
         // spawn_env applies last: a pinned CUDA_VISIBLE_DEVICES pair
         // survives the LD_LIBRARY_PATH surgery above.
-        spawn_child(&self.manifest.server_path, argv, endpoint, &env, spawn_env)
+        // Staged mlx warm-start (`blazar kv import --stage-mlx`): the
+        // supervisor arms the stage through spawn_env and materializes a
+        // wrapper beside this shim; when that wrapper exists, spawn it
+        // instead - it execs the identical server after pre-loading the
+        // staged prompt cache into the LRU.
+        let mut server_path = std::path::PathBuf::from(&self.manifest.server_path);
+        if spawn_env
+            .iter()
+            .any(|(k, _)| k == crate::kv::mlx_preload::STAGE_ENV)
+        {
+            let wrapper = std::path::Path::new(&self.manifest.server_path)
+                .parent()
+                .map(|dir| dir.join(crate::kv::mlx_preload::WRAPPER_NAME));
+            if let Some(wrapper) = wrapper
+                && wrapper.is_file()
+            {
+                tracing::debug!(
+                    "mlx spawn: preload wrapper engaged at {}",
+                    wrapper.display()
+                );
+                server_path = wrapper;
+            }
+        }
+        let server_path = server_path.to_string_lossy().into_owned();
+        spawn_child(&server_path, argv, endpoint, &env, spawn_env)
     }
 
     async fn health_check(&self, endpoint: &Endpoint, timeout: std::time::Duration) -> Result<()> {

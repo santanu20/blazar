@@ -331,6 +331,10 @@ pub enum CodecLane {
     /// `--prompt-cache-file` safetensors export and lands it in the vLLM
     /// fs tier.
     MlxToVllm,
+    /// vLLM HF lane -> mlx-lm lane: reads the engine's fs-tier blocks and
+    /// stages an mlx-lm prompt-cache file the supervisor's spawn wrapper
+    /// pre-loads into the mlx server's LRU.
+    VllmToMlx,
 }
 
 impl CodecLane {
@@ -341,6 +345,7 @@ impl CodecLane {
             Self::LlamaCppToVllm => "llama.cpp -> vllm",
             Self::VllmToLlamaCpp => "vllm -> llama.cpp",
             Self::MlxToVllm => "mlx -> vllm",
+            Self::VllmToMlx => "vllm -> mlx",
         }
     }
 }
@@ -356,6 +361,7 @@ pub fn admitted_pairs(cfg: &TranslationSection) -> Vec<CodecLane> {
             CodecLane::LlamaCppToVllm,
             CodecLane::VllmToLlamaCpp,
             CodecLane::MlxToVllm,
+            CodecLane::VllmToMlx,
         ]
     } else {
         Vec::new()
@@ -795,6 +801,213 @@ pub fn mlx_cache_to_carrier(
     Ok((carrier, report))
 }
 
+/// Widen f16 bits to f32 bits exactly (bit-domain: every f16 value is
+/// representable in f32; subnormals normalize, inf/NaN map structurally).
+fn f16_bits_to_f32_bits(h: u16) -> u32 {
+    let sign = u32::from(h >> 15) << 31;
+    let exp = ((h >> 10) & 0x1F).cast_signed();
+    let frac = u32::from(h & 0x3FF);
+    if exp == 0 {
+        if frac == 0 {
+            return sign; // +-0
+        }
+        // Subnormal f16: value = frac * 2^-24. Normalize into an f32
+        // normal by shifting the significand until bit 10 is the
+        // implicit-one position.
+        let mut e = -1i32;
+        let mut f = frac;
+        while f & 0x400 == 0 {
+            f <<= 1;
+            e -= 1;
+        }
+        f &= 0x3FF;
+        let f32_exp = 127 - 15 + e - 10;
+        return sign | (u32::try_from(f32_exp).unwrap_or(0) << 23) | (f << 13);
+    }
+    if exp == 0x1F {
+        return sign | 0x7F80_0000 | (frac << 13); // inf / NaN
+    }
+    sign | (u32::try_from(exp - 15 + 127).unwrap_or(0) << 23) | (frac << 13)
+}
+
+/// Narrow f32 bits to bf16 bits with round-to-nearest-even. The source is
+/// always an f16-widened value, so overflow past bf16's range is
+/// impossible and non-finite values cannot appear (the reader refuses
+/// them) - the rounding bias word alone is safe.
+fn f32_bits_to_bf16_bits(bits: u32) -> u16 {
+    u16::try_from((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).unwrap_or(0)
+}
+
+/// Scatter-carrier report for the staged mlx direction.
+#[derive(Debug)]
+pub struct MlxStageReport {
+    pub layers: u32,
+    pub cells: u32,
+    pub capacity: u32,
+    /// `bf16` or `f16` - the cache dtype written, mirroring the model
+    /// weights the way mlx-lm's own cache does.
+    pub dtype: &'static str,
+}
+
+/// Write a carrier back out as an mlx-lm prompt-cache safetensors file:
+/// per-layer `{i}.0` (K), `{i}.1` (V) shaped `[1, heads, capacity, dim]`
+/// with the used-length scalar `{i}.2`, and the `__metadata__` tree
+/// `load_prompt_cache` reconstructs from. Capacity rounds up to the
+/// `KVCache` step (256) exactly like mlx-lm's own allocation.
+///
+/// `weights_dtype` is the HF config dtype string; the cache mirrors the
+/// weights (mlx-lm behavior), so `bfloat16` emits bf16 rows (converted
+/// from the carrier's f16 with round-to-nearest-even - f16 values are
+/// always in bf16's range) and `float16` emits f16 rows verbatim.
+/// Build the mlx-lm safetensors header (and the total data length it
+/// describes) for a staged prompt cache - the exact schema
+/// `load_prompt_cache` reconstructs from.
+fn mlx_stage_header(
+    geo: &RepackGeometry,
+    dtype: &str,
+    capacity: u32,
+    model_path: &str,
+) -> Result<(Vec<u8>, u64), String> {
+    let tensor_bytes = usize::try_from(geo.head_dim.checked_mul(2).ok_or("head size overflows")?)
+        .map_err(|_| "head size too large".to_string())?
+        .checked_mul(capacity as usize)
+        .and_then(|v| v.checked_mul(geo.kv_heads as usize))
+        .ok_or_else(|| "tensor size overflows".to_string())?;
+    let mut tensors = serde_json::Map::new();
+    let mut data_len = 0u64;
+    for i in 0..geo.layers {
+        for (leg, dtype_name) in [("0", dtype_upper(dtype)), ("1", dtype_upper(dtype))] {
+            tensors.insert(
+                format!("{i}.{leg}"),
+                serde_json::json!({
+                    "dtype": dtype_name,
+                    "shape": [1, geo.kv_heads, capacity, geo.head_dim],
+                    "data_offsets": [data_len, data_len + tensor_bytes as u64],
+                }),
+            );
+            data_len += tensor_bytes as u64;
+        }
+        tensors.insert(
+            format!("{i}.2"),
+            serde_json::json!({
+                "dtype": "I32",
+                "shape": [],
+                "data_offsets": [data_len, data_len + 4],
+            }),
+        );
+        data_len += 4;
+    }
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("0.model".to_string(), serde_json::json!(model_path));
+    metadata.insert(
+        "0.tokenizer_config".to_string(),
+        serde_json::json!(r#"{"trust_remote_code": false}"#),
+    );
+    for i in 0..geo.layers {
+        metadata.insert(format!("1.{i}"), serde_json::json!("KVCache"));
+    }
+    metadata.insert("2.0".to_string(), serde_json::json!(""));
+    for i in 0..geo.layers {
+        metadata.insert(
+            format!("2.{}.0", i + 1),
+            serde_json::json!(format!("{i}.2")),
+        );
+        metadata.insert(format!("2.{}.1", i + 1), serde_json::json!("scalar"));
+    }
+    let mut header_map = serde_json::Map::new();
+    header_map.append(&mut tensors);
+    header_map.insert(
+        "__metadata__".to_string(),
+        serde_json::Value::Object(metadata),
+    );
+    let header_bytes =
+        serde_json::to_vec(&serde_json::Value::Object(header_map)).map_err(|e| e.to_string())?;
+    Ok((header_bytes, data_len))
+}
+
+pub fn carrier_to_mlx_cache(
+    carrier: &KvCarrier,
+    model_path: &str,
+    weights_dtype: &str,
+) -> Result<(Vec<u8>, MlxStageReport), String> {
+    let dtype: &'static str = match weights_dtype {
+        "bfloat16" => "bf16",
+        "float16" => "f16",
+        other => {
+            return Err(format!(
+                "the mlx cache dtype follows the model weights - {other:?} \
+                 weights are not admitted (only bfloat16 and float16)"
+            ));
+        }
+    };
+    let geo = &carrier.geometry;
+    let cells_us = usize::try_from(carrier.cells).map_err(|_| "cell count too large")?;
+    let layer_count = usize::try_from(geo.layers).map_err(|_| "layer count too large")?;
+    if carrier.k_rows.len() != layer_count * cells_us * geo.row_bytes() {
+        return Err("carrier K rows do not match the declared geometry".into());
+    }
+    if carrier.k_rows.len() != carrier.v_rows.len() {
+        return Err("carrier K and V rows disagree in size".into());
+    }
+    let cells = carrier.cells;
+    if cells == 0 {
+        return Err("carrier holds no cached tokens".into());
+    }
+    let capacity = cells.div_ceil(256) * 256;
+    let head_bytes = usize::try_from(geo.head_dim.checked_mul(2).ok_or("head size overflows")?)
+        .map_err(|_| "head size too large")?;
+    let row_bytes = geo.row_bytes();
+    let (header_bytes, data_len) = mlx_stage_header(geo, dtype, capacity, model_path)?;
+    let mut out =
+        Vec::with_capacity(8 + header_bytes.len() + usize::try_from(data_len).unwrap_or(0));
+    out.extend_from_slice(
+        &u64::try_from(header_bytes.len())
+            .map_err(|_| "mlx cache header exceeds the addressable size".to_string())?
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&header_bytes);
+    let cap_us = capacity as usize;
+    // Data follows the header order exactly: per layer K, then V, then the
+    // 4-byte offset scalar - the layout mlx-lm's tree_flatten produces.
+    let scatter_layer = |rows: &[u8], layer: usize, out: &mut Vec<u8>| {
+        for h in 0..geo.kv_heads as usize {
+            for t in 0..cells_us {
+                let src = layer * cells_us * row_bytes + t * row_bytes + h * head_bytes;
+                let sl = &rows[src..src + head_bytes];
+                if dtype == "bf16" {
+                    for pair in sl.as_chunks::<2>().0 {
+                        let f = f16_bits_to_f32_bits(u16::from_le_bytes(*pair));
+                        out.extend_from_slice(&f32_bits_to_bf16_bits(f).to_le_bytes());
+                    }
+                } else {
+                    out.extend_from_slice(sl);
+                }
+            }
+            // Capacity padding: mlx-lm allocates in 256-token steps; the
+            // unused tail is zeros by construction.
+            out.resize(out.len() + (cap_us - cells_us) * head_bytes, 0);
+        }
+    };
+    for l in 0..layer_count {
+        scatter_layer(&carrier.k_rows, l, &mut out);
+        scatter_layer(&carrier.v_rows, l, &mut out);
+        out.extend_from_slice(&cells.to_le_bytes());
+    }
+
+    let report = MlxStageReport {
+        layers: geo.layers,
+        cells,
+        capacity,
+        dtype,
+    };
+    Ok((out, report))
+}
+
+/// safetensors dtype name for a logical cache dtype.
+fn dtype_upper(dtype: &str) -> &'static str {
+    if dtype == "bf16" { "BF16" } else { "F16" }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(non_snake_case)]
@@ -889,7 +1102,8 @@ mod tests {
             vec![
                 CodecLane::LlamaCppToVllm,
                 CodecLane::VllmToLlamaCpp,
-                CodecLane::MlxToVllm
+                CodecLane::MlxToVllm,
+                CodecLane::VllmToMlx
             ]
         );
         assert_eq!(CodecLane::LlamaCppToVllm.pair_name(), "llama.cpp -> vllm");
@@ -1279,5 +1493,78 @@ mod tests {
         bare.truncate(8 + 2); // header claims more than remains
         let err = mlx_cache_to_carrier(&bare, &[0u32; 2]).unwrap_err();
         assert!(!err.is_empty());
+    }
+    #[test]
+    fn unit__f16_bits_to_bf16__widens_and_rounds_the_boundary_vectors() {
+        // widen f16 -> f32 -> bf16; values chosen representable in both formats
+        let cases: &[(u16, u16)] = &[
+            (0x0000, 0x0000), // zero
+            (0x8000, 0x8000), // -zero
+            (0x3C00, 0x3F80), // 1.0
+            (0x4000, 0x4000), // 2.0 (f32 0x40000000 top bits)
+            (0xC100, 0xC020), // -2.5
+            (0x3800, 0x3F00), // 0.5
+            (0x7BFF, 0x4780), // 65504: f32 0x477FE000 rounds up to bf16 0x4780
+        ];
+        for &(f16h, bf16h) in cases {
+            let widened = f16_bits_to_f32_bits(f16h);
+            assert_eq!(f32_bits_to_bf16_bits(widened), bf16h, "f16 {f16h:#06x}");
+        }
+    }
+
+    #[test]
+    fn unit__mlx_stage__reader_writer_roundtrip_is_lossless_for_bf16_clean_values() {
+        // fixture values (h+1)+t/10 are exact in bf16 -> f16 widens exactly ->
+        // f16 -> bf16 RNE returns the identical bits
+        let fx = MlxFixture {
+            layers: 2,
+            heads: 2,
+            cap: 256,
+            dim: 4,
+            cells: 70,
+            bf16: true,
+            model_path: "/models/qwen",
+            class_override: None,
+        };
+        let tokens: Vec<u32> = (1000..1070).collect();
+        let file = mlx_file(&fx);
+        let (carrier, report) = mlx_cache_to_carrier(&file, &tokens).expect("parse");
+        assert_eq!(report.source_dtype, "bf16");
+        let (round, stage_report) =
+            carrier_to_mlx_cache(&carrier, "/models/qwen", "bfloat16").expect("stage");
+        assert_eq!(stage_report.layers, 2);
+        assert_eq!(stage_report.cells, 70);
+        assert_eq!(stage_report.capacity, 256);
+        assert_eq!(stage_report.dtype, "bf16");
+        let (carrier2, _) = mlx_cache_to_carrier(&round, &tokens).expect("reparse");
+        assert_eq!(carrier2.geometry.layers, carrier.geometry.layers);
+        assert_eq!(carrier2.cells, carrier.cells);
+        assert_eq!(
+            carrier2.k_rows, carrier.k_rows,
+            "K rows must survive bf16->f16->bf16"
+        );
+        assert_eq!(
+            carrier2.v_rows, carrier.v_rows,
+            "V rows must survive bf16->f16->bf16"
+        );
+    }
+
+    #[test]
+    fn unit__mlx_stage__capacity_rounds_up_to_the_256_step() {
+        let fx = MlxFixture {
+            layers: 1,
+            heads: 2,
+            cap: 512,
+            dim: 4,
+            cells: 342,
+            bf16: true,
+            model_path: "/models/qwen",
+            class_override: None,
+        };
+        let tokens: Vec<u32> = (0..342).collect();
+        let (carrier, _) = mlx_cache_to_carrier(&mlx_file(&fx), &tokens).expect("parse");
+        let (_, report) =
+            carrier_to_mlx_cache(&carrier, "/models/qwen", "bfloat16").expect("stage");
+        assert_eq!(report.capacity, 512);
     }
 }

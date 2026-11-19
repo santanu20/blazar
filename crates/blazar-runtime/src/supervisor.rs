@@ -7003,6 +7003,42 @@ impl Supervisor {
             for w in &profile.warnings {
                 tracing::warn!(model = name, "profile: {w}");
             }
+            // Staged mlx warm-start (`blazar kv import --stage-mlx`): a
+            // ready stage parks a converted prompt cache beside this
+            // model's KV area. Arm the spawn wrapper - materialized
+            // beside the lane shim so cwd semantics stay identical -
+            // and point the child at the stage through spawn_env. The
+            // engine side no-ops (plain shim spawn) when the wrapper is
+            // absent, so a stale stage can never break a spawn.
+            let mut spawn_env = spawn_env.clone();
+            if engine.kind() == blazar_core::engine_kind::EngineKind::Mlx {
+                let stage = crate::kv::mlx_preload::stage_dir(&self.dirs.data_dir, name);
+                if crate::kv::mlx_preload::stage_ready(&stage) {
+                    let shim = std::path::Path::new(&engine.capabilities().server_path);
+                    let armed = (|| {
+                        let python = crate::kv::mlx_preload::venv_python(shim)?;
+                        let engine_dir = shim.parent()?;
+                        crate::kv::mlx_preload::materialize_wrapper(engine_dir, &python).ok()
+                    })()
+                    .is_some();
+                    if armed {
+                        tracing::info!(
+                            model = name,
+                            stage = %stage.display(),
+                            "mlx warm-start stage armed - wrapper preloads the staged prefix at spawn"
+                        );
+                        spawn_env.push((
+                            crate::kv::mlx_preload::STAGE_ENV.to_string(),
+                            stage.to_string_lossy().into_owned(),
+                        ));
+                    } else {
+                        tracing::warn!(
+                            model = name,
+                            "mlx warm-start stage present but the lane venv has no python - spawning without preload"
+                        );
+                    }
+                }
+            }
             // Shared KV daemon lane: an LMCache-flagged profile dials
             // the daemon at child boot - ensure it (and the sglang
             // client YAML) exists BEFORE the spawn, else the child's

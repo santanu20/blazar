@@ -8,6 +8,7 @@
 
 pub mod compatibility;
 pub mod interchange;
+pub mod mlx_preload;
 pub mod registry;
 pub mod repack;
 pub mod translation;
