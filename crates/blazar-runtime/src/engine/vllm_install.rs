@@ -186,12 +186,13 @@ pub async fn install_into(dir: &Path, version: &str, extras: &[String]) -> Resul
         );
     }
     let mut path_prefix = venv.join("bin").display().to_string();
+    let console_script = venv.join("bin").join("vllm");
     let mut cuda_home_export = String::new();
     if let Some(root) = &toolkit {
         cuda_home_export = format!("export CUDA_HOME=\"{}\"\n", root.display());
         path_prefix = format!("{}:{}", root.join("bin").display(), path_prefix);
     }
-    let script = wrapper_script(&path_prefix, &cuda_home_export, &cache, &venv);
+    let script = wrapper_script(&path_prefix, &cuda_home_export, &cache, &console_script);
     std::fs::create_dir_all(&cache).context("create engine cache dir")?;
     std::fs::write(&shim, script).context("write vllm-server shim")?;
     make_executable(&shim)?;
@@ -265,14 +266,23 @@ pub async fn install_into(dir: &Path, version: &str, extras: &[String]) -> Resul
 /// `CUDA_HOME`, engine-scoped cache exports, then exec the venv's own
 /// `vllm` console script (its shebang already points at the venv python)
 /// with the `serve` subcommand.
-fn wrapper_script(path_prefix: &str, cuda_home_export: &str, cache: &Path, venv: &Path) -> String {
+/// Pure formatter: every path arrives fully formed so the emitted
+/// POSIX `sh` text never depends on the host's path separator (the
+/// lane installs on Linux, but the generator stays deterministic
+/// cross-platform - `Path::join` in here would leak `\` on Windows).
+fn wrapper_script(
+    path_prefix: &str,
+    cuda_home_export: &str,
+    cache: &Path,
+    console_script: &Path,
+) -> String {
     let cache = cache.display();
+    let console_script = console_script.display();
     format!(
         "#!/bin/sh\nexport PATH=\"{path_prefix}:$PATH\"\n{cuda_home_export}export \
          VLLM_CACHE_ROOT=\"${{VLLM_CACHE_ROOT:-{cache}}}\"\nexport \
          FLASHINFER_WORKSPACE_BASE=\"${{FLASHINFER_WORKSPACE_BASE:-{cache}}}\"\nexec \
-         \"{}\" serve \"$@\"\n",
-        venv.join("bin").join("vllm").display(),
+         \"{console_script}\" serve \"$@\"\n"
     )
 }
 
@@ -334,7 +344,7 @@ mod tests {
             "/eng/venv/bin",
             "",
             Path::new("/eng/cache"),
-            Path::new("/eng/venv"),
+            Path::new("/eng/venv/bin/vllm"),
         );
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("export PATH=\"/eng/venv/bin:$PATH\""));
@@ -361,7 +371,7 @@ mod tests {
             "/eng/venv/lib/python3.12/site-packages/nvidia/cu13/bin:/eng/venv/bin",
             "export CUDA_HOME=\"/eng/venv/lib/python3.12/site-packages/nvidia/cu13\"\n",
             Path::new("/eng/cache"),
-            Path::new("/eng/venv"),
+            Path::new("/eng/venv/bin/vllm"),
         );
         assert!(script.contains(
             "export PATH=\"/eng/venv/lib/python3.12/site-packages/nvidia/cu13/bin:/eng/venv/bin:$PATH\""
