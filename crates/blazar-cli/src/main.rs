@@ -13795,9 +13795,7 @@ async fn why(
     if let Some(b) = admin_bearer() {
         req = req.bearer_auth(b);
     }
-    let resp = req
-        .send()
-        .await?;
+    let resp = req.send().await?;
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
         return Err(anyhow!("daemon: {text}"));

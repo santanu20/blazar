@@ -1018,6 +1018,82 @@ async fn latest_or_fallback(
 }
 
 impl EngineManager {
+    /// Install the active curated registry lane that advertises an architecture.
+    ///
+    /// This entry point re-fetches the configured registry, requires an exact
+    /// active lane-id + architecture match, builds from the immutable SHA,
+    /// and stamps the result as Curated. The source-mined architecture set
+    /// is checked before `CMake` runs.
+    ///
+    /// Background callers should bound concurrency and keep the build off the
+    /// request path. The generated fork is additive and never replaces the
+    /// serving-active engine.
+    pub async fn install_curated_lane_for_arch<F: FnMut(&str) + Send + ?Sized>(
+        &self,
+        architecture: &str,
+        lane_id: &str,
+        registry_url: Option<&str>,
+        on_line: &mut F,
+    ) -> Result<EngineRow> {
+        anyhow::ensure!(
+            !architecture.trim().is_empty(),
+            "architecture must not be empty"
+        );
+        anyhow::ensure!(!lane_id.trim().is_empty(), "lane id must not be empty");
+        let url = capability_registry::resolve_registry_url(registry_url)
+            .ok_or_else(|| anyhow!("capability registry is disabled"))?;
+        let lanes = capability_registry::fetch(capability_registry::http(), &url).await?;
+        let lane = capability_registry::offers_for_arch(&lanes, architecture)
+            .into_iter()
+            .find(|candidate| candidate.id == lane_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "capability registry no longer has an active lane {lane_id:?} \
+                     advertising architecture {architecture:?}"
+                )
+            })?;
+
+        let toolchain = build::detect_toolchain(&build::path_dirs());
+        let cuda_ready = lane.backends.contains("cuda")
+            && toolchain.nvcc.is_some()
+            && toolchain.nvidia_smi.is_some()
+            && build::nvidia_gpu_facts().await.1.is_some();
+        let backend = if cuda_ready {
+            build::BuildBackend::Cuda
+        } else if lane.backends.contains("cpu") {
+            build::BuildBackend::Cpu
+        } else {
+            anyhow::bail!(
+                "curated lane {lane_id:?} advertises backends [{}], but this host has \
+                 no supported automatic source-build backend (Blazar can auto-build \
+                 CPU or NVIDIA CUDA lanes); install prerequisites or build manually",
+                lane.backends.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        };
+
+        let mut opts = build::BuildOpts::new(backend, format!("capability-{lane_id}"));
+        opts.source = build::BuildSource::Fork {
+            repo: lane.repo.clone(),
+            ref_sha: lane.ref_sha.clone(),
+            base_ref: None,
+        };
+        opts.trust = manifest::TrustTier::Curated;
+        // An automatic compile is an opt-in convenience task, not a
+        // benchmark run. Avoid saturating the host's entire CPU pool.
+        opts.jobs = opts.jobs.clamp(1, 4);
+        (on_line)(&format!(
+            "auto-installing curated lane {} ({}@{}, backend {}, architecture {})",
+            lane.id,
+            lane.repo,
+            lane.ref_sha,
+            backend.as_str(),
+            architecture
+        ));
+        self.build_and_install_for_arch(&opts, architecture, on_line)
+            .await
+    }
+
     /// Install the requested tag (or the channel's target) and activate it.
     pub async fn update(&self, tag: Option<&str>, channel: UpdateChannel) -> Result<EngineRow> {
         self.update_with_retry_delay(tag, channel, ASSET_UPLOAD_RETRY_DELAY)
@@ -3000,16 +3076,18 @@ impl EngineManager {
                 .list_engines()?
                 .iter()
                 .any(|e| e.kind == EngineKind::LlamaCpp && is_cuda_engine(&e.tag, &e.asset));
-        // Fork lanes are additive: installing one never dethrones the
-        // active engine of its kind. Routing picks the newest lane per
-        // spawn when the capability is actually needed, and
-        // `blazar engine use <tag>` stays the explicit switch. A fork
-        // lane only activates when it is the first of its kind.
+        // Fork lanes are additive when a same-kind active engine exists.
+        // Curated registry lanes are ALWAYS additive, including on a host
+        // with no same-kind active row: auto-install is a compatibility
+        // repair, never an implicit global-engine switch. A user-built fork
+        // can still become active when it is the first lane of its kind;
+        // `blazar engine use <tag>` remains the explicit switch.
         let fork_additive = m.source == manifest::EngineSource::Fork
-            && store
-                .list_engines()?
-                .iter()
-                .any(|e| e.kind == row.kind && e.active);
+            && (trust == manifest::TrustTier::Curated
+                || store
+                    .list_engines()?
+                    .iter()
+                    .any(|e| e.kind == row.kind && e.active));
         // Lazy lanes never claim the serving-active flag either: the
         // supervisor adapter backs model serving, while the audio lanes
         // (whisper transcription, piper synthesis) boot on demand from

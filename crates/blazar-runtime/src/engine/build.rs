@@ -477,7 +477,7 @@ pub fn derive_engine_tag(btag: &str, backend: BuildBackend) -> String {
 // Argument list mirrors the cmake invocation inputs 1:1; a bundling
 // struct would obscure that correspondence.
 #[allow(clippy::too_many_arguments)]
-async fn run_cmake_build(
+async fn run_cmake_build<F>(
     tc: &Toolchain,
     opts: &BuildOpts,
     src: &Path,
@@ -485,8 +485,11 @@ async fn run_cmake_build(
     tag: &str,
     arch: Option<&str>,
     host_compiler: Option<&Path>,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<()> {
+    on_line: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) + ?Sized,
+{
     if let Some(cache) = &tc.compiler_cache {
         let name = cache.file_name().map_or_else(
             || cache.display().to_string(),
@@ -535,12 +538,15 @@ async fn run_cmake_build(
     run_step(bldcmd, "cmake --build", opts.timeout, on_line).await
 }
 
-async fn run_step(
+async fn run_step<F>(
     mut cmd: tokio::process::Command,
     what: &str,
     timeout: Duration,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<()> {
+    on_line: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&str) + ?Sized,
+{
     use tokio::io::{AsyncBufReadExt as _, BufReader};
 
     cmd.stdin(std::process::Stdio::null())
@@ -711,12 +717,15 @@ impl EngineManager {
     ///   (auto-retire windows, supersede mining) for code it is not.
     ///   The tree's own remote is the truth; plain fixture trees (no
     ///   .git) keep the declared source.
-    async fn resolve_effective_source(
+    async fn resolve_effective_source<F>(
         &self,
         tc: &Toolchain,
         opts: &BuildOpts,
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<BuildOpts> {
+        on_line: &mut F,
+    ) -> Result<BuildOpts>
+    where
+        F: FnMut(&str) + ?Sized,
+    {
         let resolved = match resolve_fork_pin(&self.gh, &opts.source, on_line).await? {
             Some(source) => BuildOpts {
                 source,
@@ -750,11 +759,42 @@ impl EngineManager {
     /// Clone (or take) the source tree, configure, build, install, probe,
     /// activate. The build tree is a tempfile - torn down on every exit
     /// path (Drop), success or failure.
-    pub async fn build_and_install(
+    pub async fn build_and_install<F>(&self, opts: &BuildOpts, on_line: &mut F) -> Result<EngineRow>
+    where
+        F: FnMut(&str) + ?Sized,
+    {
+        self.build_and_install_inner(opts, None, on_line).await
+    }
+
+    /// Curated registry build variant. Unlike an ordinary user build, it
+    /// requires the source-mined architecture set to contain the registry's
+    /// requested architecture before `CMake` runs.
+    pub async fn build_and_install_for_arch<F>(
         &self,
         opts: &BuildOpts,
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<EngineRow> {
+        required_arch: &str,
+        on_line: &mut F,
+    ) -> Result<EngineRow>
+    where
+        F: FnMut(&str) + Send + ?Sized,
+    {
+        anyhow::ensure!(
+            !required_arch.trim().is_empty(),
+            "required architecture must not be empty"
+        );
+        self.build_and_install_inner(opts, Some(required_arch), on_line)
+            .await
+    }
+
+    async fn build_and_install_inner<F>(
+        &self,
+        opts: &BuildOpts,
+        required_arch: Option<&str>,
+        on_line: &mut F,
+    ) -> Result<EngineRow>
+    where
+        F: FnMut(&str) + ?Sized,
+    {
         let tc = opts
             .toolchain
             .clone()
@@ -801,6 +841,7 @@ impl EngineManager {
                 &tag,
                 arch.as_deref(),
                 host_compiler.as_deref(),
+                required_arch,
                 on_line,
             )
             .await;
@@ -840,15 +881,23 @@ impl EngineManager {
     /// install pass (the live failure of 2026-09-09). Returns the
     /// installed digest, the retired old dir (for the caller's
     /// register/discard decision), and the lane identity.
-    async fn compile_source_lane(
+    // Eight inputs mirror the release-lane build contract (toolchain,
+    // options, identity, CUDA facts, the curated-lane architecture gate
+    // and the progress callback); grouping them would hide that parity.
+    #[allow(clippy::too_many_arguments)]
+    async fn compile_source_lane<F>(
         &self,
         tc: &Toolchain,
         opts: &BuildOpts,
         tag: &str,
         arch: Option<&str>,
         host_compiler: Option<&std::path::Path>,
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<(String, Option<PathBuf>, BuiltLane)> {
+        required_arch: Option<&str>,
+        on_line: &mut F,
+    ) -> Result<(String, Option<PathBuf>, BuiltLane)>
+    where
+        F: FnMut(&str) + ?Sized,
+    {
         let build_root =
             tempfile::TempDir::with_prefix("blazar-build-").context("create build tempdir")?;
         let (src, full_sha) = fetch_source(build_root.path(), tc, opts, tag, on_line).await?;
@@ -857,6 +906,20 @@ impl EngineManager {
         // capability currency the supervisor's unknown-arch re-route
         // consumes - and pin the lane's identity from it.
         let architectures = super::arch_miner::mine_architectures(&src);
+        if let Some(required) = required_arch {
+            anyhow::ensure!(
+                architectures.contains(required),
+                "curated lane {}@{} advertises architecture {required:?}, but its pinned source does not contain it in llama-arch.cpp - refusing to build/register an architecture-mismatched lane",
+                match &opts.source {
+                    BuildSource::Fork { repo, .. } => repo.as_str(),
+                    BuildSource::Upstream => LLAMA_CPP_REPO,
+                },
+                match &opts.source {
+                    BuildSource::Fork { ref_sha, .. } => ref_sha.as_str(),
+                    BuildSource::Upstream => tag,
+                },
+            );
+        }
         let (engine_tag, mut provenance) = lane_identity(
             &opts.source,
             tag,
@@ -952,11 +1015,14 @@ async fn cuda_build_facts(
 /// want-refs; the commits API happily resolves short forms. Returns
 /// `None` when the pin is already full-length (or not a fork at all),
 /// so the caller can keep borrowing the original `BuildOpts`.
-async fn resolve_fork_pin(
+async fn resolve_fork_pin<F>(
     gh: &super::gh::GhClient,
     source: &BuildSource,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<Option<BuildSource>> {
+    on_line: &mut F,
+) -> Result<Option<BuildSource>>
+where
+    F: FnMut(&str) + ?Sized,
+{
     let BuildSource::Fork {
         repo,
         ref_sha,
@@ -1137,13 +1203,16 @@ async fn query_compute_caps(tc: &Toolchain) -> Result<String> {
 /// origin (no local ref exists for an arbitrary commit), detach onto
 /// `FETCH_HEAD`, verify the checkout matches the pin, then init
 /// submodules - a no-op when the fork carries none.
-async fn fetch_source(
+async fn fetch_source<F>(
     build_root: &Path,
     tc: &Toolchain,
     opts: &BuildOpts,
     tag: &str,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<(PathBuf, Option<String>)> {
+    on_line: &mut F,
+) -> Result<(PathBuf, Option<String>)>
+where
+    F: FnMut(&str) + ?Sized,
+{
     if let Some(s) = &opts.source_dir {
         // Fixture trees often have no .git; provenance is best-effort.
         let full = git_rev_parse(tc, s).await.ok();
@@ -1291,13 +1360,16 @@ async fn git_remote_slug(tc: &Toolchain, dir: &Path) -> Option<String> {
 /// siblings in `build/bin` (verified live: the 17 KiB thin binaries
 /// resolve them via an `$ORIGIN` rpath, so the whole directory must
 /// travel together, symlink chains included).
-fn install_built_binaries(
+fn install_built_binaries<F>(
     dirs: &BlazarDirs,
     bld: &Path,
     engine_tag: &str,
     rpc: bool,
-    on_line: &mut dyn FnMut(&str),
-) -> Result<(PathBuf, String)> {
+    on_line: &mut F,
+) -> Result<(PathBuf, String)>
+where
+    F: FnMut(&str) + ?Sized,
+{
     let dir = dirs.engines_dir().join(engine_tag);
     // The caller retires any existing copy first (rollback-safe swap);
     // merging into a live dir would leave stale files behind.
@@ -1596,6 +1668,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn unit__cmake_args__cuda_vs_cpu() {
         let cuda = cmake_configure_args(
             BuildBackend::Cuda,

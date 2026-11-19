@@ -338,6 +338,110 @@ async fn integration__build_rejects__non_btag_and_local_tag_safety() {
     assert_ne!(LOCAL_TAG, "b4242-cpu");
 }
 
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__curated_fork__never_activates_when_no_engine_row_exists() {
+    let (tmp, dirs) = tmp_dirs();
+    let bin_dir = tmp.path().join("bins");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let tc = Toolchain {
+        git: Some(stub_git(&bin_dir)),
+        cmake: Some(stub_cmake(&bin_dir, "")),
+        cxx: Some(bin_dir.join("g++")),
+        nvcc: None,
+        nvidia_smi: None,
+        compiler_cache: None,
+    };
+    std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
+
+    let full_sha = "7c81a9f0".repeat(5);
+    let mut o = opts(BuildBackend::Cpu, "curated-test");
+    o.source = blazar_runtime::engine::build::BuildSource::Fork {
+        repo: "acme/llama.cpp".into(),
+        ref_sha: full_sha,
+        base_ref: None,
+    };
+    o.source_dir = Some(source_tree(tmp.path()));
+    o.toolchain = Some(tc);
+    o.trust = blazar_runtime::engine::manifest::TrustTier::Curated;
+    set_env("STUB_SERVER", stub_server_bin());
+
+    assert!(
+        Store::open(&dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .is_none(),
+        "test starts with no active engine"
+    );
+    let row = manager(&dirs)
+        .build_and_install(&o, &mut |_| {})
+        .await
+        .unwrap();
+
+    assert!(!row.active, "curated fork must be registered additively");
+    assert!(
+        Store::open(&dirs)
+            .unwrap()
+            .active_engine()
+            .unwrap()
+            .is_none(),
+        "curated fork must not become the global active engine"
+    );
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__curated_build__rejects_registry_arch_not_present_in_pinned_source() {
+    let (tmp, dirs) = tmp_dirs();
+    let bin_dir = tmp.path().join("bins");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let tc = Toolchain {
+        git: Some(stub_git(&bin_dir)),
+        cmake: Some(stub_cmake(&bin_dir, "")),
+        cxx: Some(bin_dir.join("g++")),
+        nvcc: None,
+        nvidia_smi: None,
+        compiler_cache: None,
+    };
+    std::fs::write(bin_dir.join("g++"), "#!/bin/sh\nexit 0").unwrap();
+
+    // Mirror the production caller: curated lanes build from a Fork
+    // source (pinned SHA, no b-tag currency), so the flow reaches the
+    // architecture-mining rejection instead of the upstream tag gate.
+    let mut o = opts(BuildBackend::Cpu, "capability-test");
+    o.source = blazar_runtime::engine::build::BuildSource::Fork {
+        repo: "acme/llama.cpp".into(),
+        ref_sha: "7c81a9f0".repeat(5),
+        base_ref: None,
+    };
+    o.source_dir = Some(source_tree(tmp.path()));
+    o.toolchain = Some(tc);
+    o.trust = blazar_runtime::engine::manifest::TrustTier::Curated;
+
+    let mut lines = Vec::new();
+    let err = manager(&dirs)
+        .build_and_install_for_arch(&o, "not_in_pinned_source", &mut |line| {
+            lines.push(line.to_string());
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("does not contain it"), "{err}");
+    assert!(
+        !lines.iter().any(|line| line.starts_with("configuring")),
+        "CMake must not run before the source proves the required architecture"
+    );
+    assert!(
+        Store::open(&dirs)
+            .unwrap()
+            .list_engines()
+            .unwrap()
+            .is_empty(),
+        "a metadata-mismatched lane must never be registered"
+    );
+}
 #[test]
 #[allow(non_snake_case)]
 fn unit__parse_fork_spec__accepts_slug_at_sha() {
