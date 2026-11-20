@@ -7361,10 +7361,9 @@ mod tests {
         )
         .expect("minimal stdio server parses");
         assert!(absent_stdio.env_clear.is_none());
-        let absent_url = toml::from_str::<McpServer>(
-            "name = \"srv\"\nurl = \"http://127.0.0.1:8808/mcp\"",
-        )
-        .expect("minimal url server parses");
+        let absent_url =
+            toml::from_str::<McpServer>("name = \"srv\"\nurl = \"http://127.0.0.1:8808/mcp\"")
+                .expect("minimal url server parses");
         assert!(absent_url.env_clear.is_none());
         // Explicit legacy opt-out still parses.
         let inherit = toml::from_str::<McpServer>(
@@ -7382,7 +7381,8 @@ mod tests {
         // on an EXPLICIT env_clear (sandbox options are stdio-only).
         let mut cfg = Config::default();
         cfg.mcp.push(absent_url);
-        cfg.validate().expect("url server without env_clear is valid");
+        cfg.validate()
+            .expect("url server without env_clear is valid");
     }
 
     #[test]
