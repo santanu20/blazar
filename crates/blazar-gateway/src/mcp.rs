@@ -214,16 +214,12 @@ impl Registry {
         }
     }
 
-    /// Resolve the tools of every selected server, spawning (or
-    /// respawning) sessions as needed.
-    async fn catalog(&self, sel: &str) -> Result<Vec<McpTool>, String> {
-        let names: Vec<String> = if sel == "all" {
-            let mut n = self.configured_names();
-            n.sort();
-            n
-        } else {
-            vec![sel.to_string()]
-        };
+    /// Spawn (or reuse) sessions for an explicit server-name list and
+    /// collect their tools. The caller owns name resolution AND key
+    /// scoping - authorization must precede spawning, so the mediated
+    /// chat loop pre-filters the names it passes here (an unauthorized
+    /// server is never started just to have its tools filtered away).
+    async fn catalog_scoped(&self, names: Vec<String>) -> Result<Vec<McpTool>, String> {
         let mut tools = Vec::new();
         for name in names {
             let entry = self
@@ -1235,20 +1231,46 @@ pub(crate) async fn chat_via_mcp(
     sel: &str,
     key: Option<&crate::keys::KeyCtx>,
 ) -> Result<reqwest::Response, Response> {
-    // Authorization precedes spawning: a named selector the key has no
-    // rights to must refuse BEFORE catalog() spawns or initializes the
-    // server - the caller never pays (or triggers) the subprocess cost.
-    if sel != "all"
-        && let Err((code, msg)) = crate::keys::mcp_server_permits(&state.keys, key, sel)
-    {
-        return Err(teaching_error(
-            StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
-            &msg,
-        ));
-    }
+    // Authorization precedes spawning for EVERY selector shape: a
+    // named selector the key has no rights to must refuse BEFORE
+    // catalog() spawns or initializes the server, and "all" is
+    // narrowed to the servers the key may see BEFORE anything spawns.
+    // Pre-filtering the names (instead of spawning everything and
+    // retaining tools afterward) means an unauthorized server never
+    // pays the subprocess cost and never runs at all.
+    let selected: Vec<String> = if sel == "all" {
+        let mut names: Vec<String> = state
+            .mcp
+            .configured_names()
+            .into_iter()
+            .filter(|n| crate::keys::mcp_server_permits(&state.keys, key, n).is_ok())
+            .collect();
+        names.sort();
+        if names.is_empty() {
+            let names = state.mcp.configured_names().join(", ");
+            let who = key.map_or_else(|| "the caller".to_string(), |k| format!("key '{}'", k.name));
+            return Err(teaching_error(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "mcp selection resolved 0 tool(s) but {who} is not scoped \
+                     for any of their servers; configured servers: [{names}]; widen the \
+                     key's mcp_servers allowlist or clear the mcp selector"
+                ),
+            ));
+        }
+        names
+    } else {
+        if let Err((code, msg)) = crate::keys::mcp_server_permits(&state.keys, key, sel) {
+            return Err(teaching_error(
+                StatusCode::from_u16(code).unwrap_or(StatusCode::FORBIDDEN),
+                &msg,
+            ));
+        }
+        vec![sel.to_string()]
+    };
     let tools = state
         .mcp
-        .catalog(sel)
+        .catalog_scoped(selected)
         .await
         .map_err(|e| teaching_error(StatusCode::BAD_REQUEST, &e))?;
     // Key-scoped servers never reach the prompt: their tool definitions

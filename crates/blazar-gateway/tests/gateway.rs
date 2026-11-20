@@ -6037,6 +6037,123 @@ async fn e2e__mcp__per_key_server_allowlist_gates_the_tool_loop() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// The "all" selector must narrow to the key's server allowlist BEFORE
+/// anything spawns: a key scoped to one server of several gets only
+/// that server's process started, and a key scoped to none is refused
+/// outright without a single subprocess. Marker files prove spawn (or
+/// its absence) on both legs.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__mcp__all_selector_spawns_only_permitted_servers() {
+    use blazar_core::ApiKey;
+    use blazar_core::config::McpServer;
+
+    let dir = std::env::temp_dir().join("blazar-e2e-mcp-all-selector");
+    std::fs::create_dir_all(&dir).expect("marker dir");
+    let marker = |name: &str| dir.join(format!("{name}.marker"));
+    for name in ["permitted", "secret"] {
+        let _ = std::fs::remove_file(marker(name));
+    }
+    let stub = |name: &str| {
+        let path = marker(name).to_string_lossy().into_owned();
+        let (command, mut env) = mcp_stub_command(
+            &format!("touch {path}; exit 0"),
+            "New-Item -ItemType File -Force -Path $env:BLZ_MARKER | Out-Null",
+        );
+        if cfg!(windows) {
+            env.insert("BLZ_MARKER".into(), path);
+        }
+        McpServer {
+            name: name.into(),
+            command,
+            url: None,
+            env,
+            timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
+        }
+    };
+    let cfg = Config {
+        keys: vec![
+            ApiKey {
+                name: "tooluser".into(),
+                key: "plm_tooluser".into(),
+                mcp_servers: vec!["permitted".into()],
+                ..ApiKey::default()
+            },
+            ApiKey {
+                name: "noaccess".into(),
+                key: "plm_noaccess".into(),
+                mcp_servers: vec!["elsewhere".into()],
+                ..ApiKey::default()
+            },
+        ],
+        mcp: vec![stub("permitted"), stub("secret")],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    // No-access leg: "all" resolves to nothing for this key -> 403
+    // teaching, and NOT ONE server process was spawned.
+    let refused = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_noaccess")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "all",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "empty permitted set refuses");
+    let v: serde_json::Value = refused.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("not scoped") && msg.contains("noaccess"),
+        "teaching names the key: {msg}"
+    );
+    assert!(
+        !marker("permitted").exists() && !marker("secret").exists(),
+        "refused 'all' must not spawn any server"
+    );
+
+    // Scoped leg: "all" spawns ONLY the permitted server (marker
+    // touched), which then fails MCP init fast -> teaching 400 naming
+    // it. The unpermitted server never runs.
+    let engaged = c
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_tooluser")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "all",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(engaged.status(), 400, "init failure teaches, not 5xx");
+    let v: serde_json::Value = engaged.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("permitted"),
+        "failure names the engaged server: {msg}"
+    );
+    assert!(marker("permitted").exists(), "permitted server engages");
+    assert!(
+        !marker("secret").exists(),
+        "'all' must not spawn servers outside the key's allowlist"
+    );
+
+    for name in ["permitted", "secret"] {
+        let _ = std::fs::remove_file(marker(name));
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 /// Tool-level MCP scoping end-to-end, against a stdio stub that speaks
 /// enough JSON-RPC to list two tools (`read_file`, `write_file`) and
 /// answer `tools/call` by echoing the called tool's name.
