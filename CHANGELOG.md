@@ -4,7 +4,7 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
-## [Unreleased]
+## [0.34.0] - 2026-11-20
 
 ### Changed
 - **Curated capability-lane rescue is on by default.** `capability_lane_auto_install` now defaults to `true`: an unknown-architecture GGUF load failure builds the matching active curated registry lane in the background (still registry-only, immutable-SHA, architecture-verified before CMake, one build at a time, additive registration). Set `capability_lane_auto_install = false` to opt out - the build compiles third-party source and can consume substantial CPU, disk, and time on first rescue.
