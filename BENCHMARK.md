@@ -4,8 +4,8 @@ _Rendered 2026-11-20-v0.33-wave-final; blazar 0.33.0; power state of gateway row
 
 > **Provenance and publication.** This file is machine-rendered by
 > `scripts/bench_matrix.py`; the label above identifies the campaign of the
-> LAST RENDER (here the 2026-09-29 flagship pass on blazar 0.13.0), not
-> necessarily the newest campaign. Every campaign's receipts, engine builds,
+> LAST RENDER, not necessarily the newest campaign. Every campaign's
+> receipts, engine builds,
 > and blazar versions are catalogued per artifact directory:
 > [`bench-artifacts/INDEX.md`](bench-artifacts/INDEX.md) carries one row per
 > matrix-rendered campaign, and ad-hoc audit sessions carry a committed
