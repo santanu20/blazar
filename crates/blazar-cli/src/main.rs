@@ -942,13 +942,18 @@ enum KvCmd {
     },
     /// Report reclaimable KV debris: session dirs no live model owns,
     /// empty session dirs, identity manifests whose bank is gone.
-    /// Report-only - `--dry-run` is required; this release deletes
-    /// nothing.
+    /// `--dry-run` prints the orphan report; `--apply` moves the
+    /// listed orphans into a timestamped trash directory under
+    /// `sessions/.gc-trash/` (nothing is hard-deleted - reclaim the
+    /// space by removing the trash dir once the reasons check out).
     Gc {
-        /// Print the orphan report (always required: nothing is ever
-        /// deleted by this command in this release)
+        /// Print the orphan report without touching anything
         #[arg(long)]
         dry_run: bool,
+        /// Move the reported orphans into `sessions/.gc-trash/<ts>/`
+        /// (a backup, not a delete; remove the trash dir to reclaim)
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
     },
 }
 
@@ -4220,8 +4225,8 @@ fn kv_cmd(cmd: KvCmd) -> Result<()> {
             print!("{out}");
             Ok(())
         }
-        KvCmd::Gc { dry_run } => {
-            let out = kv_gc_cmd(&dirs(), dry_run)?;
+        KvCmd::Gc { dry_run, apply } => {
+            let out = kv_gc_cmd(&dirs(), dry_run, apply)?;
             print!("{out}");
             Ok(())
         }
@@ -4443,11 +4448,11 @@ fn kv_inspect_cmd(d: &BlazarDirs, model: &str, json: bool) -> Result<String> {
 /// dirs no live model owns, empty session dirs, identity manifests
 /// whose bank is gone. Report-only in this release: the command
 /// refuses to run without `--dry-run` and deletes nothing either way.
-fn kv_gc_cmd(d: &BlazarDirs, dry_run: bool) -> Result<String> {
+fn kv_gc_cmd(d: &BlazarDirs, dry_run: bool, apply: bool) -> Result<String> {
     use blazar_runtime::kv::inventory;
-    if !dry_run {
+    if !dry_run && !apply {
         anyhow::bail!(
-            "kv gc is report-only in this release - pass --dry-run for the orphan report"
+            "kv gc needs --dry-run (orphan report) or --apply (move orphans into sessions/.gc-trash/)"
         );
     }
     let store = Store::open(d)?;
@@ -4480,14 +4485,88 @@ fn kv_gc_cmd(d: &BlazarDirs, dry_run: bool) -> Result<String> {
     )
     .unwrap();
     let total: u64 = orphans.iter().map(|o| o.bytes).sum();
+    if dry_run {
+        writeln!(
+            out,
+            "\nreclaimable: {} across {} item(s) - report-only: nothing was deleted \
+             (remove the paths yourself once the reasons check out, or rerun with --apply)",
+            humansize(i64::try_from(total).unwrap_or(i64::MAX)),
+            orphans.len(),
+        )
+        .unwrap();
+        return Ok(out);
+    }
+    let applied = kv_gc_apply(&d.data_dir, &orphans)?;
+    write!(out, "{applied}").unwrap();
+    Ok(out)
+}
+
+/// The `kv gc --apply` leg: move every reported orphan into a
+/// timestamped trash directory under `sessions/` (same filesystem, so
+/// each rename is atomic; the leading dot keeps the scanner blind to
+/// it). Nothing is hard-deleted - the trash dir is the undo until the
+/// operator removes it. Any move failure fails the command loudly with
+/// the per-item report already in hand.
+fn kv_gc_apply(
+    data_dir: &std::path::Path,
+    orphans: &[blazar_runtime::kv::inventory::OrphanKv],
+) -> Result<String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let trash_root = data_dir
+        .join("sessions")
+        .join(".gc-trash")
+        .join(ts.to_string());
+    std::fs::create_dir_all(&trash_root)?;
+    let mut out = String::new();
+    let mut moved = 0u64;
+    let mut moved_bytes = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+    for o in orphans {
+        let name = o.path.file_name().map_or_else(
+            || o.path.display().to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        let mut target = trash_root.join(&name);
+        let mut n = 1;
+        while target.exists() {
+            target = trash_root.join(format!("{name}-{n}"));
+            n += 1;
+        }
+        match std::fs::rename(&o.path, &target) {
+            Ok(()) => {
+                moved += 1;
+                moved_bytes += o.bytes;
+            }
+            Err(e) => failures.push(format!("{}: {e}", o.path.display())),
+        }
+    }
     writeln!(
         out,
-        "\nreclaimable: {} across {} item(s) - report-only: nothing was deleted \
-         (remove the paths yourself once the reasons check out)",
-        humansize(i64::try_from(total).unwrap_or(i64::MAX)),
-        orphans.len(),
+        "\nmoved {} item(s) ({}) into {}",
+        moved,
+        humansize(i64::try_from(moved_bytes).unwrap_or(i64::MAX)),
+        trash_root.display(),
     )
     .unwrap();
+    if !failures.is_empty() {
+        writeln!(out, "failed to move {} item(s):", failures.len()).unwrap();
+        for f in &failures {
+            writeln!(out, "  {f}").unwrap();
+        }
+    }
+    writeln!(
+        out,
+        "reclaim the space by removing the trash dir once the reasons check out (this command never hard-deletes)"
+    )
+    .unwrap();
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} orphan(s) could not be moved - see the report above",
+        failures.len()
+    );
     Ok(out)
 }
 
@@ -36170,22 +36249,22 @@ engine = "sglang"
     }
 
     /// `kv gc` without `--dry-run` is a hard refusal, not a silent
-    /// no-op: the teaching names the flag and the report-only contract.
+    /// no-op: the teaching names both flags.
     #[test]
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected
-    fn unit__kv_gc_cmd__refuses_without_dry_run_and_teaches() {
+    fn unit__kv_gc_cmd__refuses_without_a_mode_and_teaches() {
         let root = tempfile::tempdir().unwrap();
         let d = card_test_dirs(root.path());
-        let err = kv_gc_cmd(&d, false).unwrap_err().to_string();
+        let err = kv_gc_cmd(&d, false, false).unwrap_err().to_string();
         assert!(
-            err.contains("report-only") && err.contains("--dry-run"),
+            err.contains("--dry-run") && err.contains("--apply"),
             "teaching refusal, got: {err}"
         );
     }
 
     /// The dry-run report lists orphaned session dirs with sizes and
     /// reasons, sums the reclaimable bytes, and states that nothing
-    /// was deleted - the report-only contract is part of the output.
+    /// was deleted - the report never mutates the store.
     #[test]
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__kv_gc_cmd__dry_run_reports_orphans_without_deleting() {
@@ -36194,13 +36273,54 @@ engine = "sglang"
         let sessions = d.data_dir.join("sessions").join("ghost-70aa2f7e");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("_auto-4096"), b"stale").unwrap();
-        let out = kv_gc_cmd(&d, true).unwrap();
+        let out = kv_gc_cmd(&d, true, false).unwrap();
         assert!(out.contains("ghost-70aa2f7e"), "{out}");
         assert!(out.contains("no live model owns"), "{out}");
         assert!(out.contains("reclaimable:"), "{out}");
         assert!(out.contains("report-only: nothing was deleted"), "{out}");
         // The debris stays on disk - the report never mutates.
         assert!(sessions.join("_auto-4096").exists());
+    }
+
+    /// `--apply` moves the reported orphans into a timestamped trash
+    /// dir (never a hard delete), leaves live-model banks untouched,
+    /// and a follow-up scan comes back clean.
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__kv_gc_cmd__apply_moves_orphans_to_trash_and_spares_live_banks() {
+        let root = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(root.path());
+        let s = blazar_core::Store::open(&d).unwrap();
+        s.upsert_model(&kv_test_model("live-m")).unwrap();
+        let sessions = d.data_dir.join("sessions");
+        let live = sessions.join(blazar_core::profile::path_safe("live-m"));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("_auto-4096"), b"bank!").unwrap();
+        let ghost = sessions.join("ghost-70aa2f7e");
+        std::fs::create_dir_all(&ghost).unwrap();
+        std::fs::write(ghost.join("_auto-8192"), b"stale").unwrap();
+
+        let out = kv_gc_cmd(&d, false, true).unwrap();
+        assert!(out.contains("moved 1 item(s)"), "{out}");
+        assert!(out.contains(".gc-trash"), "{out}");
+        assert!(out.contains("never hard-deletes"), "{out}");
+
+        // The orphan moved into the trash dir with its contents; the
+        // live model's bank is exactly where it was.
+        let trash_root = sessions.join(".gc-trash");
+        let ts_dir = std::fs::read_dir(&trash_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(ts_dir.join("ghost-70aa2f7e").join("_auto-8192").exists());
+        assert!(!ghost.exists());
+        assert!(live.join("_auto-4096").exists());
+
+        // The scanner is blind to dot-dirs: a second pass is clean.
+        let names = vec!["live-m".to_string()];
+        assert!(blazar_runtime::kv::inventory::orphan_scan(&d.data_dir, &names).is_empty());
     }
 
     /// `kv status --json` walks the real session layout for live
