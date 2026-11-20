@@ -1094,6 +1094,7 @@ _COMMAND_ATTRS = {
     "engine.build": (False, False, True, True, False),
     "engine.install": (False, False, True, True, False),
     "engine.offers": (False, False, False, True, True),
+    "engine.card": (False, False, False, False, True),
     "lora.add": (False, False, False, False, True),
     "lora.rm": (False, False, False, False, True),
     "lora.list": (False, False, False, False, True),
@@ -1169,6 +1170,9 @@ _COMMAND_ATTRS = {
     "registry.sign": (False, False, False, False, True),
     "registry.verify": (False, False, False, False, True),
     "kv.import": (False, True, True, False, True),
+    "kv.status": (False, False, False, False, True),
+    "kv.inspect": (False, False, False, False, True),
+    "kv.gc": (False, False, False, False, True),
 }
 
 COMMANDS = [
