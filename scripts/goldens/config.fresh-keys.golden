@@ -15,6 +15,7 @@ cache_reuse
 cache_type
 cache_type_k
 cache_type_v
+capability_lane_auto_install
 check_tensors
 child_header_timeout_secs
 child_transport
@@ -65,9 +66,11 @@ image_min_tokens
 keep_tags
 keep_tokens
 keys
+kv
 kv_unified_per_slot
 late_chunking_max_tokens
 lazy_mode
+legacy_open_records
 load_mode
 logit_bias
 lora_init_without_apply
@@ -81,6 +84,7 @@ mmproj_auto
 mmproj_device
 mmproj_offload
 model_overrides
+model_pools
 moe_cache_cpu_share
 moe_cache_mib
 mtmd_batch_max_tokens
@@ -100,6 +104,7 @@ override_kv
 override_tensor
 pii_scrub
 poll
+pools_ops_persist
 port
 predictive_preload
 preload
@@ -116,6 +121,8 @@ reasoning_format
 remote_fallback
 remotes
 repack
+reserve_budgets
+reserve_default_tokens
 reuse_port
 router
 router_max_models
@@ -177,6 +184,7 @@ update_channel
 video_ffmpeg_dir
 video_fps
 video_timestamp_interval
+vllm
 warm_on_pull
 warm_peg
 warmup

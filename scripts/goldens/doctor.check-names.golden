@@ -16,6 +16,8 @@ keys
 kv budget llamacpp
 kv budget mistralrs
 kv budget mlx
+kv import
+kv translation
 manifest vocab
 modality coverage
 model types
@@ -41,3 +43,4 @@ versions mlx
 versions piper
 versions sdcpp
 versions sglang
+versions vllm

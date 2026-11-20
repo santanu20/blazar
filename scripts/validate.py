@@ -2209,7 +2209,7 @@ _K = [
     ),
     (
         "capability_lane_auto_install",
-        True,
+        False,
         False,
         "behavior",
         None,
@@ -10390,11 +10390,14 @@ def phase_wave() -> None:
     rargv: list[str] = []  # bound here so the cov() below survives the skip
     rpc_skip = not os.path.exists(rpc_srv_path)
     if rpc_skip:
-        check(
+        # Fork lanes and the CUDA asset deliberately build without the
+        # RPC backend (see F167); that is an asset-shape boundary, not
+        # a regression - the override leg only runs where the binary
+        # exists.
+        boundary(
             "wave",
             "rpc override leg (ggml-rpc-server present in asset)",
-            False,
-            f"{rpc_srv_path} missing - rpc override leg skipped (F164 guard)",
+            f"{rpc_srv_path} missing - asset ships without the RPC backend (F164/F167)",
         )
         d.start({"port": PORT}, floor_model=f_small)
         st = 0
@@ -13931,6 +13934,11 @@ def _full_toplevel() -> dict:
         "allow_unauthenticated_remote": False,
         # BLZ-1 legacy-sharing posture exercised explicitly on the
         # full-manifest boot; strict mode flips it negative-side.
+        "capability_lane_auto_install": True,
+        "capability_registry_pubkey": None,
+        # serialized empty = every vllm knob at its default; the key
+        # still counts for the (c0) membership gate
+        "vllm": None,
         "legacy_open_records": True,
         # strict token-budget lane exercised off (default advisory
         # accounting) here; gates phase proves the reservation refusal.
@@ -15543,6 +15551,7 @@ _FLAG_EVIDENCE: dict[str, dict[str, str]] = {
         "--model": "flag.why.--model",
         "--limit": "flag.why.--limit",
         "--flagged": "flag.why.--flagged",
+        "--prom": "flag.why.--prom",
         "--watch": "flag.why.--watch",
     },
 }
@@ -16181,6 +16190,13 @@ def phase_coverage() -> None:
             "flag.why.--limit",
             p.returncode == 0,
             f"rc={p.returncode} limited listing",
+        )
+        p = cli("why", "--prom", timeout=60)
+        reg(
+            "flag.why.--prom",
+            p.returncode == 0
+            and ("# HELP" in p.stdout or "# TYPE" in p.stdout),
+            f"rc={p.returncode} prometheus text exposition",
         )
         p = cli("why", "--model", MODEL, timeout=60)
         reg(

@@ -10,6 +10,7 @@ connect
 coreside
 cp
 create
+diagnose
 doctor
 drafts
 engine
@@ -20,6 +21,7 @@ import
 init
 join
 keys
+kv
 launch
 list
 login
@@ -30,11 +32,13 @@ mmproj
 model-doctor
 optimize
 plan
+pool
 prune
 ps
 pull
 push
 quantize
+registry
 replicate
 rm
 route
