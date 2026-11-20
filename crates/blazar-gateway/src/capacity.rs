@@ -382,6 +382,9 @@ pub(crate) async fn fit(
     let pick = recommended
         .and_then(|idx| census_rows.get(idx).cloned())
         .or(primary.clone());
+    // Captured before the destructure below moves `pick`: the
+    // parallelism advisor wants the picked card's free VRAM.
+    let pick_free_mib = pick.as_ref().map(|d| d.free_mib);
     let (device, free_mib, fits, max_ctx, max_ctx_q8, max_parallel) = if let Some(dev) = pick {
         let fits = demand_mib <= dev.free_mib;
         let max_ctx = ctx_ladder(weights_mib, kv, dev.free_mib, ctx_evaluated);
@@ -434,6 +437,96 @@ pub(crate) async fn fit(
                 })
             })
     };
+    let confidence = fit_confidence(!census_rows.is_empty(), calibration.as_ref());
+
+    // Media-job pressure from the durable ledger: running jobs already
+    // hold VRAM (the census free numbers include them), queued ones
+    // will contend when they spawn - the fit math never subtracts a
+    // reservation it cannot verify, so the pressure rides as a block
+    // plus notes instead.
+    let (media_jobs, media_notes) = {
+        let (running, queued) = state
+            .with_store(|s| {
+                (
+                    s.list_jobs(Some("running"), None, 1000, None)
+                        .unwrap_or_default(),
+                    s.list_jobs(Some("queued"), None, 1000, None)
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        let mut media_notes = Vec::new();
+        let block = media_jobs_block(&running, &queued);
+        if block["running"].as_u64().is_some_and(|n| n > 0) {
+            media_notes
+                .push("running media job(s) already hold VRAM the census reflects in free_mib");
+        }
+        if block["queued"].as_u64().is_some_and(|n| n > 0) {
+            media_notes.push("queued media job(s) will contend for VRAM when they spawn");
+        }
+        (block, media_notes)
+    };
+    notes.extend(media_notes);
+
+    // Parallelism advisory keyed off the lane that would actually
+    // serve this model (same shape resolution as /api/explain): its
+    // newest installed row's probed flag vocabulary gates every axis
+    // reported, so no combo is suggested the child would reject.
+    let parallelism = {
+        let serving = state.with_store(|s| {
+            let engines = s.list_engines().unwrap_or_default();
+            let kinds: Vec<blazar_core::engine_kind::EngineKind> =
+                engines.iter().map(|r| r.kind).collect();
+            let shape = blazar_core::engine_kind::FormatShape {
+                diffusion: row.has_component_set(),
+                shards: blazar_core::engine_kind::ShardFormat::detect(
+                    std::path::Path::new(&row.path).is_dir(),
+                    blazar_core::store::quantized_safetensors_signal(&row.name, "", &row.path),
+                    row.is_mlx(),
+                    row.is_litert_bundle(),
+                ),
+            };
+            let policy = state.cfg().engine_routing.policy;
+            let kind = blazar_core::engine_kind::EngineKind::route_format(shape, &kinds, policy);
+            (kind, engines)
+        });
+        let flags = serving.and_then(|(kind, engines)| {
+            kind.and_then(|k| {
+                engines
+                    .iter()
+                    .find(|r| r.kind == k)
+                    .and_then(|r| {
+                        serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest).ok()
+                    })
+                    .map(|m| m.flags)
+            })
+        });
+        flags.and_then(|flags| {
+            parallelism_advisor(
+                &flags,
+                census_rows.len(),
+                weights_mib,
+                kv_mib,
+                pick_free_mib,
+            )
+        })
+    };
+
+    // PD-disaggregation advisory: multi-GPU + sglang lane + long ctx.
+    let sglang_installed = state
+        .with_store(|s| {
+            s.list_engines().is_ok_and(|rows| {
+                rows.iter()
+                    .any(|r| r.kind == blazar_core::engine_kind::EngineKind::Sglang)
+            })
+        })
+        .unwrap_or(false);
+    let pd = pd_advisory(census_rows.len(), ctx_evaluated, sglang_installed);
+    if pd.is_some() {
+        notes.push(
+            "pd advisory: long-context multi-GPU prefill/decode disaggregation candidate - see pd_advisory",
+        );
+    }
 
     (
         StatusCode::OK,
@@ -454,10 +547,167 @@ pub(crate) async fn fit(
             "devices": devices,
             "recommended_device": recommended_device,
             "calibration": calibration,
+            "confidence": confidence,
+            "media_jobs": media_jobs,
+            "parallelism": parallelism,
+            "pd_advisory": pd,
             "notes": notes,
         })),
     )
         .into_response()
+}
+
+/// How much to trust this fit card: `measured` when this exact model
+/// has an observed load in the admission calibration, `estimated` when
+/// only the live census backs the math, `unavailable` when not even
+/// the census runs (non-NVIDIA boxes keep the arithmetic but carry no
+/// device truth).
+fn fit_confidence(census_present: bool, calibration: Option<&serde_json::Value>) -> &'static str {
+    match (census_present, calibration.is_some()) {
+        (_, true) => "measured",
+        (true, false) => "estimated",
+        (false, false) => "unavailable",
+    }
+}
+
+/// Job kinds that render on the GPU box outside the text lanes. The
+/// ledger also carries `doctor` / `responses` jobs - CPU-bound or
+/// gateway-local, they never contend for VRAM, so they stay out.
+const MEDIA_JOB_KINDS: [&str; 3] = ["image", "video", "audio"];
+
+/// Active media-job pressure for the fit card: running jobs already
+/// hold VRAM (the census `free_mib` reflects them), queued ones will
+/// contend when they spawn. Kinds are unique+sorted so the JSON is
+/// stable regardless of ledger row order.
+fn media_jobs_block(
+    running: &[blazar_core::store::JobRow],
+    queued: &[blazar_core::store::JobRow],
+) -> serde_json::Value {
+    fn media(rows: &[blazar_core::store::JobRow]) -> Vec<&blazar_core::store::JobRow> {
+        rows.iter()
+            .filter(|j| MEDIA_JOB_KINDS.contains(&j.kind.as_str()))
+            .collect()
+    }
+    let (run_m, queued_m) = (media(running), media(queued));
+    let mut kinds: Vec<&str> = run_m
+        .iter()
+        .chain(queued_m.iter())
+        .map(|j| j.kind.as_str())
+        .collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    serde_json::json!({
+        "running": run_m.len(),
+        "queued": queued_m.len(),
+        "kinds": kinds,
+    })
+}
+
+/// One parallelism axis the engine's own `--help` vocabulary verified.
+struct ParallelAxis {
+    key: &'static str,
+    flag: &'static str,
+}
+
+/// The axes the card reports, in the order the capability card scans
+/// them (same names, same `--` prefix - one vocabulary everywhere).
+const PARALLELISM_AXES: [ParallelAxis; 6] = [
+    ParallelAxis {
+        key: "tensor",
+        flag: "--tensor-parallel-size",
+    },
+    ParallelAxis {
+        key: "pipeline",
+        flag: "--pipeline-parallel-size",
+    },
+    ParallelAxis {
+        key: "data",
+        flag: "--data-parallel-size",
+    },
+    ParallelAxis {
+        key: "expert",
+        flag: "--expert-parallel-size",
+    },
+    ParallelAxis {
+        key: "context",
+        flag: "--context-parallel-size",
+    },
+    ParallelAxis {
+        key: "decode_context",
+        flag: "--decode-context-parallel-size",
+    },
+];
+
+/// Flag-verified parallelism advisory for the lane that would serve
+/// this model: which axes its build actually accepts, plus the
+/// even-split TP shard counts that would fit one card. `None` when
+/// the serving lane's flag vocabulary carries no parallelism axis at
+/// all (llama.cpp lanes today) - the card stays honestly absent
+/// instead of enumerating combos the child would reject at argv time.
+/// Estimates are even-split approximations; interconnect/communication
+/// cost is NOT modeled (no portable probe), and the note says so.
+fn parallelism_advisor(
+    flags: &std::collections::BTreeSet<String>,
+    n_devices: usize,
+    weights_mib: u64,
+    kv_mib: u64,
+    min_free_mib: Option<u64>,
+) -> Option<serde_json::Value> {
+    let supported: Vec<&ParallelAxis> = PARALLELISM_AXES
+        .iter()
+        .filter(|a| flags.contains(a.flag))
+        .collect();
+    if supported.is_empty() {
+        return None;
+    }
+    let axes: serde_json::Value = serde_json::Map::from_iter(
+        supported
+            .iter()
+            .map(|a| {
+                (
+                    a.key.to_string(),
+                    serde_json::json!({
+                        "flag": a.flag,
+                        "max_shards": n_devices,
+                    }),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into();
+    // Viable even-split TP shard counts: weights/tp + kv/tp + spawn
+    // overhead must fit one card's free VRAM. No census -> honest
+    // null (a guessed free number would drive real spawn decisions).
+    let viable_tp: Option<Vec<u64>> = min_free_mib.map(|free| {
+        (2..=n_devices as u64)
+            .filter(|&tp| weights_mib / tp + kv_mib / tp + FIT_SPAWN_OVERHEAD_MIB <= free)
+            .collect()
+    });
+    Some(serde_json::json!({
+        "axes": axes,
+        "viable_tp": viable_tp,
+        "note": "flag-verified only; even-split approximation; interconnect cost not modeled",
+    }))
+}
+
+/// Prefill/decode disaggregation advisory for long-context shapes on
+/// multi-GPU boxes with the sglang lane installed. Advisory ONLY -
+/// the supervised router owns room allocation once enabled (the
+/// gateway never invents rooms; pd.rs boundary), and real KV transfer
+/// needs the mooncake/nixl wheel. Single-GPU or short-context boxes
+/// get an honest null, not a hedge.
+fn pd_advisory(n_devices: usize, ctx: u64, sglang_installed: bool) -> Option<serde_json::Value> {
+    if n_devices < 2 || !sglang_installed || ctx < 8192 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "candidate": true,
+        "gpus": n_devices,
+        "ctx": ctx,
+        "why": "long-context prefill on a multi-GPU box with the sglang lane installed",
+        "config": "sglang.disagg_pair = true (supervised router; KV transfer needs the mooncake/nixl wheel)",
+        "caveat": "advisory only - consult /api/route before enabling",
+    }))
 }
 
 #[cfg(test)]
@@ -543,5 +793,112 @@ mod tests {
         assert_eq!(rec, None);
         assert!(rows.iter().all(|r| r["fits"] == serde_json::json!(false)));
         assert!(rows.iter().all(|r| r["max_ctx"] == serde_json::json!(0)));
+    }
+
+    #[test]
+    fn unit__fit_confidence__tiers() {
+        // Calibration sample outranks census: a measured prediction
+        // error exists for this model.
+        assert_eq!(
+            fit_confidence(true, Some(&serde_json::json!({"error_pct": 4.2}))),
+            "measured"
+        );
+        // Census without calibration: honest estimate.
+        assert_eq!(fit_confidence(true, None), "estimated");
+        // No census at all: nothing was measured on this box.
+        assert_eq!(fit_confidence(false, None), "unavailable");
+        assert_eq!(
+            fit_confidence(false, Some(&serde_json::json!({}))),
+            "measured"
+        );
+    }
+
+    fn job_row(kind: &str, state: &str) -> blazar_core::store::JobRow {
+        blazar_core::store::JobRow {
+            id: format!("j-{kind}-{state}"),
+            kind: kind.to_string(),
+            model: None,
+            state: state.to_string(),
+            request_json: String::new(),
+            result_json: None,
+            error: None,
+            artifact_path: None,
+            owner: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn unit__media_jobs_block__counts_media_kinds_only() {
+        // doctor/responses jobs are gateway bookkeeping, not media
+        // pressure - they must not inflate the VRAM-contention counts.
+        let running = [
+            job_row("image", "running"),
+            job_row("video", "running"),
+            job_row("doctor", "running"),
+        ];
+        let queued = [job_row("audio", "queued"), job_row("responses", "queued")];
+        let block = media_jobs_block(&running, &queued);
+        assert_eq!(block["running"], serde_json::json!(2));
+        assert_eq!(block["queued"], serde_json::json!(1));
+        assert_eq!(
+            block["kinds"],
+            serde_json::json!(["audio", "image", "video"])
+        );
+        // Nothing active: zero counts, empty kinds - not nulls (the
+        // ledger WAS consulted).
+        let empty = media_jobs_block(&[], &[]);
+        assert_eq!(empty["running"], serde_json::json!(0));
+        assert_eq!(empty["kinds"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn unit__parallelism_advisor__flag_gated_axes_and_viable_tp() {
+        let mut flags = std::collections::BTreeSet::new();
+        flags.insert("--tensor-parallel-size".to_string());
+        flags.insert("--context-parallel-size".to_string());
+        // weights 10000, kv 0, free 5800: tp2 5000+700 fits, tp3
+        // 3333+700 fits, tp4 2500+700 fits -> [2, 3, 4].
+        let card = parallelism_advisor(&flags, 4, 10_000, 0, Some(5800)).unwrap();
+        assert_eq!(
+            card["axes"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["context", "tensor"],
+            "only flag-verified axes appear, scanned order"
+        );
+        assert_eq!(card["axes"]["tensor"]["flag"], "--tensor-parallel-size");
+        assert_eq!(card["axes"]["tensor"]["max_shards"], serde_json::json!(4));
+        assert_eq!(card["viable_tp"], serde_json::json!([2, 3, 4]));
+        // No census: axes still reported, viable_tp honestly null.
+        let no_census = parallelism_advisor(&flags, 4, 10_000, 0, None).unwrap();
+        assert_eq!(no_census["viable_tp"], serde_json::json!(null));
+        // Tight card: only tp4's shard fits.
+        let tight = parallelism_advisor(&flags, 4, 10_000, 0, Some(3300)).unwrap();
+        assert_eq!(tight["viable_tp"], serde_json::json!([4]));
+        // A lane with no parallelism flag vocabulary (llama.cpp today)
+        // gets no card at all - never a guessed axis list.
+        let mut none = std::collections::BTreeSet::new();
+        none.insert("--ctx-size".to_string());
+        assert!(parallelism_advisor(&none, 4, 10_000, 0, Some(5800)).is_none());
+    }
+
+    #[test]
+    fn unit__pd_advisory__requires_multi_gpu_long_ctx_sglang() {
+        // All three gates must hold: multi-GPU, long context, sglang.
+        assert!(pd_advisory(1, 16_384, true).is_none(), "single GPU");
+        assert!(pd_advisory(4, 4096, true).is_none(), "short context");
+        assert!(pd_advisory(4, 16_384, false).is_none(), "no sglang lane");
+        let advisory = pd_advisory(4, 16_384, true).unwrap();
+        assert_eq!(advisory["candidate"], serde_json::json!(true));
+        assert_eq!(advisory["gpus"], serde_json::json!(4));
+        assert_eq!(advisory["ctx"], serde_json::json!(16_384));
+        let config = advisory["config"].as_str().unwrap();
+        assert!(config.contains("disagg_pair"), "{config}");
+        assert!(
+            advisory["caveat"]
+                .as_str()
+                .unwrap()
+                .contains("advisory only")
+        );
     }
 }
