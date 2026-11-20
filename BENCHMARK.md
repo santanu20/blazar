@@ -1,32 +1,30 @@
 # Blazar inference benchmark
 
-_Rendered 20260929-flagship-gguf; blazar 0.13.0; power state of gateway rows: ac._
+_Rendered 2026-11-20-v0.33-wave-final; blazar 0.33.0; power state of gateway rows: ac._
 
 ## Executive summary
 
-- v0.9.4: gateway 18.9 vs direct 21.4 t/s (-11.7%)
-- v0.9.4 prompt-cache prefill 241 vs 243 t/s cold
-- b11202-cuda sweep C=1/2/4/8/16: C1: 40.0 t/s system (4x65536); C2: 65.9 t/s system (4x65536); C4: 104.8 t/s system (4x65536); C8: 102.7 t/s system (4x65536); C16: 103.4 t/s system (4x65536)
-- v0.9.4 sweep C=1/8/16: C1: 18.6 t/s system (engine-scheduled); C8: 25.0 t/s system (engine-scheduled); C16: 16.1 t/s system (engine-scheduled)
-- ITL p99 51.22 ms vs ollama 75.01 ms (1.5x tighter)
-- tool-call TTFT p50 117 ms vs ollama 284 ms (2.4x)
-- adaptive reshape under sustained load: slots 4->8, 49.1->63.0 t/s while serving, zero failed requests
-- greedy determinism: direct 20/20 exact, gateway transparency 7/20 exact at temp 0 (divergence = multi-slot batching numerics, not translation drift)
+- v0.9.5 prompt-cache prefill 19356 vs 17079 t/s cold
+- fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda sweep C=4: C4: 445.5 t/s system (2x32768)
+- ITL p99 5.75 ms vs ollama 4.01 ms (0.7x tighter)
+- tool-call TTFT p50 14 ms vs ollama 291 ms (20.6x)
+- adaptive reshape under sustained load: slots 2->16, 842.5->1629.3 t/s while serving, zero failed requests
+- greedy determinism: direct 20/20 exact, gateway transparency 12/20 exact at temp 0 (divergence = multi-slot batching numerics, not translation drift)
 - gateway cold boot 0.52 s
-- cold TTFT 8495 ms vs ollama 4404 ms (0.5x)
-- idle wake 3627 ms (sleep) vs ollama 6212 ms (full reload)
-- evict-ladder wake 4478 ms (full respawn still beats ollama's reload)
+- cold TTFT 3292 ms vs ollama 1995 ms (0.6x)
+- idle wake 32 ms (sleep) vs ollama 2326 ms (full reload)
+- evict-ladder wake 1547 ms (full respawn still beats ollama's reload)
 
 ## Measured in this campaign
 
-- blazar: 32 cell(s)
+- blazar: 31 cell(s)
 - cold-ollama: 1 cell(s)
-- conc-blazar: 10 cell(s)
-- conc-direct: 5 cell(s)
-- conc-ollama: 5 cell(s)
+- conc-blazar: 2 cell(s)
+- conc-direct: 1 cell(s)
+- conc-ollama: 1 cell(s)
 - ctxcurve-blazar: 6 cell(s)
 - ctxcurve-ollama: 3 cell(s)
-- direct: 13 cell(s)
+- direct: 12 cell(s)
 - features: 2 cell(s)
 - greedy: 2 cell(s)
 - greedy_gw: 1 cell(s)
@@ -40,19 +38,30 @@ _Rendered 20260929-flagship-gguf; blazar 0.13.0; power state of gateway rows: ac
 - media-whisper: 1 cell(s)
 - ollama: 1 cell(s)
 - ppl: 2 cell(s)
+- quality: 2 cell(s)
+- quality-direct: 2 cell(s)
+- quality-ollama: 1 cell(s)
 - reshape: 2 cell(s)
 - tools: 2 cell(s)
 - tools-ollama: 1 cell(s)
 
 ## Engine coverage
 
+_Engine selection policy: latest installed version per engine kind._
 | Engine | Kind | Lane | ok cells | err cells | Status |
 |---|---|---|---:|---:|---|
-| v0.9.4 | mistralrs | text (direct + gateway) | 30 | 1 | benchmarked |
-| b5130 | whisper | media | 1 | 0 | benchmarked |
-| b11202-cuda | llamacpp | text (direct + gateway) | 49 | 0 | benchmarked |
-| master-920-2f88688 | sdcpp | media | 5 | 0 | benchmarked |
-| sglang-0.5.19 | - | - | 0 | 0 | excluded: model-format sweep: this campaign sweeps a GGUF file; sglang serves HF safetensors checkpoints (rerun with --model <safetensors-row>) |
+| 2023.11.14-2 | piper | media (tts) | 0 | 2 | attempted, all cells errored (see cells.jsonl) |
+| b5454 | whisper | media | 0 | 1 | attempted, all cells errored (see cells.jsonl) |
+| mlx-0.32.2 | mlx | text (direct venv + gateway) | 0 | 0 | model-format sweep: GGUF/safetensors campaign; this lane serves MLX-layout checkpoints (rerun with --model <mlx-row>) |
+| v0.9.5 | mistralrs | text (direct + gateway) | 7 | 21 | benchmarked |
+| master-1043-3be2378 | sdcpp | media | 2 | 3 | benchmarked |
+| sglang-0.5.23 | sglang | text (direct venv + gateway) | 0 | 0 | no cells in this campaign |
+| litert-0.19.2 | openaihost | text (direct venv + gateway) | 0 | 0 | model-format sweep: GGUF/safetensors campaign; this lane serves .litertlm bundles (rerun with --model <litertlm-row>) |
+| fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | llamacpp | text (direct + gateway) | 42 | 0 | benchmarked |
+| b12521-cuda | - | - | 0 | 0 | excluded: latest-per-kind policy: superseded by fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda |
+| fork-AtomicBot-ai_atomic-llama-cpp-turboquant-8d935078-cuda | - | - | 0 | 0 | excluded: latest-per-kind policy: superseded by fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda |
+| kokoro-1.0 | - | - | 0 | 0 | excluded: kind 'kokoro' has no bench lane in this harness |
+| vllm-0.34.0 | - | - | 0 | 0 | excluded: kind 'vllm' has no bench lane in this harness |
 
 ## Test bed
 
@@ -63,8 +72,8 @@ _Rendered 20260929-flagship-gguf; blazar 0.13.0; power state of gateway rows: ac
 | Integrated GPU | Intel Graphics (RPL-S), Vulkan device |
 | RAM | 16 GiB (13.3 GiB usable) |
 | OS | Linux Mint 22.3, kernel 7.0.0-31-generic |
-| Runtimes compared | blazar 0.13.0 gateway - inventory - llama.cpp b11202-cuda - mistral.rs v0.9.4 - ollama-host - piper TTS (engines lane) - stable-diffusion.cpp master-920-2f88688 - whisper.cpp b5130 |
-| Model | Qwen3.5-9B-Q4_K_M.gguf, en_US-amy-medium, ggml-base, qwen-image-2.1-uncensored, wan_2.1_comfyui_repackaged |
+| Runtimes compared | blazar 0.33.0 gateway - inventory - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda - mistral.rs v0.9.5 - ollama-host - piper 2023.11.14-2 - stable-diffusion.cpp master-1043-3be2378 - whisper.cpp b5454 |
+| Model | en_US-amy-medium, ggml-base, qwen-image-2.1-uncensored, qwen2.5-0.5b-instruct-q4_k_m.gguf, wan_2.1_comfyui_repackaged |
 
 ## Methodology
 
@@ -86,7 +95,6 @@ _Rendered 20260929-flagship-gguf; blazar 0.13.0; power state of gateway rows: ac
 - Idle-wake: blazar's reaper sleeps the child at idle_sleep_secs (weights stay RAM-resident, VRAM released) - wake TTFT is a sleep-wake; ollama's keep_alive expiry fully unloads - wake TTFT is a disk reload. The policy column names the semantic; both measured after the policy is observed via /api/ps.
 - Long-context curve: per-ctx cells (blazar model_overrides ctx / ollama num_ctx) x 3-run decode suites; each ollama point evicts first so the runner respawns at that ctx.
 - Sustained concurrency: sequential bursts of the parallel-stream lane (default 3 rounds); TTFT p99 aggregates every stream of every round.
-- Prompt-diversity disclosure: every speed lane states whether its prompt set repeats across runs; speculative-decode cells (ngram/draft) additionally state the set's diversity, because acceptance rides repetition - home-GPU measurements show a repeated-prompt set inflating ngram speedup to ~4.75x while a diverse set sits at 0.89-1.06x. Repetition-inflated speedups are labeled as such, never presented as general throughput.
 - Every blazar row records the spawned engine's argv (slots/context shown in tables) and stamps blazar version, wall clock, 5-min load average, and AC/battery power state; GPU cells refuse to run on battery.
 - Media lanes run in isolated sandbox daemons (same protocol as text blazar cells); the engine child spawns lazily, so each family's first request is the COLD number (spawn + weights + first artifact), labeled cold_request_s.
 - Media TTFB = time to first BODY byte (first audio sample for streamed PCM, not response headers); buffered WAV TTFB equals its total by construction and the table says so.
@@ -112,82 +120,55 @@ _Rendered 20260929-flagship-gguf; blazar 0.13.0; power state of gateway rows: ac
 
 | Runtime | slots x ctx | decode t/s | tok/s per W (net) | TTFT p50 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - llama.cpp b11202-cuda | 4x65536 | 40.6 | - | 121.5 | 181.4 | 24.6 | 25.7 | 1297.8 | 7364.4 | 6169 | 55.2 |
-| blazar gateway - llama.cpp b11202-cuda (single-stream) | 1x16384 | 41.0 | - | 121.2 | 127.7 | 24.2 | 25.5 | 1322.2 | 7580.8 | 5666 | 55.1 |
-| blazar gateway - llama.cpp b11202-cuda (cont_batching_off) | 4x65536 | 40.6 | - | 122.6 | 178.4 | 24.6 | 25.6 | 1310.7 | 7258.9 | 6152 | 55.4 |
-| blazar gateway - llama.cpp b11202-cuda (fa_on) | 4x65536 | 40.6 | - | 120.9 | 129.4 | 24.6 | 25.7 | 1334.5 | 7483.4 | 6152 | 55.5 |
-| blazar gateway - llama.cpp b11202-cuda (fa_off) | 4x65536 | 10.0 | - | 233.9 | 618.1 | 100.0 | 110.2 | 501.6 | 3173.8 | 6612 | 36.7 |
-| blazar gateway - llama.cpp b11202-cuda (kv_unified_on) | 4x65536 | 40.7 | - | 119.7 | 126.2 | 24.6 | 25.7 | 1336.2 | 7499.3 | 6152 | 55.4 |
-| blazar gateway - llama.cpp b11202-cuda (kv_unified_off) | 2x8192 | 41.0 | - | 122.5 | 128.7 | 24.4 | 25.4 | 1321.5 | 7324.0 | 5458 | 55.1 |
-| blazar gateway - llama.cpp b11202-cuda (swa_full_on) | 4x65536 | 40.8 | - | 120.2 | 125.8 | 24.5 | 25.6 | 1306.7 | 7223.9 | 6152 | 55.4 |
-| blazar gateway - llama.cpp b11202-cuda (no_kv_offload_on) | 2x8192 | 18.9 | - | 148.4 | 203.0 | 52.9 | 58.0 | 962.2 | 5198.1 | 5106 | 52.1 |
-| blazar gateway - llama.cpp b11202-cuda (cache_q8_q8_0) | 4x65536 | 32.0 | - | 130.3 | 200.8 | 31.4 | 33.6 | 1189.8 | 6372.3 | 6544 | 53.9 |
-| blazar gateway - llama.cpp b11202-cuda (ctx_checkpoints_4) | 4x65536 | 41.0 | - | 120.3 | 126.1 | 24.4 | 25.4 | 1343.2 | 7382.3 | 6152 | 55.4 |
-| blazar gateway - llama.cpp b11202-cuda (spec_off) | 4x65536 | 41.0 | - | 121.0 | 174.3 | 24.3 | 25.6 | 1406.2 | 7400.1 | 6152 | 55.7 |
-| blazar gateway - llama.cpp b11202-cuda (deterministic_on) | 1x16384 | 41.0 | - | 120.9 | 122.4 | 24.3 | 25.5 | 1325.5 | 7299.1 | 5666 | 55.8 |
-| blazar gateway - llama.cpp b11202-cuda (mmproj_offload_off) | 4x65536 | 40.6 | - | 121.7 | 128.3 | 24.6 | 25.8 | 1302.0 | 7190.4 | 6152 | 56.9 |
-| blazar gateway - llama.cpp b11202-cuda (threads_batch_8) | 4x65536 | 41.2 | - | 121.9 | 177.5 | 24.3 | 25.5 | 1319.7 | 7419.7 | 6152 | 55.5 |
-| blazar gateway - llama.cpp b11202-cuda (cache_reuse_256) | 4x65536 | 40.6 | - | 120.7 | 176.9 | 24.6 | 25.7 | 1341.0 | 7188.5 | 6152 | 55.3 |
-| blazar gateway - llama.cpp b11202-cuda (kv_unified_per_slot_4096) | 4x65536 | 40.6 | - | 121.7 | 126.6 | 24.5 | 25.9 | 1349.1 | 7217.1 | 6152 | 56.2 |
-| blazar gateway - llama.cpp b11202-cuda (conc_default) | 4x65536 | - | - | - | - | - | 37.3 | - | - | 6158 | 55.0 |
-| blazar gateway - llama.cpp b11202-cuda (adaptive_slots_off) | 4x65536 | - | - | - | - | - | 86.0 | - | - | 6148 | 54.8 |
-| blazar gateway - llama.cpp b11202-cuda (poll_50) | 4x65536 | - | - | - | - | - | 51.2 | - | - | 6279 | 54.9 |
-| blazar gateway - mistral.rs v0.9.4 | engine-scheduled | 18.8 | - | 132.0 | 143.2 | 53.7 | 60.9 | 242.1 | 244.6 | 6948 | 38.1 |
-| blazar gateway - mistral.rs v0.9.4 (paged_attn_off) | engine-scheduled | 18.9 | - | 141.3 | 155.2 | 53.2 | 61.3 | 239.7 | 241.2 | 6948 | 42.2 |
-| blazar gateway - mistral.rs v0.9.4 (single-stream) | engine-scheduled | 18.8 | - | 139.7 | 152.7 | 53.4 | 62.1 | 237.6 | 239.5 | 6948 | 41.0 |
-| blazar gateway - mistral.rs v0.9.4 (kv_unified_on) | engine-scheduled | 18.9 | - | 131.3 | 136.9 | 53.3 | 61.3 | 244.0 | 247.1 | 6948 | 37.5 |
-| blazar gateway - mistral.rs v0.9.4 (kv_unified_off) | engine-scheduled | 18.8 | - | 128.4 | 147.7 | 53.3 | 60.9 | 237.7 | 247.6 | 6948 | 40.4 |
-| blazar gateway - mistral.rs v0.9.4 (spec_off) | engine-scheduled | 18.6 | - | 135.6 | 142.5 | 53.8 | 62.9 | 239.2 | 236.8 | 6948 | 39.6 |
-| blazar gateway - mistral.rs v0.9.4 (deterministic_on) | engine-scheduled | 18.8 | - | 132.2 | 142.5 | 53.6 | 60.7 | 237.6 | 244.4 | 6948 | 37.3 |
-| blazar gateway - mistral.rs v0.9.4 (pa_mem_0.85) | engine-scheduled | 18.7 | - | 130.1 | 147.4 | 52.9 | 61.5 | 237.2 | 249.6 | 6948 | 43.0 |
-| blazar gateway - mistral.rs v0.9.4 (pa_mem_0.55) | engine-scheduled | 18.6 | - | 134.1 | 140.0 | 54.0 | 62.4 | 239.0 | 247.4 | 6948 | 38.4 |
-| blazar gateway - mistral.rs v0.9.4 (mr_prefix_cache_256) | engine-scheduled | 18.9 | - | 131.4 | 136.1 | 53.0 | 61.1 | 241.0 | 246.5 | 6948 | 36.7 |
-| blazar gateway - mistral.rs v0.9.4 (mr_enc_cache_512mb) | engine-scheduled | 18.9 | - | 137.2 | 143.7 | 53.0 | 61.0 | 243.0 | 241.0 | 6948 | 36.7 |
-| direct engine - llama.cpp b11202-cuda | 1x16384 | 41.5 | - | 115.5 | 119.5 | 24.0 | 25.1 | 1335.7 | 7769.5 | 5660 | 55.2 |
-| direct engine - mistral.rs v0.9.4 | 1x16384 | 21.4 | - | 105.7 | 108.1 | 46.7 | 52.3 | 321.3 | 323.4 | 7042 | 44.3 |
-| ollama 0.33.3 - qwen3.5:9b (t/s NOT comparable - matrix model differs) | service | 40.7 | - | 129.7 | 140.5 | 24.8 | 75.0 | 1416.3 | 7337.1 | 6570 | 55.1 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | 2x32768 | 322.0 | 23.382 | 8.9 | 12.4 | 3.1 | 5.1 | 17354.7 | 60677.5 | 1268 | 54.8 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (single-stream) | 1x16384 | 326.6 | 32.706 | 9.4 | 10.6 | 3.1 | 4.3 | 18044.7 | 62597.2 | 1060 | 54.3 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (cont_batching_off) | 2x32768 | 331.5 | 29.966 | 8.7 | 10.0 | 3.1 | 4.3 | 18698.9 | 58373.7 | 1270 | 54.7 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (fa_on) | 2x32768 | 329.8 | 29.841 | 8.6 | 11.0 | 3.0 | 4.3 | 18935.1 | 60915.5 | 1268 | 55.0 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (fa_off) | 2x32768 | 321.0 | 31.376 | 22.7 | 24.0 | 3.1 | 4.6 | 10889.4 | 60518.3 | 1922 | 54.9 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (kv_unified_on) | 2x32768 | 330.4 | 30.098 | 9.0 | 10.8 | 3.0 | 4.4 | 18427.7 | 68052.7 | 1270 | 54.8 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (kv_unified_off) | 2x32768 | 328.4 | 29.715 | 9.0 | 10.5 | 3.1 | 4.3 | 18386.3 | 62546.0 | 1252 | 54.6 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (swa_full_on) | 2x32768 | 329.8 | 29.657 | 9.0 | 12.0 | 3.1 | 4.0 | 18146.0 | 65339.9 | 1268 | 54.6 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (no_kv_offload_on) | 2x32768 | 187.8 | 13.156 | 10.4 | 13.7 | 5.3 | 7.8 | 14033.4 | 45550.6 | 860 | 43.1 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (cache_q8_q8_0) | 2x32768 | 331.8 | 28.443 | 7.4 | 11.1 | 3.0 | 4.4 | 17911.7 | 62320.9 | 1096 | 54.9 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (ctx_checkpoints_4) | 2x32768 | 337.1 | 26.519 | 9.0 | 11.6 | 3.0 | 3.9 | 18614.3 | 59652.3 | 1268 | 54.7 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (spec_off) | 2x32768 | 350.0 | 31.463 | 8.3 | 10.4 | 2.9 | 3.4 | 19120.4 | 63163.3 | 1401 | 54.8 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (deterministic_on) | 1x16384 | 349.1 | 27.542 | 8.4 | 10.7 | 2.8 | 3.7 | 18337.9 | 64742.6 | 1060 | 54.9 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (mmproj_offload_off) | 2x32768 | 335.2 | 30.796 | 9.4 | 12.4 | 2.9 | 4.2 | 18059.4 | 60927.6 | 1268 | 55.0 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (threads_batch_8) | 2x32768 | 322.7 | 26.405 | 8.8 | 11.5 | 3.1 | 4.1 | 18098.5 | 61259.7 | 1268 | 54.8 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (cache_reuse_256) | 2x32768 | 320.5 | 31.175 | 9.0 | 11.1 | 3.1 | 4.4 | 17779.8 | 63070.8 | 1268 | 54.7 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (kv_unified_per_slot_4096) | 2x32768 | 332.5 | 28.316 | 8.6 | 10.1 | 3.0 | 4.1 | 14317.9 | 62350.3 | 1268 | 54.9 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (conc_default) | 2x32768 | - | - | - | - | - | 14.3 | - | - | 1278 | 53.3 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (adaptive_slots_off) | 2x32768 | - | - | - | - | - | 5.6 | - | - | 1270 | 54.2 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (poll_50) | 2x32768 | - | - | - | - | - | 5.8 | - | - | 1274 | 53.4 |
+| blazar gateway - mistral.rs v0.9.5 (paged_attn_off) | engine-scheduled | 241.5 | 14.299 | 11.1 | 12.7 | 4.1 | 5.1 | 17078.8 | 19355.6 | 806 | 51.4 |
+| direct engine - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | 1x16384 | 347.4 | 20.748 | 6.3 | 9.1 | 2.9 | 3.6 | 20020.1 | 80285.0 | 788 | 55.0 |
+| ollama 0.33.3 - qwen2.5:0.5b (t/s NOT comparable - matrix model differs) | service | 344.4 | 96.923 | 11.5 | 15.9 | 2.9 | 4.0 | 5872.6 | 128870.9 | 726 | 51.9 |
 
 </details>
 
 ### Single-stream decode throughput (chart)
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/speed-single-stream.svg" alt="Single-stream decode throughput (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/speed-single-stream.svg" alt="Single-stream decode throughput (chart)"></p>
 
-_Median decode t/s per runtime and engine; whiskers span the interquartile range of the 5 runs; the dashed line marks the fastest direct engine. Higher is better. Source: 20260929-flagship-gguf/cells.jsonl._
+_Median decode t/s per runtime and engine; whiskers span the interquartile range of the 5 runs; the dashed line marks the fastest direct engine. Higher is better. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 ### Gateway overhead (chart)
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/gateway-overhead.svg" alt="Gateway overhead (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/gateway-overhead.svg" alt="Gateway overhead (chart)"></p>
 
-_Decode t/s delta of routing through blazar relative to driving the same engine build directly; left of zero means the gateway path won. Source: 20260929-flagship-gguf/cells.jsonl._
+_Decode t/s delta of routing through blazar relative to driving the same engine build directly; left of zero means the gateway path won. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
-### Concurrency (1x2x4x8x16 parallel streams x 128 tokens)
+### Concurrency (4 parallel streams x 128 tokens)
 
 <details>
 <summary><b>Receipt table - concurrency lanes</b></summary>
 
 | Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - llama.cpp b11202-cuda | 4x65536 | 3 of 3x1 | 3 | 40.0 | 125.6 | 9.61 | 264 | 262 | 26.1 |
-| blazar gateway - llama.cpp b11202-cuda | 4x65536 | 6 of 3x2 | 3 | 65.9 | 216.5 | 11.66 | 372 | 371 | 35.7 |
-| blazar gateway - llama.cpp b11202-cuda | 4x65536 | 12 of 3x4 | 3 | 104.8 | 346.3 | 14.65 | 554 | 554 | 37.6 |
-| blazar gateway - llama.cpp b11202-cuda | 4x65536 | 24 of 3x8 | 3 | 102.7 | 675.3 | 29.90 | 5840 | 5840 | 54.8 |
-| blazar gateway - llama.cpp b11202-cuda | 4x65536 | 48 of 3x16 | 3 | 103.4 | 1350.1 | 59.43 | 15802 | 15798 | 85.8 |
-| blazar gateway - mistral.rs v0.9.4 | engine-scheduled | 3 of 3x1 | 3 | 18.6 | 56.8 | 20.65 | 171 | 170 | 60.3 |
-| blazar gateway - mistral.rs v0.9.4 | engine-scheduled | 6 of 3x2 | 3 | 0.0 | 0.0 | 0.18 | 73 | 73 | - |
-| blazar gateway - mistral.rs v0.9.4 | engine-scheduled | 12 of 3x4 | 3 | 0.0 | 0.0 | 0.30 | 114 | 114 | - |
-| blazar gateway - mistral.rs v0.9.4 | engine-scheduled | 24 of 3x8 | 3 | 25.0 | 76.0 | 25.56 | 509 | 508 | 81.8 |
-| blazar gateway - mistral.rs v0.9.4 | engine-scheduled | 48 of 3x16 | 3 | 16.1 | 33.6 | 15.88 | 864 | 864 | 337.1 |
-| direct engine - llama.cpp b11202-cuda | 1 | 1 of 1x1 | 1 | 40.0 | 41.5 | 3.20 | 139 | - | 25.1 |
-| direct engine - llama.cpp b11202-cuda | 2 | 2 of 1x2 | 1 | 70.5 | 73.7 | 3.63 | 184 | - | 32.2 |
-| direct engine - llama.cpp b11202-cuda | 4 | 4 of 1x4 | 1 | 111.3 | 117.0 | 4.60 | 260 | - | 36.5 |
-| direct engine - llama.cpp b11202-cuda | 8 | 8 of 1x8 | 1 | 136.9 | 144.0 | 7.48 | 425 | - | 58.7 |
-| direct engine - llama.cpp b11202-cuda | 16 | 16 of 1x16 | 1 | 236.6 | 262.5 | 8.66 | 918 | - | 69.1 |
-| ollama - qwen3.5:9b | service | 3 of 3x1 | 3 | 23.3 | 121.7 | 16.49 | 6764 | 6632 | 74.2 |
-| ollama - qwen3.5:9b | service | 6 of 3x2 | 3 | 29.8 | 243.3 | 25.81 | 9557 | 9392 | 74.7 |
-| ollama - qwen3.5:9b | service | 12 of 3x4 | 3 | 33.6 | 486.7 | 45.69 | 16287 | 15928 | 74.8 |
-| ollama - qwen3.5:9b | service | 24 of 3x8 | 3 | 36.2 | 969.7 | 84.88 | 28972 | 28217 | 74.8 |
-| ollama - qwen3.5:9b | service | 48 of 3x16 | 3 | 37.0 | 1941.0 | 166.02 | 57266 | 55711 | 75.0 |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | 2x32768 | 12 of 3x4 | 3 | 445.5 | 3355.0 | 2.25 | 517 | 504 | 6.3 |
+| blazar gateway - mistral.rs v0.9.5 | engine-scheduled | 12 of 3x4 | 3 | 0.0 | 0.0 | 0.07 | 27 | 26 | - |
+| direct engine - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | 4 | 12 of 3x4 | 3 | 717.9 | 2633.7 | 1.77 | 45 | 43 | 8.2 |
+| ollama - qwen2.5:0.5b | service | 12 of 3x4 | 3 | 183.0 | 4074.2 | 4.99 | 2885 | 2865 | 4.1 |
 
 _sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
 
@@ -195,28 +176,32 @@ _sum-stream >> system t/s means streams serialize on one slot; roughly equal mea
 
 ### Concurrency scaling (chart)
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/concurrency-throughput.svg" alt="Concurrency scaling (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/concurrency-throughput.svg" alt="Concurrency scaling (chart)"></p>
 
-_Aggregate system tokens/s as parallel streams are added; flat-to-rising means the scheduler keeps the device saturated. Higher is better. Source: 20260929-flagship-gguf/cells.jsonl._
+_Aggregate system tokens/s as parallel streams are added; flat-to-rising means the scheduler keeps the device saturated. Higher is better. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 ### Concurrency tail latency (chart)
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/concurrency-ttft.svg" alt="Concurrency tail latency (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/concurrency-ttft.svg" alt="Concurrency tail latency (chart)"></p>
 
-_Worst-case first-token wait per stream as concurrency rises (log scale) - the tail the scheduler must bound. Lower is better. Source: 20260929-flagship-gguf/cells.jsonl._
+_Worst-case first-token wait per stream as concurrency rises (log scale) - the tail the scheduler must bound. Lower is better. Dashed curves carry the median time-to-first-byte, which upper-bounds queue wait under burst arrival. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 ### Resource cost and reliability vs concurrency
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/concurrency-vram.svg" alt="Resource cost vs concurrency (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/concurrency-vram.svg" alt="Resource cost vs concurrency (chart)"></p>
 
-_Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source: 20260929-flagship-gguf/cells.jsonl._
+_Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
+
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/concurrency-power.svg" alt="Resource cost vs concurrency (chart)"></p>
+
+_Peak GPU board power per concurrency level - the energy price of keeping the device saturated. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 ### Concurrency frontier verdicts
 
-- blazar gateway - llama.cpp b11202-cuda: throughput plateaus at C=8 (<10% per-level gain), peak 104.8 t/s at C=4.
-- blazar gateway - mistral.rs v0.9.4: 5 level(s) measured - insufficient levels for a saturation verdict.
-- direct engine - llama.cpp b11202-cuda: still gaining at C=16 (40.0 -> 236.6 t/s) - saturation not reached within the sweep.
-- ollama - qwen3.5:9b: throughput plateaus at C=8 (<10% per-level gain), peak 37.0 t/s at C=16.
+- blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda: 1 level(s) measured - insufficient levels for a saturation verdict.
+- blazar gateway - mistral.rs v0.9.5: 1 level(s) measured - insufficient levels for a saturation verdict.
+- direct engine - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda: 1 level(s) measured - insufficient levels for a saturation verdict.
+- ollama - qwen2.5:0.5b: 1 level(s) measured - insufficient levels for a saturation verdict.
 
 ### Adaptive reshape under sustained load (no-lag proof)
 
@@ -225,14 +210,14 @@ _Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source:
 
 | Runtime | reshape | slots | time to reshape s | req before/after | TTFT p50 before->after ms | sys t/s before->after | failed |
 |---|---|---|---:|---:|---:|---:|---:|
-| blazar gateway - llama.cpp b11202-cuda | yes | 4->8 | 74 | 32/147 | 7413->349 | 49->63 | 0 |
-| blazar gateway - mistral.rs v0.9.4 | n/a | skipped: adaptive reshape is a llamacpp-lane mechanism; this engine's child exposes no slot shape (-np) to observe or adopt | - | - | - | - | - |
+| blazar gateway - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | yes | 2->16 | 32 | 281/4547 | 425->56 | 842->1629 | 0 |
+| blazar gateway - mistral.rs v0.9.5 | n/a | skipped: adaptive reshape is a llamacpp-lane mechanism; this engine's child exposes no slot shape (-np) to observe or adopt | - | - | - | - | - |
 
-<details><summary>daemon tail (slots/reshape) - llama.cpp b11202-cuda</summary>
+<details><summary>daemon tail (slots/reshape) - llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda</summary>
 
 ```
-2026-09-29T18:01:53.480677Z  INFO evict: terminating child and releasing the slot model="qwen3.5-9b" pid=217652
-2026-09-29T18:01:53.480677Z  INFO evict: terminating child and releasing the slot model="qwen3.5-9b" pid=217652
+2026-11-20T14:07:59.935220Z  INFO evict: terminating child and releasing the slot model="qwen2.5-0.5b-instruct" pid=2232880
+2026-11-20T14:07:59.935220Z  INFO evict: terminating child and releasing the slot model="qwen2.5-0.5b-instruct" pid=2232880
 ```
 
 </details>
@@ -246,8 +231,8 @@ _Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source:
 
 | Engine | KV rung | perplexity (ctx 2048, offline ASCII corpus) | ppl tool |
 |---|---|---:|---|
-| llama.cpp b11202-cuda | f16 | 4.83 +/- 0.19 | own |
-| mistral.rs v0.9.4 | f16 | 4.83 +/- 0.19 | borrowed (llama-b11202) |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | f16 | 8.67 +/- 0.42 | own |
+| mistral.rs v0.9.5 | f16 | 8.67 +/- 0.42 | borrowed (llama-fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda) |
 
 </details>
 
@@ -258,10 +243,10 @@ _Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source:
 
 | Comparison | exact / total | ratio mean | ratio min |
 |---|---:|---:|---:|
-| llama.cpp b11202-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
-| mistral.rs v0.9.4 vs same-engine reference (direct) | 0/20 | 0.514 | 0.000 |
-| llama.cpp b11202-cuda through blazar gateway vs direct | 7/20 | 0.643 | 0.017 |
-| ollama (qwen3.5:9b) run-to-run, temp 0 | 20/20 | 1.000 | 1.000 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
+| mistral.rs v0.9.5 vs same-engine reference (direct) | None/None | - | - |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda through blazar gateway vs direct | 12/20 | 0.925 | 0.587 |
+| ollama (qwen2.5:0.5b) run-to-run, temp 0 | 15/20 | 0.846 | 0.105 |
 
 _Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (blazar `deterministic = true` pins it)._
 
@@ -274,17 +259,42 @@ _Exact-match divergence across GPU backends is expected float nondeterminism (ba
 
 | Runtime | scenarios | well-formed | selection | args valid | control FP | TTFT p50 ms |
 |---|---:|---:|---:|---:|---|---:|
-| blazar gateway - b11202-cuda | 6 | 4/6 | 4/5 | 4/5 | no | 117 |
-| blazar gateway - v0.9.4 | 6 | 5/6 | 5/5 | 5/5 | no | 1784 |
-| ollama - qwen3.5:9b | 6 | 4/6 | 4/5 | 4/5 | no | 284 |
+| blazar gateway - fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | 6 | 5/6 | 5/5 | 5/5 | yes | 14 |
+| blazar gateway - v0.9.5 | 6 | 0/6 | 0/5 | 0/5 | no | 4 |
+| ollama - qwen3.5:9b | 6 | 4/6 | 4/5 | 4/5 | no | 291 |
 
 </details>
 
 ### Quality suites (checker-verified, seeded, greedy)
 
-- _quality lane: **not-measured** - no quality rows in this campaign (lane not reached for the selected providers/engines)_
+- _quality lane: **ran** - 3 scored row(s); suites: code, instruct, multilingual, niah, reason, safety, schema_
 
-_Not measured in this campaign (20260929-flagship-gguf); quality suites lane not run._
+<details>
+<summary><b>Receipt table - quality suites</b></summary>
+
+| Runtime | Engine | config | reason | instruct | code | schema | niah | multilingual | safety | overall | conc quality |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| direct | llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | direct | 1/12 | 4/10 | 2/5 | 5/6 | 6/6 | 3/8 | 12/12 | 33/59 | - |
+| blazar | llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | default | 1/12 | 4/10 | 2/5 | 5/6 | 6/6 | 3/8 | 12/12 | 33/59 | 7/18 @C=4 |
+| ollama | ollama daemon | ollama | 0/12 | 2/10 | 4/5 | 6/6 | 6/6 | 3/8 | 12/12 | 33/59 | 6/18 @C=4 |
+
+</details>
+
+- Gateway parity on llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda: overall pass 55.9% direct vs 55.9% through blazar (+0.0 pp) on the identical seeded task set.
+- Quality under load on llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda: 7/18 at C=4 (38.9%) vs 33.3% serial on the same fast subset - held.
+- ollama reference: 55.9% overall on qwen2.5:0.5b (same-family build, not the campaign checkpoint).
+
+### Quality suites (chart)
+
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/quality-suites.svg" alt="Quality suites (chart)"></p>
+
+_Deterministic-checker pass rates per suite (reasoning, instruction following, code, schema, needle-in-haystack, multilingual, safety) across runtimes on the identical seeded task set. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
+
+### Gateway quality parity (chart)
+
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/quality-parity.svg" alt="Gateway quality parity (chart)"></p>
+
+_Per-suite pass-rate delta of routing through blazar vs the same engine build driven directly; bars hugging the zero axis are the gateway being output-transparent. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 ### Optimization axes (ctx 4096, single stream)
 
@@ -293,11 +303,9 @@ _Not measured in this campaign (20260929-flagship-gguf); quality suites lane not
 
 | Engine | axis | setting | decode t/s | delta vs dense | prefill cold t/s | delta |
 |---|---|---|---:|---:|---:|---:|
-| llama.cpp b11202-cuda | kv | q8_0 | 41.1 | -0.2 | 1332.6 | 72.0 |
-| llama.cpp b11202-cuda | pa | on | 41.5 | 0.1 | 1335.0 | 74.4 |
-| llama.cpp b11202-cuda | spec | ngram-simple | 41.1 | -0.3 | 1330.8 | 70.2 |
-| llama.cpp b11202-cuda | mmproj | True | 41.5 | 0.1 | 1342.6 | 81.9 |
-| mistral.rs v0.9.4 | pa | off | 18.8 | -2.6 | 237.9 | -80.9 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | kv | q8_0 | 331.6 | -16.2 | 18655.7 | -1202.5 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | pa | on | 346.0 | -1.7 | 18915.0 | -943.3 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | spec | ngram-simple | 328.1 | -19.6 | 19296.9 | -561.3 |
 
 </details>
 
@@ -308,32 +316,23 @@ _Not measured in this campaign (20260929-flagship-gguf); quality suites lane not
 
 | Engine | config | decode t/s | decode delta% | ttft p50 ms | ttft delta% | GPU peak MiB | GPU delta | output vs default |
 |---|---|---:|---:|---:|---:|---:|---:|:-:|
-| llama.cpp b11202-cuda | single-stream | 41.0 | +1.0% | 121 | -0.2% | 5666 | -503 | same |
-| llama.cpp b11202-cuda | cont_batching_off | 40.6 | +0.2% | 123 | +0.8% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | fa_on | 40.6 | -0.0% | 121 | -0.5% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | fa_off | 10.0 | -75.3% | 234 | +92.5% | 6612 | +443 | same |
-| llama.cpp b11202-cuda | kv_unified_on | 40.7 | +0.2% | 120 | -1.5% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | kv_unified_off | 41.0 | +1.1% | 123 | +0.8% | 5458 | -711 | same |
-| llama.cpp b11202-cuda | swa_full_on | 40.8 | +0.5% | 120 | -1.1% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | no_kv_offload_on | 18.9 | -53.5% | 148 | +22.1% | 5106 | -1063 | same |
-| llama.cpp b11202-cuda | cache_q8_q8_0 | 32.0 | -21.1% | 130 | +7.2% | 6544 | +375 | same |
-| llama.cpp b11202-cuda | ctx_checkpoints_4 | 41.0 | +1.1% | 120 | -1.0% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | spec_off | 41.0 | +1.1% | 121 | -0.5% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | deterministic_on | 41.0 | +1.0% | 121 | -0.5% | 5666 | -503 | same |
-| llama.cpp b11202-cuda | mmproj_offload_off | 40.6 | -0.0% | 122 | +0.1% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | threads_batch_8 | 41.2 | +1.6% | 122 | +0.3% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | cache_reuse_256 | 40.6 | +0.1% | 121 | -0.7% | 6152 | -17 | same |
-| llama.cpp b11202-cuda | kv_unified_per_slot_4096 | 40.6 | +0.1% | 122 | +0.1% | 6152 | -17 | same |
-| mistral.rs v0.9.4 | paged_attn_off | 18.9 | +0.5% | 141 | +7.1% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | single-stream | 18.8 | -0.1% | 140 | +5.9% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | kv_unified_on | 18.9 | +0.5% | 131 | -0.5% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | kv_unified_off | 18.8 | +0.3% | 128 | -2.7% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | spec_off | 18.6 | -1.2% | 136 | +2.8% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | deterministic_on | 18.8 | -0.1% | 132 | +0.2% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | pa_mem_0.85 | 18.7 | -0.2% | 130 | -1.4% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | pa_mem_0.55 | 18.6 | -0.9% | 134 | +1.7% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | mr_prefix_cache_256 | 18.9 | +0.7% | 131 | -0.4% | 6948 | +0 | same |
-| mistral.rs v0.9.4 | mr_enc_cache_512mb | 18.9 | +0.5% | 137 | +4.0% | 6948 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | single-stream | 326.6 | +1.4% | 9 | +5.7% | 1060 | -208 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | cont_batching_off | 331.5 | +2.9% | 9 | -2.1% | 1270 | +2 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | fa_on | 329.8 | +2.4% | 9 | -3.8% | 1268 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | fa_off | 321.0 | -0.3% | 23 | +154.6% | 1922 | +654 | DRIFT |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | kv_unified_on | 330.4 | +2.6% | 9 | +0.9% | 1270 | +2 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | kv_unified_off | 328.4 | +2.0% | 9 | +1.3% | 1252 | -16 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | swa_full_on | 329.8 | +2.4% | 9 | +1.0% | 1268 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | no_kv_offload_on | 187.8 | -41.7% | 10 | +16.1% | 860 | -408 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | cache_q8_q8_0 | 331.8 | +3.0% | 7 | -17.1% | 1096 | -172 | DRIFT |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | ctx_checkpoints_4 | 337.1 | +4.7% | 9 | +0.7% | 1268 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | spec_off | 350.0 | +8.7% | 8 | -7.0% | 1401 | +133 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | deterministic_on | 349.1 | +8.4% | 8 | -6.4% | 1060 | -208 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | mmproj_offload_off | 335.2 | +4.1% | 9 | +5.5% | 1268 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | threads_batch_8 | 322.7 | +0.2% | 9 | -1.8% | 1268 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | cache_reuse_256 | 320.5 | -0.5% | 9 | +1.0% | 1268 | +0 | same |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | kv_unified_per_slot_4096 | 332.5 | +3.3% | 9 | -4.1% | 1268 | +0 | same |
+| mistral.rs v0.9.5 | paged_attn_off | 241.5 | - | 11 | - | 806 | - | - |
 
 </details>
 
@@ -344,9 +343,9 @@ _Not measured in this campaign (20260929-flagship-gguf); quality suites lane not
 
 | Engine | config | sys tok/s | sys delta% | ttft p99 ms | ttft delta% | GPU peak MiB | GPU delta | errs |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| llama.cpp b11202-cuda | conc_default | 84.9 | +0.0% | 10101 | +0.0% | 6158 | +0 | 0 |
-| llama.cpp b11202-cuda | adaptive_slots_off | 84.3 | -0.8% | 9893 | -2.1% | 6148 | -10 | 0 |
-| llama.cpp b11202-cuda | poll_50 | 84.0 | -1.1% | 10320 | +2.2% | 6279 | +121 | 0 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | conc_default | 325.0 | +0.0% | 2718 | +0.0% | 1278 | +0 | 0 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | adaptive_slots_off | 286.3 | -11.9% | 3604 | +32.6% | 1270 | -8 | 0 |
+| llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | poll_50 | 271.0 | -16.6% | 3204 | +17.9% | 1274 | -4 | 0 |
 
 </details>
 
@@ -355,7 +354,7 @@ _Not measured in this campaign (20260929-flagship-gguf); quality suites lane not
 <details>
 <summary><b>Receipt table - capability matrix</b></summary>
 
-| Capability | llama.cpp b11202-cuda | mistral.rs v0.9.4 |
+| Capability | llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda | mistral.rs v0.9.5 |
 |---|---:|---:|
 | anthropic-api | no | yes |
 | ctx-override | yes | yes |
@@ -378,21 +377,21 @@ _Not measured in this campaign (20260929-flagship-gguf); quality suites lane not
 
 ### Cold start and idle wake (lifecycle)
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/lifecycle-cold-idle.svg" alt="Lifecycle: cold start and idle wake (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/lifecycle-cold-idle.svg" alt="Lifecycle: cold start and idle wake (chart)"></p>
 
-_Seconds to first token after a cold start (page cache dropped) and after idle-policy expiry; blazar keeps weights resident while ollama reloads from disk. Warm-daemon ollama caveat applies. Lower is better. Source: 20260929-flagship-gguf/cells.jsonl._
+_Seconds to first token after a cold start (page cache dropped) and after idle-policy expiry; blazar keeps weights resident while ollama reloads from disk. Warm-daemon ollama caveat applies. Lower is better. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 _Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (noted on the chart when it applies). blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design - each dot measures its own runtime's idle path after the policy verifiably fired. Per-run detail and per-config rows: the campaign's cells.jsonl._
 
 ### Long-context degradation curve
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/ctx-curve.svg" alt="Long-context degradation (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/ctx-curve.svg" alt="Long-context degradation (chart)"></p>
 
-_Single-stream decode t/s as prompt context grows (log x-axis) - KV-cache pressure made visible. Source: 20260929-flagship-gguf/cells.jsonl._
+_Single-stream decode t/s as prompt context grows (log x-axis) - KV-cache pressure made visible. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
-<p align="center"><img src="bench-artifacts/20260929-flagship-gguf/plots/vram-vs-context.svg" alt="Memory vs context (chart)"></p>
+<p align="center"><img src="bench-artifacts/2026-11-20-v0.33-wave-final/plots/vram-vs-context.svg" alt="Memory vs context (chart)"></p>
 
-_Peak VRAM as prompt context grows (log x-axis) - the KV-cache slope that sets the usable context ceiling. Source: 20260929-flagship-gguf/cells.jsonl._
+_Peak VRAM as prompt context grows (log x-axis) - the KV-cache slope that sets the usable context ceiling. Source: 2026-11-20-v0.33-wave-final/cells.jsonl._
 
 ### Media lanes (image / video / TTS / whisper)
 
@@ -401,24 +400,12 @@ _Peak VRAM as prompt context grows (log x-axis) - the KV-cache slope that sets t
 
 | Lane | cold s | median s | min s | max s | ground truth | gate reject s | TTFB speedup |
 |---|---:|---:|---:|---:|---|---:|---:|
-| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 56.33 | 45.55 | 45.51 | 45.83 | 512x512 PNG, entropy 7.1 bits, contrast 75.6 |  |  |
-| image - qwen-image-2.1-uncensored (512x512, steps=[4]) [fa_off] | 61.94 | 52.21 | 52.19 | 52.22 | 512x512 PNG, entropy 6.9 bits, contrast 68.4 |  |  |
-| image - qwen-image-2.1-uncensored (512x512, steps=[4]) [vae_tiling_on] | 58.01 | 46.45 | 46.45 | 46.52 | 512x512 PNG, entropy 7.0 bits, contrast 73.4 |  |  |
-| image - qwen-image-2.1-uncensored (512x512, steps=[4]) [sage_attn_on] | 56.77 | 45.55 | 45.49 | 45.58 | 512x512 PNG, entropy 7.3 bits, contrast 70.9 |  |  |
-| tts - en_US-amy-medium (840 chars, wav+pcm) | - | 2.05 | - | 3.41 | RTF wav 0.034 / pcm 0.056 (61s audio) |  | 4.08x |
-| tts-conc - en_US-amy-medium (400 chars x4 pcm) | - | 4.72 | 4.88 | - | efficiency 3.83 of 4 streams |  | 1578ms max TTFB |
-| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | 38.24 | 11.07 | 11.07 | 11.08 | 5f: mux==reported==aligned | 0.001 |  |
-| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 22.10 | 22.10 | 22.11 | 13f: mux==reported==aligned |  |  |
-| video - wan_2.1_comfyui_repackaged (320x320, steps=8) | - | 52.16 | 52.16 | 52.17 | 33f: mux==reported==aligned |  |  |
-| whisper - ggml-base (transcribes piper wav) | 2.41 | 2.14 | - | - | RTF 0.069 |  |  |
+| image - qwen-image-2.1-uncensored (512x512, steps=[4]) | 56.52 | 46.52 | 41.88 | 50.03 | 512x512 PNG, entropy 7.3 bits, contrast 74.1 |  |  |
+| image - qwen-image-2.1-uncensored (512x512, steps=[4]) [fa_off] | 55.43 | 38.65 | 36.00 | 45.70 | 512x512 PNG, entropy 7.0 bits, contrast 71.6 |  |  |
 
 | Engine | config | median total s | delta% vs default | cold request s |
 |---|---|---:|---:|---:|
-| stable-diffusion.cpp master-920-2f88688 | fa_off | 52.2 | +14.6% | 61.9 |
-| stable-diffusion.cpp master-920-2f88688 | vae_tiling_on | 46.5 | +2.0% | 58.0 |
-| stable-diffusion.cpp master-920-2f88688 | sage_attn_on | 45.5 | inert | 56.8 |
-
-> stable-diffusion.cpp master-920-2f88688 sage_attn_on: config knob inert on this box: profiler skipped sage_attn (SageAttention requires a CUDA device (SM80+, CUDA build) and the child dies during load otherwise; active device Vulkan1) - this row measures the default posture; treat delta% as run-to-run noise
+| stable-diffusion.cpp master-1043-3be2378 | fa_off | 38.6 | -16.9% | 55.4 |
 
 _Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5); media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
 
@@ -426,22 +413,18 @@ _Media cells run through the same sandboxed gateway as text lanes but do not ass
 
 ## Findings (this campaign)
 
-1. **Gateway overhead vs direct spawn: within measurement noise.** b11202-cuda decode 41.0 t/s through the gateway vs 41.5 t/s direct (-1.3%), greedy parity through the gateway 7/20 exact.
-2. **Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes this campaign: 1x16384, 2x8192, 4x65536 - slots follow the live hardware census, each row's child_argv carries the receipt.
-3. **Concurrency scaling per engine.** b11202-cuda (C=1/2/4/8/16): peak 104.8 t/s at C=4, 66% of ideal at C=4; v0.9.4 (C=1/8/16): peak 25.0 t/s at C=8, 17% of ideal at C=8; serialization behavior per level in the frontier table below.
-4. **Prompt cache pays 5.7x on prefill** (7364 cached vs 1298 t/s cold).
-5. **Speculative n-gram decoding is a net loss for this model** (decode 41.1 t/s, -0.3 vs dense baseline) - measured, not assumed.
-6. **KV quantization (q8_0) is decode-neutral** (decode 41.1 t/s vs 41.4 dense).
-7. **v0.9.4 serves this model through blazar's profile** ( blazar auto-disables PA on tight cards and the model then serves; the row's argv is the receipt).
-8. **Tool-call quality (single-turn, temp 0).** b11202-cuda: selection 4/5, args 4/5 (control clean); v0.9.4: selection 5/5, args 5/5 (control clean); ollama: selection 4/5, args 4/5 (control clean); per-scenario detail in cells.jsonl.
-9. **Adaptive reshape lands under sustained load.** llama.cpp b11202-cuda: reshaped 4->8 slots after 74.1 s under sustained C=8, TTFT p50 7413->349 ms, 0 dropped requests; mistral.rs v0.9.4: no reshape observed in the lane window (graceful-drain: adoption waits for in-flight streams, never kills one).
-10. **Image quality stamps (PIL, luma domain): entropy 7.11 bits, rms contrast 75.6, 27459 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
-11. **Image quality stamps (PIL, luma domain): entropy 6.94 bits, rms contrast 68.4, 27560 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
-12. **Image quality stamps (PIL, luma domain): entropy 7.03 bits, rms contrast 73.4, 31438 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
-13. **Image quality stamps (PIL, luma domain): entropy 7.31 bits, rms contrast 70.9, 33526 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
-14. **Streamed PCM cuts time-to-first-audio 4.08x vs buffered WAV** (piper lane, first audio 0.50s vs 2.05s full synthesis) - total wall time is slightly higher (per-chunk synthesis), the win is interactivity.
-15. **4 parallel PCM streams through one gateway: perfectly parallel** (efficiency 3.83 = sum of per-stream totals / 4.88s wall, max TTFB 1578 ms, NON-uniform stream outputs - flagged) - the scalability receipt for the TTS lane.
-16. **Video VRAM gate rejects an over-budget request in 1 ms** with the full estimate math and override levers in the error body - instead of an opaque child abort minutes later.
+1. **Gateway overhead vs direct spawn: within measurement noise.** fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda decode 349.1 t/s through the gateway vs 347.4 t/s direct (+0.5%), greedy parity through the gateway 12/20 exact.
+2. **Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes this campaign: 1x16384, 2x32768 - slots follow the live hardware census, each row's child_argv carries the receipt.
+3. **Concurrency scaling per engine.** fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda (C=4): peak 445.5 t/s at C=4; serialization behavior per level in the frontier table below.
+4. **Prompt cache pays 3.5x on prefill** (60677 cached vs 17355 t/s cold).
+5. **Speculative n-gram decoding is a net loss for this model** (decode 328.1 t/s, -19.6 vs dense baseline) - measured, not assumed.
+6. **KV quantization (q8_0) is decode-neutral** (decode 331.6 t/s vs 347.7 dense).
+7. **v0.9.5 serves this model through blazar's profile** ( blazar auto-disables PA on tight cards and the model then serves; the row's argv is the receipt).
+8. **Tool-call quality (single-turn, temp 0).** fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda: selection 5/5, args 5/5 (control FP); v0.9.5: selection 0/5, args 0/5 (control clean); ollama: selection 4/5, args 4/5 (control clean); per-scenario detail in cells.jsonl.
+9. **Adaptive reshape lands under sustained load.** llama.cpp fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda: reshaped 2->16 slots after 32.2 s under sustained C=8, TTFT p50 425->56 ms, 0 dropped requests; mistral.rs v0.9.5: no reshape observed in the lane window (graceful-drain: adoption waits for in-flight streams, never kills one).
+10. **Image quality stamps (PIL, luma domain): entropy 7.33 bits, rms contrast 74.1, 30824 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+11. **Image quality stamps (PIL, luma domain): entropy 7.03 bits, rms contrast 71.6, 25419 unique colors @256x256** on qwen-image-2.1-uncensored - perceptual baseline for cross-run comparisons; audit PNG saved beside the cells.
+12. **TTS concurrency probe FAILED: media tts-conc cell crashed: MemAvailable 6837 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A co-resident blazar/ollama engine is likely holding memory: stop it for the validation window.** - the gateway did not sustain None parallel PCM streams; needs investigation.
 
 ## Failed cells (engine-reality receipts)
 
@@ -449,12 +432,37 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 
 | Engine | lane | config | failure |
 |---|---|---|---|
-| v0.9.4 | blazar | mr_batch_64 | cold probe failed: HTTP Error 502: Bad Gateway |
+| v0.9.5 | blazar | default | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | single-stream | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | kv_unified_on | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | kv_unified_off | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | spec_off | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | deterministic_on | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | pa_mem_0.85 | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | pa_mem_0.55 | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | mr_prefix_cache_256 | zero tokens served (model failed to load/serve) |
+| v0.9.5 | blazar | mr_enc_cache_512mb | zero tokens served (model failed to load/serve) |
+| v0.9.5 | ctxcurve-blazar |  | zero tokens served (model failed to load/serve) |
+| v0.9.5 | ctxcurve-blazar |  | zero tokens served (model failed to load/serve) |
+| v0.9.5 | ctxcurve-blazar |  | zero tokens served (model failed to load/serve) |
+| v0.9.5 | direct |  | child exited rc=1 during load; last output: Error: multimodal GGUF architecture `qwen2` is not suppo |
+| v0.9.5 | direct |  | child exited rc=1 during load; last output: Error: multimodal GGUF architecture `qwen2` is not suppo |
+| v0.9.5 | direct |  | child exited rc=1 during load; last output: Error: multimodal GGUF architecture `qwen2` is not suppo |
+| v0.9.5 | direct |  | child exited rc=1 during load; last output: Error: multimodal GGUF architecture `qwen2` is not suppo |
+| v0.9.5 | direct |  | child exited rc=1 during load; last output: Error: multimodal GGUF architecture `qwen2` is not suppo |
+| v0.9.5 | greedy |  | child failed to become healthy; stderr tail: 'Error: multimodal GGUF architecture `qwen2` is not sup |
+| master-1043-3be2378 | media-image | vae_tiling_on | media image cell crashed: MemAvailable 5550 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A co |
+| master-1043-3be2378 | media-image | sage_attn_on | media image cell crashed: MemAvailable 7392 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A co |
+| 2023.11.14-2 | media-tts |  | media tts cell crashed: MemAvailable 7105 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A co-r |
+| 2023.11.14-2 | media-tts-conc |  | media tts-conc cell crashed: MemAvailable 6837 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A |
+| master-1043-3be2378 | media-video |  | media video cell crashed: MemAvailable 7071 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A co |
+| b5454 | media-whisper |  | media whisper cell crashed: MemAvailable 6568 MiB < needed ~7899 MiB (model 5500 MiB + headroom). A  |
+| v0.9.5 | quality | default | quality lanes: first task transport failure (reason/reason-0: HTTP Error 503: Service Unavailable) |
+| v0.9.5 | quality-direct | direct | child failed to become healthy; stderr tail: 'Error: multimodal GGUF architecture `qwen2` is not sup |
 
 ## Structured skips (tool/format boundaries)
 
-- master-920-2f88688 (media-image): config knob inert on this box: profiler skipped sage_attn (SageAttention requires a CUDA device (SM80+, CUDA build) and the child dies during load otherwise; active device Vulkan1) - this row measures the default posture; treat delta% as run-to-run noise
-- v0.9.4 (reshape): skipped: adaptive reshape is a llamacpp-lane mechanism; this engine's child exposes no slot shape (-np) to observe or adopt
+- v0.9.5 (reshape): skipped: adaptive reshape is a llamacpp-lane mechanism; this engine's child exposes no slot shape (-np) to observe or adopt
 
 ## Caveats
 
@@ -463,238 +471,11 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 - All GPU rows measured on AC power at bounded load; rows record load average and power state (battery runs are rejected by the harness).
 - Numbers are medians of 5 runs on one hybrid laptop; expect absolute shifts on other hardware, ratios to travel better.
 
-## Artifact policy
-
-The repo tracks the summary layer only: `bench-artifacts/INDEX.md`,
-per-campaign reports (`bench-artifacts/*/*.md`), and root receipt JSONs.
-Raw payloads (cells.jsonl, charts, media outputs, dumps) are gitignored;
-the full snapshot through 2026-10-07 lives on the
-[bench-archive-2026-10 release](https://github.com/santanu20/blazar/releases/tag/bench-archive-2026-10),
-and git history carries everything prior. Regenerate charts from a
-campaign's `cells.jsonl` with `python3 scripts/bench_charts.py`.
-
-Publish a new campaign's payload alongside its report:
-
-```bash
-tar -czf /tmp/bench-<campaign>.tar.gz -C bench-artifacts <campaign>/
-gh release upload bench-archive-2026-10 /tmp/bench-<campaign>.tar.gz --clobber --repo santanu20/blazar
-```
-
 ## Reproduce
 
 ```bash
-python3 scripts/bench_matrix.py --artifacts-dir bench-artifacts/20260929-flagship-gguf --engines b11202-cuda v0.9.4 master-920-2f88688 b5130 --conc-sweep 1,2,4,8,16 --md bench-artifacts/20260929-flagship-gguf/benchmark.md
+python3 scripts/bench_matrix.py --blazar-bin /tmp/opencode/relbuild/target/release/blazar --model qwen2.5-0.5b-instruct --artifacts-dir bench-artifacts/2026-11-20-v0.33-wave-final --md BENCHMARK.md
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> [--append-campaign <sibling-campaign-dir>] --md BENCHMARK.md
 ```
 
-_Raw per-cell records (argv, per-run lists, daemon logs): `bench-artifacts/20260929-flagship-gguf/cells.jsonl`._
-
-
-# Appended campaign: 20261006-matched-conc
-
-_Different lane than the main publication: model Qwen3.5-9B-Q4_K_M.gguf and format differ, so absolute t/s is NOT comparable across chapters; comparisons inside this chapter use its own reference rows._
-_Rendered 20261006-matched-conc; blazar 0.20.0; power state of gateway rows: ac._
-
-### Executive summary
-
-- b11429-cuda: gateway 40.9 vs direct 41.5 t/s (-1.3%)
-- b11429-cuda prompt-cache prefill 7525 vs 1328 t/s cold
-- b11429-cuda sweep C=1/2/4/8: C1: 36.7 t/s system (4x65536); C2: 57.5 t/s system (4x65536); C4: 86.1 t/s system (4x65536); C8: 87.4 t/s system (4x65536)
-- gateway cold boot 0.52 s
-
-### Measured in this campaign
-
-- blazar: 2 cell(s)
-- cold-ollama: 1 cell(s)
-- conc-blazar: 4 cell(s)
-- conc-blazar-matched: 4 cell(s)
-- conc-direct: 4 cell(s)
-- direct: 4 cell(s)
-- ollama: 1 cell(s)
-
-### Engine coverage
-
-_Engine selection policy: latest installed version per engine kind._
-| Engine | Kind | Lane | ok cells | err cells | Status |
-|---|---|---|---:|---:|---|
-| b11429-cuda | llamacpp | text (direct + gateway) | 18 | 0 | benchmarked |
-| 2023.11.14-2 | - | - | 0 | 0 | excluded: kind 'piper' has no bench lane in this harness |
-| b5130 | - | - | 0 | 0 | excluded: kind 'whisper' has no bench lane in this harness |
-| master-929-3f8527a | - | - | 0 | 0 | excluded: kind 'sdcpp' has no bench lane in this harness |
-| mlx-0.32.0 | - | - | 0 | 0 | excluded: kind 'mlx' has no bench lane in this harness |
-| sglang-0.5.21 | - | - | 0 | 0 | excluded: model-format sweep: this campaign sweeps a GGUF file; sglang serves HF safetensors checkpoints (rerun with --model <safetensors-row>) |
-| v0.9.4 | - | - | 0 | 0 | excluded: kind 'mistralrs' has no bench lane in this harness |
-
-### Results
-
-#### Single-stream decode (512-token prompt, 128 generated, median of 5)
-
-<details>
-<summary><b>Receipt table - single-stream decode</b></summary>
-
-| Runtime | slots x ctx | decode t/s | tok/s per W (net) | TTFT p50 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | prefill cold t/s | prefill cached t/s | GPU peak MiB | GPU power W |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - llama.cpp b11429-cuda | 4x65536 | 40.6 | 1.299 | 123.5 | 126.3 | 24.6 | 26.1 | 1311.1 | 7340.9 | 6361 | 55.6 |
-| blazar gateway - llama.cpp b11429-cuda (single-stream) | 1x16384 | 40.9 | 1.356 | 124.1 | 131.0 | 24.4 | 25.8 | 1327.6 | 7525.4 | 6101 | 56.0 |
-| direct engine - llama.cpp b11429-cuda | 1x16384 | 41.5 | 1.531 | 121.1 | 122.5 | 24.1 | 25.2 | 1344.0 | 7682.0 | 5681 | 55.6 |
-
-</details>
-
-#### Single-stream decode throughput (chart)
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/speed-single-stream.svg" alt="Single-stream decode throughput (chart)"></p>
-
-_Median decode t/s per runtime and engine; whiskers span the interquartile range of the 5 runs; the dashed line marks the fastest direct engine. Higher is better. Source: 20261006-matched-conc/cells.jsonl._
-
-#### Gateway overhead (chart)
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/gateway-overhead.svg" alt="Gateway overhead (chart)"></p>
-
-_Decode t/s delta of routing through blazar relative to driving the same engine build directly; left of zero means the gateway path won. Source: 20261006-matched-conc/cells.jsonl._
-
-#### Concurrency (1x2x4x8 parallel streams x 128 tokens)
-
-<details>
-<summary><b>Receipt table - concurrency lanes</b></summary>
-
-| Runtime | slots | ok streams | rounds | system t/s | sum-stream t/s | wall s | TTFT max ms | TTFT p99 ms | ITL p99 ms |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| blazar gateway - llama.cpp b11429-cuda | 4x65536 | 3 of 3x1 | 3 | 36.7 | 123.2 | 4.85 | 276 | 273 | 25.8 |
-| blazar gateway - llama.cpp b11429-cuda | 4x65536 | 6 of 3x2 | 3 | 57.5 | 219.9 | 5.79 | 314 | 314 | 31.7 |
-| blazar gateway - llama.cpp b11429-cuda | 4x65536 | 12 of 3x4 | 3 | 86.1 | 356.8 | 8.74 | 523 | 518 | 40.9 |
-| blazar gateway - llama.cpp b11429-cuda | 4x65536 | 24 of 3x8 | 3 | 87.4 | 651.3 | 16.68 | 3937 | 3833 | 167.5 |
-| blazar gateway (matched slots) - llama.cpp b11429-cuda | 1x16384 | 3 of 3x1 | 3 | 36.0 | 122.8 | 4.75 | 318 | 315 | 25.9 |
-| blazar gateway (matched slots) - llama.cpp b11429-cuda | 2x16384 | 6 of 3x2 | 3 | 56.4 | 218.8 | 5.81 | 393 | 384 | 32.4 |
-| blazar gateway (matched slots) - llama.cpp b11429-cuda | 4x16384 | 12 of 3x4 | 3 | 87.0 | 349.5 | 8.85 | 512 | 501 | 55.2 |
-| blazar gateway (matched slots) - llama.cpp b11429-cuda | 8x16384 | 24 of 3x8 | 3 | 84.4 | 365.4 | 18.15 | 1159 | 1087 | 105.7 |
-| direct engine - llama.cpp b11429-cuda | 1 | 3 of 3x1 | 3 | 40.1 | 124.2 | 9.58 | 128 | 128 | 25.3 |
-| direct engine - llama.cpp b11429-cuda | 2 | 6 of 3x2 | 3 | 70.6 | 222.4 | 10.88 | 216 | 216 | 28.3 |
-| direct engine - llama.cpp b11429-cuda | 4 | 12 of 3x4 | 3 | 109.5 | 353.4 | 14.03 | 412 | 412 | 36.6 |
-| direct engine - llama.cpp b11429-cuda | 8 | 24 of 3x8 | 3 | 133.6 | 435.8 | 23.00 | 800 | 800 | 58.5 |
-
-_sum-stream >> system t/s means streams serialize on one slot; roughly equal means genuinely parallel._
-
-</details>
-
-#### Concurrency scaling (chart)
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/concurrency-throughput.svg" alt="Concurrency scaling (chart)"></p>
-
-_Aggregate system tokens/s as parallel streams are added; flat-to-rising means the scheduler keeps the device saturated. Higher is better. Source: 20261006-matched-conc/cells.jsonl._
-
-#### Concurrency tail latency (chart)
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/concurrency-ttft.svg" alt="Concurrency tail latency (chart)"></p>
-
-_Worst-case first-token wait per stream as concurrency rises (log scale) - the tail the scheduler must bound. Lower is better. Dashed curves carry the median time-to-first-byte, which upper-bounds queue wait under burst arrival. Source: 20261006-matched-conc/cells.jsonl._
-
-#### Resource cost and reliability vs concurrency
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/concurrency-vram.svg" alt="Resource cost vs concurrency (chart)"></p>
-
-_Peak VRAM footprint as parallel streams (and their KV caches) stack up. Source: 20261006-matched-conc/cells.jsonl._
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/concurrency-power.svg" alt="Resource cost vs concurrency (chart)"></p>
-
-_Peak GPU board power per concurrency level - the energy price of keeping the device saturated. Source: 20261006-matched-conc/cells.jsonl._
-
-#### Concurrency frontier verdicts
-
-- blazar gateway - llama.cpp b11429-cuda: throughput plateaus at C=8 (<10% per-level gain), peak 87.4 t/s at C=8.
-- blazar gateway (matched slots) - llama.cpp b11429-cuda: throughput plateaus at C=8 (<10% per-level gain), peak 87.0 t/s at C=4.
-- direct engine - llama.cpp b11429-cuda: still gaining at C=8 (40.1 -> 133.6 t/s) - saturation not reached within the sweep.
-
-#### Adaptive reshape under sustained load (no-lag proof)
-
-_Not measured in this campaign (20261006-matched-conc); adaptive reshape lane not run._
-
-#### Perplexity
-
-_Not measured in this campaign (20261006-matched-conc); perplexity lane not run._
-
-#### Greedy parity and gateway transparency (20 prompts, 256 tokens)
-
-_Not measured in this campaign (20261006-matched-conc); greedy parity lane not run._
-
-_Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (blazar `deterministic = true` pins it)._
-
-#### Tool calls (single-turn selection + schema quality)
-
-_Not measured in this campaign (20261006-matched-conc); tool calls lane not run._
-
-#### Quality suites (checker-verified, seeded, greedy)
-
-- _quality lane: **not-measured** - no quality rows in this campaign (lane not reached for the selected providers/engines)_
-
-_Not measured in this campaign (20261006-matched-conc); quality suites lane not run._
-
-#### Optimization axes (ctx 4096, single stream)
-
-_Not measured in this campaign (20261006-matched-conc); optimization axes lane not run._
-
-#### Gateway config knobs (on/off vs default profile)
-
-<details>
-<summary><b>Receipt table - config knob A/B</b></summary>
-
-| Engine | config | decode t/s | decode delta% | ttft p50 ms | ttft delta% | GPU peak MiB | GPU delta | output vs default |
-|---|---|---:|---:|---:|---:|---:|---:|:-:|
-| llama.cpp b11429-cuda | single-stream | 40.9 | +0.7% | 124 | +0.5% | 6101 | -260 | same |
-
-</details>
-
-#### Gateway scheduler knobs under concurrent load (C=8 bursts)
-
-_Not measured in this campaign (20261006-matched-conc); conc lane A/B lane not run._
-
-#### Engine capability matrix
-
-_Not measured in this campaign (20261006-matched-conc); capability matrix lane not run._
-
-#### Cold start and idle wake (lifecycle)
-
-<p align="center"><img src="bench-artifacts/20261006-matched-conc/plots/lifecycle-cold-idle.svg" alt="Lifecycle: cold start and idle wake (chart)"></p>
-
-_Seconds to first token after a cold start (page cache dropped) and after idle-policy expiry; blazar keeps weights resident while ollama reloads from disk. Lower is better. Source: 20261006-matched-conc/cells.jsonl._
-
-_Every cold probe runs page-cache-dropped and GPU-idle-asserted on both runtimes; ollama rows without --ollama-service-restart leave the daemon warm (noted on the chart when it applies). blazar sleeps with weights in RAM (wake = resume); ollama unloads at keep_alive expiry (wake = full disk reload). Policies differ by design - each dot measures its own runtime's idle path after the policy verifiably fired. Per-run detail and per-config rows: the campaign's cells.jsonl._
-
-#### Long-context degradation curve
-
-_Not measured in this campaign (20261006-matched-conc); long-context lane not run._
-
-#### Media lanes (image / video / TTS / whisper)
-
-_Not measured in this campaign (20261006-matched-conc); media lane not run._
-
-_Not measured in this campaign (20261006-matched-conc); media config A/B lane not run._
-
-_Media cells run through the same sandboxed gateway as text lanes but do not assert GPU-idle: a warm engine child is the normal serving shape, so each row stamps gpu_busy_mib / ram_avail_mib / loadavg instead. 3 runs (not 5); media variance is dominated by the model, not the scheduler. Video frame counts are read from the EBML container (lacing-aware), never from an API field; the VRAM gate probe times how fast an over-budget request is rejected with a teaching error._
-
-### Findings (this campaign)
-
-1. **Gateway overhead vs direct spawn: within measurement noise.** b11429-cuda decode 40.9 t/s through the gateway vs 41.5 t/s direct (-1.3%).
-2. **Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes this campaign: 1x16384, 4x65536 - slots follow the live hardware census, each row's child_argv carries the receipt.
-3. **Concurrency scaling per engine.** b11429-cuda (C=1/2/4/8): peak 87.4 t/s at C=8, 30% of ideal at C=8; serialization behavior per level in the frontier table below.
-4. **Prompt cache pays 5.6x on prefill** (7341 cached vs 1311 t/s cold).
-
-### Carried-over findings (no receipt in this campaign)
-
-_Established in earlier campaigns whose receipts live in their bench-artifacts/ directories; this campaign did not measure these lanes._
-
-1. **Speculative n-gram decoding is a net loss for this 9B model** (no draft model; acceptance too low to pay the verification overhead) - documented so the flag is not cargo-culted.
-2. **KV q8_0 quantization is decode-neutral and prefill-neutral steady-state**; the one cold-prefill outlier below is a first-invocation pipeline-compile artifact (controlled re-probe measured full-rate steady state).
-3. **mistral.rs 0.9.3 with default paged attention cannot fit this model on an 8 GiB card** (upstream sizes KV as a fraction of total VRAM); blazar's profile auto-disables paged attention on tight cards and the model then serves correctly.
-4. **Gateway passes OpenAI tools verbatim** (tools-aware validation, no schema rewriting); tool-call quality is the engine's own - selection and argument schema are scored per scenario with a no-tool control for false positives.
-5. Gateway adaptive slots reshape under sustained concurrency without dropping streams.
-
-### Failed cells (engine-reality receipts)
-
-_These knobs crashed the engine child on this test bed; the crash signature is the receipt. Raw logs: `cells.jsonl` (`daemon_log_tail` field)._
-
-| Engine | lane | config | failure |
-|---|---|---|---|
-| ollama-host | cold-ollama |  | ollama not reachable on 11434 (skipped, not started) |
-| ollama-host | ollama |  | ollama not reachable on 11434 (skipped, not started) |
-
-_Raw per-cell records (argv, per-run lists, daemon logs): `bench-artifacts/20261006-matched-conc/cells.jsonl`._
+_Raw per-cell records (argv, per-run lists, daemon logs): `bench-artifacts/2026-11-20-v0.33-wave-final/cells.jsonl`._
