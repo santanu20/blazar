@@ -223,6 +223,11 @@ def hbar_svg(
     if signed:
         vmin = min(0.0, min(lo for _, _, lo, _, _ in rows)) * 1.15
         vmax = max(vmax, 0.0)
+    if vmax - vmin <= 0.0:
+        # Degenerate scale: every row collapsed to a single value (e.g. an
+        # all-zero parity-delta panel). Widen to a unit range so ticks and
+        # the zero axis still render instead of dividing by zero.
+        vmax = vmin + 1.0
 
     def x(v: float) -> float:
         if signed:
