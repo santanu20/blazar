@@ -267,6 +267,66 @@ async fn e2e__healthz_version_tags_models() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// `/api/engines` renders every installed row joined with its derived
+/// capability card. The upserted row (llamacpp lane, empty manifest
+/// JSON) must come back with the full lane contract and the registry's
+/// KV caps - the same join `blazar engine card` renders, over the same
+/// cached store handle the daemon serves from.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__api_engines_lists_rows_with_capability_cards() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    ts.state
+        .with_store(|s| {
+            s.upsert_engine(&blazar_core::EngineRow {
+                tag: "card-t".into(),
+                asset: "stub".into(),
+                sha256: "card".into(),
+                installed_at: 1,
+                active: true,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+            })
+            .unwrap();
+            s.set_active_engine("card-t").unwrap();
+        })
+        .unwrap();
+    let v: serde_json::Value = c
+        .get(format!("{}/api/engines", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["object"], "blazar.engines", "{v}");
+    let rows = v["engines"].as_array().expect("engines array");
+    let row = rows
+        .iter()
+        .find(|r| r["tag"] == "card-t")
+        .expect("upserted engine row listed");
+    assert_eq!(row["kind"], "llamacpp");
+    assert_eq!(row["active"], true);
+    // Derived lane contract: the llama lane serves GGUF, speaks slot
+    // banks, and rides a native (non-venv) child.
+    let lane = &row["capabilities"]["lane"];
+    assert_eq!(lane["kind"], "llamacpp");
+    assert_eq!(lane["formats_served"], serde_json::json!(["gguf"]));
+    assert_eq!(lane["slot_banks"], true);
+    assert_eq!(lane["venv_serving_lane"], false);
+    assert_eq!(lane["schema_version"], 1);
+    // KV caps mirror the connector registry for the lane.
+    let kv = &row["capabilities"]["kv"];
+    assert_eq!(kv["export"], true);
+    assert_eq!(kv["import"], true);
+    assert_eq!(
+        kv["supported_formats"],
+        serde_json::json!(["llama-slot-bank"])
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {

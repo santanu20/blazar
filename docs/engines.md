@@ -86,6 +86,21 @@ honoring the contract above, and a coverage section in this doc. Preflight
 refusals (dead `--rpc` endpoints, unsupported transports) happen BEFORE any
 child exists - crash-looping after spawn is a contract violation.
 
+### Capability cards
+
+`blazar engine card [tag|--kind K]` renders one lane's derived capability
+card: the kind-level contract (serving class, modalities, formats the
+routing table lets this lane decode, slot-bank support, serving tier) plus
+the installed row's probed facts (build identity, spec/cache types, flag
+vocabulary, GPU census, parallelism flags) and the KV connector caps under
+the live `[kv.lmcache]` truth. Every field is DERIVED from the predicates
+and routing tables the runtime already enforces - the card cannot claim
+something the router or supervisor gates would refuse, and a lane grows a
+capability by updating the predicate, never by editing the card. An
+uninstalled `--kind` still renders the lane contract with build/probe
+sections marked absent. `GET /api/engines` serves the same cards as JSON,
+one object per installed row.
+
 ## Per-engine notes
 
 ### llama.cpp

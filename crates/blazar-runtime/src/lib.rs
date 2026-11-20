@@ -60,7 +60,9 @@ pub use daemon::{
     validate_parent_death_guard, wait_for_shutdown_signal,
 };
 pub use engine::gh::GhClient;
-pub use engine::manifest::{Manifest, Vendor, predicted_rescue_lane, probe as probe_manifest};
+pub use engine::manifest::{
+    Manifest, Vendor, lane_only_capability_card, predicted_rescue_lane, probe as probe_manifest,
+};
 pub use engine::{EngineManager, LOCAL_TAG, system_vendor_hint};
 pub use engine_impl::{
     ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, MlxEngine, OpenAiHostEngine, SdCppEngine,

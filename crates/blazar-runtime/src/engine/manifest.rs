@@ -50,6 +50,19 @@ pub enum Vendor {
     Other,
 }
 
+impl Vendor {
+    /// Stable token for JSON surfaces (capability cards).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Amd => "amd",
+            Self::Intel => "intel",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Where an installed engine's code came from. `Fork` marks a
 /// capability lane built from an unmerged llama.cpp fork at a pinned
 /// commit (see `engine build --fork`); routing treats forks as
@@ -498,6 +511,117 @@ impl Manifest {
         self.server_path = folded;
         true
     }
+
+    /// Install-level capability card: the lane contract
+    /// ([`EngineKind::lane_capabilities`](blazar_core::engine_kind::EngineKind::lane_capabilities),
+    /// derived from core's routing/predicate tables) joined with THIS
+    /// build's probed manifest facts and the KV connector registry's
+    /// honest caps - the one JSON surface `blazar engine card` and
+    /// `/api/engines` render. Purely derived: no field here is a new
+    /// claim source, so the card cannot disagree with the router, the
+    /// profile compiler's flag gate, or the connector the supervisor
+    /// dials.
+    ///
+    /// `sglang_lmcache` is the config-level shared-daemon truth
+    /// (`[kv.lmcache] enabled` AND `[sglang] lmcache enabled`) - the
+    /// same term the supervisor feeds `kv::registry::connector_for`,
+    /// so the card's KV block and the running lane's connector cannot
+    /// drift.
+    #[must_use]
+    pub fn capability_card(
+        &self,
+        kind: blazar_core::engine_kind::EngineKind,
+        sglang_lmcache: bool,
+    ) -> serde_json::Value {
+        use serde_json::json;
+
+        // Probed parallelism vocabulary: which multi-GPU shapes this
+        // build accepts, straight from the flag set the profile
+        // compiler gates on (a flag absent here is a hard error at
+        // argv compile time, so this is the honest ceiling).
+        let parallelism_flags = [
+            "tensor-parallel-size",
+            "pipeline-parallel-size",
+            "data-parallel-size",
+            "expert-parallel-size",
+            "context-parallel-size",
+            "decode-context-parallel-size",
+        ];
+        let parallelism_supported: Vec<&str> = parallelism_flags
+            .iter()
+            .copied()
+            .filter(|f| self.flags.contains(&format!("--{f}")))
+            .collect();
+
+        let caps =
+            crate::kv::registry::connector_for(kind, None, None, sglang_lmcache).capabilities();
+
+        json!({
+            "lane": kind.lane_capabilities(),
+            "build": {
+                "tag": self.tag,
+                "build_number": self.build_number,
+                "version_raw": self.version_raw,
+                "source": self.source.as_str(),
+            },
+            // Probe census (as probed at install; `engine reprobe`
+            // refreshes). Empty arrays = lane has no such probe; the
+            // profile compiler falls back to flag-presence gating.
+            "probes": {
+                "spec_types": self.spec_types,
+                "cache_types": self.cache_types,
+                // null (not []) = never probed: only sglang lanes run
+                // the live quant-registry probe.
+                "quant_methods": self.quant_methods,
+                "flag_vocabulary": self.flags.len(),
+            },
+            "devices": self.devices.iter().map(|d| json!({
+                "name": d.name,
+                "vendor": d.vendor().as_str(),
+                "total_mib": d.total_mib,
+                "free_mib": d.free_mib,
+            })).collect::<Vec<_>>(),
+            "parallelism": { "supported": parallelism_supported },
+            "kv": {
+                "export": caps.export,
+                "import": caps.import,
+                "persistent": caps.persistent,
+                "prefix_blocks": caps.prefix_blocks,
+                "cross_process": caps.cross_process,
+                "supported_formats": caps.supported_formats,
+            },
+        })
+    }
+}
+
+/// The lane-contract card for a kind with no readable install row
+/// (uninstalled lane, or a manifest that predates a schema change and
+/// no longer decodes): the derived lane contract plus the registry's
+/// KV caps - both are lane-level facts that need no install - with
+/// build/probe sections null. The CLI and `/api/engines` share this
+/// fallback so an unreadable row renders the same honest card on both
+/// surfaces.
+#[must_use]
+pub fn lane_only_capability_card(
+    kind: blazar_core::engine_kind::EngineKind,
+    sglang_lmcache: bool,
+) -> serde_json::Value {
+    let caps = crate::kv::registry::connector_for(kind, None, None, sglang_lmcache).capabilities();
+    serde_json::json!({
+        "lane": kind.lane_capabilities(),
+        "build": serde_json::Value::Null,
+        "probes": serde_json::Value::Null,
+        "devices": [],
+        "parallelism": { "supported": [] },
+        "kv": {
+            "export": caps.export,
+            "import": caps.import,
+            "persistent": caps.persistent,
+            "prefix_blocks": caps.prefix_blocks,
+            "cross_process": caps.cross_process,
+            "supported_formats": caps.supported_formats,
+        },
+    })
 }
 
 /// Probe a llama-server binary: version, devices, flags.
@@ -2644,5 +2768,110 @@ mod live_census_tests {
         let mut perms = std::fs::metadata(path).expect("stat").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(path, perms).expect("chmod");
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod capability_card_tests {
+    use super::*;
+    use blazar_core::engine_kind::EngineKind;
+
+    fn fixture_manifest(kind: &str) -> Manifest {
+        // Minimal row-shaped manifest; only the fields the card joins
+        // are populated, exactly as a probed row would carry them.
+        let mut m = Manifest {
+            tag: format!("t-{kind}"),
+            build_number: 1,
+            version_raw: "0.1".into(),
+            ..Manifest::default()
+        };
+        match kind {
+            "sglang" => {
+                m.flags.insert("--tensor-parallel-size".into());
+                m.flags.insert("--decode-context-parallel-size".into());
+                m.flags.insert("--ctx-size".into());
+            }
+            "llamacpp" => {
+                m.flags.insert("--ctx-size".into());
+                m.spec_types = vec!["draft-mtp".into()];
+                m.cache_types = vec!["f16".into(), "q8_0".into()];
+            }
+            _ => {}
+        }
+        m
+    }
+
+    /// The card's KV block mirrors the connector registry for the SAME
+    /// config truth the supervisor feeds it: flipping the shared-daemon
+    /// term flips the card, so the card can never claim a store the
+    /// running lane does not dial.
+    #[test]
+    fn unit__capability_card__kv_block_tracks_lmcache_truth() {
+        let m = fixture_manifest("sglang");
+        let off = m.capability_card(EngineKind::Sglang, false);
+        assert!(!off["kv"]["persistent"].as_bool().expect("bool"));
+        assert_eq!(
+            off["kv"]["supported_formats"].as_array().map(Vec::len),
+            Some(0)
+        );
+        let on = m.capability_card(EngineKind::Sglang, true);
+        assert!(on["kv"]["persistent"].as_bool().expect("bool"));
+        assert!(on["kv"]["cross_process"].as_bool().expect("bool"));
+        assert!(
+            on["kv"]["supported_formats"][0]
+                .as_str()
+                .expect("str")
+                .starts_with("lmcache-mp"),
+            "{}",
+            on["kv"]["supported_formats"]
+        );
+    }
+
+    /// The parallelism block lists only flags the probed vocabulary
+    /// actually carries - the same set the profile compiler's
+    /// strict flag gate would accept.
+    #[test]
+    fn unit__capability_card__parallelism_lists_probed_flags_only() {
+        let m = fixture_manifest("sglang");
+        let card = m.capability_card(EngineKind::Sglang, false);
+        assert_eq!(
+            card["parallelism"]["supported"],
+            serde_json::json!(["tensor-parallel-size", "decode-context-parallel-size"]),
+            "{}",
+            card["parallelism"]
+        );
+        // A lane without multi-GPU flags reports an empty list, not a
+        // guessed default.
+        let quiet = fixture_manifest("llamacpp").capability_card(EngineKind::LlamaCpp, false);
+        assert_eq!(quiet["parallelism"]["supported"], serde_json::json!([]));
+    }
+
+    /// Lane contract rides along verbatim (derived in core, asserted
+    /// there): the join must not restate or mutate kind facts, and the
+    /// llama lane's slot-bank truth reaches the card's kv block.
+    #[test]
+    fn unit__capability_card__joins_lane_contract_and_probes() {
+        let m = fixture_manifest("llamacpp");
+        let card = m.capability_card(EngineKind::LlamaCpp, false);
+        assert_eq!(card["lane"]["kind"], "llamacpp");
+        assert_eq!(card["lane"]["slot_banks"], true);
+        assert_eq!(card["lane"]["formats_served"], serde_json::json!(["gguf"]));
+        // Slot-bank lane: gateway-commanded export/import are real.
+        assert_eq!(card["kv"]["export"], true);
+        assert_eq!(card["kv"]["import"], true);
+        // Probes ride as probed: spec + cache vocab present, quant
+        // registry null (llama lanes never run that probe).
+        assert_eq!(
+            card["probes"]["spec_types"],
+            serde_json::json!(["draft-mtp"])
+        );
+        assert_eq!(
+            card["probes"]["cache_types"],
+            serde_json::json!(["f16", "q8_0"])
+        );
+        assert!(card["probes"]["quant_methods"].is_null());
+        assert_eq!(card["probes"]["flag_vocabulary"], 1);
+        assert_eq!(card["build"]["tag"], "t-llamacpp");
     }
 }

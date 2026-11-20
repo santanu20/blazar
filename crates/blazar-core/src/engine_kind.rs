@@ -595,6 +595,78 @@ pub fn advertising_lanes<'a>(
     hits.into_iter().map(|(tag, _)| tag).collect()
 }
 
+/// Lane-level capability contract (schema v1): the consolidation of
+/// every per-kind predicate and routing-table fact this file already
+/// owns, in one queryable card. Derived, never asserted - each field
+/// is computed from the predicates/tables above, so a lane that grows
+/// a capability updates the card by updating the predicate it cites,
+/// and the card cannot drift from the router or the supervisor gates.
+/// NOT load-bearing: scheduling and routing keep reading the
+/// predicates; this is the surface `engine card` / `/api/engines`
+/// render for humans and tooling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaneCapabilities {
+    /// Bump when a field's meaning changes; readers reject unknown
+    /// future versions instead of guessing at new semantics.
+    pub schema_version: u16,
+    pub kind: EngineKind,
+    /// Coarse serving class: "text" | "image" | "transcription" |
+    /// "speech" (audio lanes split by direction).
+    pub lane_class: String,
+    /// What the lane serves: text | image | audio.
+    pub modalities: Vec<String>,
+    /// Model formats this kind can decode, named as the routing table
+    /// discriminates them. Empty = lazy audio lanes, which serve no
+    /// model rows and never join format routing.
+    pub formats_served: Vec<String>,
+    /// [`EngineKind::supports_slot_banks`] - the session-bank API gate.
+    pub slot_banks: bool,
+    /// [`EngineKind::is_venv_serving_lane`] - the serving-succession tier.
+    pub venv_serving_lane: bool,
+}
+
+impl EngineKind {
+    /// The derived capability card for this lane. Every field cites its
+    /// predicate; the formats list mirrors the routing tables
+    /// ([`EngineKind::route_format`] preference orders + domain gates)
+    /// so the card and the router cannot disagree.
+    #[must_use]
+    pub fn lane_capabilities(self) -> LaneCapabilities {
+        let (lane_class, modalities, formats_served) = match self {
+            EngineKind::LlamaCpp => ("text", vec!["text"], vec!["gguf"]),
+            // GGUF overlap fallback in the file lane's preference order.
+            EngineKind::MistralRs => ("text", vec!["text"], vec!["gguf", "safetensors"]),
+            // Quantized safetensors (AWQ/GPTQ/FP8) gate sglang-only.
+            EngineKind::Sglang => (
+                "text",
+                vec!["text"],
+                vec!["safetensors", "quantized-safetensors"],
+            ),
+            // Third candidate in every dir preference order.
+            EngineKind::Vllm => ("text", vec!["text"], vec!["safetensors"]),
+            // Diffusion component sets (DiT+VAE+TE) - image domain gate.
+            EngineKind::SdCpp => ("image", vec!["image"], vec!["diffusion-components"]),
+            // Lazy audio lanes: transcription / speech synthesis. They
+            // serve no model rows, so no format can land on them.
+            EngineKind::Whisper => ("transcription", vec!["audio"], Vec::new()),
+            EngineKind::Piper | EngineKind::Kokoro => ("speech", vec!["audio"], Vec::new()),
+            // MLX quant layout - one-kind domain gate.
+            EngineKind::Mlx => ("text", vec!["text"], vec!["mlx"]),
+            // `.litertlm` bundles - one-kind domain gate.
+            EngineKind::OpenAiHost => ("text", vec!["text"], vec!["litertlm"]),
+        };
+        LaneCapabilities {
+            schema_version: 1,
+            kind: self,
+            lane_class: lane_class.into(),
+            modalities: modalities.into_iter().map(String::from).collect(),
+            formats_served: formats_served.into_iter().map(String::from).collect(),
+            slot_banks: self.supports_slot_banks(),
+            venv_serving_lane: self.is_venv_serving_lane(),
+        }
+    }
+}
+
 impl fmt::Display for EngineKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -1301,5 +1373,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pick.map(|(t, _)| t), Some("b11100-cuda".to_string()));
+    }
+
+    /// The capability card is DERIVED, not asserted: every boolean
+    /// field must equal the predicate it cites, for every lane - a new
+    /// predicate flip that forgets the card (or vice versa) fails here.
+    #[test]
+    fn unit__lane_capabilities__card_fields_equal_source_predicates() {
+        for kind in EngineKind::ALL {
+            let card = kind.lane_capabilities();
+            assert_eq!(card.kind, kind);
+            assert_eq!(card.slot_banks, kind.supports_slot_banks(), "{kind}");
+            assert_eq!(
+                card.venv_serving_lane,
+                kind.is_venv_serving_lane(),
+                "{kind}"
+            );
+            // Lazy audio lanes are exactly the no-format lanes: they
+            // never join routing, so their formats list is empty.
+            assert_eq!(
+                card.formats_served.is_empty(),
+                kind.is_lazy_lane(),
+                "{kind}: lazy audio lanes serve no model rows"
+            );
+            // Lane class matches the audio/text/image split.
+            let expected_class = match kind {
+                EngineKind::SdCpp => "image",
+                EngineKind::Whisper => "transcription",
+                EngineKind::Piper | EngineKind::Kokoro => "speech",
+                _ => "text",
+            };
+            assert_eq!(card.lane_class, expected_class, "{kind}");
+        }
+    }
+
+    /// The card's formats list cannot drift from the router: for every
+    /// claimed format, a roster with only this lane installed must
+    /// route that format's shape TO this lane; and for every format
+    /// NOT claimed, the same roster must teach unserved.
+    #[test]
+    fn unit__lane_capabilities__formats_mirror_the_routing_table() {
+        use crate::config::RoutingPolicy::Quality;
+        let shape_for = |fmt: &str| match fmt {
+            "gguf" => shape(false, GgufFile),
+            "safetensors" => shape(false, SafetensorsDir),
+            "quantized-safetensors" => shape(false, QuantizedSafetensors),
+            "mlx" => shape(false, ShardFormat::MlxLayout),
+            "litertlm" => shape(false, LitertBundle),
+            "diffusion-components" => shape(true, ShardFormat::SafetensorsDir),
+            other => panic!("unknown format token {other:?} - extend the map"),
+        };
+        let all_formats = [
+            "gguf",
+            "safetensors",
+            "quantized-safetensors",
+            "mlx",
+            "litertlm",
+            "diffusion-components",
+        ];
+        for kind in EngineKind::ALL {
+            let card = kind.lane_capabilities();
+            if kind.is_lazy_lane() {
+                continue; // pinned above: audio lanes carry no formats
+            }
+            for fmt in all_formats {
+                let roster = [kind];
+                let routed = EngineKind::route_format(shape_for(fmt), &roster, Quality);
+                if card.formats_served.iter().any(|f| f == fmt) {
+                    assert_eq!(
+                        routed,
+                        Some(kind),
+                        "{kind} claims {fmt} but a lone {kind} roster cannot serve it"
+                    );
+                } else {
+                    assert_eq!(
+                        routed, None,
+                        "{kind} card omits {fmt} but a lone {kind} roster routes it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The card serializes and round-trips - it is a wire/JSON surface
+    /// (`engine card --json`, `/api/engines`), so field drift between
+    /// serialize and deserialize must fail here, not in a client.
+    #[test]
+    fn unit__lane_capabilities__serde_roundtrip_all_kinds() {
+        for kind in EngineKind::ALL {
+            let card = kind.lane_capabilities();
+            let json = serde_json::to_string(&card).unwrap();
+            let back: LaneCapabilities = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, card);
+            // Stable shape pins: the version and kind tokens clients
+            // branch on land as expected.
+            assert!(json.contains("\"schema_version\":1"), "{json}");
+            assert!(json.contains(&format!("\"kind\":\"{}\"", kind.as_str())));
+        }
     }
 }

@@ -1276,6 +1276,29 @@ enum EngineCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show one lane's capability card (contract + probed build facts)
+    ///
+    /// Renders the DERIVED lane contract (routing formats, slot
+    /// banks, serving tier), this build's probed vocabulary (spec
+    /// types, cache types, quant registry, parallelism flags), and the
+    /// honest KV connector caps for the current `[kv.lmcache]` truth.
+    /// A positional tag picks that exact row; `--kind` picks the
+    /// newest installed row of a lane (and still renders the
+    /// lane-level contract when that lane is not installed); neither
+    /// picks the active row.
+    Card {
+        /// Exact engine tag (see `blazar engine list`)
+        tag: Option<String>,
+        /// Engine lane: llamacpp | mistralrs | sglang | vllm | sdcpp |
+        /// whisper | piper | kokoro | mlx | openaihost - newest
+        /// installed row of that lane
+        #[arg(long, conflicts_with = "tag")]
+        kind: Option<String>,
+        /// Emit the machine-readable card (JSON) instead of the
+        /// sectioned text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `blazar registry` subcommands: maintain the signature chain that
@@ -23076,8 +23099,311 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
         EngineCmd::Offers { arch, json } => engine_offers(arch.as_deref(), json).await?,
         EngineCmd::Delta { tag, json } => engine_delta(&d, tag.as_deref(), json)?,
         EngineCmd::Recommend { model, json } => engine_recommend_cmd(model.as_deref(), json)?,
+        EngineCmd::Card { tag, kind, json } => {
+            let out = engine_card(&d, tag.as_deref(), kind.as_deref(), json)?;
+            print!("{out}");
+        }
     }
     Ok(())
+}
+
+/// `blazar engine card` - render one lane's derived capability card:
+/// the kind-level contract (core's routing/predicate tables), the
+/// installed row's probed manifest facts, and the KV connector caps
+/// under the live `[kv.lmcache]` truth. `--kind` of an uninstalled
+/// lane still renders the lane contract (it derives from the kind,
+/// not the install) with the build/probe sections marked absent.
+/// Returns the output; the dispatch arm prints it (keeps the renderer
+/// unit-testable without capturing stdout).
+fn engine_card(
+    d: &BlazarDirs,
+    tag: Option<&str>,
+    kind: Option<&str>,
+    json: bool,
+) -> Result<String> {
+    let cfg = Config::load(d).map_err(|e| anyhow!("{e}"))?;
+    let sglang_lmcache = cfg.kv.lmcache.enabled && cfg.sglang.lmcache.enabled;
+
+    // Row resolution: exact tag > newest row of a lane > active row.
+    let rows = Store::open(d)?.list_engines()?;
+    let row: Option<_> = if let Some(tag) = tag {
+        let found = rows.iter().find(|r| r.tag == tag);
+        if found.is_none() {
+            anyhow::bail!("no installed engine tag {tag:?} - blazar engine list");
+        }
+        found
+    } else if let Some(kind) = kind {
+        let kind: EngineKind = kind
+            .parse()
+            .map_err(|e| anyhow!("engine card --kind {kind:?}: {e}"))?;
+        rows.iter().find(|r| r.kind == kind)
+    } else {
+        let active = rows.iter().find(|r| r.active);
+        if active.is_none() {
+            anyhow::bail!("no active engine - pass a tag or --kind, or blazar engine install");
+        }
+        active
+    };
+
+    let kind = row.map_or_else(
+        || {
+            kind.and_then(|k| k.parse().ok())
+                .expect("row or --kind must resolve a lane")
+        },
+        |r| r.kind,
+    );
+
+    let (card, install_note) = match row {
+        Some(r) => {
+            match serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest) {
+                Ok(m) => (m.capability_card(kind, sglang_lmcache), None),
+                Err(_) => (
+                    // Row exists but its manifest JSON is unreadable:
+                    // render the honest lane contract, say why the
+                    // build section is missing (engine reprobe heals).
+                    blazar_runtime::lane_only_capability_card(kind, sglang_lmcache),
+                    Some("manifest unreadable - blazar engine reprobe <tag> refreshes it"),
+                ),
+            }
+        }
+        None => (
+            blazar_runtime::lane_only_capability_card(kind, sglang_lmcache),
+            Some("lane not installed - blazar engine install --kind <kind>"),
+        ),
+    };
+
+    if json {
+        if let Some(note) = install_note {
+            // Additive key, same shape the card body uses for honest
+            // gaps: null-valued probes already speak "not probed".
+            return Ok(format!(
+                "{}\n",
+                serde_json::json!({ "install": note, "card": card })
+            ));
+        }
+        return Ok(format!("{card}\n"));
+    }
+
+    let mut out = render_engine_card(&card);
+    if let Some(note) = install_note {
+        writeln!(out, "\n{note}").unwrap();
+    }
+    Ok(out)
+}
+
+/// Render a card list value: `,`-joined strings, `none` for an empty
+/// array (an empty cell would read as "measured and zero"), `-` when
+/// the key is absent.
+fn render_card_list(v: &serde_json::Value) -> String {
+    match v.as_array() {
+        Some(items) if items.is_empty() => "none".to_string(),
+        Some(items) => items
+            .iter()
+            .filter_map(|i| i.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => "-".to_string(),
+    }
+}
+
+/// Lane-contract section: the schema-versioned core card (routing
+/// tables + supervisor gates), rendered as key/value lines.
+fn render_card_lane_section(out: &mut String, lane: &serde_json::Value) {
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    writeln!(
+        out,
+        "\nlane contract (schema {})",
+        lane["schema_version"].as_u64().unwrap_or_default()
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  class           {}",
+        lane["lane_class"].as_str().unwrap_or("-")
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  modalities      {}",
+        render_card_list(&lane["modalities"])
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  formats served  {}",
+        render_card_list(&lane["formats_served"])
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  slot banks      {}",
+        yes_no(lane["slot_banks"].as_bool().unwrap_or(false))
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  serving tier    {}",
+        if lane["venv_serving_lane"].as_bool().unwrap_or(false) {
+            "venv child (can hold serving-active)"
+        } else {
+            "native child"
+        }
+    )
+    .unwrap();
+}
+
+/// Build section: the installed row's identity, or the explicit
+/// "no installed row" line for a lane-only card.
+fn render_card_build_section(out: &mut String, card: &serde_json::Value) {
+    if card["build"].is_null() {
+        writeln!(out, "\nbuild            no installed row for this lane").unwrap();
+        return;
+    }
+    let build = &card["build"];
+    writeln!(out, "\nbuild").unwrap();
+    writeln!(
+        out,
+        "  tag             {}",
+        build["tag"].as_str().unwrap_or("-")
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  build           {}",
+        build["build_number"]
+            .as_u64()
+            .map_or_else(|| "-".to_string(), |b| b.to_string())
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  version         {}",
+        build["version_raw"].as_str().unwrap_or("-")
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  source          {}",
+        build["source"].as_str().unwrap_or("-")
+    )
+    .unwrap();
+}
+
+/// Probes section: install-time manifest probes, with honest absent
+/// text per probe (`none probed` vs `not probed` vs `-`).
+fn render_card_probes_section(out: &mut String, card: &serde_json::Value) {
+    if card["probes"].is_null() {
+        writeln!(out, "\nprobes           no installed row for this lane").unwrap();
+        return;
+    }
+    let probes = &card["probes"];
+    let probed_list = |key: &str| -> String {
+        if probes[key].as_array().is_some_and(Vec::is_empty) {
+            "none probed".to_string()
+        } else {
+            render_card_list(&probes[key])
+        }
+    };
+    writeln!(out, "\nprobes").unwrap();
+    writeln!(out, "  spec types      {}", probed_list("spec_types")).unwrap();
+    writeln!(out, "  cache types     {}", probed_list("cache_types")).unwrap();
+    writeln!(
+        out,
+        "  quant methods   {}",
+        match probes["quant_methods"].as_array() {
+            None => "not probed (sglang lanes only)".to_string(),
+            Some(items) if items.is_empty() => "none".to_string(),
+            Some(_) => render_card_list(&probes["quant_methods"]),
+        }
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "  flag vocabulary {}",
+        probes["flag_vocabulary"]
+            .as_u64()
+            .map_or_else(|| "-".to_string(), |n| format!("{n} flags"))
+    )
+    .unwrap();
+}
+
+/// Devices + parallelism sections: probed GPU census and the
+/// parallelism flags this build's `--help` vocabulary carries.
+fn render_card_devices_section(out: &mut String, card: &serde_json::Value) {
+    let devices = card["devices"].as_array().cloned().unwrap_or_default();
+    writeln!(out, "\ndevices").unwrap();
+    if devices.is_empty() {
+        writeln!(out, "  none probed").unwrap();
+    }
+    for dev in &devices {
+        writeln!(
+            out,
+            "  {:<15} {}, {} MiB total, {} MiB free",
+            dev["name"].as_str().unwrap_or("-"),
+            dev["vendor"].as_str().unwrap_or("-"),
+            dev["total_mib"].as_u64().unwrap_or_default(),
+            dev["free_mib"].as_u64().unwrap_or_default(),
+        )
+        .unwrap();
+    }
+    writeln!(out, "\nparallelism").unwrap();
+    writeln!(
+        out,
+        "  supported       {}",
+        render_card_list(&card["parallelism"]["supported"])
+    )
+    .unwrap();
+}
+
+/// KV connector section: the caps the live connector reports under
+/// the current `[kv.lmcache]` truth.
+fn render_card_kv_section(out: &mut String, card: &serde_json::Value) {
+    let kv = &card["kv"];
+    let yes_no = |b: bool| if b { "yes" } else { "no" };
+    writeln!(out, "\nkv connector").unwrap();
+    for (label, key) in [
+        ("export", "export"),
+        ("import", "import"),
+        ("persistent", "persistent"),
+        ("prefix blocks", "prefix_blocks"),
+        ("cross process", "cross_process"),
+    ] {
+        writeln!(
+            out,
+            "  {:<15} {}",
+            label,
+            yes_no(kv[key].as_bool().unwrap_or(false))
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "  formats         {}",
+        render_card_list(&kv["supported_formats"])
+    )
+    .unwrap();
+}
+
+/// Human rendering of a capability card: sectioned key/value lines,
+/// one section per card block. `yes`/`no` for booleans, `,`-joined
+/// lists, and explicit "not probed"-style text for absent facts -
+/// empty cells would read as "measured and zero".
+fn render_engine_card(card: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let lane = &card["lane"];
+    writeln!(
+        out,
+        "engine card - {} ({})",
+        card["build"]["tag"].as_str().unwrap_or("no installed row"),
+        lane["kind"].as_str().unwrap_or("?")
+    )
+    .unwrap();
+    render_card_lane_section(&mut out, lane);
+    render_card_build_section(&mut out, card);
+    render_card_probes_section(&mut out, card);
+    render_card_devices_section(&mut out, card);
+    render_card_kv_section(&mut out, card);
+    out
 }
 
 /// `blazar engine install` - install + activate a prebuilt mistral.rs
@@ -35405,5 +35731,113 @@ engine = "sglang"
             assert!(err.contains("group/world-readable"), "{err}");
             assert!(err.contains("chmod 600"), "{err}");
         }
+    }
+
+    fn card_test_dirs(root: &std::path::Path) -> BlazarDirs {
+        BlazarDirs {
+            config_dir: root.join("cfg").join("blazar"),
+            data_dir: root.join("data").join("blazar"),
+        }
+    }
+
+    /// The card command's row resolution + join over a real store: a
+    /// seeded sglang row with probed parallelism flags renders the
+    /// lane contract, the probed vocabulary, and the KV block for the
+    /// fresh-config truth (lmcache off -> no persistent store).
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_card__tag_row_json_joins_manifest_and_kv_truth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(tmp.path());
+        let mut m = blazar_runtime::Manifest {
+            tag: "sg-test".into(),
+            ..Default::default()
+        };
+        m.flags.insert("--tensor-parallel-size".into());
+        m.flags.insert("--context-parallel-size".into());
+        let store = Store::open(&d).unwrap();
+        store
+            .upsert_engine(&blazar_core::EngineRow {
+                tag: "sg-test".into(),
+                asset: "stub".into(),
+                sha256: "x".into(),
+                installed_at: 1,
+                active: true,
+                manifest: serde_json::to_string(&m).unwrap(),
+                kind: blazar_core::engine_kind::EngineKind::Sglang,
+            })
+            .unwrap();
+        store.set_active_engine("sg-test").unwrap();
+        drop(store);
+
+        let out = engine_card(&d, Some("sg-test"), None, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["lane"]["kind"], "sglang");
+        assert_eq!(
+            v["lane"]["formats_served"],
+            serde_json::json!(["safetensors", "quantized-safetensors"])
+        );
+        assert_eq!(
+            v["parallelism"]["supported"],
+            serde_json::json!(["tensor-parallel-size", "context-parallel-size"]),
+            "{}",
+            v["parallelism"]
+        );
+        // Fresh config: the shared lmcache daemon is off, so the KV
+        // block must not claim a persistent store.
+        assert_eq!(v["kv"]["persistent"], false);
+    }
+
+    /// `--kind` of a lane with no install still renders the derived
+    /// lane contract - the card's honest gap, not an error.
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_card__uninstalled_kind_renders_lane_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(tmp.path());
+        let out = engine_card(&d, None, Some("mlx"), false).unwrap();
+        assert!(
+            out.contains("engine card - no installed row (mlx)"),
+            "{out}"
+        );
+        assert!(out.contains("formats served  mlx"), "{out}");
+        assert!(out.contains("no installed row for this lane"), "{out}");
+        assert!(out.contains("lane not installed"), "{out}");
+    }
+
+    /// Unknown tags and no-active-row states teach the fix, matching
+    /// the command family's error style.
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__engine_card__unknown_tag_and_empty_store_teach() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(tmp.path());
+        let err = engine_card(&d, Some("nope"), None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no installed engine tag \"nope\""), "{err}");
+        assert!(err.contains("blazar engine list"), "{err}");
+        let err = engine_card(&d, None, None, false).unwrap_err().to_string();
+        assert!(err.contains("no active engine"), "{err}");
+        assert!(err.contains("blazar engine install"), "{err}");
+    }
+
+    /// The human renderer prints every section with explicit absent
+    /// text - no silently-empty cells.
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__render_engine_card__sections_and_honest_absences() {
+        let card = blazar_runtime::lane_only_capability_card(
+            blazar_core::engine_kind::EngineKind::Whisper,
+            false,
+        );
+        let text = render_engine_card(&card);
+        assert!(text.contains("lane contract (schema 1)"), "{text}");
+        assert!(text.contains("class           transcription"), "{text}");
+        assert!(text.contains("formats served  none"), "{text}");
+        assert!(text.contains("slot banks      no"), "{text}");
+        assert!(text.contains("no installed row for this lane"), "{text}");
+        assert!(text.contains("kv connector"), "{text}");
+        assert!(text.contains("formats         none"), "{text}");
     }
 }

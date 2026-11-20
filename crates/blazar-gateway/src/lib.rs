@@ -13,6 +13,7 @@ pub mod classify;
 pub mod config_api;
 pub mod console;
 pub mod engine_recommend;
+pub mod engines;
 pub mod error_codes;
 pub mod explain;
 pub mod fabric;
@@ -694,6 +695,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mcp", get(mcp::mcp_status))
         .route("/api/fabric", get(fabric::fabric))
         .route("/api/quantiles", get(quantiles::quantiles))
+        .route("/api/engines", get(engines::engines))
         .route("/api/benchmarks", get(benchmarks::benchmarks))
         .route("/ui", get(console::ui))
         .route("/api/replicate", post(federation::replicate))
