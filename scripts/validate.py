@@ -2217,6 +2217,15 @@ _K = [
         "default MCP exposure; validated against known servers or all/none",
     ),
     (
+        "mcp_max_request_secs",
+        False,
+        False,
+        "boundary",
+        None,
+        "aggregate wall-clock ceiling for one MCP-mediated chat loop; "
+        "exceeded -> 504 teaching + clean cancel of the engine request",
+    ),
+    (
         "capability_registry_url",
         True,
         False,
@@ -4608,6 +4617,64 @@ def phase_inventory() -> None:
                 alias in mounted,
                 f"-> {alias}",
             )
+
+
+def phase_docs() -> None:
+    """Docs TOML drift alarm.
+
+    Every ```toml block in docs/*.md is fed to the REAL binary's config
+    parser (config list under the sandbox XDG) - the schema itself is the
+    authority, so knob renames, section moves, and type changes surface as
+    parse/validate failures here instead of shipping stale examples.
+    Cross-block fragments: pool/failover members may reference an
+    [[remotes]] name introduced in another block of the same file, so the
+    file's [[remotes]] blocks are prepended as shared context.
+    """
+    print("\n== phase 0c: docs toml drift ==")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    docs_dir = os.path.join(repo, "docs")
+    cfg_path = os.path.join(SANDBOX.config_dir, "config.toml")
+    total = 0
+    for fname in sorted(os.listdir(docs_dir)):
+        if not fname.endswith(".md"):
+            continue
+        with open(os.path.join(docs_dir, fname), encoding="utf-8") as f:
+            blocks = re.findall(r"```toml\n(.*?)```", f.read(), re.DOTALL)
+        if not blocks:
+            continue
+        # Blocks that declare remotes serve as shared context for the
+        # others; line-anchored so a comment mentioning [[remotes]] does
+        # not count (that false-positive doubles the pools and trips the
+        # duplicate-name guard).
+        remotes_ctx = "\n".join(
+            b for b in blocks if re.search(r"^\[\[remotes\]\]", b, re.MULTILINE)
+        )
+        for i, block in enumerate(blocks):
+            total += 1
+            first = block.strip().splitlines()[0]
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                # Block first, context after: a bare top-level key in the
+                # block would otherwise be absorbed into the preceding
+                # [[remotes]] table (TOML last-table-wins semantics).
+                f.write(block + "\n" + remotes_ctx if remotes_ctx else block)
+            p = cli("config", "list")
+            err = ""
+            if p.stdout and p.stdout.startswith("blazar: config"):
+                err = p.stdout.strip().splitlines()[0]
+            check(
+                "docs",
+                f"{fname} toml block {i} ({first[:40]})",
+                p.returncode == 0,
+                err or "accepted by live schema",
+            )
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        f.write("")
+    check(
+        "docs",
+        "docs toml blocks discovered",
+        total > 0,
+        f"{total} blocks scanned across docs/*.md",
+    )
 
 
 def phase_manifests() -> None:
@@ -14304,6 +14371,7 @@ def _full_toplevel() -> dict:
         "keep_tags": 2,
         "mcp": [],
         "mcp_default": "none",
+        "mcp_max_request_secs": 120,
         # Options deliberately omitted at boot (None counts for c0):
         # capability_registry_url (sandbox has no egress), rope_freq_base/
         # rope_freq_scale (model-specific rope tuning), flash_attention
@@ -17431,6 +17499,7 @@ def main() -> int:
     phases = [
         ("manifests", phase_manifests),
         ("inventory", phase_inventory),
+        ("docs", phase_docs),
         ("baseline", phase_baseline),
         ("config", phase_config),
         ("api", phase_api),

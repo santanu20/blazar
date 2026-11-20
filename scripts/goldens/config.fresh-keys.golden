@@ -77,6 +77,7 @@ lora_init_without_apply
 main_gpu
 max_loaded_models
 mcp
+mcp_max_request_secs
 media_job_wait_secs
 mistralrs
 mlx
