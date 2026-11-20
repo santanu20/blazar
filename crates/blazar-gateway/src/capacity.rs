@@ -272,6 +272,50 @@ pub(crate) struct FitRequest {
     ctx: Option<u32>,
 }
 
+/// Per-device fit facts for one demand. Pure so the multi-GPU math is
+/// unit-pinnable without a live census: one JSON row per device
+/// (`fits` / `max_ctx` / `max_ctx_q8` / `max_parallel`) plus the index of
+/// the recommended device - the first card where the demand fits. `None`
+/// when it fits nowhere (or there is no census at the call site).
+fn per_device_fit(
+    weights_mib: u64,
+    kv: impl Fn(u64) -> u64,
+    ctx_evaluated: u64,
+    demand_mib: u64,
+    devs: &[DeviceRow],
+) -> (Vec<serde_json::Value>, Option<usize>) {
+    let mut recommended = None;
+    let rows = devs
+        .iter()
+        .enumerate()
+        .map(|(idx, dev)| {
+            let fits = demand_mib <= dev.free_mib;
+            if fits && recommended.is_none() {
+                recommended = Some(idx);
+            }
+            let max_ctx = ctx_ladder(weights_mib, &kv, dev.free_mib, ctx_evaluated);
+            let max_ctx_q8 = ctx_ladder(
+                weights_mib,
+                |c| kv(c).div_ceil(2),
+                dev.free_mib,
+                ctx_evaluated,
+            );
+            // Whole instances of this demand the card holds at free time.
+            let max_parallel = dev.free_mib / demand_mib.max(1);
+            serde_json::json!({
+                "id": format!("cuda:{}", dev.index),
+                "name": dev.name,
+                "free_mib": dev.free_mib,
+                "fits": fits,
+                "max_ctx": max_ctx,
+                "max_ctx_q8": max_ctx_q8,
+                "max_parallel": max_parallel,
+            })
+        })
+        .collect();
+    (rows, recommended)
+}
+
 /// POST /api/fit - pre-flight capacity math for one model at a context
 /// size: "will `<model>` load at `<ctx>` on the primary GPU right now?"
 ///
@@ -280,6 +324,14 @@ pub(crate) struct FitRequest {
 /// `parse_devices` census - so the answer cannot drift from what a spawn
 /// attempt would actually do. `max_ctx` / `max_ctx_q8` walk the same
 /// halve-until-fits ladder as `blazar fit` (floor 1024; q8 halves KV).
+/// Multi-GPU boxes additionally get one row per card (placement
+/// recommendation = first fitting card) and the measured-vs-predicted
+/// calibration from `/api/admission-accuracy` when a sample exists.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
 pub(crate) async fn fit(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<FitRequest>,
@@ -323,11 +375,14 @@ pub(crate) async fn fit(
     let demand_mib = weights_mib + kv_mib + FIT_SPAWN_OVERHEAD_MIB;
 
     let mut notes = Vec::new();
-    let (device, free_mib, fits, max_ctx, max_ctx_q8) = if let Some(dev) = census
-        .as_deref()
-        .map(parse_devices)
-        .and_then(|rows| rows.first().cloned())
-    {
+    let census_rows = census.as_deref().map(parse_devices).unwrap_or_default();
+    let (devices, recommended) =
+        per_device_fit(weights_mib, kv, ctx_evaluated, demand_mib, &census_rows);
+    let primary = census_rows.first().cloned();
+    let pick = recommended
+        .and_then(|idx| census_rows.get(idx).cloned())
+        .or(primary.clone());
+    let (device, free_mib, fits, max_ctx, max_ctx_q8, max_parallel) = if let Some(dev) = pick {
         let fits = demand_mib <= dev.free_mib;
         let max_ctx = ctx_ladder(weights_mib, kv, dev.free_mib, ctx_evaluated);
         let max_ctx_q8 = ctx_ladder(
@@ -336,23 +391,49 @@ pub(crate) async fn fit(
             dev.free_mib,
             ctx_evaluated,
         );
+        let max_parallel = dev.free_mib / demand_mib.max(1);
         (
             format!("cuda:{} {}", dev.index, dev.name),
             dev.free_mib,
             Some(fits),
             Some(max_ctx),
             Some(max_ctx_q8),
+            Some(max_parallel),
         )
     } else {
         notes.push(
             "no nvidia-smi census on this box - fit math reported, fits/max_ctx null \
              (non-NVIDIA boxes: consult the engine's own loader)",
         );
-        ("unknown".to_string(), 0, None, None, None)
+        ("unknown".to_string(), 0, None, None, None, None)
     };
     if max_ctx == Some(0) {
         notes.push("even ctx 1024 does not fit free VRAM - smaller quant or free capacity first");
     }
+    let recommended_device = recommended.map(|idx| format!("cuda:{}", census_rows[idx].index));
+
+    // Measured-vs-predicted calibration for this exact model, when a load
+    // has been observed (ties the fit answer to `/api/admission-accuracy`
+    // instead of trusting the floor blindly).
+    let calibration = {
+        let model = row.name.as_str();
+        state
+            .admission
+            .snapshot()
+            .into_iter()
+            .find(|r| r.model == model)
+            .map(|r| {
+                serde_json::json!({
+                    "predicted_mib": r.predicted_mib,
+                    "actual_mib": r.actual_mib,
+                    "delta_mib": r.actual_mib.map(|a| a as i64 - r.predicted_mib as i64),
+                    "error_pct": r.actual_mib.filter(|_| r.predicted_mib > 0).map(|a| {
+                        ((a as f64 - r.predicted_mib as f64) / r.predicted_mib as f64) * 100.0
+                    }),
+                    "sampled_unix": r.sampled_unix,
+                })
+            })
+    };
 
     (
         StatusCode::OK,
@@ -369,6 +450,10 @@ pub(crate) async fn fit(
             "fits": fits,
             "max_ctx": max_ctx,
             "max_ctx_q8": max_ctx_q8,
+            "max_parallel": max_parallel,
+            "devices": devices,
+            "recommended_device": recommended_device,
+            "calibration": calibration,
             "notes": notes,
         })),
     )
@@ -422,5 +507,41 @@ mod tests {
         assert_eq!(ctx_ladder(5000, |c| c / 10, 10_000, 8192), 8192);
         // Even 1024 (kv ~102) does not fit.
         assert_eq!(ctx_ladder(6000, |c| c / 10, 6000, 8192), 0);
+    }
+
+    fn dev_row(index: u32, name: &str, free_mib: u64) -> DeviceRow {
+        DeviceRow {
+            index,
+            name: name.to_string(),
+            total_mib: free_mib,
+            free_mib,
+            util_pct: 0,
+        }
+    }
+
+    #[test]
+    fn unit__per_device_fit__recommends_first_fitting_card_with_parallelism() {
+        // Small primary + roomy secondary: the recommendation skips the
+        // full card 0 and lands on card 1, whose free MiB holds four
+        // whole instances of the demand.
+        let devs = [dev_row(0, "RTX 4070", 4096), dev_row(1, "RTX 3090", 24_575)];
+        let (rows, rec) = per_device_fit(5000, |c| c / 10, 8192, 5700, &devs);
+        assert_eq!(rec, Some(1));
+        assert_eq!(rows[0]["fits"], serde_json::json!(false));
+        assert_eq!(rows[0]["max_parallel"], serde_json::json!(0));
+        assert_eq!(rows[0]["max_ctx"], serde_json::json!(0));
+        assert_eq!(rows[1]["fits"], serde_json::json!(true));
+        assert_eq!(rows[1]["max_parallel"], serde_json::json!(4));
+        assert_eq!(rows[1]["max_ctx"], serde_json::json!(8192));
+        assert_eq!(rows[1]["id"], serde_json::json!("cuda:1"));
+    }
+
+    #[test]
+    fn unit__per_device_fit__fits_nowhere_recommends_none() {
+        let devs = [dev_row(0, "a", 1000), dev_row(1, "b", 2000)];
+        let (rows, rec) = per_device_fit(6000, |c| c / 10, 8192, 6700, &devs);
+        assert_eq!(rec, None);
+        assert!(rows.iter().all(|r| r["fits"] == serde_json::json!(false)));
+        assert!(rows.iter().all(|r| r["max_ctx"] == serde_json::json!(0)));
     }
 }
