@@ -4703,6 +4703,27 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP blazar_slo_deadline_exceeded_total Requests admitted AFTER their SLO deadline expired (served late: queue burn)\n# TYPE blazar_slo_deadline_exceeded_total counter\nblazar_slo_deadline_exceeded_total {}\n",
         state.queue.slo_deadline_exceeded()
     );
+    // Scheduler observability (suggestion #14): how long admitted
+    // requests WAITED for a slot (only contended requests enter the
+    // histogram), how many gave up, and why admissions were refused.
+    state.queue.wait_secs().render(&mut merged);
+    let _ = write!(
+        merged,
+        "# HELP blazar_queue_wait_timeouts_total Waiters that hit the queue-timeout arm instead of being admitted\n# TYPE blazar_queue_wait_timeouts_total counter\nblazar_queue_wait_timeouts_total {}\n",
+        state.queue.timeouts()
+    );
+    let _ = write!(
+        merged,
+        "# HELP blazar_gateway_admission_rejections_total Requests refused at the gateway, by teaching kind\n# TYPE blazar_gateway_admission_rejections_total counter\n"
+    );
+    for (kind, n) in state.keys.rejection_snapshot() {
+        let _ = writeln!(
+            merged,
+            "blazar_gateway_admission_rejections_total{{kind=\"{}\"}} {}",
+            escape_label(kind),
+            n
+        );
+    }
     // Measured prompt-cache hit rate (A16): drives the adaptive
     // --cache-ram clamp. Absent until the poller has a full window.
     hint_gauge(

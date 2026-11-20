@@ -133,6 +133,13 @@ pub struct PriorityQueue {
     /// Waiters admitted AFTER their SLO deadline expired (the "burn"
     /// signal - the request was served, but too late for its class).
     deadline_exceeded: std::sync::atomic::AtomicU64,
+    /// Time-to-admission histogram: observed at the waiter when a slot
+    /// is granted (never on timeout - the histogram stays
+    /// served-latency truth; refused waits are `timeouts` below).
+    wait_obs: crate::histogram::Histogram,
+    /// Waiters that exhausted their bounded wait and were refused
+    /// (503 `all_slots_busy`) - the demand we turned away.
+    timeouts: std::sync::atomic::AtomicU64,
 }
 
 impl Default for PriorityQueue {
@@ -142,6 +149,8 @@ impl Default for PriorityQueue {
             notify: tokio::sync::Notify::new(),
             epoch: std::time::Instant::now(),
             deadline_exceeded: std::sync::atomic::AtomicU64::new(0),
+            wait_obs: crate::histogram::queue_wait(),
+            timeouts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -214,6 +223,7 @@ impl PriorityQueue {
         timeout: Duration,
         wfq: Option<(&str, u32)>,
     ) -> Result<(), String> {
+        let started = std::time::Instant::now();
         let (tx, mut rx) = oneshot::channel();
         let key = {
             let mut q = self.inner.lock().expect("queue lock");
@@ -270,7 +280,10 @@ impl PriorityQueue {
         };
         self.notify.notify_waiters();
         match tokio::time::timeout(timeout, &mut rx).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                self.wait_obs.observe_secs(started.elapsed().as_secs_f64());
+                Ok(())
+            }
             Ok(Err(_)) => Err("queue shut down".into()),
             Err(_) => {
                 // Race closure: an admission can fire in the same instant the
@@ -281,6 +294,7 @@ impl PriorityQueue {
                 // still counts as empty here); anything but a live admission
                 // falls through to the honest timeout path below.
                 if rx.try_recv().is_ok() {
+                    self.wait_obs.observe_secs(started.elapsed().as_secs_f64());
                     return Ok(());
                 }
                 // F59: remove our own entry - on an idle system no future
@@ -291,6 +305,8 @@ impl PriorityQueue {
                 q.waiters.remove(&key);
                 q.meta.remove(&key);
                 drop(q);
+                self.timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(format!(
                     "waited longer than {} for a slot (all_slots_busy)",
                     fmt_wait(timeout)
@@ -399,6 +415,20 @@ impl PriorityQueue {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Time-to-admission histogram for `/metrics` (rendered by the
+    /// metrics responder alongside ttft/tpot).
+    #[must_use]
+    pub fn wait_secs(&self) -> &crate::histogram::Histogram {
+        &self.wait_obs
+    }
+
+    /// Total waiters that exhausted their bounded wait and were refused
+    /// (503 `all_slots_busy`). Monotonic counter for `/metrics`.
+    #[must_use]
+    pub fn timeouts(&self) -> u64 {
+        self.timeouts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Borrowing check for reserved capacity: is any Tool/Interactive
     /// waiter parked for this model right now? While one is, `RawLong`
     /// admission is capped below the reserved slots.
@@ -471,6 +501,66 @@ mod tests {
         }
         q.signal_free();
         assert_eq!(q.slo_deadline_exceeded(), 0, "on-time admission is free");
+    }
+
+    #[tokio::test]
+    async fn unit__queue__wait_histogram_observes_on_admission() {
+        let q = std::sync::Arc::new(PriorityQueue::new());
+        let waiter = tokio::spawn({
+            let q = q.clone();
+            async move {
+                q.wait(
+                    "m",
+                    Priority::Normal,
+                    WorkClass::Interactive,
+                    None,
+                    0,
+                    Duration::from_secs(5),
+                    None,
+                )
+                .await
+            }
+        });
+        // Async sleep: the current-thread runtime must yield so the
+        // spawned waiter actually parks before the signal arrives (a
+        // blocking sleep would starve it past its own timeout).
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        q.signal_free();
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("admitted within timeout");
+        assert_eq!(q.wait_secs().count(), 1, "one contended wait observed");
+        let mut rendered = String::new();
+        q.wait_secs().render(&mut rendered);
+        assert!(
+            rendered.contains("blazar_queue_wait_seconds_count"),
+            "metrics carry the queue-wait family: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unit__queue__timeout_bumps_counter_not_histogram() {
+        let q = std::sync::Arc::new(PriorityQueue::new());
+        let err = q
+            .wait(
+                "m",
+                Priority::Normal,
+                WorkClass::Interactive,
+                None,
+                0,
+                Duration::from_millis(20),
+                None,
+            )
+            .await
+            .expect_err("no signal ever arrives");
+        assert!(err.contains("all_slots_busy"), "teaching text: {err}");
+        assert_eq!(q.timeouts(), 1, "timeout counted once");
+        assert_eq!(
+            q.wait_secs().count(),
+            0,
+            "a refused wait never enters the wait histogram"
+        );
     }
 
     #[tokio::test]

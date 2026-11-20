@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cumulative-bucket histogram rendering in Prometheus text format.
+#[derive(Debug)]
 pub struct Histogram {
     name: &'static str,
     help: &'static str,
@@ -217,6 +218,22 @@ pub fn ttft_cold() -> Histogram {
         "Time-to-first-token for cold generations (usage reported 0 cached prompt tokens)",
         &[
             0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        ],
+    )
+}
+
+/// Time parked in the priority admission queue before a slot was granted.
+/// Only contended requests ever enter the queue - an uncontended request
+/// never registers a waiter, so every observation is real contention
+/// latency, not ambient request volume. Top bound mirrors the 2-minute
+/// admission cap in `proxy::ensure_with_admission`.
+#[must_use]
+pub fn queue_wait() -> Histogram {
+    Histogram::new(
+        "blazar_queue_wait_seconds",
+        "Time-to-admission for requests parked in the priority queue (contention only; served requests, timeouts counted separately)",
+        &[
+            0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
         ],
     )
 }

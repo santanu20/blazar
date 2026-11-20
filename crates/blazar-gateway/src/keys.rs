@@ -373,6 +373,11 @@ pub struct KeysLimiter {
     /// Loaded from the store at startup so daily budgets survive restarts.
     #[allow(dead_code)] // documents provenance of pre-loaded counters
     loaded_day: String,
+    /// Admissions refused before generation, by rejection kind (the
+    /// exact `Rejection` teaching label). Rare by construction - a
+    /// mutex is fine off the hot path - and rendered per-kind in
+    /// `/metrics` so operators see WHICH budget is binding.
+    rejections: Mutex<HashMap<&'static str, u64>>,
 }
 
 impl KeysLimiter {
@@ -408,7 +413,34 @@ impl KeysLimiter {
             entries: std::sync::RwLock::new(entries),
             states: Mutex::new(pre),
             loaded_day: today,
+            rejections: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Count one refused admission under its rejection kind (see the
+    /// `rejections` field - the label is the same string the 4xx/429
+    /// body teaches, so dashboards and error text never disagree).
+    fn bump_rejection(&self, kind: &'static str) {
+        *self
+            .rejections
+            .lock()
+            .expect("rejection counters poisoned")
+            .entry(kind)
+            .or_insert(0) += 1;
+    }
+
+    /// Refusals by kind, sorted for scrape-stable `/metrics` rendering.
+    #[must_use]
+    pub fn rejection_snapshot(&self) -> Vec<(&'static str, u64)> {
+        let mut rows: Vec<(&'static str, u64)> = self
+            .rejections
+            .lock()
+            .expect("rejection counters poisoned")
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        rows.sort_unstable();
+        rows
     }
 
     /// Bearer secret -> key entry (None = unknown / no keys configured).
@@ -513,6 +545,7 @@ impl KeysLimiter {
     /// ceiling against tpm/daily headroom until it settles.
     pub fn admit(&self, key: &blazar_core::ApiKey, model: &str) -> Result<(), Rejection> {
         if !key.models.is_empty() && !key.models.iter().any(|m| scope_matches(m, model)) {
+            self.bump_rejection("key-scope");
             return Err(Rejection::Scope {
                 name: key.name.clone(),
                 model: model.to_string(),
@@ -534,6 +567,7 @@ impl KeysLimiter {
                     .as_secs()
                     .max(1)
             });
+            self.bump_rejection("requests-per-minute");
             return Err(Rejection::Rate {
                 kind: "requests-per-minute",
                 retry_after_secs,
@@ -557,6 +591,7 @@ impl KeysLimiter {
                         .as_secs()
                         .max(1)
                 });
+                self.bump_rejection("tokens-per-minute");
                 return Err(Rejection::Rate {
                     kind: "tokens-per-minute",
                     retry_after_secs: retry,
@@ -565,6 +600,7 @@ impl KeysLimiter {
             }
         }
         if key.daily_tokens > 0 && st.tokens >= key.daily_tokens {
+            self.bump_rejection("daily token budget");
             return Err(Rejection::Rate {
                 kind: "daily token budget",
                 retry_after_secs: secs_until_utc_midnight(),
@@ -615,6 +651,7 @@ impl KeysLimiter {
         let mut states = self.states.lock().expect("keys state poisoned");
         let st = states.entry(name.to_string()).or_default();
         if st.in_flight >= max_concurrent {
+            self.bump_rejection("concurrent requests");
             return Err(Rejection::Rate {
                 kind: "concurrent requests",
                 retry_after_secs: 2,
@@ -678,6 +715,7 @@ impl KeysLimiter {
                         .as_secs()
                         .max(1)
                 });
+                self.bump_rejection("token budget reservation (tokens-per-minute)");
                 return Err(Rejection::Rate {
                     kind: "token budget reservation (tokens-per-minute)",
                     retry_after_secs,
@@ -692,6 +730,7 @@ impl KeysLimiter {
                 .saturating_add(estimate)
                 > entry.daily_tokens
         {
+            self.bump_rejection("token budget reservation (daily token budget)");
             return Err(Rejection::Rate {
                 kind: "token budget reservation (daily token budget)",
                 retry_after_secs: secs_until_utc_midnight(),
@@ -1682,6 +1721,27 @@ mod tests {
             super::mcp_access(&keyed, Some(&ctx("ghost"))),
             McpAccess::Tools
         );
+    }
+
+    #[test]
+    fn unit__rejection_counters__bump_per_kind() {
+        let over_tpm = key("metered", 0, 10, 0, &[]);
+        let scoped = key("scoped", 0, 0, 0, &["allowed-model"]);
+        let lim = KeysLimiter::loaded(None, vec![over_tpm.clone(), scoped.clone()]);
+        // Tokens-per-minute: exhaust the window, the next admit refuses.
+        lim.charge_tokens("metered", 10);
+        match lim.admit(&over_tpm, "any") {
+            Err(Rejection::Rate { kind, .. }) => assert_eq!(kind, "tokens-per-minute"),
+            other => panic!("expected tpm rejection, got {other:?}"),
+        }
+        // Key scope: the model is not in the key's allowlist.
+        match lim.admit(&scoped, "other-model") {
+            Err(Rejection::Scope { .. }) => {}
+            other => panic!("expected scope rejection, got {other:?}"),
+        }
+        let snapshot = lim.rejection_snapshot();
+        assert!(snapshot.contains(&("tokens-per-minute", 1)), "{snapshot:?}");
+        assert!(snapshot.contains(&("key-scope", 1)), "{snapshot:?}");
     }
 
     fn key(name: &str, rpm: u32, tpm: u64, daily: u64, models: &[&str]) -> ApiKey {
