@@ -218,6 +218,44 @@ impl InstanceState {
             Self::Crashed => "crashed",
         }
     }
+
+    /// The lifecycle contract as an executable table. Every state flip in
+    /// the supervisor must be a legal edge here; the full matrix is pinned
+    /// by `unit__instance_state__transition_matrix_is_the_documented_contract`.
+    ///
+    /// Legal edges (8) and their owners:
+    ///
+    /// | from | to | owner / trigger |
+    /// |---|---|---|
+    /// | Loading | Ready | spawn path after the health check passes |
+    /// | Loading | Crashed | child died before first health (counts toward the breaker) |
+    /// | Ready | Sleeping | engine check observes the child self-slept (`--sleep-idle-seconds`) |
+    /// | Ready | Evicted | idle ladder, capacity admission, user stop, header-timeout wedge |
+    /// | Ready | Crashed | reap path: child died while serving |
+    /// | Sleeping | Ready | request touch wakes the child (`was_sleeping` in the ensure path) |
+    /// | Sleeping | Evicted | same eviction funnels as Ready |
+    /// | Sleeping | Crashed | reap path: sleeper died |
+    ///
+    /// Everything else is illegal, notably: no edge back INTO Loading (a
+    /// respawn is a fresh instance, never a state flip), and no edges out
+    /// of Evicted/Crashed (the map entry is removed; `Evicted` is a
+    /// posthumous marker so `blazar ps` can attribute the vanished child).
+    #[must_use]
+    pub fn can_transition(from: Self, to: Self) -> bool {
+        matches!(
+            (from, to),
+            (Self::Loading, Self::Ready | Self::Crashed)
+                | (Self::Ready, Self::Sleeping | Self::Evicted | Self::Crashed)
+                | (Self::Sleeping, Self::Ready | Self::Evicted | Self::Crashed)
+        )
+    }
+
+    /// Terminal lifecycle states: the instance is gone from the map (the
+    /// state is only retained as an attribution marker).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Evicted | Self::Crashed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -314,5 +352,45 @@ mod tests {
     async fn unit__bus__no_subscriber__not_an_error() {
         let bus = EventBus::default();
         assert_eq!(bus.publish(BlazarEvent::QueueDepth { n: 1 }), 0);
+    }
+
+    /// Pins the complete 5x5 transition matrix: exactly the 8 documented
+    /// edges are legal, all 17 others (incl. every edge into Loading and
+    /// every edge out of Evicted/Crashed) are refused. If a new edge is
+    /// ever needed, change `can_transition` and this test together - the
+    /// doc table in its comment is the same contract.
+    #[test]
+    fn unit__instance_state__transition_matrix_is_the_documented_contract() {
+        use InstanceState as S;
+        const ALL: [S; 5] = [S::Loading, S::Ready, S::Sleeping, S::Evicted, S::Crashed];
+        let legal = [
+            (S::Loading, S::Ready),
+            (S::Loading, S::Crashed),
+            (S::Ready, S::Sleeping),
+            (S::Ready, S::Evicted),
+            (S::Ready, S::Crashed),
+            (S::Sleeping, S::Ready),
+            (S::Sleeping, S::Evicted),
+            (S::Sleeping, S::Crashed),
+        ];
+        let mut legal_count = 0;
+        for from in ALL {
+            for to in ALL {
+                let allowed = S::can_transition(from, to);
+                assert_eq!(
+                    allowed,
+                    legal.contains(&(from, to)),
+                    "edge {from:?} -> {to:?} disagrees with the documented contract"
+                );
+                legal_count += usize::from(allowed);
+            }
+        }
+        assert_eq!(legal_count, 8);
+
+        // Terminal semantics: posthumous markers, nothing follows them.
+        assert!(S::Evicted.is_terminal() && S::Crashed.is_terminal());
+        assert!(!S::Loading.is_terminal());
+        assert!(!S::Ready.is_terminal());
+        assert!(!S::Sleeping.is_terminal());
     }
 }
