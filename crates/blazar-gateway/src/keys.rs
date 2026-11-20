@@ -708,7 +708,11 @@ impl KeysLimiter {
     /// day stamp. F55: entries dirty under a PRIOR day stamp flush under
     /// that day - `roll_day` resets counters on first charge of the new
     /// day, so filtering on `today` here silently dropped the last
-    /// <flush-interval of pre-midnight usage every night.
+    /// <flush-interval of pre-midnight usage every night. Writes are
+    /// monotonic merges (see [`Store::set_key_usage_day`]) followed by a
+    /// read-back heal, so a reboot through a store outage can neither
+    /// erase the persisted baseline nor keep admitting against it once
+    /// the store recovers.
     pub fn flush(&self, dirs: &blazar_core::BlazarDirs) {
         let drained: Vec<(String, String, u64, u64)> = {
             let mut states = self.states.lock().expect("keys state poisoned");
@@ -755,6 +759,25 @@ impl KeysLimiter {
                     .map(|(d, n, r, t)| (d, n, r, t))
                     .collect();
                 mark_dirty(&failed);
+            } else {
+                // Recovery heal: the merge write kept the durable row at
+                // the high-water mark; raise the in-memory view to match.
+                // A gateway that booted through a store outage is running
+                // zero-based counters, and without this read-back its
+                // daily token gates would keep admitting against a
+                // baseline the store already knows is spent - the merge
+                // alone persists the truth but never throttles again
+                // until the next reboot. Reconcile-on-success closes the
+                // bypass window for the rest of the day.
+                if let Ok(persisted) = store.key_usage(day) {
+                    let mut states = self.states.lock().expect("keys state poisoned");
+                    for row in persisted {
+                        if let Some(st) = states.get_mut(&row.name) {
+                            st.requests = st.requests.max(u64::try_from(row.requests).unwrap_or(0));
+                            st.tokens = st.tokens.max(u64::try_from(row.tokens).unwrap_or(0));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1542,6 +1565,53 @@ mod tests {
         // Keyless callers imply no keys are configured: still open.
         assert!(owner_allows(None, None, false));
         assert!(owner_allows(Some("alice"), None, false));
+    }
+
+    /// Quota-recovery end-to-end: boot through a store outage starts
+    /// zero-based (loaded(None, ..)); the first successful flush after
+    /// recovery must (1) merge so the DB keeps the pre-outage baseline,
+    /// (2) heal the in-memory view up to it, and (3) re-arm the daily
+    /// token gate - closing the quota-bypass window same-day.
+    #[test]
+    fn unit__flush__outage_recovery_heals_persisted_baseline() {
+        use blazar_core::{BlazarDirs, Store};
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let today = utc_day(SystemTime::now());
+        let alpha = key("alpha", 0, 0, 900_000, &[]);
+        // Pre-outage daemon persisted a near-exhausted daily budget.
+        {
+            let s = Store::open(&dirs).unwrap();
+            s.set_key_usage_day(&today, &[("alpha".into(), 10, 900_000)])
+                .unwrap();
+        }
+        // Reboot through the outage: store unavailable, counters start at 0.
+        let limiter = KeysLimiter::loaded(None, vec![alpha.clone()]);
+        limiter.admit(&alpha, "m").unwrap();
+        limiter.admit(&alpha, "m").unwrap();
+        limiter.charge_tokens("alpha", 3_000);
+        // Store recovers; flush merges + heals.
+        limiter.flush(&dirs);
+        // (1) Durable row kept the high-water mark.
+        let s = Store::open(&dirs).unwrap();
+        let rows = s.key_usage(&today).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].requests, rows[0].tokens), (10, 900_000));
+        // (2) In-memory view healed to the persisted baseline.
+        let snap = limiter.usage_snapshot();
+        let (_, day, requests, tokens) = snap
+            .iter()
+            .find(|(n, _, _, _)| n.as_str() == "alpha")
+            .expect("alpha usage row");
+        assert_eq!((day.clone(), *requests, *tokens), (today, 10, 900_000));
+        // (3) The daily gate re-arms immediately - no bypass window.
+        match limiter.admit(&alpha, "m") {
+            Err(Rejection::Rate { kind, .. }) => assert_eq!(kind, "daily token budget"),
+            other => panic!("expected daily-budget rejection, got {other:?}"),
+        }
     }
 
     fn key(name: &str, rpm: u32, tpm: u64, daily: u64, models: &[&str]) -> ApiKey {

@@ -2872,18 +2872,25 @@ impl Store {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Overwrite one day's counters for a batch of keys (absolute values,
-    /// not deltas - the gateway holds the live counters and writes the
-    /// whole day-state behind). One transaction per batch.
+    /// Merge one day's counters for a batch of keys into the store
+    /// (monotonic high-water mark, not an overwrite). The gateway holds
+    /// live absolute counters and flushes the whole day-state behind -
+    /// but a flush must never SHRINK a persisted row: a gateway that
+    /// booted through a store outage comes back zero-based
+    /// (`KeysLimiter::loaded` degrades instead of blocking boot), and
+    /// its first successful flush would erase the day's already
+    /// persisted baseline, resetting the daily token budget mid-day
+    /// (quota bypass). Within one (day, key) the counters only ever
+    /// grow, so `MAX()` is exact, not a heuristic. One transaction per
+    /// batch.
     pub fn set_key_usage_day(&self, day: &str, rows: &[(String, u64, u64)]) -> CoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         for (name, requests, tokens) in rows {
             tx.execute(
-                "DELETE FROM key_usage WHERE day = ?1 AND name = ?2",
-                rusqlite::params![day, name],
-            )?;
-            tx.execute(
-                "INSERT INTO key_usage (day, name, requests, tokens) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO key_usage (day, name, requests, tokens) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (day, name) DO UPDATE SET
+                     requests = MAX(requests, excluded.requests),
+                     tokens   = MAX(tokens, excluded.tokens)",
                 rusqlite::params![
                     day,
                     name,
@@ -3243,6 +3250,28 @@ mod tests {
                 .is_none()
         );
         assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
+    }
+
+    /// Quota-recovery contract: the day write is a monotonic merge, so
+    /// a degraded flush (reboot through a store outage = zero-based
+    /// counters) can never lower the persisted baseline; only growth
+    /// persists. Regression-pins the `MAX()` upsert semantics.
+    #[test]
+    fn unit__key_usage_day__monotonic_merge_never_lowers_counters() {
+        let (_t, s) = tmp_store();
+        let row = |r: u64, t: u64| vec![("k".to_string(), r, t)];
+        s.set_key_usage_day("2026-11-20", &row(10, 900_000))
+            .unwrap();
+        // Degraded flush lands LOWER counters - merge keeps the high-water mark.
+        s.set_key_usage_day("2026-11-20", &row(3, 3_000)).unwrap();
+        let rows = s.key_usage("2026-11-20").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].requests, rows[0].tokens), (10, 900_000));
+        // Genuine growth still persists.
+        s.set_key_usage_day("2026-11-20", &row(12, 1_200_000))
+            .unwrap();
+        let rows = s.key_usage("2026-11-20").unwrap();
+        assert_eq!((rows[0].requests, rows[0].tokens), (12, 1_200_000));
     }
 
     #[test]
