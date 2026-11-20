@@ -355,6 +355,97 @@ pub struct AppState {
     /// Recording is an O(1) hash bump on the response path; a periodic
     /// task flushes buckets into `usage_daily`.
     pub usage: std::sync::Arc<crate::usage::UsageMeter>,
+    /// Admission-accuracy samples (R-admission): the last poller join of
+    /// "what the fit gate charged" vs "what the driver actually
+    /// reports", per resident engine process. Purely observational -
+    /// never feeds a gate, so a stale or missing sample can only make
+    /// the surface less informed, never wrong.
+    pub admission: std::sync::Arc<AdmissionAccuracy>,
+}
+
+/// One predicted-vs-actual VRAM sample for a resident engine child.
+/// `predicted_mib` is the admission floor the gate charged (weights +
+/// KV floor + spawn overhead); `actual_mib` is the driver-reported
+/// compute footprint of that exact pid, when the platform exposes one.
+#[derive(Debug, Clone)]
+pub struct AccuracyRow {
+    /// Display name from `ps` (includes any `+lora` suffix).
+    pub model: String,
+    /// Engine child pid - the join key against driver tenant lists.
+    pub pid: u32,
+    /// Device the child was placed on (e.g. `cuda:0`), when known.
+    pub device: Option<String>,
+    /// `admission_floor_bytes` / MiB - the gate's charge.
+    pub predicted_mib: u64,
+    /// Driver-reported compute usage of `pid`, when a tenant census ran.
+    /// `None` = platform without a census tool (or a skipped tick): the
+    /// prediction side stays visible, honestly unverified.
+    pub actual_mib: Option<u64>,
+    /// Unix seconds of the poller tick that produced this row.
+    pub sampled_unix: i64,
+}
+
+/// Latest admission-accuracy snapshot, wholesale-replaced by the
+/// gateway poller each tick. Wholesale replacement (not merge) is the
+/// pid-reuse defense: rows never outlive the `ps` census that keyed
+/// them, and staleness is explicit via `sampled_unix`.
+#[derive(Debug, Default)]
+pub struct AdmissionAccuracy {
+    rows: std::sync::Mutex<Vec<AccuracyRow>>,
+}
+
+impl AdmissionAccuracy {
+    /// Replace the whole sample set (poller tick boundary).
+    pub fn replace(&self, rows: Vec<AccuracyRow>) {
+        *self.rows.lock().expect("admission accuracy poisoned") = rows;
+    }
+
+    /// Point-in-time copy of the current samples.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<AccuracyRow> {
+        self.rows
+            .lock()
+            .expect("admission accuracy poisoned")
+            .clone()
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Join the supervisor's `ps` census with a driver compute-tenant list
+/// into accuracy rows. Pure so the join is unit-testable without a
+/// daemon: the poller supplies live inputs, tests supply table rows.
+/// CPU rows, routers (`bytes == 0`) and unspawned entries are skipped -
+/// the accuracy question only exists for GPU-charged residents.
+/// Partial-offload residents are KEPT: the gate charges the full floor,
+/// so `actual < predicted` there is exactly the signal worth seeing.
+#[must_use]
+pub fn join_accuracy_rows(
+    ps: &[blazar_runtime::supervisor::PsRow],
+    tenants: Option<&[blazar_runtime::probe::GpuTenant]>,
+    mmproj_of: impl Fn(&str) -> u64,
+    now_unix: i64,
+) -> Vec<AccuracyRow> {
+    ps.iter()
+        .filter(|p| p.gpu != "cpu" && p.pid > 0 && p.bytes > 0)
+        .map(|p| {
+            // Store keys drop the `+lora` display suffix; the predictor
+            // charges the mmproj of the base row either way.
+            let (base, _lora) = blazar_core::catalog::split_lora_suffix(&p.name);
+            let mmproj = mmproj_of(base);
+            let bytes = u64::try_from(p.bytes).unwrap_or(0);
+            let predicted_mib = blazar_core::profile::admission_floor_bytes(bytes, mmproj) / MIB;
+            AccuracyRow {
+                model: p.name.clone(),
+                pid: p.pid,
+                device: p.device.clone(),
+                predicted_mib,
+                actual_mib: tenants
+                    .and_then(|list| list.iter().find(|t| t.pid == p.pid).map(|t| t.used_mib)),
+                sampled_unix: now_unix,
+            }
+        })
+        .collect()
 }
 
 /// Client for dialing ONE child endpoint: the shared TCP pool, or the
@@ -568,6 +659,7 @@ impl AppState {
             failover,
             mcp,
             usage,
+            admission: Arc::new(AdmissionAccuracy::default()),
             singleflight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -751,5 +843,99 @@ mod tests {
             out.matches("# HELP blazar_gateway_cache_hit_ratio").count(),
             1
         );
+    }
+
+    /// Minimal `ps` row builder mirroring the supervisor struct field
+    /// order; only the fields the join reads vary per scenario.
+    fn row(name: &str, pid: u32, bytes: i64, gpu: &str) -> blazar_runtime::supervisor::PsRow {
+        blazar_runtime::supervisor::PsRow {
+            name: name.to_string(),
+            engine: "llama".to_string(),
+            replica: None,
+            state: "ready",
+            endpoint: "http://127.0.0.1:1".to_string(),
+            idle_secs: 0,
+            in_flight: 0,
+            ctx: 4096,
+            capacity: None,
+            slots: None,
+            slots_configured: None,
+            slots_source: None,
+            gpu: gpu.to_string(),
+            device: Some("cuda:0".to_string()),
+            device_id: Some("CUDA0".to_string()),
+            warnings: Vec::new(),
+            spec_mode: String::new(),
+            draft: None,
+            pid,
+            bytes,
+            heat: 0,
+            keep_alive_secs: None,
+        }
+    }
+
+    #[allow(clippy::cast_possible_wrap)] // test weights are tiny positives
+    fn gpu_row(name: &str, pid: u32, weights_mib: u64) -> blazar_runtime::supervisor::PsRow {
+        row(name, pid, (weights_mib * super::MIB) as i64, "full")
+    }
+
+    #[allow(clippy::cast_possible_wrap)] // test weights are tiny positives
+    fn cpu_row(name: &str) -> blazar_runtime::supervisor::PsRow {
+        row(name, 99, 500 * super::MIB as i64, "cpu")
+    }
+
+    fn router_row() -> blazar_runtime::supervisor::PsRow {
+        row("router", 0, 0, "auto")
+    }
+
+    fn tenant(pid: u32, used_mib: u64) -> blazar_runtime::probe::GpuTenant {
+        blazar_runtime::probe::GpuTenant {
+            pid,
+            process_name: "llama-server".to_string(),
+            used_mib,
+        }
+    }
+
+    #[test]
+    fn unit__join_accuracy_rows__pid_match_joins_actual() {
+        let rows = vec![gpu_row("qwen", 42, 100), cpu_row("cpu-model"), router_row()];
+        let tenants = vec![tenant(7, 10), tenant(42, 1234)];
+        let out = join_accuracy_rows(&rows, Some(&tenants), |_| 0, 1_700_000_000);
+        assert_eq!(out.len(), 1, "cpu/router rows must be filtered");
+        let r = &out[0];
+        assert_eq!(r.model, "qwen");
+        assert_eq!(r.pid, 42);
+        assert_eq!(r.actual_mib, Some(1234));
+        // floor = 100 weights + 512 KV floor + 700 spawn overhead.
+        assert_eq!(r.predicted_mib, 100 + 512 + 700);
+        assert_eq!(r.sampled_unix, 1_700_000_000);
+    }
+
+    #[test]
+    fn unit__join_accuracy_rows__no_census_keeps_prediction_honest_none() {
+        let rows = vec![gpu_row("qwen", 42, 100)];
+        let out = join_accuracy_rows(&rows, None, |_| 0, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].actual_mib, None);
+        // An empty census list is still a census: unmatched pid = no
+        // tenant visible (not "uses 0 MiB").
+        let out = join_accuracy_rows(&rows, Some(&[]), |_| 0, 0);
+        assert_eq!(out[0].actual_mib, None);
+    }
+
+    #[test]
+    fn unit__join_accuracy_rows__lora_display_looks_up_base_and_folds_mmproj() {
+        let rows = vec![gpu_row("qwen+my-adapter", 42, 100)];
+        let out = join_accuracy_rows(
+            &rows,
+            None,
+            |base| {
+                assert_eq!(base, "qwen", "store lookup must use the base name");
+                3 * super::MIB // vision projector bytes
+            },
+            0,
+        );
+        assert_eq!(out[0].model, "qwen+my-adapter", "display name kept");
+        assert_eq!(out[0].predicted_mib, 100 + 3 + 512 + 700);
     }
 }

@@ -2719,6 +2719,29 @@ async fn e2e__chat_message_images_translate_to_parts() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__admission_accuracy_surface_shape() {
+    // The stub child runs CPU-side, so the honest expectation is an
+    // empty sample set - the surface exists, parses, and never invents
+    // rows. Join semantics live in the state.rs unit tests; this lane
+    // pins the HTTP contract (route, object marker, count/samples).
+    let ts = start(Config::default()).await;
+    let c = client();
+    let v: serde_json::Value = c
+        .get(format!("{}/api/admission-accuracy", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["object"], "blazar.admission_accuracy");
+    assert_eq!(v["count"], 0);
+    assert!(v["samples"].as_array().is_some_and(Vec::is_empty));
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__ps_and_show() {
     let ts = start(Config::default()).await;
     let c = client();

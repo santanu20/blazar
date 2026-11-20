@@ -684,6 +684,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/capacity", get(capacity::capacity))
         .route("/api/fit", post(capacity::fit))
         .route("/api/usage", get(crate::usage::usage_api))
+        // R-admission accuracy: what the fit gate charged vs what the
+        // driver reports, per resident engine process.
+        .route("/api/admission-accuracy", get(ollama::admission_accuracy))
         .route("/api/failover", get(failover::list))
         .route("/api/failover/{chain}", get(failover::detail))
         .route("/api/failover/{chain}/pin", post(failover::pin))
@@ -1379,7 +1382,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
             "blazar": ["/api/evict", "/api/warm", "/api/lora/sync", "/api/session", "/api/sessions", "/api/why",
-                        "/api/watch", "/api/keys", "/api/keys/rotate",
+                        "/api/watch", "/api/keys", "/api/keys/rotate", "/api/admission-accuracy",
                         "/.well-known/blazar", "/metrics", "/healthz", "/health"],
         },
         "headers": ["x-blazar-num-ctx", "x-blazar-deadline-ms", "x-blazar-priority",
@@ -1767,6 +1770,54 @@ pub async fn serve(
             }
         })
     };
+    // R-admission accuracy poller: joins the supervisor's `ps` census
+    // with a driver compute-tenant list every 30s so the predicted
+    // floor the gates charge can be compared against actual usage
+    // (GET /api/admission-accuracy + /metrics gauges). A census-tool
+    // failure (None) SKIPS the tick - stale samples stay visible with
+    // their original `sampled_unix` rather than being zeroed.
+    let admission_accuracy_task = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await; // immediate first tick: skip (empty)
+            loop {
+                interval.tick().await;
+                let ps = state.sup.ps();
+                if ps.is_empty() {
+                    state.admission.replace(Vec::new());
+                    continue;
+                }
+                // nvidia-smi is a blocking subprocess: keep it off the
+                // async workers.
+                let tenants =
+                    tokio::task::spawn_blocking(blazar_runtime::probe::gpu_compute_tenants)
+                        .await
+                        .ok()
+                        .flatten();
+                if tenants.is_none() {
+                    continue;
+                }
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+                let rows = crate::state::join_accuracy_rows(
+                    &ps,
+                    tenants.as_deref(),
+                    |base| {
+                        state
+                            .with_store(|s| s.get_model(base).ok().flatten())
+                            .flatten()
+                            .and_then(|m| m.mmproj_path)
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .map_or(0, |meta| meta.len())
+                    },
+                    now_unix,
+                );
+                state.admission.replace(rows);
+            }
+        })
+    };
     // OTLP flusher (no-op task when the endpoint is unset).
     let otlp_task = {
         let otlp = Arc::clone(&state.otlp);
@@ -1992,6 +2043,7 @@ pub async fn serve(
     hint_task.abort();
     reshape_wake_task.abort();
     usage_flush_task.abort();
+    admission_accuracy_task.abort();
     // Final usage drain after the flusher stops: everything recorded
     // since the last tick lands in the store before exit.
     if let Err(e) = state.usage.flush() {

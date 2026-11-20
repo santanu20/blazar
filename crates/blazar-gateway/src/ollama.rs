@@ -517,6 +517,47 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
 }
 
 /// GET /api/ps - live slots: name, state, ctx, idle countdown, endpoint.
+/// Admission-accuracy surface (suggestion #13): the predicted floor the
+/// fit gate charged vs the driver-reported usage of each resident
+/// engine child, joined by the 30s poller. Read-only observation - the
+/// gate itself never reads this back.
+#[allow(clippy::cast_possible_wrap)] // MiB deltas fit i64 by construction
+pub async fn admission_accuracy(State(state): State<Arc<AppState>>) -> Response {
+    let rows = state.admission.snapshot();
+    let samples: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let mut v = json!({
+                "model": r.model,
+                "pid": r.pid,
+                "predicted_mib": r.predicted_mib,
+                "sampled_unix": r.sampled_unix,
+            });
+            if let Some(dev) = &r.device {
+                v["device"] = json!(dev);
+            }
+            if let Some(actual) = r.actual_mib {
+                v["actual_mib"] = json!(actual);
+                v["delta_mib"] = json!(actual as i64 - r.predicted_mib as i64);
+                #[allow(clippy::cast_precision_loss)] // display-only ratio
+                let error_pct = if r.predicted_mib > 0 {
+                    (actual as f64 - r.predicted_mib as f64) / r.predicted_mib as f64 * 100.0
+                } else {
+                    0.0
+                };
+                v["error_pct"] = json!(error_pct);
+            }
+            v
+        })
+        .collect();
+    axum::Json(json!({
+        "object": "blazar.admission_accuracy",
+        "count": samples.len(),
+        "samples": samples,
+    }))
+    .into_response()
+}
+
 /// Router mode: translate the child's GET /models (per-model load state
 /// from the engine's own supervisor) instead of blazar instance rows.
 #[allow(clippy::too_many_lines)] // row assembly + sleep probes + remote capacity fold
@@ -4524,6 +4565,7 @@ fn engine_build_gauge(state: &AppState, out: &mut String) {
 // Prometheus exposition: one flat text buffer write per metric family.
 // Extracting families into helpers is queued with the parallel gateway wave.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::cast_possible_wrap)] // MiB gauges fit i64 by construction
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     let mut merged = String::new();
     for e in state.sup.live_http_endpoints() {
@@ -4723,6 +4765,51 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             escape_label(kind),
             n
         );
+    }
+    // Admission accuracy (suggestion #13): per-resident predicted floor
+    // vs driver-reported usage. Gauges (not histograms): the population
+    // is "resident engines", not events - one sample per live child per
+    // poller tick, last-write-wins with `sampled_unix` staleness on the
+    // JSON surface.
+    let _ = write!(
+        merged,
+        "# HELP blazar_admission_predicted_mib Admission floor the fit gate charged, per resident model (MiB)\n# TYPE blazar_admission_predicted_mib gauge\n"
+    );
+    for row in state.admission.snapshot() {
+        let _ = writeln!(
+            merged,
+            "blazar_admission_predicted_mib{{model=\"{}\"}} {}",
+            escape_label(&row.model),
+            row.predicted_mib
+        );
+    }
+    let _ = write!(
+        merged,
+        "# HELP blazar_admission_actual_mib Driver-reported compute usage of the engine child pid, per resident model (MiB)\n# TYPE blazar_admission_actual_mib gauge\n"
+    );
+    for row in state.admission.snapshot() {
+        if let Some(actual) = row.actual_mib {
+            let _ = writeln!(
+                merged,
+                "blazar_admission_actual_mib{{model=\"{}\"}} {}",
+                escape_label(&row.model),
+                actual
+            );
+        }
+    }
+    let _ = write!(
+        merged,
+        "# HELP blazar_admission_delta_mib actual minus predicted VRAM per resident model - negative = gate overcharged (conservative), positive = undercharged (investigate)\n# TYPE blazar_admission_delta_mib gauge\n"
+    );
+    for row in state.admission.snapshot() {
+        if let Some(actual) = row.actual_mib {
+            let _ = writeln!(
+                merged,
+                "blazar_admission_delta_mib{{model=\"{}\"}} {}",
+                escape_label(&row.model),
+                actual as i64 - row.predicted_mib as i64
+            );
+        }
     }
     // Measured prompt-cache hit rate (A16): drives the adaptive
     // --cache-ram clamp. Absent until the poller has a full window.
