@@ -433,7 +433,7 @@ fn check_cwd(cfg: &McpServer) -> Result<(), String> {
 /// cannot find PATH-resolved binaries unless PATH is allowlisted back.
 fn spawn_error(cfg: &McpServer, e: &std::io::Error) -> String {
     let mut m = format!("spawn {}: {e}", cfg.command[0]);
-    if cfg.env_clear {
+    if cfg.env_clear.unwrap_or(true) {
         m.push_str(
             " - env_clear scrubbed the inherited environment; if the binary \
              lives on PATH, add \"PATH\" to allowed_env (Windows also needs \
@@ -451,7 +451,7 @@ async fn spawn_session(cfg: &McpServer) -> Result<Session, String> {
     // Sandbox precedence: scrubbed env first, then allowlisted parent
     // variables, then explicit `env` entries last so user-set values
     // always win over an inherited variable of the same name.
-    if cfg.env_clear {
+    if cfg.env_clear.unwrap_or(true) {
         cmd.env_clear();
         for key in &cfg.allowed_env {
             if let Ok(v) = std::env::var(key) {
@@ -1788,7 +1788,7 @@ mod tests {
             url: None,
             env,
             timeout_secs: 30,
-            env_clear: true,
+            env_clear: Some(true),
             // PATH is the one guaranteed-present parent variable (the
             // test runner itself needs it); it doubles as the re-inherit
             // probe while HOME proves the scrub.

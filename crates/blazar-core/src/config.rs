@@ -3672,13 +3672,6 @@ pub struct ModelPool {
     pub members: Vec<PoolMember>,
 }
 
-/// MCP stdio children default to a scrubbed environment: inheriting
-/// the daemon's environment hands every server the daemon's
-/// credentials.
-pub(crate) fn default_mcp_env_clear() -> bool {
-    true
-}
-
 /// A local MCP (Model Context Protocol) server the gateway can pull
 /// tools from. Tools are injected into chat requests that opt in via
 /// the `mcp` body field or `x-blazar-mcp` header; the gateway executes
@@ -3704,13 +3697,15 @@ pub struct McpServer {
     #[serde(default = "default_mcp_timeout_secs")]
     pub timeout_secs: u64,
     /// Security boundary (stdio only): start the child from an EMPTY
-    /// environment instead of inheriting the daemon's. On by default -
-    /// the child sees only what `env` sets below, what `allowed_env`
-    /// re-inherits, and nothing else. Servers that genuinely need the
-    /// daemon's full environment opt back in with `env_clear = false`
-    /// (the legacy inherit-everything behavior).
-    #[serde(default = "default_mcp_env_clear")]
-    pub env_clear: bool,
+    /// environment instead of inheriting the daemon's. Tri-state -
+    /// absent means scrub (the secure default for stdio children);
+    /// explicit `false` opts back into the legacy inherit-everything
+    /// behavior; explicit `true` is the same scrub spelled out (and is
+    /// refused on url servers, where sandbox options are meaningless).
+    /// The child sees only what `env` sets below, what `allowed_env`
+    /// re-inherits, and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_clear: Option<bool>,
     /// Parent variables an `env_clear` server may re-inherit, e.g.
     /// `["PATH", "HOME"]`. Meaningful only together with `env_clear`;
     /// names not set in the parent are skipped. Explicit `env` entries
@@ -5432,13 +5427,13 @@ impl Config {
                     srv.name
                 )));
             }
-            if srv.env_clear && srv.url.is_some() {
+            if srv.env_clear == Some(true) && srv.url.is_some() {
                 return Err(CoreError::Config(format!(
                     "mcp server '{}' sets env_clear on a url server: the sandbox options (env_clear, allowed_env, cwd, max_output_bytes) are stdio-only",
                     srv.name
                 )));
             }
-            if !srv.env_clear && !srv.allowed_env.is_empty() {
+            if srv.env_clear == Some(false) && !srv.allowed_env.is_empty() {
                 return Err(CoreError::Config(format!(
                     "mcp server '{}' lists allowed_env without env_clear: allowed_env only takes effect when env_clear scrubs the inherited environment first",
                     srv.name
@@ -7358,25 +7353,36 @@ mod tests {
     }
 
     #[test]
-    fn unit__mcp_server__env_clear_on_by_default() {
-        // Absent: scrubbed environment is the secure default.
-        let absent = toml::from_str::<McpServer>(
+    fn unit__mcp_server__env_clear_tri_state() {
+        // Absent: no opinion spelled out - stdio spawn scrubs (the
+        // secure default), url servers stay valid without opting out.
+        let absent_stdio = toml::from_str::<McpServer>(
             "name = \"srv\"\ncommand = [\"uvx\", \"mcp-server-fetch\"]",
         )
-        .expect("minimal server parses");
-        assert!(absent.env_clear, "env_clear must default ON");
+        .expect("minimal stdio server parses");
+        assert!(absent_stdio.env_clear.is_none());
+        let absent_url = toml::from_str::<McpServer>(
+            "name = \"srv\"\nurl = \"http://127.0.0.1:8808/mcp\"",
+        )
+        .expect("minimal url server parses");
+        assert!(absent_url.env_clear.is_none());
         // Explicit legacy opt-out still parses.
         let inherit = toml::from_str::<McpServer>(
             "name = \"srv\"\ncommand = [\"uvx\", \"mcp-server-fetch\"]\nenv_clear = false",
         )
         .expect("explicit inherit parses");
-        assert!(!inherit.env_clear);
-        // Explicit true round-trips too.
+        assert_eq!(inherit.env_clear, Some(false));
+        // Explicit scrub round-trips too.
         let scrubbed = toml::from_str::<McpServer>(
             "name = \"srv\"\ncommand = [\"uvx\", \"mcp-server-fetch\"]\nenv_clear = true",
         )
         .expect("explicit scrub parses");
-        assert!(scrubbed.env_clear);
+        assert_eq!(scrubbed.env_clear, Some(true));
+        // Absent url server is config-valid: the url guard only fires
+        // on an EXPLICIT env_clear (sandbox options are stdio-only).
+        let mut cfg = Config::default();
+        cfg.mcp.push(absent_url);
+        cfg.validate().expect("url server without env_clear is valid");
     }
 
     #[test]
@@ -10010,7 +10016,7 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
-            env_clear: false,
+            env_clear: Some(false),
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
@@ -10040,7 +10046,7 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             url: Some("not-a-url".into()),
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
-            env_clear: false,
+            env_clear: Some(false),
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
@@ -10063,7 +10069,7 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
-            env_clear: true,
+            env_clear: Some(true),
             allowed_env: vec!["PATH".into()],
             cwd: Some("/".into()),
             max_output_bytes: Some(4096),
@@ -10089,7 +10095,7 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
         // allowed_env without env_clear does nothing - refuse loudly.
         cfg.mcp[0] = {
             let mut s = hardened();
-            s.env_clear = false;
+            s.env_clear = Some(false);
             s
         };
         let err = cfg.validate().unwrap_err().to_string();
@@ -10123,7 +10129,7 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
             url: None,
             env: std::collections::HashMap::new(),
             timeout_secs: default_mcp_timeout_secs(),
-            env_clear: false,
+            env_clear: Some(false),
             allowed_env: Vec::new(),
             cwd: None,
             max_output_bytes: None,
