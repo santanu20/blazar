@@ -106,11 +106,18 @@ pub struct Registry {
     /// Config-level default (`mcp_default`) applied when a request carries
     /// no selector of its own. `"none"`/absent keeps requests MCP-free.
     default_sel: Option<String>,
+    /// Aggregate wall-clock ceiling (`mcp_max_request_secs`) for one
+    /// mediated chat: catalog spawn + all rounds + all tool calls.
+    max_request_secs: u64,
 }
 
 impl Registry {
     #[must_use]
-    pub fn from_config(servers: &[McpServer], default_sel: Option<String>) -> Self {
+    pub fn from_config(
+        servers: &[McpServer],
+        default_sel: Option<String>,
+        max_request_secs: u64,
+    ) -> Self {
         let entries = servers
             .iter()
             .cloned()
@@ -155,12 +162,18 @@ impl Registry {
         Self {
             entries,
             default_sel,
+            max_request_secs,
         }
     }
 
     #[must_use]
     pub fn configured_names(&self) -> Vec<String> {
         self.entries.keys().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn max_request_secs(&self) -> u64 {
+        self.max_request_secs
     }
 
     /// Layer the config default under a request-level selector result:
@@ -1223,8 +1236,44 @@ fn json_kind(v: &Value) -> &'static str {
 /// through `child_send`, return the final child response (rebuilt with
 /// the receipt header). `openai_body` must be the OpenAI-dialect chat
 /// body with `stream == false` (callers gate streaming requests).
-#[allow(clippy::result_large_err, clippy::too_many_lines)] // Response is the handlers' currency; one cohesive mediated loop
+///
+/// The whole exchange rides one aggregate wall-clock budget
+/// (`mcp_max_request_secs`): catalog spawn, every engine round, and
+/// every tool execution share it. Exceeding the budget cancels the
+/// loop with a 504 - the dropped future aborts the in-flight engine
+/// request (connection close) and releases the stdio lock; a server
+/// left mid-exchange is detected dead and respawned on the next call.
+#[allow(clippy::result_large_err)] // Response is the handlers' currency
 pub(crate) async fn chat_via_mcp(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    openai_body: &mut Value,
+    sel: &str,
+    key: Option<&crate::keys::KeyCtx>,
+) -> Result<reqwest::Response, Response> {
+    let budget = std::time::Duration::from_secs(state.mcp.max_request_secs());
+    match tokio::time::timeout(
+        budget,
+        chat_via_mcp_inner(state, engine, openai_body, sel, key),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(teaching_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            &format!(
+                "mcp mediation exceeded mcp_max_request_secs ({}) - catalog spawn, engine \
+                 rounds and tool calls share this aggregate budget; the in-flight round was \
+                 cancelled. Raise the knob in config.toml if the tool loop is legitimately \
+                 slower",
+                state.mcp.max_request_secs()
+            ),
+        )),
+    }
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_lines)] // Response is the handlers' currency; one cohesive mediated loop
+async fn chat_via_mcp_inner(
     state: &Arc<AppState>,
     engine: &EngineRef,
     openai_body: &mut Value,
@@ -1896,7 +1945,7 @@ mod tests {
     #[allow(non_snake_case)]
     #[test]
     fn unit__resolve__request_wins_default_layers_none_opts_out() {
-        let with_default = Registry::from_config(&[], Some("all".into()));
+        let with_default = Registry::from_config(&[], Some("all".into()), 120);
         // No request selector -> config default applies.
         assert_eq!(with_default.resolve(Ok(None)), Ok(Some("all".into())));
         // Request selector overrides the default.
@@ -1909,9 +1958,9 @@ mod tests {
         // Request errors teach, never fall back to the default.
         assert!(with_default.resolve(Err("bad selector".into())).is_err());
 
-        let off = Registry::from_config(&[], Some("none".into()));
+        let off = Registry::from_config(&[], Some("none".into()), 120);
         assert_eq!(off.resolve(Ok(None)), Ok(None));
-        let bare = Registry::from_config(&[], None);
+        let bare = Registry::from_config(&[], None, 120);
         assert_eq!(bare.resolve(Ok(None)), Ok(None));
         assert_eq!(
             bare.resolve(Ok(Some("fetch".into()))),

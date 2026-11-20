@@ -1044,6 +1044,14 @@ pub struct Config {
     /// opt in per request.
     #[serde(default)]
     pub mcp_default: Option<String>,
+    /// Aggregate wall-clock ceiling for ONE gateway-mediated MCP chat:
+    /// catalog spawn + every engine round + every tool execution share
+    /// this budget, and exceeding it cancels the loop with a 504. The
+    /// per-server `timeout_secs` bounds a single call; this bounds the
+    /// whole exchange so a multi-round tool loop can never pin a
+    /// request (or its worker) indefinitely. Must be >= 1.
+    #[serde(default = "default_mcp_max_request_secs")]
+    pub mcp_max_request_secs: u64,
     /// Federation fallback: when a requested model is absent from the
     /// local store but a `[[remotes]]` peer lists it (`/v1/models`
     /// presence), the request routes there instead of 404ing. Kill
@@ -3740,6 +3748,10 @@ fn default_mcp_timeout_secs() -> u64 {
     30
 }
 
+fn default_mcp_max_request_secs() -> u64 {
+    120
+}
+
 /// Federation fallback defaults ON: with remotes configured, a bare
 /// model name absent locally but present on a peer routes there.
 fn default_remote_fallback() -> bool {
@@ -4158,6 +4170,7 @@ impl Default for Config {
             model_pools: Vec::new(),
             mcp: Vec::new(),
             mcp_default: None,
+            mcp_max_request_secs: default_mcp_max_request_secs(),
             rpc_servers: String::new(),
             cache_ram_mb: DEFAULT_CACHE_RAM_MB,
             slots: default_slots(),
@@ -4992,6 +5005,10 @@ impl Config {
         push_if(old.failover != new.failover, "failover");
         push_if(old.mcp != new.mcp, "mcp");
         push_if(old.mcp_default != new.mcp_default, "mcp_default");
+        push_if(
+            old.mcp_max_request_secs != new.mcp_max_request_secs,
+            "mcp_max_request_secs",
+        );
         push_if(old.sentinel != new.sentinel, "sentinel");
         push_if(
             old.sentinel_stall_secs != new.sentinel_stall_secs,
@@ -5445,6 +5462,15 @@ impl Config {
                 d,
                 known.join(", ")
             )));
+        }
+        // 0 would 504 every mediated request at once - there is no
+        // "unbounded" reading of an aggregate deadline, refuse it.
+        if self.mcp_max_request_secs == 0 {
+            return Err(CoreError::Config(
+                "mcp_max_request_secs must be >= 1 (got 0) - the aggregate deadline bounds the \
+                 whole mediated tool loop, not a single call"
+                    .into(),
+            ));
         }
         // Scheme ladder: the bearer `key` must never travel in
         // cleartext off-machine. Loopback HTTP is fine (never leaves
@@ -10097,6 +10123,18 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
         assert!(err.contains("fetch"), "teaching lists known names: {err}");
         cfg.mcp_default = None;
         assert!(cfg.validate().is_ok());
+    }
+
+    /// The aggregate MCP deadline must stay a real bound: 0 would 504
+    /// every mediated request at once, and there is no "unbounded"
+    /// reading of a wall-clock ceiling.
+    #[test]
+    fn unit__validation__mcp_max_request_secs_must_be_positive() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "default 120 validates");
+        cfg.mcp_max_request_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp_max_request_secs must be >= 1"), "{err}");
     }
 
     #[test]

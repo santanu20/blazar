@@ -6154,6 +6154,64 @@ async fn e2e__mcp__all_selector_spawns_only_permitted_servers() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// The aggregate wall-clock deadline (`mcp_max_request_secs`) bounds the
+/// WHOLE mediated exchange, not a single call: a server that never
+/// finishes initializing (per-server timeout would wait 30s) trips the
+/// 1s aggregate budget first, teaching 504 instead of pinning the
+/// request through every per-call timeout in the loop.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__mcp__aggregate_deadline_gates_the_mediated_loop() {
+    use blazar_core::config::McpServer;
+
+    let (command, env) = mcp_stub_command("sleep 3; exit 0", "Start-Sleep -Seconds 3");
+    let cfg = Config {
+        mcp: vec![McpServer {
+            name: "slow".into(),
+            command,
+            url: None,
+            env,
+            timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
+        }],
+        mcp_max_request_secs: 1,
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+
+    let began = std::time::Instant::now();
+    let resp = c
+        .post(format!("{}/api/chat", ts.base))
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "slow",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let elapsed = began.elapsed();
+    assert_eq!(resp.status(), 504, "aggregate expiry teaches 504");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("mcp_max_request_secs") && msg.contains("cancelled"),
+        "teaching names the knob and the cancellation: {msg}"
+    );
+    // The 1s budget fired well before the 3s stub (or the 30s per-server
+    // timeout) could resolve - proving the deadline is aggregate-first.
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "deadline must fire at ~1s, took {elapsed:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 /// Tool-level MCP scoping end-to-end, against a stdio stub that speaks
 /// enough JSON-RPC to list two tools (`read_file`, `write_file`) and
 /// answer `tools/call` by echoing the called tool's name.
