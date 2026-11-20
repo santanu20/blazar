@@ -1014,6 +1014,7 @@ _COMMAND_ATTRS = {
     "keys.add": (True, False, False, False, True),
     "keys.rotate": (True, False, False, False, True),
     "keys.rm": (True, False, False, False, True),
+    "keys.show": (True, False, False, False, True),
     "quantize.happy": (False, False, True, False, False),
     "quantize.refusal": (False, False, False, False, True),
     "quantize.recipe": (False, False, False, False, True),
@@ -1152,6 +1153,22 @@ _COMMAND_ATTRS = {
     "config.reload": (True, False, False, False, True),
     "engine.delta": (True, False, False, False, True),
     "engine.changelog": (False, False, False, True, True),
+    # Diagnose/pool/registry/kv surfaces: diagnose + pool subcommands ride
+    # the live daemon; registry is offline crypto over local files; kv
+    # import is an offline admission-gated converter (needs a real
+    # GGUF+HF pair for the happy path - harness proves its gates).
+    "diagnose": (True, True, False, False, True),
+    "pool.status": (True, False, False, False, True),
+    "pool.list": (True, False, False, False, True),
+    "pool.watch": (True, False, False, False, True),
+    "pool.drain": (True, False, False, False, True),
+    "pool.undrain": (True, False, False, False, True),
+    "pool.pin": (True, False, False, False, True),
+    "pool.unpin": (True, False, False, False, True),
+    "registry.keygen": (False, False, False, False, True),
+    "registry.sign": (False, False, False, False, True),
+    "registry.verify": (False, False, False, False, True),
+    "kv.import": (False, True, True, False, True),
 }
 
 COMMANDS = [
@@ -2249,7 +2266,7 @@ _K = [
     ),
     (
         "reserve_budgets",
-        True,
+        False,
         False,
         "behavior",
         None,
@@ -2257,7 +2274,7 @@ _K = [
     ),
     (
         "reserve_default_tokens",
-        True,
+        False,
         False,
         "behavior",
         None,
@@ -2265,11 +2282,28 @@ _K = [
     ),
     (
         "legacy_open_records",
-        True,
+        False,
         False,
         "behavior",
         None,
         "strict tenancy for ownerless legacy records; boot + truth table unit-pinned",
+    ),
+    (
+        "pools_ops_persist",
+        False,
+        False,
+        "behavior",
+        None,
+        "persist drain/pin pool ops across daemon restarts; fresh default off",
+    ),
+    (
+        "vllm",
+        False,
+        True,
+        "config",
+        None,
+        "vLLM engine-lane block; kv_offload sub-table visible at fresh boot "
+        "(enabled=false, cpu_bytes_gib=2, connector=offload)",
     ),
     (
         "checkpoint_min_step",
@@ -12025,6 +12059,12 @@ def phase_commands() -> None:
         and (secret2 or "?") not in p.stdout,
         "names listed, full secrets hidden (redacted plm_ prefix ok)",
     )
+    p = cli("keys", "show", "vk2")
+    reg(
+        "keys.show",
+        p.returncode == 0 and "vk2" in p.stdout and (secret2 or "?") not in p.stdout,
+        "detail card rendered, secret stays redacted",
+    )
     p = cli("keys", "rotate", "vk1")
     newsec = re.search(r"plm_\S+", p.stdout + p.stderr)
     reg(
@@ -13543,6 +13583,94 @@ def phase_commands() -> None:
         f"local member service_measured={measured} after first completion",
     )
 
+    # pool + diagnose surfaces against the live keyed daemon. Member ops
+    # verify data-level via the route table (drained/pinned flags), not
+    # just rc; the member string is whatever the pool reports (effective
+    # name) so env-overridden models stay honest.
+    def _vp_member() -> dict:
+        st, _, v = http_json("GET", "/api/route/vp", None, admin_h)
+        if st == 200 and isinstance(v, dict):
+            ms = (v.get("pool") or {}).get("members") or []
+            if ms:
+                return ms[0]
+        return {}
+
+    member = _vp_member().get("effective") or ""
+    p = cli("pool", "status")
+    reg(
+        "pool.status",
+        p.returncode == 0 and "vp (Adaptive)" in p.stdout and "members 1" in p.stdout,
+        f"rc={p.returncode} vp card present",
+    )
+    p = cli("pool", "list", "--json")
+    try:
+        pl = json.loads(p.stdout)
+    except Exception:
+        pl = {}
+    reg(
+        "pool.list",
+        p.returncode == 0 and pl.get("count") == 1,
+        f"rc={p.returncode} pools count={pl.get('count')}",
+    )
+    p = cli("pool", "drain", "vp", member, "--ttl-secs", "120")
+    reg(
+        "pool.drain",
+        bool(member) and p.returncode == 0 and _vp_member().get("drained") is True,
+        f"member={member} rc={p.returncode} drained={_vp_member().get('drained')}",
+    )
+    p = cli("pool", "undrain", "vp", member)
+    reg(
+        "pool.undrain",
+        p.returncode == 0 and _vp_member().get("drained") is False,
+        f"rc={p.returncode} drained={_vp_member().get('drained')}",
+    )
+    p = cli("pool", "pin", "vp", member)
+    reg(
+        "pool.pin",
+        bool(member) and p.returncode == 0 and _vp_member().get("pinned") is True,
+        f"member={member} rc={p.returncode} pinned={_vp_member().get('pinned')}",
+    )
+    p = cli("pool", "unpin", "vp", member)
+    reg(
+        "pool.unpin",
+        p.returncode == 0 and _vp_member().get("pinned") is False,
+        f"rc={p.returncode} pinned={_vp_member().get('pinned')}",
+    )
+    # pool watch: live refresh loop - timeout-kill after 5s, banner + a
+    # rendered pool frame must appear (same containment as `watch`).
+    w = subprocess.run(
+        ["timeout", "5", PAL, "pool", "watch"],
+        env=SANDBOX.env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    reg(
+        "pool.watch",
+        w.returncode == 124 and "refreshing every 2s" in w.stdout,
+        f"rc={w.returncode} banner={'refreshing every 2s' in w.stdout}",
+    )
+
+    # diagnose: composed health card (residency + usage + sentinel +
+    # route + explain) off the live daemon; --json is the same
+    # composition for machines.
+    p = cli("diagnose", MODEL)
+    pj = cli("diagnose", MODEL, "--json")
+    try:
+        dj = json.loads(pj.stdout)
+    except Exception:
+        dj = {}
+    reg(
+        "diagnose",
+        p.returncode == 0
+        and "USAGE" in p.stdout
+        and "ROUTE" in p.stdout
+        and pj.returncode == 0
+        and dj.get("object") == "blazar.diagnose"
+        and dj.get("model") == MODEL,
+        f"card rc={p.returncode}; json rc={pj.returncode} object={dj.get('object')}",
+    )
+
     # legacy_open_records: strict-mode boot accepted (truth table is
     # unit-pinned in keys.rs; here we prove the knob boots a keyed
     # daemon with the management gate intact).
@@ -13576,6 +13704,139 @@ def phase_commands() -> None:
         "stop.bare", p.returncode == 0 and down, f"rc={p.returncode} daemon down={down}"
     )
     d.stop()
+
+    # -- W: offline surface lanes (registry / kv import / join) ---------
+    # All three run with the daemon down: registry is local-file crypto,
+    # kv import reads config.toml directly, join bails before any worker
+    # install.
+
+    # registry: full Ed25519 keygen -> sign -> verify roundtrip against
+    # the real shipped catalog, plus a tampered byte proving FAIL + rc1.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    catalog = os.path.join(repo_root, "registry", "capability-lanes.json")
+    keydir = os.path.join(SANDBOX.root, "registry")
+    os.makedirs(keydir, exist_ok=True)
+    p = cli("registry", "keygen")
+    klines = [ln for ln in p.stdout.splitlines() if ln.strip()]
+    priv = pub = ""
+    for i, ln in enumerate(klines):
+        if ln.startswith("private key"):
+            priv = klines[i + 1].strip()
+        elif ln.startswith("public key"):
+            pub = klines[i + 1].strip()
+    try:
+        pub_len = len(base64.b64decode(pub))
+    except Exception:
+        pub_len = -1
+    reg(
+        "registry.keygen",
+        p.returncode == 0 and len(priv) > 100 and pub_len == 32,
+        f"rc={p.returncode} priv={len(priv)}ch raw-pub={pub_len}B",
+    )
+    p = cli("registry", "sign", catalog, "--key", priv)
+    sig = p.stdout.splitlines()[0].strip() if p.stdout else ""
+    try:
+        sig_len = len(base64.b64decode(sig))
+    except Exception:
+        sig_len = -1
+    sig_path = os.path.join(keydir, "capability-lanes.json.sig")
+    with open(sig_path, "w") as f:
+        f.write(sig + "\n")
+    reg(
+        "registry.sign",
+        p.returncode == 0 and sig_len == 64,
+        f"rc={p.returncode} ed25519 sig={sig_len}B over shipped catalog",
+    )
+    tampered = os.path.join(keydir, "tampered-catalog.json")
+    with open(catalog, "rb") as src, open(tampered, "wb") as dst:
+        body = src.read()
+        dst.write(body[:-1] + bytes([body[-1] ^ 0x01]))
+    p = cli("registry", "verify", catalog, "--sig", sig_path, "--pubkey", pub)
+    t = cli("registry", "verify", tampered, "--sig", sig_path, "--pubkey", pub)
+    reg(
+        "registry.verify",
+        p.returncode == 0
+        and "verifies" in (p.stdout + p.stderr)
+        and t.returncode == 1
+        and "does not verify" in (t.stdout + t.stderr),
+        f"ok rc={p.returncode}; tampered rc={t.returncode} (integrity negative proven)",
+    )
+
+    # kv import: offline admission gates in order - the translation knob
+    # keeps cross-engine KV admission explicit, then store-row
+    # resolution, converter XOR, and the HF-shape refusal.
+    def _kvout(proc):
+        return proc.stdout + proc.stderr
+
+    cfg_path = os.path.join(SANDBOX.config_dir, "config.toml")
+    g1 = cli("kv", "import", "--from", MODEL, "--to", MODEL)
+    with open(cfg_path, "a") as f:
+        f.write("\n[kv.translation]\nenabled = true\n")
+    g2 = cli("kv", "import", "--from", "zzz-nope", "--to", MODEL)
+    g3 = cli(
+        "kv",
+        "import",
+        "--from",
+        MODEL,
+        "--to",
+        MODEL,
+        "--stage-mlx",
+        "--cache-file",
+        os.path.join(keydir, "x.bin"),
+    )
+    g4 = cli("kv", "import", "--from", MODEL, "--to", MODEL)
+    reg(
+        "kv.import",
+        g1.returncode != 0
+        and "gated on [kv.translation]" in _kvout(g1)
+        and g2.returncode != 0
+        and 'no model named "zzz-nope"' in _kvout(g2)
+        and g3.returncode != 0
+        and "pass exactly one" in _kvout(g3)
+        and g4.returncode != 0
+        and "not an HF directory" in _kvout(g4),
+        f"knob-gate={g1.returncode != 0} store={g2.returncode != 0} "
+        f"converter-xor={g3.returncode != 0} hf-shape={g4.returncode != 0}",
+    )
+
+    # join: contained donor-refusal legs. An isolated XDG with an
+    # unlikely discovery_port makes the udp seek deterministic (no
+    # gateway can answer); the explicit --gateway leg points at a closed
+    # port. Both bail with teaching before any worker install.
+    jx = os.path.join(SANDBOX.root, "join-xdg")
+    os.makedirs(os.path.join(jx, "blazar"), exist_ok=True)
+    with open(os.path.join(jx, "blazar", "config.toml"), "w") as f:
+        f.write("discovery_port = 39391\n")
+    jenv = {
+        **os.environ,
+        "XDG_CONFIG_HOME": jx,
+        "XDG_DATA_HOME": os.path.join(jx, "data"),
+    }
+    j1 = subprocess.run(
+        [PAL, "join", "--yes"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=jenv,
+        check=False,
+    )
+    j2 = subprocess.run(
+        [PAL, "join", "--gateway", "http://127.0.0.1:1", "--fleet-token", "t", "--yes"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=jenv,
+        check=False,
+    )
+    reg(
+        "join",
+        j1.returncode != 0
+        and "no gateway answered on udp/39391" in (j1.stdout + j1.stderr)
+        and j2.returncode != 0
+        and "no daemon at http://127.0.0.1:1" in (j2.stdout + j2.stderr),
+        f"discover-bail={j1.returncode != 0} verify-bail={j2.returncode != 0} "
+        "(no worker install attempted)",
+    )
 
 
 def phase_knobs_argv() -> None:
@@ -13944,6 +14205,9 @@ def _full_toplevel() -> dict:
         # accounting) here; gates phase proves the reservation refusal.
         "reserve_budgets": False,
         "reserve_default_tokens": 1024,
+        # pool member ops (drain/pin) are restart-durable when on; the
+        # benign boot keeps them ephemeral like a fresh install.
+        "pools_ops_persist": False,
         "late_chunking_max_tokens": 8192,
         "session_keep_secs": 900,
         # agent-tooling wave: validated for prefix/pairing/JSON/XOR in
@@ -16194,8 +16458,7 @@ def phase_coverage() -> None:
         p = cli("why", "--prom", timeout=60)
         reg(
             "flag.why.--prom",
-            p.returncode == 0
-            and ("# HELP" in p.stdout or "# TYPE" in p.stdout),
+            p.returncode == 0 and ("# HELP" in p.stdout or "# TYPE" in p.stdout),
             f"rc={p.returncode} prometheus text exposition",
         )
         p = cli("why", "--model", MODEL, timeout=60)
