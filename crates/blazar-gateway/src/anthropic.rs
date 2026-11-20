@@ -54,7 +54,10 @@ pub async fn messages(
     // remote member refuses with the pool named (same posture as a
     // directly remote-prefixed ask, one lane, one contract).
     let requested_model = model.clone();
-    if let Some((effective, rewritten)) = crate::pools::expand_request(&state, &model, &body) {
+    let wf = crate::pools::workflow_hint(&headers).map(|h| h.id);
+    if let Some((effective, rewritten)) =
+        crate::pools::expand_request(&state, &model, &body, wf.as_deref())
+    {
         if crate::remotes::split_remote(&effective, &state.cfg()).is_some() {
             return anthropic_error(
                 400,

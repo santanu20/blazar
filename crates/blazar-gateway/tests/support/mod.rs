@@ -221,6 +221,12 @@ impl RemoteStub {
 /// Spawn the stub on an ephemeral port with `--alias m1` (any `OpenAI`
 /// server shape works as a remote); polls /health until ready.
 pub async fn spawn_remote_stub() -> RemoteStub {
+    spawn_remote_stub_as("m1").await
+}
+
+/// Same stub with a chosen `--alias` - lets one test run two stubs
+/// serving DIFFERENT model names (pool-member identity tests).
+pub async fn spawn_remote_stub_as(alias: &str) -> RemoteStub {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -233,7 +239,7 @@ pub async fn spawn_remote_stub() -> RemoteStub {
             "--port",
             &port.to_string(),
             "--alias",
-            "m1",
+            alias,
             "-m",
             "/dev/null",
         ])

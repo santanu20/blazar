@@ -251,6 +251,61 @@ const AFFINITY_CAP: usize = 256;
 /// clients may inspect it for transparency.
 pub const EFFECTIVE_MODEL_HEADER: &str = "x-blazar-effective-model";
 
+/// Request header carrying a client-chosen workflow identity: when
+/// present (and sane), it REPLACES the conversation-opener hash as
+/// the affinity key for pool expansion, so the turns of one agent
+/// workflow land on the member that already holds the workflow's
+/// prefix KV - even when each turn opens with different text (tool
+/// results, branch summaries). Absent header = the opener-hash path,
+/// byte-identical to before this header existed.
+pub const WORKFLOW_ID_HEADER: &str = "x-blazar-workflow-id";
+
+/// Optional companion to [`WORKFLOW_ID_HEADER`]: the workflow's turn
+/// number (1, 2, ...). Telemetry/audit ONLY - never an affinity
+/// input (each turn must find the SAME member, not a fresh one).
+pub const WORKFLOW_TURN_HEADER: &str = "x-blazar-workflow-turn";
+
+/// Bound + charset for a client-supplied workflow id: it flows into
+/// map keys and log/audit lines, so it must be short and plain.
+const WORKFLOW_ID_MAX_LEN: usize = 128;
+
+/// One request's workflow identity, parsed and sanitized from the
+/// headers. `None` when the id header is absent or fails sanitation
+/// (empty, over-length, or characters outside a conservative
+/// id-safe set) - an unusable hint falls back to the opener-hash
+/// path rather than refusing the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowHint {
+    pub id: String,
+    pub turn: Option<u64>,
+}
+
+/// Extract and sanitize [`WORKFLOW_ID_HEADER`] (+ turn). The id is
+/// client-supplied: trim, length-cap, and charset-check BEFORE it
+/// touches any key, log, or audit line (an unsanitized id would sit
+/// in the affinity map and audit files verbatim).
+#[must_use]
+pub fn workflow_hint(headers: &axum::http::HeaderMap) -> Option<WorkflowHint> {
+    let raw = headers.get(WORKFLOW_ID_HEADER)?.to_str().ok()?;
+    let id = raw.trim();
+    let sane = !id.is_empty()
+        && id.len() <= WORKFLOW_ID_MAX_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:@/-".contains(&b));
+    if !sane {
+        return None;
+    }
+    let turn = headers
+        .get(WORKFLOW_TURN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    Some(WorkflowHint {
+        id: id.to_string(),
+        turn,
+    })
+}
+
 /// The affinity discount for an entry of this age (see
 /// [`AFFINITY_FULL_MS`]). Pure integer math, unit-pinned.
 fn affinity_discount(age: std::time::Duration) -> u64 {
@@ -1019,11 +1074,28 @@ fn expand_with(state: &AppState, requested: &str, affinity: Option<(&str, u64)>)
 /// Adaptive pools additionally consult and record per-prefix cache
 /// affinity: the member that served the same opening prompt recently
 /// gets its re-prefill cost discounted (see [`AFFINITY_FULL_MS`]).
-pub fn expand_request(state: &AppState, requested: &str, body: &Bytes) -> Option<(String, Bytes)> {
+///
+/// `workflow` (the sanitized [`WORKFLOW_ID_HEADER`] value, when
+/// present) overrides the opener hash as the affinity key: all turns
+/// of one workflow share one key (`{pool}:wf:{id}`), so each finds
+/// the member holding the workflow's earlier KV. `None` keeps the
+/// historical opener-hash behavior, byte-identical.
+pub fn expand_request(
+    state: &AppState,
+    requested: &str,
+    body: &Bytes,
+    workflow: Option<&str>,
+) -> Option<(String, Bytes)> {
     let cfg = state.cfg();
     let pool = find(&cfg, requested)?;
     let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
-    let key = parsed.as_ref().and_then(|v| affinity_key(&pool.name, v));
+    // Workflow key first: an explicit workflow identity outranks the
+    // opener hash (a workflow whose turns open differently still wants
+    // one member). The `wf:` namespace cannot collide with the
+    // `{:016x}` hash suffix of an opener key.
+    let key = workflow
+        .map(|w| format!("{}:wf:{}", pool.name, w))
+        .or_else(|| parsed.as_ref().and_then(|v| affinity_key(&pool.name, v)));
     let affinity = key.as_ref().and_then(|k| {
         state
             .pools_affinity
@@ -2479,5 +2551,76 @@ mod tests {
 
         let raw = Bytes::from_static(b"not json");
         assert_eq!(remotes::rewrite_model(raw.clone(), "m1"), raw);
+    }
+
+    /// `x-blazar-workflow-id` is client-supplied: sanitize before it
+    /// ever reaches a key, a log line, or the affinity map - absent,
+    /// empty, oversized, or wrong-charset ids are dropped to `None`
+    /// (the request then rides the ordinary opener-hash lane, exactly
+    /// as before the header existed). The turn header is optional
+    /// telemetry: unparsable turns leave the id usable.
+    #[test]
+    fn unit__workflow_hint__sanitizes_and_parses_turn() {
+        let hdr = |k: &str, v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+            h
+        };
+        // Absent id -> no hint at all (the structural no-header path).
+        assert!(workflow_hint(&axum::http::HeaderMap::new()).is_none());
+        // Well-formed id + turn round-trips both.
+        let h = workflow_hint(&hdr(WORKFLOW_ID_HEADER, "agent-42/session.7"))
+            .expect("charset-safe id keys");
+        assert_eq!(h.id, "agent-42/session.7");
+        assert_eq!(h.turn, None);
+        let mut both = hdr(WORKFLOW_ID_HEADER, "wf-a");
+        both.insert(
+            axum::http::HeaderName::from_bytes(WORKFLOW_TURN_HEADER.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str("3").unwrap(),
+        );
+        let h = workflow_hint(&both).expect("id+turn keys");
+        assert_eq!(h.id, "wf-a");
+        assert_eq!(h.turn, Some(3));
+        // Whitespace trims; empty-after-trim is absent.
+        let h = workflow_hint(&hdr(WORKFLOW_ID_HEADER, "  wf-b  ")).unwrap();
+        assert_eq!(h.id, "wf-b");
+        assert!(
+            workflow_hint(&hdr(WORKFLOW_ID_HEADER, "   ")).is_none(),
+            "blank id never keys"
+        );
+        // Oversized ids refuse (unbounded client strings never enter
+        // the map or logs).
+        let long = "x".repeat(WORKFLOW_ID_MAX_LEN + 1);
+        assert!(workflow_hint(&hdr(WORKFLOW_ID_HEADER, &long)).is_none());
+        let edge = "y".repeat(WORKFLOW_ID_MAX_LEN);
+        assert!(workflow_hint(&hdr(WORKFLOW_ID_HEADER, &edge)).is_some());
+        // Wrong charset refuses: spaces, quotes, backslashes,
+        // semicolons - none can smuggle log formatting or path
+        // separators through the id. (Control/non-ASCII bytes cannot
+        // reach here: the HTTP layer rejects them before a HeaderValue
+        // exists, and the charset predicate would refuse them anyway.)
+        for bad in [
+            "has space",
+            "quo\"te",
+            "back\\slash",
+            "semi;colon",
+            "star*id",
+        ] {
+            assert!(
+                workflow_hint(&hdr(WORKFLOW_ID_HEADER, bad)).is_none(),
+                "{bad:?} must be refused"
+            );
+        }
+        // Unparsable turn: telemetry drops, the id still steers.
+        let mut bad_turn = hdr(WORKFLOW_ID_HEADER, "wf-c");
+        bad_turn.insert(
+            axum::http::HeaderName::from_bytes(WORKFLOW_TURN_HEADER.as_bytes()).unwrap(),
+            axum::http::HeaderValue::from_str("second").unwrap(),
+        );
+        let h = workflow_hint(&bad_turn).expect("id survives bad turn");
+        assert_eq!(h.turn, None);
     }
 }

@@ -458,6 +458,118 @@ async fn client__model_pool__routes_member_scope_and_route_table() {
     stub.shutdown().await;
 }
 
+/// `x-blazar-workflow-id` steers pool continuity: two chat requests
+/// in one workflow but with DIFFERENT conversation openers (which the
+/// opener-hash lane would never link) land on the same pool member,
+/// the affinity map carries the workflow-namespaced key, and the
+/// audit trail records id + turn. The turn header is telemetry only -
+/// it never joins the key (turn 1 vs turn 2 below must not fork it).
+#[tokio::test]
+async fn client__model_pool__workflow_header_pins_member_across_openers() {
+    let stub_a = support::spawn_remote_stub_as("m1").await;
+    let stub_b = support::spawn_remote_stub_as("m2").await;
+    let cfg = blazar_core::Config {
+        keys: vec![blazar_core::ApiKey {
+            name: "admin".into(),
+            key: "plm_admin".into(),
+            ..blazar_core::ApiKey::default()
+        }],
+        ..blazar_core::Config::default()
+    };
+    let cfg = support::with_remote(cfg, "a", &stub_a.base);
+    let cfg = support::with_remote(cfg, "b", &stub_b.base);
+    // Ordered strategy (first healthy member): the member-constancy
+    // contract holds trivially under it - the MECHANISM proof is the
+    // workflow-namespaced map key below (the opener hash can never
+    // produce `svc:wf:...`), the pin then honoring that key both turns.
+    let cfg = support::with_pool(
+        cfg,
+        "svc",
+        blazar_core::config::PoolStrategy::Ordered,
+        &[("a", "m1"), ("b", "m2")],
+    );
+    let ts = start(cfg).await;
+    let c = client();
+
+    let ask = |opener: &str, turn: &str| {
+        c.post(format!("{}/api/chat", ts.base))
+            .bearer_auth("plm_admin")
+            .header("x-blazar-workflow-id", "wf-e2e")
+            .header("x-blazar-workflow-turn", turn)
+            .json(&serde_json::json!({
+                "model": "svc", "stream": false,
+                "messages": [{"role": "user", "content": opener}],
+            }))
+    };
+    let resp = ask("first turn of the workflow", "1").send().await.unwrap();
+    assert_eq!(resp.status(), 200, "workflow turn 1 serves");
+    let first = resp
+        .headers()
+        .get("x-blazar-effective-model")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "effective-model header on workflow turn 1; headers: {:?}",
+                resp.headers()
+            )
+        })
+        .to_string();
+    // Different opener text AND a different turn: the opener-hash lane
+    // would key this as a new conversation and RoundRobin would rotate
+    // to the other member - only the workflow pin holds the member.
+    let resp = ask("a completely different opener follows up", "2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "workflow turn 2 serves");
+    let second = resp
+        .headers()
+        .get("x-blazar-effective-model")
+        .and_then(|v| v.to_str().ok())
+        .expect("effective-model header on workflow turn 2")
+        .to_string();
+    assert_eq!(
+        first, second,
+        "same workflow id must pin one member across openers"
+    );
+
+    // The map carries the workflow-namespaced key (pool:wf:id) - the
+    // structural proof the header, not the opener hash, keyed it.
+    {
+        let map = ts.state.pools_affinity.lock().unwrap();
+        assert!(
+            map.contains_key("svc:wf:wf-e2e"),
+            "workflow key seeded: {map:?}"
+        );
+    }
+
+    // Audit trail: both audited POSTs carry the workflow id (and their
+    // own turn) - the writer is async, so poll briefly for the second
+    // line before asserting.
+    let audit_path = ts.dirs.data_dir.join("log").join("audit.jsonl");
+    let mut raw = String::new();
+    for _ in 0..40 {
+        if let Ok(text) = std::fs::read_to_string(&audit_path)
+            && text.matches("\"workflow\":\"wf-e2e\"").count() >= 2
+        {
+            raw = text;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let turns: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.contains("\"workflow\":\"wf-e2e\""))
+        .collect();
+    assert_eq!(turns.len(), 2, "both workflow turns audited: {raw}");
+    assert!(turns[0].contains("\"workflow_turn\":1"), "{}", turns[0]);
+    assert!(turns[1].contains("\"workflow_turn\":2"), "{}", turns[1]);
+
+    ts.state.sup.shutdown_all().await.unwrap();
+    stub_a.shutdown().await;
+    stub_b.shutdown().await;
+}
+
 /// Pool member operator overrides: drain skips a member while an
 /// alternative exists, undrain restores it, pin outranks the strategy,
 /// and both verbs are admin-plane (scoped keys get 403).

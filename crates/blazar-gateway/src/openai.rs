@@ -695,9 +695,10 @@ pub async fn openai_proxy(
     let pool_expansion = parsed_body
         .is_some()
         .then(|| {
+            let wf = crate::pools::workflow_hint(&headers).map(|h| h.id);
             model
                 .as_deref()
-                .and_then(|m| crate::pools::expand_request(&state, m, &body))
+                .and_then(|m| crate::pools::expand_request(&state, m, &body, wf.as_deref()))
         })
         .flatten()
         .filter(|(effective, _)| Some(effective.as_str()) != model.as_deref());
@@ -859,6 +860,15 @@ pub async fn openai_proxy(
         .await;
         if let Some(Extension(k)) = key_ext.as_ref() {
             out = maybe_charge_remote(out, &state, &k.name, budget_lease);
+        }
+        // Pool attribution on the remote lane: a pool expand rewrote
+        // the model to `remote:model` before this branch, so the member
+        // rides the response exactly like the local paths stamp it.
+        if let Some(member) = &pool_member
+            && let Ok(v) = axum::http::HeaderValue::from_str(member)
+        {
+            out.headers_mut()
+                .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
         }
         return out;
     }
@@ -2068,7 +2078,8 @@ pub async fn responses_api(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.starts_with("multipart/form-data"))
     {
-        match crate::pools::expand_request(&state, &model, &body) {
+        let wf = crate::pools::workflow_hint(&headers).map(|h| h.id);
+        match crate::pools::expand_request(&state, &model, &body, wf.as_deref()) {
             Some((effective, rewritten)) if effective != model => {
                 tracing::info!(target: "blazar::pools", member = %effective, "responses: pool routed to member");
                 let member = effective.clone();
@@ -2098,6 +2109,15 @@ pub async fn responses_api(
         .await;
         if let Some(Extension(k)) = key_ext.as_ref() {
             out = maybe_charge_remote(out, &state, &k.name, None);
+        }
+        // Pool attribution on the remote lane: a pool expand rewrote
+        // the model to `remote:model` before this branch, so the member
+        // rides the response like every other lane stamps it.
+        if let Some(member) = &pool_member
+            && let Ok(v) = axum::http::HeaderValue::from_str(member)
+        {
+            out.headers_mut()
+                .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
         }
         return out;
     }

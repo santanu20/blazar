@@ -1343,18 +1343,17 @@ pub async fn chat(
     // off the member string. Placed before the failover block so a
     // member that is itself a chain alias escalates through it; the
     // guard keeps a self-named member (refused at boot) from looping.
-    let (model_field, body, pool_member) = match crate::pools::expand_request(
-        &state,
-        &model_field,
-        &body,
-    ) {
-        Some((effective, rewritten)) if effective != model_field => {
-            tracing::info!(target: "blazar::pools", pool = %model_field, member = %effective, "ollama chat: pool routed to member");
-            req["model"] = serde_json::Value::String(effective.clone());
-            let member = effective.clone();
-            (effective, rewritten, Some(member))
+    let (model_field, body, pool_member) = {
+        let wf = crate::pools::workflow_hint(&headers).map(|h| h.id);
+        match crate::pools::expand_request(&state, &model_field, &body, wf.as_deref()) {
+            Some((effective, rewritten)) if effective != model_field => {
+                tracing::info!(target: "blazar::pools", pool = %model_field, member = %effective, "ollama chat: pool routed to member");
+                req["model"] = serde_json::Value::String(effective.clone());
+                let member = effective.clone();
+                (effective, rewritten, Some(member))
+            }
+            _ => (model_field, body, None),
         }
-        _ => (model_field, body, None),
     };
     // Failover chains (ollama dialect): a virtual alias resolves to a
     // concrete target - local model or `remote:<name>:<model>` (the
@@ -1477,6 +1476,17 @@ pub async fn chat(
             }
             Err(resp) => resp,
         };
+        // Pool attribution on the remote lane too: the pool-aware
+        // branch serves `remote:model` members (the pool expand above
+        // rewrote the ask), so the member must ride the response the
+        // same way the local tail stamps it - clients and the usage
+        // meter cannot see past the alias otherwise.
+        if let Some(member) = &pool_member
+            && let Ok(v) = axum::http::HeaderValue::from_str(member)
+        {
+            out.headers_mut()
+                .insert(crate::pools::EFFECTIVE_MODEL_HEADER, v);
+        }
         // Token budgets ride the remote NDJSON exactly like the local
         // lane (final line carries eval counts).
         if (budget_lease.is_some()
@@ -3888,14 +3898,17 @@ pub async fn generate(
     // This lane is local-only (refuse_remote_prefix below), so a pool
     // whose picked member is remote refuses exactly like a directly
     // remote-prefixed ask - the generate translator never forwards.
-    let (model, body, pool_member) = match crate::pools::expand_request(&state, &model, &body) {
-        Some((effective, rewritten)) if effective != model => {
-            tracing::info!(target: "blazar::pools", pool = %model, member = %effective, "ollama generate: pool routed to member");
-            req["model"] = serde_json::Value::String(effective.clone());
-            let member = effective.clone();
-            (effective, rewritten, Some(member))
+    let (model, body, pool_member) = {
+        let wf = crate::pools::workflow_hint(&headers).map(|h| h.id);
+        match crate::pools::expand_request(&state, &model, &body, wf.as_deref()) {
+            Some((effective, rewritten)) if effective != model => {
+                tracing::info!(target: "blazar::pools", pool = %model, member = %effective, "ollama generate: pool routed to member");
+                req["model"] = serde_json::Value::String(effective.clone());
+                let member = effective.clone();
+                (effective, rewritten, Some(member))
+            }
+            _ => (model, body, None),
         }
-        _ => (model, body, None),
     };
     let key_entry = key_ext
         .as_ref()

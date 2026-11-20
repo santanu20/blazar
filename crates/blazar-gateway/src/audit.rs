@@ -71,6 +71,15 @@ pub struct AuditLine {
     pub ms: u128,
     pub priority: String,
     pub queue_depth: usize,
+    /// Sanitized `x-blazar-workflow-id`, when the request carried one:
+    /// ties the audit line to the workflow whose pool affinity (and
+    /// thus member placement) it steered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// `x-blazar-workflow-turn` (telemetry only, never an affinity
+    /// input) - orders the lines of one workflow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_turn: Option<u64>,
 }
 
 /// Extract the `model` string field from a JSON body (best effort -
@@ -275,17 +284,45 @@ mod tests {
                     ms: 42,
                     priority: "normal".into(),
                     queue_depth: 0,
+                    workflow: None,
+                    workflow_turn: None,
                 })
                 .await;
         }
+        // A workflow-tagged request (x-blazar-workflow-id/-turn headers)
+        // lands both fields; the header-less lines above must carry
+        // NEITHER key - skip-if-none keeps the historical bytes intact.
+        let _ = tx
+            .send(AuditLine {
+                ts: 1_700_000_003,
+                trace: "plm-wf".into(),
+                key: Some("ci".into()),
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                model: Some("m".into()),
+                status: 200,
+                ms: 7,
+                priority: "normal".into(),
+                queue_depth: 0,
+                workflow: Some("wf-x".into()),
+                workflow_turn: Some(7),
+            })
+            .await;
         drop(tx);
         task.await.expect("writer exits with channel");
         let raw = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
         let lines: Vec<&str> = raw.lines().collect();
-        assert_eq!(lines.len(), 3, "{raw}");
+        assert_eq!(lines.len(), 4, "{raw}");
         assert!(lines[0].contains("\"trace\":\"plm-0\""));
         assert!(lines[0].contains("\"key\":\"ci\""));
+        assert!(
+            !lines[0].contains("workflow"),
+            "header-less line stays byte-shape historical: {}",
+            lines[0]
+        );
         assert!(lines[2].contains("\"status\":200"));
+        assert!(lines[3].contains("\"workflow\":\"wf-x\""), "{}", lines[3]);
+        assert!(lines[3].contains("\"workflow_turn\":7"), "{}", lines[3]);
         assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

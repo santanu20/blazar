@@ -245,6 +245,16 @@ async fn request_log(
     // bytes back untouched. Neither on = zero request-path changes.
     let audit_on = state.audit_tx.is_some();
     let usage_lane = crate::usage::USAGE_PATHS.contains(&path.as_str());
+    // Workflow hint (sanitized at parse): audit-only here - the pool
+    // lanes re-parse per-request where affinity applies. Read before
+    // `req` is consumed by the handler run; a no-audit gateway (or a
+    // non-audited path) pays nothing.
+    let workflow_hint =
+        if state.audit_tx.is_some() && crate::audit::AUDITED_PATHS.contains(&path.as_str()) {
+            crate::pools::workflow_hint(req.headers())
+        } else {
+            None
+        };
     let key = req
         .extensions()
         .get::<keys::KeyCtx>()
@@ -315,6 +325,8 @@ async fn request_log(
             ms,
             priority: priority.clone(),
             queue_depth: state.queue.depth(),
+            workflow: workflow_hint.as_ref().map(|h| h.id.clone()),
+            workflow_turn: workflow_hint.as_ref().and_then(|h| h.turn),
         };
         if tx.try_send(line).is_err() {
             state.audit_dropped.fetch_add(1, Ordering::Relaxed);
