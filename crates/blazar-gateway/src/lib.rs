@@ -736,6 +736,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fleet/invite", post(fleet::invite))
         .route("/api/config/reload", post(config_api::reload))
         .route("/api/why", get(ollama::why))
+        .route("/api/diagnose/{model}", get(ollama::diagnose))
         .route("/api/watch", get(ollama::watch))
         // Machine-readable stable error-code catalog (self-describing
         // API contract; codes are additive-only once shipped).
@@ -1382,7 +1383,7 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/api/embeddings", "/api/embed", "/api/rerank", "/api/pull",
                        "/api/delete", "/api/events", "/api/version"],
             "blazar": ["/api/evict", "/api/warm", "/api/lora/sync", "/api/session", "/api/sessions", "/api/why",
-                        "/api/watch", "/api/keys", "/api/keys/rotate", "/api/admission-accuracy",
+                        "/api/watch", "/api/keys", "/api/keys/rotate", "/api/admission-accuracy", "/api/diagnose/{model}",
                         "/.well-known/blazar", "/metrics", "/healthz", "/health"],
         },
         "headers": ["x-blazar-num-ctx", "x-blazar-deadline-ms", "x-blazar-priority",

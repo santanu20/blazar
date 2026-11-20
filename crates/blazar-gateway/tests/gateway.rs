@@ -2742,6 +2742,57 @@ async fn e2e__admission_accuracy_surface_shape() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__diagnose_composite_card_degrades_legs_to_null() {
+    // Unknown model on a cold gateway: every leg must answer its own
+    // degrade path (store-miss teachings / empty sets) without one leg
+    // blanking the card - the composite always returns the full key set.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let v: serde_json::Value = c
+        .get(format!("{}/api/diagnose/zzz-nope", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["object"], "blazar.diagnose");
+    assert_eq!(v["model"], "zzz-nope");
+    for key in [
+        "residency",
+        "usage",
+        "why",
+        "route",
+        "explain",
+        "certificate",
+        "calibration",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "diagnose card missing leg {key} on the degrade path"
+        );
+    }
+    // Residency filtering is per-model: no matching rows, and the
+    // calibration poller has no sample, so the honest answer is null.
+    assert!(
+        v["residency"]["models"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert!(v["calibration"].is_null());
+
+    // Empty-model guard: the route itself teaches instead of crashing.
+    let bad = c
+        .get(format!("{}/api/diagnose/%20", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__ps_and_show() {
     let ts = start(Config::default()).await;
     let c = client();

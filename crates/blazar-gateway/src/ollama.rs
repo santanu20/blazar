@@ -558,6 +558,150 @@ pub async fn admission_accuracy(State(state): State<Arc<AppState>>) -> Response 
     .into_response()
 }
 
+/// One diagnose leg: keep the body only when the leg answered 2xx AND it
+/// parses as JSON. Anything else degrades to `null` so a missing leg
+/// never blanks the card (same contract as the CLI's n/a sections).
+async fn diagnose_leg(resp: Response) -> Option<serde_json::Value> {
+    let ok = resp.status().is_success();
+    let bytes = axum::body::to_bytes(resp.into_body(), 4 << 20).await.ok()?;
+    if !ok {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// GET /api/diagnose/{model} - the unified operational card for one
+/// model, server-side in a single round trip: residency, 7-day usage,
+/// decision trace (why), route, explain, doctor certificate, plus the
+/// admission-accuracy calibration sample when the poller has one for
+/// this model. Each leg runs through its real endpoint handler - tenant
+/// scoping (usage, route, doctor) keeps the exact semantics it has when
+/// called directly; residency/why/explain stay management-wide like
+/// their own endpoints.
+#[allow(clippy::too_many_lines)] // seven legs, one card; splitting would hide the degrade contract
+#[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)] // MiB math: u64 counters into signed deltas
+pub async fn diagnose(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+    key_ext: Option<Extension<crate::keys::KeyCtx>>,
+) -> Response {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "diagnose needs a model name: GET /api/diagnose/{model}",
+        )
+            .into_response();
+    }
+
+    // Residency: full ps snapshot filtered to this model (exact display
+    // name or its LoRA base), remotes passthrough for peer context.
+    let residency = diagnose_leg(ps(State(state.clone())).await)
+        .await
+        .map(|mut v| {
+            let matches = |row: &serde_json::Value| {
+                row.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|n| n == model || n.split('+').next() == Some(&model))
+            };
+            if let Some(models) = v
+                .get_mut("models")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                models.retain(|row| matches(row));
+            }
+            v
+        });
+
+    let usage = diagnose_leg(
+        crate::usage::usage_api(
+            State(state.clone()),
+            axum::extract::Query(crate::usage::UsageQuery { days: Some(7) }),
+            key_ext.clone(),
+        )
+        .await,
+    )
+    .await;
+
+    let why = match "/api/why?limit=10".parse::<Uri>() {
+        Ok(uri) => diagnose_leg(why(State(state.clone()), uri).await).await,
+        Err(_) => None,
+    };
+
+    let route = diagnose_leg(
+        crate::federation::route(
+            State(state.clone()),
+            axum::extract::Path(model.clone()),
+            key_ext.clone(),
+        )
+        .await,
+    )
+    .await;
+
+    let explain = diagnose_leg(
+        crate::explain::explain(State(state.clone()), axum::extract::Path(model.clone())).await,
+    )
+    .await;
+
+    let certificate = diagnose_leg(
+        crate::model_doctor::cert(
+            State(state.clone()),
+            axum::extract::Path(model.clone()),
+            key_ext,
+        )
+        .await,
+    )
+    .await;
+
+    // Calibration joins on the full display name (LoRA variants carry
+    // their own sample rows); absent poller data stays null, never 0.
+    let calibration = state
+        .admission
+        .snapshot()
+        .into_iter()
+        .find(|r| r.model == model)
+        .map(|r| {
+            let predicted = r.predicted_mib;
+            r.actual_mib.map_or_else(
+                || {
+                    json!({
+                        "predicted_mib": predicted,
+                        "actual_mib": serde_json::Value::Null,
+                        "sampled_unix": r.sampled_unix,
+                    })
+                },
+                |actual| {
+                    let delta = actual as i64 - predicted as i64;
+                    let error_pct = if predicted == 0 {
+                        0.0
+                    } else {
+                        (delta as f64 / predicted as f64) * 100.0
+                    };
+                    json!({
+                        "predicted_mib": predicted,
+                        "actual_mib": actual,
+                        "delta_mib": delta,
+                        "error_pct": error_pct,
+                        "sampled_unix": r.sampled_unix,
+                    })
+                },
+            )
+        });
+
+    axum::Json(json!({
+        "object": "blazar.diagnose",
+        "model": model,
+        "residency": residency,
+        "usage": usage,
+        "why": why,
+        "route": route,
+        "explain": explain,
+        "certificate": certificate,
+        "calibration": calibration,
+    }))
+    .into_response()
+}
+
 /// Router mode: translate the child's GET /models (per-model load state
 /// from the engine's own supervisor) instead of blazar instance rows.
 #[allow(clippy::too_many_lines)] // row assembly + sleep probes + remote capacity fold
