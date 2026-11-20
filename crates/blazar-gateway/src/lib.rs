@@ -1156,6 +1156,20 @@ async fn keys_add(
             "mcp_tools must be an array of \"<server>:<tool>\" selector strings",
         );
     }
+    // MCP access posture: closed set (validated, not coerced - a typo
+    // must teach, not silently mean "tools").
+    let mcp_access: Option<String> = match body.get("mcp_access") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some(s) if matches!(s, "tools" | "catalog" | "off") => Some(s.to_string()),
+            _ => {
+                return error_response(
+                    400,
+                    "mcp_access must be one of \"tools\", \"catalog\", \"off\"",
+                );
+            }
+        },
+    };
     #[allow(clippy::result_large_err)]
     let num = |field: &str, default: u64| -> Result<u64, Response> {
         match body.get(field) {
@@ -1188,6 +1202,7 @@ async fn keys_add(
         models,
         mcp_servers,
         mcp_tools,
+        mcp_access,
         rpm: u32::try_from(rpm).unwrap_or(u32::MAX),
         tpm,
         daily_tokens,

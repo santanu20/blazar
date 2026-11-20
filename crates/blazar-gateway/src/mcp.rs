@@ -1280,6 +1280,19 @@ async fn chat_via_mcp_inner(
     sel: &str,
     key: Option<&crate::keys::KeyCtx>,
 ) -> Result<reqwest::Response, Response> {
+    // Hard posture first: a key with mcp_access = "off" never engages
+    // MCP at all - any selector (including the config default) is
+    // refused before a single server spawns.
+    if crate::keys::mcp_access(&state.keys, key) == crate::keys::McpAccess::Off {
+        let who = key.map_or_else(|| "the caller".to_string(), |k| format!("key '{}'", k.name));
+        return Err(teaching_error(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "{who} has mcp access disabled (mcp_access = \"off\") - remove the mcp \
+                 selector or set the key's mcp_access to \"tools\" or \"catalog\""
+            ),
+        ));
+    }
     // Authorization precedes spawning for EVERY selector shape: a
     // named selector the key has no rights to must refuse BEFORE
     // catalog() spawns or initializes the server, and "all" is
@@ -1498,7 +1511,29 @@ async fn chat_via_mcp_inner(
                                     );
                                     Err(why)
                                 }
-                                Ok(()) => state.mcp.execute(&server, &tool, &args).await,
+                                // Catalog posture: definitions were
+                                // injected for audit, but this key never
+                                // executes - the refusal rides the tool
+                                // result back into the reply so the model
+                                // (and the operator reading the
+                                // transcript) sees exactly why.
+                                Ok(()) => {
+                                    if crate::keys::mcp_access(&state.keys, key)
+                                        == crate::keys::McpAccess::Catalog
+                                    {
+                                        tracing::warn!(
+                                            target: "blazar::mcp",
+                                            server = %server, tool = %tool,
+                                            "tool call refused: key mcp_access = \"catalog\" (audit-only)"
+                                        );
+                                        Err("mcp tool call refused: this key's mcp_access = \
+                                             \"catalog\" - tool definitions are visible for \
+                                             audit but execution is disabled"
+                                            .into())
+                                    } else {
+                                        state.mcp.execute(&server, &tool, &args).await
+                                    }
+                                }
                             }
                         }
                     };

@@ -88,6 +88,39 @@ pub fn scope_permits(
     }
 }
 
+/// Per-key MCP access posture (`mcp_access`): full tool semantics,
+/// catalog-only (inject definitions, refuse execution), or off (MCP
+/// never engages). See `ApiKey::mcp_access` for the operator meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAccess {
+    Tools,
+    Catalog,
+    Off,
+}
+
+/// Resolve the caller's MCP posture from the live key entry (same
+/// name lookup as the other MCP gates). The open gateway (no keys
+/// configured) and unresolved identities are `Tools` here on purpose:
+/// a missing/unknown bearer is the OTHER gates' 401 to teach, and the
+/// open gateway has no postures to enforce. Unknown values cannot
+/// occur - config validation rejects them at load.
+pub fn mcp_access(keys: &KeysLimiter, key: Option<&KeyCtx>) -> McpAccess {
+    if keys.is_empty() {
+        return McpAccess::Tools;
+    }
+    let Some(k) = key else {
+        return McpAccess::Tools;
+    };
+    let Some(entry) = keys.entry(k.name.as_str()) else {
+        return McpAccess::Tools;
+    };
+    match entry.mcp_access.as_deref() {
+        Some("catalog") => McpAccess::Catalog,
+        Some("off") => McpAccess::Off,
+        _ => McpAccess::Tools,
+    }
+}
+
 /// MCP server-scope predicate: may `key` drive tools of `server`?
 /// Mirrors [`scope_permits`] semantics - an empty `mcp_servers` list
 /// admits every configured server (admin posture), a non-empty list is
@@ -1614,6 +1647,43 @@ mod tests {
         }
     }
 
+    /// Posture truth table: open gateway and unresolved identities are
+    /// `Tools` (the other gates own the 401s); a keyed gateway resolves
+    /// the entry's `mcp_access` with absent/unknown defaulting to full
+    /// semantics.
+    #[test]
+    fn unit__mcp_access__posture_truth_table() {
+        let ctx = |name: &str| KeyCtx {
+            name: name.into(),
+            weight: 1,
+        };
+        let open = KeysLimiter::loaded(None, Vec::new());
+        assert_eq!(super::mcp_access(&open, None), McpAccess::Tools);
+        let mut auditor = key("auditor", 0, 0, 0, &[]);
+        auditor.mcp_access = Some("catalog".into());
+        let mut sealed = key("sealed", 0, 0, 0, &[]);
+        sealed.mcp_access = Some("off".into());
+        let keyed = KeysLimiter::loaded(None, vec![key("tooler", 0, 0, 0, &[]), auditor, sealed]);
+        assert_eq!(
+            super::mcp_access(&keyed, Some(&ctx("tooler"))),
+            McpAccess::Tools
+        );
+        assert_eq!(
+            super::mcp_access(&keyed, Some(&ctx("auditor"))),
+            McpAccess::Catalog
+        );
+        assert_eq!(
+            super::mcp_access(&keyed, Some(&ctx("sealed"))),
+            McpAccess::Off
+        );
+        // Unresolved identities defer to the other gates' 401s.
+        assert_eq!(super::mcp_access(&keyed, None), McpAccess::Tools);
+        assert_eq!(
+            super::mcp_access(&keyed, Some(&ctx("ghost"))),
+            McpAccess::Tools
+        );
+    }
+
     fn key(name: &str, rpm: u32, tpm: u64, daily: u64, models: &[&str]) -> ApiKey {
         ApiKey {
             name: name.into(),
@@ -1621,6 +1691,7 @@ mod tests {
             models: models.iter().map(|s| String::from(*s)).collect(),
             mcp_servers: Vec::new(),
             mcp_tools: Vec::new(),
+            mcp_access: None,
             rpm,
             tpm,
             daily_tokens: daily,

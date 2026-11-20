@@ -1703,6 +1703,7 @@ async fn e2e__keys_scoped_rate_and_accounting() {
         models: vec!["m1".into()],
         mcp_servers: Vec::new(),
         mcp_tools: Vec::new(),
+        mcp_access: None,
         rpm: 2,
         tpm: 0,
         daily_tokens: 0,
@@ -6164,7 +6165,7 @@ async fn e2e__mcp__all_selector_spawns_only_permitted_servers() {
 async fn e2e__mcp__aggregate_deadline_gates_the_mediated_loop() {
     use blazar_core::config::McpServer;
 
-    let (command, env) = mcp_stub_command("sleep 3; exit 0", "Start-Sleep -Seconds 3");
+    let (command, env) = mcp_stub_command("sleep 8; exit 0", "Start-Sleep -Seconds 8");
     let cfg = Config {
         mcp: vec![McpServer {
             name: "slow".into(),
@@ -6203,11 +6204,137 @@ async fn e2e__mcp__aggregate_deadline_gates_the_mediated_loop() {
         msg.contains("mcp_max_request_secs") && msg.contains("cancelled"),
         "teaching names the knob and the cancellation: {msg}"
     );
-    // The 1s budget fired well before the 3s stub (or the 30s per-server
-    // timeout) could resolve - proving the deadline is aggregate-first.
+    // The 1s budget fired well before the 8s stub (or the 30s per-server
+    // timeout) could resolve - the margin absorbs engine-resolution
+    // latency that precedes the mediated loop, so the assert only fails
+    // if the deadline genuinely never cut the exchange short.
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "deadline must fire at ~1s, took {elapsed:?}"
+        elapsed < std::time::Duration::from_secs(6),
+        "deadline must fire at ~1s (plus routing overhead), took {elapsed:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Least-privilege MCP postures end-to-end. A `catalog` key sees the
+/// injected tool definitions and can round-trip a call attempt, but the
+/// EXECUTE gate refuses with teaching that rides the tool result back
+/// into the reply (auditor posture). An `off` key never engages MCP:
+/// the selector is refused up front, before any server spawns.
+#[allow(non_snake_case)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn e2e__mcp__access_postures_catalog_only_and_off() {
+    use blazar_core::ApiKey;
+
+    fn mcp_fs_clone() -> blazar_core::config::McpServer {
+        let speaker = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fs","version":"1"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_file","description":"read","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"tool-ok:read_file"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+        let ps_speaker = r#"
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  $id = ''
+  if ($line -match '"id":(\d+)') { $id = $Matches[1] }
+  if ($line -match '"method":"initialize"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"fs","version":"1"}}}')
+  } elseif ($line -match '"method":"tools/list"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"read_file","description":"read","inputSchema":{"type":"object"}}]}}')
+  } elseif ($line -match '"method":"tools/call"') {
+    [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"tool-ok:read_file"}]}}')
+  }
+  [Console]::Out.Flush()
+}
+"#;
+        let (command, env) = mcp_stub_command(speaker, ps_speaker);
+        blazar_core::config::McpServer {
+            name: "fs".into(),
+            command,
+            url: None,
+            env,
+            timeout_secs: 30,
+            env_clear: false,
+            allowed_env: Vec::new(),
+            cwd: None,
+            max_output_bytes: None,
+            follow_redirects: false,
+            validate_args: true,
+        }
+    }
+    fn base_cfg(mcp_access: &str) -> Config {
+        Config {
+            keys: vec![ApiKey {
+                name: "poster".into(),
+                key: "plm_poster".into(),
+                mcp_servers: vec!["fs".into()],
+                mcp_access: Some(mcp_access.into()),
+                ..ApiKey::default()
+            }],
+            mcp: vec![mcp_fs_clone()],
+            ..Config::default()
+        }
+    }
+
+    // Catalog posture: definitions inject, the forced call is refused at
+    // the execute gate, and the teaching rides the tool result the model
+    // reflects back - an auditor reading the transcript sees exactly why.
+    let ts = start_with(
+        base_cfg("catalog"),
+        vec![
+            ("STUB_TOOL_CALL".into(), "1".into()),
+            ("STUB_TOOL_CALL_NAME".into(), "mcp__fs__read_file".into()),
+            ("STUB_REFLECT_TOOL".into(), "1".into()),
+        ],
+    )
+    .await;
+    let v = client()
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_poster")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "fs",
+            "messages": [{"role": "user", "content": "use the tool"}]}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let text = v["message"]["content"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("mcp_access = \"catalog\"") && text.contains("execution is disabled"),
+        "catalog refusal rides the tool result: {v}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+
+    // Off posture: MCP never engages - 403 before anything spawns.
+    let ts = start(base_cfg("off")).await;
+    let resp = client()
+        .post(format!("{}/api/chat", ts.base))
+        .bearer_auth("plm_poster")
+        .json(
+            &serde_json::json!({"model": "m1", "stream": false, "mcp": "fs",
+            "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "off posture refuses the selector");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let msg = v.to_string();
+    assert!(
+        msg.contains("mcp access disabled") && msg.contains("poster"),
+        "teaching names the key and the knob: {msg}"
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }

@@ -3795,6 +3795,16 @@ pub struct ApiKey {
     /// refused before execution.
     #[serde(default)]
     pub mcp_tools: Vec<String>,
+    /// MCP access posture for this key. `"tools"` (or absent) = the
+    /// default full semantics above; `"catalog"` = servers spawn and
+    /// tool definitions are injected (an auditor can see what exists)
+    /// but every execution is refused, with the refusal text riding the
+    /// tool result back into the reply; `"off"` = MCP never engages for
+    /// this key - any selector (including the config default) is
+    /// refused up front. Deliberately not a "read-only" preset: tool
+    /// names carry no mutation semantics a gateway could trust.
+    #[serde(default)]
+    pub mcp_access: Option<String>,
     /// Requests per minute cap; 0 = unlimited.
     #[serde(default)]
     pub rpm: u32,
@@ -5471,6 +5481,17 @@ impl Config {
                  whole mediated tool loop, not a single call"
                     .into(),
             ));
+        }
+        for k in &self.keys {
+            if let Some(access) = &k.mcp_access
+                && !matches!(access.as_str(), "tools" | "catalog" | "off")
+            {
+                return Err(CoreError::Config(format!(
+                    "key '{}' mcp_access must be one of \"tools\", \"catalog\", \"off\" (got \
+                     '{access}')",
+                    k.name
+                )));
+            }
         }
         // Scheme ladder: the bearer `key` must never travel in
         // cleartext off-machine. Loopback HTTP is fine (never leaves
@@ -10135,6 +10156,34 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
         cfg.mcp_max_request_secs = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("mcp_max_request_secs must be >= 1"), "{err}");
+    }
+
+    /// Key MCP postures are a closed set - anything else fails config
+    /// load with the key named, rather than silently meaning "tools".
+    #[test]
+    fn unit__validation__key_mcp_access_postures() {
+        let mut cfg = Config::default();
+        for good in ["tools", "catalog", "off"] {
+            cfg.keys = vec![ApiKey {
+                name: "k".into(),
+                key: "plm_k".into(),
+                mcp_access: Some(good.into()),
+                ..ApiKey::default()
+            }];
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("{good} must validate: {e}"));
+        }
+        cfg.keys = vec![ApiKey {
+            name: "k".into(),
+            key: "plm_k".into(),
+            mcp_access: Some("read-only".into()),
+            ..ApiKey::default()
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mcp_access must be one of") && err.contains("'k'"),
+            "{err}"
+        );
     }
 
     #[test]
