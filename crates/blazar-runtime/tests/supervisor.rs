@@ -535,6 +535,101 @@ async fn integration__churn__clean_stop_run_never_trips_circuit() {
     sup.shutdown_all().await.unwrap();
 }
 
+/// Scan /proc for stub children whose argv carries `marker`, returning
+/// (pid, null-separated cmdline joined for the failure message).
+fn live_children_with(marker: &str) -> Vec<(u32, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&cmdline).contains(marker) {
+            let pid = name.parse::<u32>().unwrap_or(0);
+            found.push((pid, String::from_utf8_lossy(&cmdline).replace('\0', " ")));
+        }
+    }
+    found
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__churn__no_orphaned_children_after_concurrent_lifecycle() {
+    // The orphan gate: concurrent loads, capacity evictions and a
+    // mid-flight crash must leave zero engine children alive once the
+    // supervisor shuts down - proven against the real process table,
+    // not the supervisor's own state. Model names embed this test's pid
+    // so sibling test binaries running stubs cannot cross-match.
+    let tag = format!("orphan-{}", std::process::id());
+    let models = [format!("{tag}-a"), format!("{tag}-b"), format!("{tag}-c")];
+    let named: Vec<(&str, u64)> = models.iter().map(|m| (m.as_str(), 500)).collect();
+    let (_t, dirs) = setup(&named);
+    let mut cfg = base_config();
+    // Capacity 1: every racer's ensure evicts a live instance under the
+    // others' feet, so spawn/evict/respawn all interleave.
+    cfg.max_loaded_models = 1;
+    let sup = supervisor(&dirs, cfg, true);
+
+    let mut racers = Vec::new();
+    for round in 0..3 {
+        for m in &models {
+            let sup = sup.clone();
+            let m = m.clone();
+            racers.push(tokio::spawn(async move {
+                let _ = sup.ensure(&m).await;
+            }));
+        }
+        // One hard crash mid-churn routes some teardown through the
+        // reaper instead of the graceful path.
+        if round == 1
+            && let Some(row) = sup.ps().first()
+        {
+            unsafe { libc::kill(i32::try_from(row.pid).unwrap_or(-1), libc::SIGKILL) };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for r in racers {
+        let _ = tokio::time::timeout(Duration::from_secs(30), r).await;
+    }
+
+    // Mid-run honesty: whatever is still alive must be an instance the
+    // supervisor knows - an evicted name's child surviving here IS an
+    // orphan even before shutdown. ps rows can trail the OS by one
+    // reaper tick, so poll briefly before declaring a mismatch.
+    let mut unknown_after_grace: Vec<(u32, String)> = Vec::new();
+    for _ in 0..10 {
+        let known: Vec<u32> = sup.ps().iter().map(|r| r.pid).collect();
+        unknown_after_grace = live_children_with(&tag)
+            .into_iter()
+            .filter(|(pid, _)| !known.contains(pid))
+            .collect();
+        if unknown_after_grace.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        unknown_after_grace.is_empty(),
+        "children alive but unknown to the supervisor: {unknown_after_grace:?}"
+    );
+
+    sup.shutdown_all().await.unwrap();
+    // SIGKILL delivery and reap need a beat before the scan is honest.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let survivors = live_children_with(&tag);
+    assert!(
+        survivors.is_empty(),
+        "orphaned stub children after shutdown: {survivors:?}"
+    );
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn integration__shutdown_kills_children__idempotent() {
