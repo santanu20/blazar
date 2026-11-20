@@ -87,6 +87,28 @@ pub struct EngineEndpoint {
     pub port: u16,
 }
 
+/// The engine integration contract. Every lane implements the same five
+/// semantics so the supervisor can treat children uniformly - a new
+/// engine is "done" when all five hold:
+///
+/// 1. *Capability declaration* - `capabilities()` exposes the probed
+///    [`Manifest`](crate::engine::manifest::Manifest) vocabulary (flags,
+///    devices, spec/cache types, trust tier); argv compilation may only
+///    emit flags that vocabulary advertises.
+/// 2. *Spawn* - `spawn()` owns process-group setup, env layering
+///    (`engine_env` first, per-spawn overrides after, overrides logged)
+///    and preflight refusals (dead `--rpc` endpoints, unsupported
+///    transports): refuse BEFORE any child exists rather than
+///    crash-looping after the fact.
+/// 3. *Health* - `health_check()` polls the engine's own ready signal
+///    (llama: `{"status":"ok"}` body; sglang: probe-200; sdcpp:
+///    `/v1/models`) within the caller's `model_load_timeout` deadline.
+/// 4. *Cancellation* - children run via [`spawn_child`]: own process
+///    group, kernel parent-death tie, `kill_on_drop`; termination is
+///    single-pid by design.
+/// 5. *Memory accounting* - weights on disk plus the admission floor
+///    gate the spawn (`admission_floor_bytes`); the measured settle
+///    delta is exposed observationally via `/api/admission-accuracy`.
 #[async_trait]
 pub trait Engine: Send + Sync {
     /// Capabilities of the active engine build (manifest).
@@ -2515,6 +2537,85 @@ mod tests {
         })
         .await;
         assert!(err.to_string().contains("model_load_timeout"), "{err:#}");
+    }
+
+    /// llama.cpp readiness is the /health BODY, not the HTTP status line:
+    /// a loading child answers 200 with `{"status":"loading"}` for the whole
+    /// model-load window. The stub answers `loading_responses` requests
+    /// with the loading body, then switches to ok (`usize::MAX` = never).
+    async fn status_body_health_stub(loading_responses: usize) -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stub");
+        let port = listener.local_addr().unwrap().port();
+        let remaining = std::sync::atomic::AtomicUsize::new(loading_responses);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 || buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let left = remaining.load(std::sync::atomic::Ordering::SeqCst);
+                let body = if left > 0 {
+                    remaining.store(left - 1, std::sync::atomic::Ordering::SeqCst);
+                    r#"{"status":"loading"}"#
+                } else {
+                    r#"{"status":"ok"}"#
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    fn llama_engine() -> LlamaCppEngine {
+        LlamaCppEngine::new(crate::engine::manifest::Manifest::default())
+    }
+
+    #[tokio::test]
+    async fn unit__llama_health__http_200_without_ok_status_is_not_ready() {
+        // usize::MAX loading bodies: a steady stream of plain 200s must
+        // never satisfy readiness - only the ok status field does.
+        let port = status_body_health_stub(usize::MAX).await;
+        let engine = llama_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = engine
+            .health_check(&endpoint, std::time::Duration::from_millis(500))
+            .await
+            .expect_err("200-without-ok must keep polling until the deadline");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("did not become healthy"), "{msg}");
+        assert!(msg.contains("model_load_timeout"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn unit__llama_health__ok_status_body_completes_readiness() {
+        // One loading response, then ok: readiness lands exactly when the
+        // body flips - the earlier loading 200 is retried, not trusted.
+        let port = status_body_health_stub(1).await;
+        let engine = llama_engine();
+        let endpoint = Endpoint::Tcp {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        engine
+            .health_check(&endpoint, std::time::Duration::from_secs(3))
+            .await
+            .expect("ok status body must complete readiness");
     }
 
     fn sdcpp_engine() -> SdCppEngine {

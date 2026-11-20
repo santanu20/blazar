@@ -67,6 +67,25 @@ Ask Blazar why a model landed on a lane:
 blazar explain <model>            # the routing decision, with reasons
 ```
 
+## Engine integration contract
+
+Every lane - llama.cpp, mistral.rs, sglang, vLLM, MLX, sdcpp, OpenAI-host -
+implements the same five semantics. An engine is production-ready when all
+five hold; each is pinned by tests, not convention:
+
+| Semantic | Contract | Where |
+|---|---|---|
+| Capability declaration | Probed `Manifest` vocabulary (flags, devices, spec/cache types, trust tier); argv may only emit advertised flags | `engine/manifest.rs` (`probe_kind`, `MANIFEST_PROBE_VERSION` generations), coverage doc below |
+| Health | Readiness = the engine's own signal (llama: `{"status":"ok"}` body; sglang: probe-200; sdcpp: `/v1/models`), polled within `model_load_timeout` | `Engine::health_check` + per-lane deadline/signal unit tests |
+| Cancellation | Own process group, kernel parent-death tie (Linux PDEATHSIG), `kill_on_drop`; termination is single-pid by design | `spawn_child` in `engine_impl.rs`, `probe::parent_death_tie` |
+| Memory accounting | Weights + admission floor gate the spawn; the measured settle delta is observational, exposed at `/api/admission-accuracy` | `admission_floor_bytes`, spawn-settle task, accuracy poller |
+| Lifecycle | Instance states Loading/Ready/Sleeping/Evicted/Crashed with one legal transition matrix; evicted/crashed are terminal | `events.rs` (`can_transition`), architecture doc |
+
+Adding a lane means: a `probe_<kind>` manifest parser, an `Engine` impl
+honoring the contract above, and a coverage section in this doc. Preflight
+refusals (dead `--rpc` endpoints, unsupported transports) happen BEFORE any
+child exists - crash-looping after spawn is a contract violation.
+
 ## Per-engine notes
 
 ### llama.cpp
