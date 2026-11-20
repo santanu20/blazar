@@ -921,6 +921,35 @@ enum KvCmd {
         #[arg(long)]
         to_sglang: bool,
     },
+    /// Per-model KV state inventory: session banks (current + legacy
+    /// layouts), sizes, newest context, and the engine-managed tiers
+    /// (mlx stage, `sglang` `HiCache` pages) - the read-side picture the
+    /// doctor rows compress.
+    Status {
+        /// One JSON object per model (JSONL); suppresses the table
+        #[arg(long)]
+        json: bool,
+    },
+    /// One model's KV state in detail: every bank with ctx/slot/size,
+    /// the identity manifests beside them (engine tag, model sha,
+    /// `LoRA` bindings), and legacy-layout banks.
+    Inspect {
+        /// Model name (store row), as `blazar list` shows it
+        model: String,
+        /// One JSON object instead of the sectioned text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report reclaimable KV debris: session dirs no live model owns,
+    /// empty session dirs, identity manifests whose bank is gone.
+    /// Report-only - `--dry-run` is required; this release deletes
+    /// nothing.
+    Gc {
+        /// Print the orphan report (always required: nothing is ever
+        /// deleted by this command in this release)
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4181,7 +4210,285 @@ fn kv_cmd(cmd: KvCmd) -> Result<()> {
                 to_sglang,
             },
         ),
+        KvCmd::Status { json } => {
+            let out = kv_status_cmd(&dirs(), json)?;
+            print!("{out}");
+            Ok(())
+        }
+        KvCmd::Inspect { model, json } => {
+            let out = kv_inspect_cmd(&dirs(), &model, json)?;
+            print!("{out}");
+            Ok(())
+        }
+        KvCmd::Gc { dry_run } => {
+            let out = kv_gc_cmd(&dirs(), dry_run)?;
+            print!("{out}");
+            Ok(())
+        }
     }
+}
+
+/// `blazar kv status` - one row per model: bank counts (current +
+/// legacy layouts), total bytes, newest context, and the engine-managed
+/// tiers that apply to the model's shape (`mlx` stage / `sglang` `HiCache`
+/// pages for HF dirs). Read-only; `--json` emits one object per model.
+/// Returns the output; the dispatch arm prints it (keeps the renderer
+/// unit-testable without capturing stdout).
+fn kv_status_cmd(d: &BlazarDirs, json: bool) -> Result<String> {
+    use blazar_runtime::kv::inventory;
+    let store = Store::open(d)?;
+    let rows = store.list_models()?;
+    let cfg = Config::load(d).map_err(|e| anyhow!("{e}"))?;
+    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+    let inventories = inventory::scan(&d.data_dir, &names);
+    let mut out = String::new();
+    for (row, inv) in rows.iter().zip(&inventories) {
+        let is_hf = std::path::Path::new(&row.path)
+            .join("config.json")
+            .is_file();
+        let pages = std::fs::read_dir(sglang_hicache_dir_of(&d.data_dir, &cfg)).map_or(0, |rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                .count()
+        });
+        let newest_ctx = inv
+            .banks
+            .iter()
+            .chain(inv.legacy_banks.iter())
+            .filter_map(|b| b.ctx)
+            .max();
+        if json {
+            let obj = serde_json::json!({
+                "model": inv.model,
+                "banks": inv.banks.iter().map(|b| serde_json::json!({
+                    "name": b.name,
+                    "ctx": b.ctx,
+                    "slot": b.slot,
+                    "bytes": b.bytes,
+                    "modified_unix": b.modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                })).collect::<Vec<_>>(),
+                "legacy_banks": inv.legacy_banks.len(),
+                "bytes": inv.total_bytes(),
+                "newest_ctx": newest_ctx,
+                "mlx_stage_ready": inv.mlx_stage_ready,
+                "hicache_pages": if is_hf { Some(pages) } else { None },
+            });
+            writeln!(out, "{obj}").unwrap();
+            continue;
+        }
+        let tiers = if is_hf {
+            let stage = inv.mlx_stage_ready.map_or("unset", |ready| {
+                if ready {
+                    "ready"
+                } else {
+                    "present, incomplete"
+                }
+            });
+            format!("mlx {stage}, {pages} hicache page(s)")
+        } else {
+            "-".to_string()
+        };
+        writeln!(
+            out,
+            "{:<40} {:>3} bank(s), {:>2} legacy, {:>10}, ctx {}, {}",
+            inv.model,
+            inv.banks.len(),
+            inv.legacy_banks.len(),
+            humansize(i64::try_from(inv.total_bytes()).unwrap_or(i64::MAX)),
+            newest_ctx.map_or_else(|| "-".to_string(), |c| c.to_string()),
+            tiers,
+        )
+        .unwrap();
+    }
+    Ok(out)
+}
+
+/// `blazar kv inspect <model>` - the full per-bank picture: every bank
+/// (current + legacy) with ctx/slot/size/mtime, and the identity
+/// manifest beside each bank when present (engine tag, model sha,
+/// `LoRA` bindings - the fields the restore gate verifies). Legacy
+/// banks without manifests say so instead of guessing.
+fn kv_bank_identity(
+    session_dir: Option<&std::path::Path>,
+    bank: &blazar_runtime::kv::inventory::BankFile,
+) -> Option<blazar_core::session_identity::SessionIdentity> {
+    // The manifest sits beside the bank file
+    // (`<bank>.identity.json`); read_manifest resolves it.
+    session_dir
+        .map(|dir| dir.join(&bank.name))
+        .and_then(|bank_path| blazar_core::session_identity::read_manifest(&bank_path))
+}
+
+fn kv_bank_json(
+    bank: &blazar_runtime::kv::inventory::BankFile,
+    identity: Option<&blazar_core::session_identity::SessionIdentity>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": bank.name,
+        "ctx": bank.ctx,
+        "slot": bank.slot,
+        "bytes": bank.bytes,
+        "modified_unix": bank.modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        "identity": identity.as_ref().map(|id| serde_json::json!({
+            "blazar_version": id.blazar_version,
+            "engine_kind": id.engine_kind,
+            "engine_tag": id.engine_tag,
+            "engine_sha": id.engine_sha,
+            "model_sha": id.model_sha,
+            "adapters": id.adapters.len(),
+            "ctx": id.ctx,
+            "cache_type": id.cache_type,
+        })),
+    })
+}
+
+fn kv_inspect_cmd(d: &BlazarDirs, model: &str, json: bool) -> Result<String> {
+    use blazar_runtime::kv::inventory;
+    let store = Store::open(d)?;
+    if store.get_model(model)?.is_none() {
+        anyhow::bail!("unknown model {model:?} - blazar list");
+    }
+    let inventories = inventory::scan(&d.data_dir, &[model.to_string()]);
+    let inv = &inventories[0];
+    let bank_identity =
+        |bank: &inventory::BankFile| kv_bank_identity(inv.session_dir.as_deref(), bank);
+    let mut out = String::new();
+    if json {
+        let current: Vec<_> = inv
+            .banks
+            .iter()
+            .map(|b| {
+                let id = bank_identity(b);
+                kv_bank_json(b, id.as_ref())
+            })
+            .collect();
+        let legacy: Vec<_> = inv
+            .legacy_banks
+            .iter()
+            .map(|b| kv_bank_json(b, None))
+            .collect();
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({
+                "model": inv.model,
+                "session_dir": inv.session_dir,
+                "banks": current,
+                "legacy_banks": legacy,
+                "mlx_stage_ready": inv.mlx_stage_ready,
+                "bytes": inv.total_bytes(),
+            })
+        )
+        .unwrap();
+        return Ok(out);
+    }
+
+    writeln!(out, "kv state - {}", inv.model).unwrap();
+    if inv.banks.is_empty() && inv.legacy_banks.is_empty() {
+        writeln!(out, "  no session banks (serve the model to start banking)").unwrap();
+    }
+    for bank in &inv.banks {
+        writeln!(
+            out,
+            "  {:<24} ctx {:>6}, slot {:>2}, {:>10}",
+            bank.name,
+            bank.ctx.map_or_else(|| "-".into(), |c| c.to_string()),
+            bank.slot.map_or_else(|| "-".into(), |s| s.to_string()),
+            humansize(i64::try_from(bank.bytes).unwrap_or(i64::MAX)),
+        )
+        .unwrap();
+        match bank_identity(bank) {
+            Some(id) => writeln!(
+                out,
+                "    identity: {} {}, engine {}, model sha {}",
+                if id.engine_kind.is_empty() {
+                    // Pre-stamping manifests carry no kind - say so
+                    // instead of rendering a hollow double space.
+                    "engine (kind unrecorded)"
+                } else {
+                    &id.engine_kind
+                },
+                id.engine_tag,
+                id.engine_sha.chars().take(12).collect::<String>(),
+                id.model_sha.as_deref().map_or_else(
+                    || "unverified".into(),
+                    |s| s.chars().take(12).collect::<String>()
+                ),
+            )
+            .unwrap(),
+            None => writeln!(
+                out,
+                "    identity: no manifest (bank pre-dates identity stamping)"
+            )
+            .unwrap(),
+        }
+    }
+    for bank in &inv.legacy_banks {
+        writeln!(
+            out,
+            "  {:<24} ctx {:>6} (legacy layout, no identity manifest)",
+            bank.name,
+            bank.ctx.map_or_else(|| "-".into(), |c| c.to_string()),
+        )
+        .unwrap();
+    }
+    Ok(out)
+}
+
+/// `blazar kv gc --dry-run` - the reclaimable-debris report: session
+/// dirs no live model owns, empty session dirs, identity manifests
+/// whose bank is gone. Report-only in this release: the command
+/// refuses to run without `--dry-run` and deletes nothing either way.
+fn kv_gc_cmd(d: &BlazarDirs, dry_run: bool) -> Result<String> {
+    use blazar_runtime::kv::inventory;
+    if !dry_run {
+        anyhow::bail!(
+            "kv gc is report-only in this release - pass --dry-run for the orphan report"
+        );
+    }
+    let store = Store::open(d)?;
+    let rows = store.list_models()?;
+    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+    let orphans = inventory::orphan_scan(&d.data_dir, &names);
+    let mut out = String::new();
+    if orphans.is_empty() {
+        writeln!(
+            out,
+            "no reclaimable KV debris (no orphaned session dirs, empty dirs, or dangling manifests)"
+        )
+        .unwrap();
+        return Ok(out);
+    }
+    let table: Vec<Vec<String>> = orphans
+        .iter()
+        .map(|o| {
+            vec![
+                o.path.display().to_string(),
+                humansize(i64::try_from(o.bytes).unwrap_or(i64::MAX)),
+                o.reason.clone(),
+            ]
+        })
+        .collect();
+    write!(
+        out,
+        "{}",
+        render_table(&["PATH", "SIZE", "WHY"], &table, &[])
+    )
+    .unwrap();
+    let total: u64 = orphans.iter().map(|o| o.bytes).sum();
+    writeln!(
+        out,
+        "\nreclaimable: {} across {} item(s) - report-only: nothing was deleted \
+         (remove the paths yourself once the reasons check out)",
+        humansize(i64::try_from(total).unwrap_or(i64::MAX)),
+        orphans.len(),
+    )
+    .unwrap();
+    Ok(out)
 }
 
 /// The forward lane: a llama.cpp session bank repacked into the vllm FS
@@ -35839,5 +36146,113 @@ engine = "sglang"
         assert!(text.contains("no installed row for this lane"), "{text}");
         assert!(text.contains("kv connector"), "{text}");
         assert!(text.contains("formats         none"), "{text}");
+    }
+
+    /// Minimal model row for KV-inventory CLI tests: a GGUF-shaped row
+    /// whose name drives the session-dir layout under test.
+    fn kv_test_model(name: &str) -> blazar_core::store::ModelRow {
+        blazar_core::store::ModelRow {
+            name: name.into(),
+            repo: "o/x".into(),
+            quant: "Q4_K_M".into(),
+            path: format!("/tmp/{name}.gguf"),
+            bytes: 1,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: None,
+            params: None,
+            ctx_train: None,
+            pulled_at: 0,
+            last_used_at: 0,
+        }
+    }
+
+    /// `kv gc` without `--dry-run` is a hard refusal, not a silent
+    /// no-op: the teaching names the flag and the report-only contract.
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__kv_gc_cmd__refuses_without_dry_run_and_teaches() {
+        let root = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(root.path());
+        let err = kv_gc_cmd(&d, false).unwrap_err().to_string();
+        assert!(
+            err.contains("report-only") && err.contains("--dry-run"),
+            "teaching refusal, got: {err}"
+        );
+    }
+
+    /// The dry-run report lists orphaned session dirs with sizes and
+    /// reasons, sums the reclaimable bytes, and states that nothing
+    /// was deleted - the report-only contract is part of the output.
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__kv_gc_cmd__dry_run_reports_orphans_without_deleting() {
+        let root = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(root.path());
+        let sessions = d.data_dir.join("sessions").join("ghost-70aa2f7e");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("_auto-4096"), b"stale").unwrap();
+        let out = kv_gc_cmd(&d, true).unwrap();
+        assert!(out.contains("ghost-70aa2f7e"), "{out}");
+        assert!(out.contains("no live model owns"), "{out}");
+        assert!(out.contains("reclaimable:"), "{out}");
+        assert!(out.contains("report-only: nothing was deleted"), "{out}");
+        // The debris stays on disk - the report never mutates.
+        assert!(sessions.join("_auto-4096").exists());
+    }
+
+    /// `kv status --json` walks the real session layout for live
+    /// models: current-layout banks carry ctx/slot/bytes, legacy
+    /// dirs are counted, and the model with no state reports zero
+    /// banks instead of being dropped from the picture.
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__kv_status_cmd__json_lists_banks_and_legacy_per_model() {
+        let root = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(root.path());
+        let s = blazar_core::Store::open(&d).unwrap();
+        s.upsert_model(&kv_test_model("live-m")).unwrap();
+        s.upsert_model(&kv_test_model("quiet-m")).unwrap();
+        let sessions = d.data_dir.join("sessions");
+        let cur = sessions.join(blazar_core::profile::path_safe("live-m"));
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("_auto-4096"), b"bank!").unwrap();
+        std::fs::write(cur.join("_auto-4096.identity.json"), b"{}").unwrap();
+        let legacy = sessions.join("live-m-v2");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("_auto-2048"), b"old").unwrap();
+        let out = kv_status_cmd(&d, true).unwrap();
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let live = rows.iter().find(|r| r["model"] == "live-m").unwrap();
+        assert_eq!(live["banks"].as_array().unwrap().len(), 1, "{live}");
+        assert_eq!(live["banks"][0]["ctx"], 4096);
+        assert_eq!(live["banks"][0]["bytes"], 5);
+        assert_eq!(live["legacy_banks"], 1);
+        let quiet = rows.iter().find(|r| r["model"] == "quiet-m").unwrap();
+        assert_eq!(quiet["banks"].as_array().unwrap().len(), 0, "{quiet}");
+        assert_eq!(quiet["legacy_banks"], 0);
+        assert_eq!(quiet["bytes"], 0);
+    }
+
+    /// `kv inspect` on a name the store does not know teaches via the
+    /// model listing instead of rendering an empty card.
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__kv_inspect_cmd__unknown_model_teaches() {
+        let root = tempfile::tempdir().unwrap();
+        let d = card_test_dirs(root.path());
+        let err = kv_inspect_cmd(&d, "no-such-model", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown model") && err.contains("blazar list"),
+            "teaching error, got: {err}"
+        );
     }
 }
