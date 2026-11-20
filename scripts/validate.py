@@ -2208,6 +2208,38 @@ _K = [
         "remote capability-registry URL; unset in sandbox (no egress)",
     ),
     (
+        "capability_lane_auto_install",
+        True,
+        False,
+        "behavior",
+        None,
+        "default-true curated-lane rescue: registry-only background build "
+        "after an unknown-architecture failure, additive registration; "
+        "explicit false opts out (unit-pinned both ways)",
+    ),
+    (
+        "capability_registry_pubkey",
+        True,
+        False,
+        "boundary",
+        None,
+        "ed25519 trust pin overriding the embedded registry key (self-hosted "
+        "registries); unset = embedded anchor, signature verified per fetch",
+    ),
+    (
+        "kv",
+        False,
+        True,
+        "boundary",
+        None,
+        "[kv] cross-engine KV section: [kv.lmcache] shared daemon "
+        "{enabled, host, port, http_port, l1_size_gb, eviction_policy} + "
+        "[kv.translation] {allow = [converters]}; parse-time gates (vllm "
+        "lmcache connector refused, sglang opt-in needs the daemon, XOR "
+        "hicache/spec/dp) and vllm kv_offload connector choice covered by "
+        "kv-gate unit tests + lmcache/translation live receipts",
+    ),
+    (
         "model_pools",
         False,
         True,
@@ -13917,6 +13949,7 @@ def _full_toplevel() -> dict:
         "mistralrs_paged_attn": False,
         "reasoning": "",
         "sglang": {},
+        "kv": {},
         "batch": {},
         "lazy_mode": "auto",
         "deterministic": False,
