@@ -783,6 +783,56 @@ fn warm_peg_served_model(argv: &[String]) -> Option<String> {
         .find_map(|w| (w[0] == "--served-model-name" || w[0] == "--model").then(|| w[1].clone()))
 }
 
+/// Dial the warm-peg probe until the child answers or the bind budget
+/// runs out. A connect refusal on a TCP endpoint is a pending bind, not
+/// a dead child (late-binding engines answer seconds after spawn) - see
+/// [`warm_peg_child`] for the wave-D receipt behind that read.
+async fn warm_peg_probe_until_bound(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+    auth: Option<&str>,
+    model: &str,
+    pending_bind: bool,
+) -> Option<reqwest::Response> {
+    let started = std::time::Instant::now();
+    let bind_deadline = std::time::Duration::from_secs(60);
+    loop {
+        let mut probe = client
+            .post(url)
+            .json(body)
+            .timeout(std::time::Duration::from_secs(90));
+        if let Some(secret) = auth {
+            probe = probe.bearer_auth(secret);
+        }
+        match probe.send().await {
+            Ok(r) => return Some(r),
+            // Connect-class only: an unbound port. Everything else
+            // (timeout past a healthy queue, DNS, TLS) keeps the
+            // warn-and-continue contract. Unix endpoints are excluded:
+            // their children bind the socket before spawn returns, so a
+            // refused UDS dial is a dead child, not a pending bind
+            // (pinned by unit__warm_peg_sglang__unix_endpoint_noop_fast).
+            Err(e) if pending_bind && e.is_connect() && started.elapsed() < bind_deadline => {
+                tracing::debug!(
+                    target: "blazar::warmpeg",
+                    model,
+                    "child not bound yet ({e}) - redialing"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "blazar::warmpeg",
+                    model,
+                    "warm-peg single probe failed: {e:#} - leaving warmup to the first request"
+                );
+                return None;
+            }
+        }
+    }
+}
+
 /// Post-spawn warm-peg for JIT-class engines (sglang): the child's
 /// /health flips 200 BEFORE residual warmup drains - the first user
 /// request then eats a ~30s queue (measured live: first post-boot TTFT
@@ -845,7 +895,6 @@ async fn warm_peg_child(
         "temperature": 0.0,
         "stream": false,
     });
-    let started = std::time::Instant::now();
     // Single probe first: drains the residual warmup queue (up to ~30s
     // on a cold venv+torch boot; generous bound so a slow-but-healthy
     // child is still pegged, not abandoned).
@@ -856,7 +905,6 @@ async fn warm_peg_child(
     // one still occupies (live receipt: wave-D mlx spawn churn). A
     // connect refusal is instead evidence the bind is still pending:
     // keep dialing against a short deadline so Ready means "answers".
-    let bind_deadline = std::time::Duration::from_secs(60);
     // Unix-endpoint children bind their socket before spawn returns, so
     // a refused UDS dial is a dead child, not a pending bind - only TCP
     // endpoints (the late-bind class; pinned by the wave-D mlx receipt)
@@ -866,39 +914,13 @@ async fn warm_peg_child(
     let pending_bind = !matches!(endpoint, blazar_core::Endpoint::Unix { .. });
     #[cfg(not(unix))]
     let pending_bind = true;
-    let resp = loop {
-        let mut probe = client
-            .post(&url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(90));
-        if let Some(secret) = auth {
-            probe = probe.bearer_auth(secret);
-        }
-        match probe.send().await {
-            Ok(r) => break r,
-            // Connect-class only: an unbound port. Everything else
-            // (timeout past a healthy queue, DNS, TLS) keeps today's
-            // warn-and-continue contract. Unix endpoints are excluded:
-            // their children bind the socket before spawn returns, so a
-            // refused UDS dial is a dead child, not a pending bind
-            // (pinned by unit__warm_peg_sglang__unix_endpoint_noop_fast).
-            Err(e) if pending_bind && e.is_connect() && started.elapsed() < bind_deadline => {
-                tracing::debug!(
-                    target: "blazar::warmpeg",
-                    model,
-                    "child not bound yet ({e}) - redialing"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "blazar::warmpeg",
-                    model,
-                    "warm-peg single probe failed: {e:#} - leaving warmup to the first request"
-                );
-                return;
-            }
-        }
+    // Wall clock for the peg spans the redial wait - a late bind IS the
+    // peg's elapsed work, so the timing stats below read total effort.
+    let started = std::time::Instant::now();
+    let Some(resp) =
+        warm_peg_probe_until_bound(&client, &url, &body, auth, model, pending_bind).await
+    else {
+        return;
     };
     if !resp.status().is_success() {
         tracing::warn!(

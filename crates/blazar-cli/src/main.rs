@@ -11905,9 +11905,8 @@ fn stop_outcome(
 /// the new daemon's stop path. A daemon-side self-clean may already have
 /// removed it - missing file is success.
 fn remove_stale_pidfile(pidfile: &std::path::Path, stopped_pid: i32) {
-    let names_stopped_pid = std::fs::read_to_string(pidfile)
-        .ok()
-        .is_some_and(|s| s.trim().parse::<i32>() == Ok(stopped_pid));
+    let names_stopped_pid =
+        std::fs::read_to_string(pidfile).is_ok_and(|s| s.trim().parse::<i32>() == Ok(stopped_pid));
     if !names_stopped_pid {
         return;
     }
