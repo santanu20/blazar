@@ -313,7 +313,7 @@ Two committed campaigns, full receipts in [`BENCHMARK.md`](BENCHMARK.md): the pe
 | Concurrent TTFT p99, C=4 | **554 ms** | 15.9 s Ollama lane | Lower tail latency |
 | Adaptive serving | **49 -> 63 t/s** | - | **~28%** gain, 0 failed requests |
 
-Concurrency rows above the Ollama block are the current-release ladder (8 x 64-token bodies, temp 0, identical child argv both sides; receipt `bench-artifacts/20261031-benchmark-audit/gateway-overhead-ladder-after-fix.json`).
+Concurrency rows above the Ollama block are the current-release ladder (8 x 64-token bodies, temp 0, identical child argv both sides; methodology and the pre-fix ladder live in the committed audit report [`bench-artifacts/20261031-benchmark-audit/report.md`](bench-artifacts/20261031-benchmark-audit/report.md), the post-serialization-fix ladder - C1 1.135, C4 1.017, C8 0.986 - in [`docs/research/2026-10-31-recursive-self-improvement-research.md`](docs/research/2026-10-31-recursive-self-improvement-research.md) with fix commit `299bf5a`; raw receipts also persist in the daemon store via `blazar bench` history).
 
 Where the gateway can matter - scheduling, residency, cache, tail control, tools - Blazar leads Ollama by receipt:
 
