@@ -76,6 +76,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -6855,6 +6856,473 @@ def write_speed_table(records: list[dict], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# targeted probes (cancel latency / eviction cost / store contention)
+#
+# Opt-in lanes (--probes): one-shot operational measurements that answer
+# questions the throughput matrix cannot - how fast a dropped connection
+# frees the engine slot, what a forced eviction costs the next cold load,
+# and whether SQLite contention is real at this deployment's write rate.
+# They never gate a campaign: rows are informational receipts.
+
+
+def _stream_until(port: int, body: dict, min_chunks: int) -> tuple[float, int]:
+    """Open a streaming chat, consume until `min_chunks` content-bearing
+    SSE chunks have arrived, then close the socket = the client abort.
+    Returns (seconds since abort was issued, chunks seen). The close() is
+    the cancellation event under measurement."""
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req, timeout=600.0)
+    chunks = 0
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                doc = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            choice = (doc.get("choices") or [{}])[0]
+            delta = choice.get("delta") or {}
+            if delta.get("content") or choice.get("text"):
+                chunks += 1
+                if chunks >= min_chunks:
+                    break
+    finally:
+        t_abort = time.perf_counter()
+        resp.close()
+    return t_abort, chunks
+
+
+def _ps_rows(port: int) -> list[dict]:
+    try:
+        doc = http_json(f"http://127.0.0.1:{port}/api/ps", timeout=10.0)
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return []
+    return list(doc.get("models") or [])
+
+
+def _row_for(rows: list[dict], name: str) -> dict | None:
+    for r in rows:
+        if r.get("name") == name:
+            return r
+    return None
+
+
+def _wait_slot_idle(port: int, name: str, deadline_s: float) -> float | None:
+    """Poll /api/ps until the model row reports in_flight == 0; returns
+    seconds elapsed, or None when the deadline hit (the failure receipt)."""
+    t0 = time.perf_counter()
+    deadline = t0 + deadline_s
+    while time.perf_counter() < deadline:
+        row = _row_for(_ps_rows(port), name)
+        if row is None:
+            # evicted mid-poll: nothing resident = slot free by definition
+            return time.perf_counter() - t0
+        if not row.get("blazar_in_flight", row.get("in_flight", 0)):
+            return time.perf_counter() - t0
+        time.sleep(0.02)
+    return None
+
+
+def run_cancel_probe_cell(
+    eng: Engine, model: Path, gw_model_name: str, reps: int
+) -> dict:
+    """Cancellation latency: abort a streaming chat mid-decode and measure
+    how long the engine slot stays occupied afterwards. Gateway leg polls
+    /api/ps in_flight; a direct llama-server leg polls /slots so the
+    proxy's added cost is visible against the engine's own floor."""
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
+
+    rec: dict[str, Any] = {"reps": reps, "engine": eng.tag}
+    body = {
+        "model": gw_model_name,
+        "messages": [
+            {"role": "user", "content": "List fun facts about the ocean, one per line."}
+        ],
+        "max_tokens": 512,
+        "stream": True,
+    }
+    sb = V.Sandbox()
+    sampler = Sampler(None)
+    sampler.start()
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
+        pin_active_engine(con, "tag = ?", eng.tag)
+        con.commit()
+        con.close()
+        daemon = V.Daemon(sb)
+        port: int | None = None
+        try:
+            daemon.start(
+                cfg=with_engine_pin({"port": V.PORT}, gw_model_name, eng),
+                floor_model=gw_model_name,
+            )
+            port = V.PORT
+            deadline = time.time() + 600
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    http_json(f"http://127.0.0.1:{port}/healthz", timeout=5.0)
+                    healthy = True
+                    break
+                except json.JSONDecodeError:
+                    healthy = True
+                    break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.5)
+            if not healthy:
+                return {"error": "sandbox daemon failed to boot for cancel probe"}
+            openai_stream_timed(
+                port,
+                {**body, "max_tokens": 8},
+                timeout=600.0,
+            )  # warm: load + first jit paths paid before timing
+
+            samples: list[float] = []
+            seen: list[int] = []
+            for _ in range(reps):
+                _t_abort, chunks = _stream_until(port, body, 8)
+                elapsed = _wait_slot_idle(port, gw_model_name, 30.0)
+                if elapsed is None:
+                    rec["error"] = "slot never freed within 30s of abort"
+                    return rec
+                samples.append((elapsed) * 1000.0)
+                seen.append(chunks)
+            rec["cancel_ms_p50"] = round(percentile(samples, 50), 1)
+            rec["cancel_ms_p90"] = round(percentile(samples, 90), 1)
+            rec["cancel_ms_max"] = round(max(samples), 1)
+            rec["tokens_seen_median"] = sorted(seen)[len(seen) // 2]
+            rec["samples"] = [round(s, 1) for s in samples]
+            capture_child_argv(rec, eng)
+        finally:
+            daemon.stop()
+            if port is not None:
+                for _ in range(20):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/healthz", timeout=1.0
+                        )
+                        time.sleep(0.5)
+                    except (urllib.error.URLError, OSError):
+                        break
+
+        # direct leg: the engine without the gateway, /slots as the truth
+        dport = free_port()
+        argv = direct_argv(eng, model, None, dport, 4096, 1, 999, None)
+        with open(
+            Path(tempfile.gettempdir()) / f"blazar-cancel-direct-{eng.tag}.stderr", "wb"
+        ) as errfh:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(eng.dir),
+                stdout=subprocess.DEVNULL,
+                stderr=errfh,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        dsampler = Sampler(proc.pid)
+        dsampler.start()
+        try:
+            if not wait_healthy(eng.kind, dport, 600.0, proc=proc):
+                rec["direct_note"] = "direct child failed to become healthy"
+                return rec
+            dbody = {
+                "model": "default",
+                "messages": body["messages"],
+                "max_tokens": 512,
+                "stream": True,
+            }
+            direct_samples: list[float] = []
+            for _ in range(reps):
+                _t_abort, _chunks = _stream_until(dport, dbody, 8)
+                t0 = time.perf_counter()
+                idle = False
+                while time.perf_counter() - t0 < 40.0:
+                    try:
+                        slots = http_json(
+                            f"http://127.0.0.1:{dport}/slots", timeout=5.0
+                        )
+                    except urllib.error.HTTPError as e:
+                        if e.code == 404:
+                            rec["direct_note"] = "/slots unavailable on this fork"
+                            break
+                        raise
+                    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+                        time.sleep(0.05)
+                        continue
+                    if all((s.get("state", 0) == 0) for s in slots):
+                        idle = True
+                        break
+                    time.sleep(0.02)
+                if rec.get("direct_note"):
+                    break
+                if not idle:
+                    rec["direct_note"] = "slots never went idle within 40s"
+                    break
+                direct_samples.append((time.perf_counter() - t0) * 1000.0)
+            if direct_samples:
+                rec["direct_cancel_ms_p50"] = round(percentile(direct_samples, 50), 1)
+        finally:
+            rec.update(teardown_proc(proc, dsampler))
+    finally:
+        sampler.stop_evt.set()
+        sb.destroy()
+    return rec
+
+
+def run_evict_probe_cell(
+    eng: Engine, model: Path, gw_model_name: str, cfg: dict, reps: int
+) -> dict:
+    """Eviction cost A/B: cold-load TTFT for model B alone vs the TTFT of
+    the same load when it must first evict a resident model A under
+    max_loaded_models=1. The delta is what eviction actually costs users;
+    the explicit /api/evict wall time and the GPU census bracket it."""
+    os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
+    V = importlib.import_module("validate")
+    V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
+
+    rec: dict[str, Any] = {"reps": reps, "engine": eng.tag}
+
+    # pick the eviction victim: smallest other .gguf actually on disk
+    sb = V.Sandbox()
+    try:
+        con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
+        try:
+            # victim must be a chat-servable text arch for the pinned llama
+            # engine - voice (piper) / embedding (bert, clip) / classifier
+            # (ggmlc) ggufs would 502 the cold leg instead of loading
+            rows = con.execute(
+                "SELECT name, path, bytes FROM models"
+                " WHERE name != ? AND path LIKE '%.gguf'"
+                " AND arch NOT IN ('piper','bert','clip','ggmlc')"
+                " ORDER BY bytes",
+                (gw_model_name,),
+            ).fetchall()
+        finally:
+            con.close()
+        candidates = [(n, Path(p)) for n, p, _ in rows if Path(p).is_file()]
+        if not candidates:
+            return {"note": "no second model on disk - eviction A/B needs a victim"}
+        victim_name, victim_path = candidates[0]
+        rec["second_model"] = victim_name
+        rec["second_model_mib"] = round(victim_path.stat().st_size / (1024 * 1024), 1)
+
+        pin_active_engine(
+            sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db"),
+            "tag = ?",
+            eng.tag,
+        )
+        daemon = V.Daemon(sb)
+        port: int | None = None
+        try:
+            daemon.start(
+                cfg=with_engine_pin(
+                    {"port": V.PORT, "max_loaded_models": 1}, gw_model_name, eng
+                ),
+                floor_model=gw_model_name,
+            )
+            port = V.PORT
+            deadline = time.time() + 600
+            healthy = False
+            while time.time() < deadline:
+                try:
+                    http_json(f"http://127.0.0.1:{port}/healthz", timeout=5.0)
+                    healthy = True
+                    break
+                except json.JSONDecodeError:
+                    healthy = True
+                    break
+                except (urllib.error.URLError, OSError):
+                    time.sleep(0.5)
+            if not healthy:
+                return {"error": "sandbox daemon failed to boot for evict probe"}
+
+            leg_body = {
+                "model": victim_name,
+                "messages": [{"role": "user", "content": "Say ok"}],
+                "max_tokens": 4,
+                "stream": True,
+            }
+            # leg 1: cold load of B with the card empty (the baseline)
+            cold = openai_stream_timed(port, leg_body, timeout=600.0)
+            t_cold_ms = float(cold.get("ttft_ms", 0.0))
+            rec["t_cold_ms"] = round(t_cold_ms, 1)
+
+            # leg 2: explicit evict wall time (drain + teardown + census)
+            t0 = time.perf_counter()
+            http_json(
+                f"http://127.0.0.1:{port}/api/evict",
+                {"model": victim_name},
+                timeout=60.0,
+            )
+            evict_wall_ms = None
+            while time.perf_counter() - t0 < 30.0:
+                if _row_for(_ps_rows(port), victim_name) is None:
+                    evict_wall_ms = (time.perf_counter() - t0) * 1000.0
+                    break
+                time.sleep(0.02)
+            rec["evict_wall_ms"] = (
+                round(evict_wall_ms, 1) if evict_wall_ms is not None else None
+            )
+
+            # leg 3: pressure reps - A resident, B must evict it to load
+            a_body = {
+                "model": gw_model_name,
+                "messages": [{"role": "user", "content": "Say ok"}],
+                "max_tokens": 4,
+                "stream": True,
+            }
+            pressure_ms: list[float] = []
+            gpu_before = gpu_used_mib()
+            for _ in range(reps):
+                openai_stream_timed(port, a_body, timeout=600.0)
+                if _row_for(_ps_rows(port), gw_model_name) is None:
+                    rec["error"] = "model A failed to become resident in pressure rep"
+                    return rec
+                got = openai_stream_timed(port, leg_body, timeout=600.0)
+                pressure_ms.append(float(got.get("ttft_ms", 0.0)))
+            gpu_after = gpu_used_mib()
+            rows = _ps_rows(port)
+            if _row_for(rows, gw_model_name) is not None:
+                rec["error"] = "model A still resident after pressure rep (no eviction)"
+                return rec
+            if _row_for(rows, victim_name) is None:
+                rec["error"] = "model B not resident after pressure rep"
+                return rec
+            t_pressure_med = percentile(pressure_ms, 50)
+            rec["t_evict_load_ms"] = round(t_pressure_med, 1)
+            rec["evict_cost_ms"] = round(max(0.0, t_pressure_med - t_cold_ms), 1)
+            rec["gpu_before_mib"] = round(gpu_before, 1)
+            rec["gpu_after_mib"] = round(gpu_after, 1)
+        finally:
+            daemon.stop()
+            if port is not None:
+                for _ in range(20):
+                    try:
+                        urllib.request.urlopen(
+                            f"http://127.0.0.1:{port}/healthz", timeout=1.0
+                        )
+                        time.sleep(0.5)
+                    except (urllib.error.URLError, OSError):
+                        break
+    finally:
+        sb.destroy()
+    return rec
+
+
+def run_store_probe_cell(reps: int) -> dict:
+    """SQLite contention probe: hammer the sandbox store's hot paths
+    (usage upsert + aggregate reads) from 1/4/16 connections and report
+    per-op-latency percentiles plus busy/locked counts. Informational -
+    the receipt decides whether a persistence redesign is ever justified."""
+    V = importlib.import_module("validate")
+    sb = V.Sandbox()
+    rec: dict[str, Any] = {"reps": reps}
+    try:
+        db_path = Path(sb.data_home) / "blazar" / "blazar.db"
+        head = sqlite3.connect(db_path, timeout=5.0)
+        rec["journal_mode"] = head.execute("PRAGMA journal_mode").fetchone()[0]
+        rec["synchronous"] = head.execute("PRAGMA synchronous").fetchone()[0]
+        head.close()
+        rec["db_size_mib"] = round(db_path.stat().st_size / (1024 * 1024), 2)
+
+        ops_per_thread = max(10, reps * 8)
+        for k in (1, 4, 16):
+            busy = [0]
+            lat: dict[str, list[float]] = {"upsert": [], "sum": [], "scan": []}
+            barrier = threading.Barrier(k)
+            lock = threading.Lock()
+
+            def worker(
+                tid: int,
+                *,
+                _db: Path = db_path,
+                _barrier: threading.Barrier = barrier,
+                _lat: dict = lat,
+                _busy: list = busy,
+                _lock: threading.Lock = lock,
+                _k: int = k,
+                _ops: int = ops_per_thread,
+            ) -> None:
+                _barrier.wait()
+                con = sqlite3.connect(_db, timeout=5.0)
+                day = "2026-01-01"
+                name = f"probe-k{_k}-t{tid}"
+                local: dict[str, list[float]] = {"upsert": [], "sum": [], "scan": []}
+                for _ in range(_ops):
+                    for op in ("upsert", "sum", "scan"):
+                        t0 = time.perf_counter()
+                        tries = 0
+                        while True:
+                            try:
+                                if op == "upsert":
+                                    con.execute(
+                                        "INSERT INTO key_usage(day, name, requests, tokens)"
+                                        " VALUES(?,?,?,?) ON CONFLICT(day, name) DO UPDATE"
+                                        " SET requests = requests + excluded.requests,"
+                                        " tokens = tokens + excluded.tokens",
+                                        (day, name, 1, 128),
+                                    )
+                                    con.commit()
+                                elif op == "sum":
+                                    con.execute(
+                                        "SELECT SUM(tokens) FROM key_usage"
+                                    ).fetchone()
+                                else:
+                                    con.execute(
+                                        "SELECT name FROM models LIMIT 5"
+                                    ).fetchall()
+                                break
+                            except sqlite3.OperationalError as e:
+                                if "locked" not in str(e) or tries >= 20:
+                                    raise
+                                tries += 1
+                                with _lock:
+                                    _busy[0] += 1
+                                time.sleep(0.01 * tries)
+                        local[op].append((time.perf_counter() - t0) * 1000.0)
+                con.close()
+                with _lock:
+                    for op, vals in local.items():
+                        _lat[op].extend(vals)
+
+            threads = [threading.Thread(target=worker, args=(t,)) for t in range(k)]
+            t0 = time.perf_counter()
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=300.0)
+            wall_s = round(time.perf_counter() - t0, 2)
+            rec[f"k{k}"] = {
+                "threads": k,
+                "ops_per_thread": ops_per_thread,
+                "wall_s": wall_s,
+                "busy_retries": busy[0],
+                "upsert_ms_p50": round(percentile(lat["upsert"], 50), 3),
+                "upsert_ms_p99": round(percentile(lat["upsert"], 99), 3),
+                "sum_ms_p50": round(percentile(lat["sum"], 50), 3),
+                "sum_ms_p99": round(percentile(lat["sum"], 99), 3),
+                "scan_ms_p50": round(percentile(lat["scan"], 50), 3),
+                "scan_ms_p99": round(percentile(lat["scan"], 99), 3),
+            }
+    finally:
+        sb.destroy()
+    return rec
+
+
+# ---------------------------------------------------------------------------
 # main
 
 
@@ -7012,6 +7480,22 @@ def main() -> int:
         ),
     )
     ap.add_argument("--corpus", help="local corpus .parquet/.txt for perplexity")
+    ap.add_argument(
+        "--probes",
+        default="",
+        help=(
+            "comma list of targeted probes appended to the campaign: "
+            "cancel (stream-abort to slot-free latency, gateway vs direct), "
+            "evict (cold-load vs evict-under-pressure A/B), "
+            "store (SQLite contention at 1/4/16 connections)"
+        ),
+    )
+    ap.add_argument(
+        "--probe-reps",
+        type=int,
+        default=5,
+        help="repetitions per probe leg (default 5)",
+    )
     ap.add_argument(
         "--fresh", action="store_true", help="ignore+replace existing cells.jsonl"
     )
@@ -8758,6 +9242,64 @@ def main() -> int:
                 "engine_policy": engine_policy,
             },
         )
+
+    # targeted probes: opt-in operational receipts appended as their own
+    # lane family; never part of the standard campaign (see --probes help)
+    wanted_probes = [p.strip() for p in (args.probes or "").split(",") if p.strip()]
+    unknown_probes = [p for p in wanted_probes if p not in ("cancel", "evict", "store")]
+    if unknown_probes:
+        log(f"! unknown probes ignored: {', '.join(unknown_probes)}")
+    probe_eng = next((e for e in text_engines if e.kind == "llamacpp"), None)
+    for probe in (p for p in wanted_probes if p in ("cancel", "evict", "store")):
+        params = {"probe": probe, "reps": args.probe_reps}
+        key = cell_key("probe", "probe", params, model.name)
+        if key in done:
+            log(f"[probe {probe}] resumed - skipping")
+            continue
+        log(f"[probe {probe}]")
+        if probe == "store":
+            try:
+                rec = run_store_probe_cell(args.probe_reps)
+            except Exception:
+                log(traceback.format_exc())
+                rec = {"error": "store probe crashed (see log above)"}
+            emit("probe", "probe", f"probe-{probe}", params, key, rec)
+            continue
+        if probe_eng is None:
+            emit(
+                "probe",
+                "probe",
+                f"probe-{probe}",
+                params,
+                key,
+                {
+                    "note": "no llamacpp engine available - probe needs a spawnable engine"
+                },
+            )
+            continue
+        if not mem_guard(2048, f"probe {probe}"):
+            emit(
+                "probe",
+                "probe",
+                f"probe-{probe}",
+                params,
+                key,
+                {"error": "GPU memory floor exceeded before probe"},
+            )
+            continue
+        try:
+            if probe == "cancel":
+                rec = run_cancel_probe_cell(
+                    probe_eng, model, gw_model_name, args.probe_reps
+                )
+            else:
+                rec = run_evict_probe_cell(
+                    probe_eng, model, gw_model_name, cfg, args.probe_reps
+                )
+        except Exception:
+            log(traceback.format_exc())
+            rec = {"error": f"{probe} probe crashed (see log above)"}
+        emit("probe", "probe", f"probe-{probe}", params, key, rec)
 
     argv_summary = portable_path(" ".join(sys.argv[1:]))
     # the report reflects the FULL campaign (cells.jsonl), not just this

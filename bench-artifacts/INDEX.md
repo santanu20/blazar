@@ -3,6 +3,7 @@
 | Campaign | Date | Lanes | Cells | blazar |
 |---|---|---|---:|---|
 | 2026-10-07-overhead | 2026 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 34 | mixed |
+| 2026-11-20-probes | 2026 | blazar,cold,ollama,probe,reshape,tools | 18 | blazar 0.33.0 |
 | 2026-11-20-v0.33-wave-final | 2026 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,greedy_ollama,idle,media,ollama,ppl,quality,reshape,tools | 88 | 0.33.0 |
 | 20260923-media | 20260923 | media | 4 | blazar 0.10.0 |
 | 20260923-media-v2 | 20260923 | media | 5 | blazar 0.10.0 |
