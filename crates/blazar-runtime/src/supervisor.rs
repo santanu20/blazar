@@ -237,6 +237,32 @@ pub fn resolve_spec_mode(queued: Option<String>, overlay: Option<String>, config
     queued.or(overlay).unwrap_or_else(|| config.to_string())
 }
 
+/// Extract a whole-number field from a receipt's `spec_params` JSON.
+/// `None` covers absent keys, non-numeric shapes and malformed JSON -
+/// callers treat that as "no parity evidence" rather than failure.
+fn spec_params_number(spec_params: &str, key: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(spec_params)
+        .ok()?
+        .get(key)?
+        .as_i64()
+}
+
+/// Race-provenance fingerprint: the engine row's stored manifest,
+/// identical to what the manual `tune --race` lane records so receipts
+/// from both paths aggregate under one hardware identity.
+fn race_hw_for(engine_row: &blazar_core::store::EngineRow) -> Option<String> {
+    blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&engine_row.manifest)
+}
+
+/// Outcome summary of one model's scheduled race pass, feeding the
+/// [`BlazarEvent::AutotuneRace`] event and the info log line.
+struct RacePassSummary {
+    arms: u32,
+    parity_failures: u32,
+    best_mode: Option<String>,
+    best_gain_pct: Option<i64>,
+}
+
 /// Evidence consult for `spec = "auto"`: the best MEASURED spec mode
 /// from `blazar tune <model> --spec-race` receipts, gated on what this
 /// engine advertises and whether the catalog's draft pair is actually
@@ -268,6 +294,24 @@ pub fn best_measured_spec_mode(
         // - every historical ngram race ran defaults.
         if r.mode == "ngram" && !r.tuned {
             continue;
+        }
+        // Parity gate (scheduled races): spec modes must reproduce the
+        // dense baseline's greedy outputs on fixed probes before their
+        // throughput counts. Receipts from the manual CLI race carry no
+        // parity keys - they stay eligible so historical evidence keeps
+        // its meaning. A partial failure (pass < total) is exactly the
+        // silent-degradation case the gate exists to refuse.
+        if let (Some(p), Some(t)) = (
+            r.spec_params
+                .as_deref()
+                .and_then(|s| spec_params_number(s, "parity_pass")),
+            r.spec_params
+                .as_deref()
+                .and_then(|s| spec_params_number(s, "parity_total")),
+        ) {
+            if p < t {
+                continue;
+            }
         }
         let eligible = match r.mode.as_str() {
             "ngram" => advertised.iter().any(|s| s == "ngram-simple"),
@@ -2617,6 +2661,18 @@ pub struct Supervisor {
     /// ran (the reaper tick re-scans at most once per
     /// [`AUTOTUNE_ADVISE_INTERVAL`]). `None` = never.
     autotune_advise_at: std::sync::Mutex<Option<Instant>>,
+    /// Autotune schedule cadence: when the last `autotune = "scheduled"`
+    /// race pass started (`None` = never). Races run real engine
+    /// children for minutes, so the reaper consults this before
+    /// detaching a pass - and the pass itself re-checks freshness per
+    /// model so a long pass never re-races what a concurrent manual
+    /// `tune --race` just measured.
+    autotune_schedule_at: std::sync::Mutex<Option<Instant>>,
+    /// Single-flight guard for the scheduled race pass: the reaper tick
+    /// is periodic but one pass can outlive several ticks (multi-model,
+    /// multi-arm). Held from pass start to pass end, including panics
+    /// (Drop releases).
+    autotune_race_busy: AtomicBool,
     // Test knobs (prod defaults from config).
     /// User-set health-gate budget (`model_load_timeout_secs`), `None` =
     /// unset. Resolved PER KIND at the health gate - see
@@ -2819,6 +2875,8 @@ impl Supervisor {
             measured: std::sync::Mutex::new(MeasuredTick::default()),
             census_cache: std::sync::Mutex::new(None),
             autotune_advise_at: std::sync::Mutex::new(None),
+            autotune_schedule_at: std::sync::Mutex::new(None),
+            autotune_race_busy: AtomicBool::new(false),
             load_timeout_secs: config.model_load_timeout_secs,
             shutdown_grace: Duration::from_secs(10),
             reaper_interval: Duration::from_secs(10),
@@ -8982,6 +9040,519 @@ drop them from rpc_servers in config.toml",
         }
     }
 
+    /// How often the `autotune = "scheduled"` posture starts a race
+    /// pass. A pass spawns real engine children (about a minute per
+    /// arm) and evicts the raced model's instances, so the cadence is
+    /// hours, not minutes; within the window every model also carries
+    /// its own freshness gate (see [`AUTOTUNE_SPEC_RECEIPT_MAX_AGE`]).
+    const AUTOTUNE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+    /// Receipt freshness for the scheduled pass: a model whose newest
+    /// spec receipt on this engine is younger than this stays
+    /// untouched; older, hardware-mismatched or missing evidence
+    /// re-races. Long enough that a tuned model is not re-measured
+    /// daily, short enough that an engine upgrade (new fingerprint)
+    /// or a week of drift gets caught.
+    const AUTOTUNE_SPEC_RECEIPT_MAX_AGE: i64 = 7 * 24 * 3600;
+
+    /// Fixed greedy probes for the parity gate: verified speculation
+    /// (target-side acceptance) is output-equivalent to dense by
+    /// construction, so every speculation arm must reproduce the dense
+    /// reference's greedy text on these prompts. Wording is frozen on
+    /// purpose - identical probes keep receipts comparable across
+    /// passes - and the three shapes (code / exact instruction /
+    /// factual recap) give a degraded arm three independent ways to
+    /// trip.
+    const AUTOTUNE_PARITY_PROMPTS: [&str; 3] = [
+        "Write a Python function fib(n) that returns the n-th Fibonacci number using iteration, nothing else.",
+        "List exactly three European capital cities, comma-separated, nothing else.",
+        "Answer in one sentence: why does the sun rise in the east?",
+    ];
+
+    /// `autotune = "scheduled"` posture: periodically race spec modes
+    /// for models with stale receipts and land the measurements as
+    /// receipts. This is the same race the manual `blazar tune <model>
+    /// --race` runs, with two additions the unattended context
+    /// demands: the pass only starts (and only continues) while a
+    /// model's lane is idle - real traffic aborts that model's
+    /// remaining arms - and every arm carries parity probes whose
+    /// greedy outputs are compared against the dense reference before
+    /// the receipt counts as adoption evidence (a parity-failed arm
+    /// is still recorded, but [`best_measured_spec_mode`] refuses
+    /// it). No config is ever written: adoption happens at spawn
+    /// through the same receipt consult the manual path feeds.
+    /// Detached from the reaper tick so a slow pass never delays the
+    /// reaper ladder. Public so integration tests drive the exact
+    /// production pass without waiting on the timer.
+    pub async fn autotune_schedule_tick(self: &Arc<Self>) {
+        if !self.cfg().autotune_scheduled() {
+            return;
+        }
+        {
+            let mut last = self
+                .autotune_schedule_at
+                .lock()
+                .expect("autotune schedule lock");
+            match *last {
+                Some(at) if at.elapsed() < Self::AUTOTUNE_SCHEDULE_INTERVAL => return,
+                _ => *last = Some(Instant::now()),
+            }
+        }
+        if self
+            .autotune_race_busy
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            // Drop releases the single-flight guard on every exit path
+            // of the pass, panics included.
+            struct RaceGuard<'a>(&'a AtomicBool);
+            impl Drop for RaceGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = RaceGuard(&mgr.autotune_race_busy);
+            mgr.autotune_race_pass().await;
+        });
+    }
+
+    /// A model is raceable only when fully idle: no live instance of
+    /// any of its keys carries traffic, and no spawn is mid-load. The
+    /// scheduled pass must never race under (or evict) a serving child.
+    fn model_lane_idle(&self, model: &str) -> bool {
+        self.instances.iter().all(|e| {
+            model_of_key(e.key()) != model || e.value().in_flight.load(Ordering::SeqCst) <= 0
+        }) && !self.loading.contains_key(model)
+    }
+
+    /// Test-facing read of the scheduled-race single-flight flag:
+    /// integration tests assert the guard releases after a pass.
+    #[must_use]
+    pub fn autotune_race_busy_for_test(&self) -> bool {
+        self.autotune_race_busy.load(Ordering::SeqCst)
+    }
+
+    /// One scheduled race pass: for each stale GGUF model on the
+    /// llamacpp lane (the only lane spec racing drives today), evict
+    /// its idle children, race every manifest-advertised spec mode
+    /// against dense with parity probes, land receipts, and warm the
+    /// model back if it was resident. Traffic-aware at every step - a
+    /// model that gains traffic is skipped, a model whose traffic
+    /// returns mid-race aborts its remaining arms.
+    async fn autotune_race_pass(self: &Arc<Self>) {
+        let store = match Store::open(&self.dirs) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("autotune race: store unavailable, skipping pass: {e}");
+                return;
+            }
+        };
+        // Same lane rule as the manual tune lane: the race drives
+        // llama-server children, so argv compile needs a llamacpp
+        // engine row (active-if-llamacpp, else first installed).
+        let engine_row = match store
+            .active_engine()
+            .ok()
+            .flatten()
+            .filter(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+            .or_else(|| {
+                store
+                    .list_engines()
+                    .ok()?
+                    .into_iter()
+                    .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
+            }) {
+            Some(e) => e,
+            None => {
+                tracing::debug!("autotune race: no llamacpp engine installed; nothing to race");
+                return;
+            }
+        };
+        let mut manifest: crate::Manifest = match serde_json::from_str(&engine_row.manifest) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("autotune race: engine manifest unreadable: {e}");
+                return;
+            }
+        };
+        manifest.anchor_server_path(&self.dirs.data_dir);
+        // Race-provenance fingerprint matches the manual lane: the
+        // engine row's manifest, not the live census.
+        let race_hw =
+            blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&engine_row.manifest);
+        let bench_bin = match crate::bench::find_bench_bin(&self.dirs) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("autotune race: llama-bench not found, skipping pass: {e}");
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let models = match store.list_models() {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("autotune race: model list unreadable: {e}");
+                return;
+            }
+        };
+        for row in models {
+            // GGUF-only lane: the race compiles llama.cpp argv against
+            // GGUF metadata (read failure = not a GGUF row / unreadable
+            // file - skip either way, the manual lane owns the loud
+            // error path).
+            let gguf = match blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            let receipts = store
+                .list_spec_receipts(&row.name, &engine_row.tag)
+                .unwrap_or_default();
+            let freshest = receipts.iter().map(|r| r.measured_at).max();
+            let stale = match freshest {
+                None => true,
+                Some(at) => {
+                    now - at > Self::AUTOTUNE_SPEC_RECEIPT_MAX_AGE
+                        || receipts
+                            .iter()
+                            .all(|r| r.hw_fingerprint.as_deref() != race_hw.as_deref())
+                }
+            };
+            if !stale {
+                continue;
+            }
+            if !self.model_lane_idle(&row.name) {
+                tracing::info!(
+                    model = %row.name,
+                    "autotune race: lane busy, skipping model this pass"
+                );
+                continue;
+            }
+            let was_resident = self
+                .instances
+                .iter()
+                .any(|e| model_of_key(e.key()) == &row.name);
+            if let Err(e) = self.evict_model(&row.name).await {
+                tracing::warn!(model = %row.name, "autotune race: evict failed: {e}");
+                continue;
+            }
+            // Store reads before the async race: rusqlite handles are
+            // !Send, so the racing fn never holds a connection.
+            let draft_pick = crate::pick_draft(
+                &store,
+                &row.name,
+                "auto",
+                crate::lane_for(blazar_core::engine_kind::EngineKind::LlamaCpp),
+                Some(&row.path),
+            );
+            let loras: Vec<(String, f64)> = store
+                .list_loras(Some(&row.name))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| (l.path, l.scale))
+                .collect();
+            match self
+                .autotune_race_model(
+                    &row,
+                    &gguf,
+                    &engine_row,
+                    &manifest,
+                    &bench_bin,
+                    draft_pick,
+                    &loras,
+                )
+                .await
+            {
+                Ok(summary) => {
+                    tracing::info!(
+                        model = %row.name,
+                        arms = summary.arms,
+                        parity_failures = summary.parity_failures,
+                        best = summary.best_mode.as_deref().unwrap_or("n/a"),
+                        "autotune race: receipts landed (adoption resolves at spawn)"
+                    );
+                    self.bus.publish(BlazarEvent::AutotuneRace {
+                        model: row.name.clone(),
+                        arms: summary.arms,
+                        parity_failures: summary.parity_failures,
+                        best_mode: summary.best_mode,
+                        best_gain_pct: summary.best_gain_pct,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(model = %row.name, "autotune race: pass aborted: {e}")
+                }
+            }
+            // Warm-back: a model the pass evicted from residency
+            // returns to it, exactly as if it had been spawned for the
+            // race itself.
+            if was_resident && self.model_lane_idle(&row.name) {
+                let mgr = Arc::clone(self);
+                let key = row.name.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = mgr.spawn_instance(&key).await {
+                        tracing::warn!(
+                            model = %key,
+                            "autotune race: warm-back spawn failed: {e}"
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    /// Race every advertised spec mode for one model and land the
+    /// receipts. Returns a pass summary for the event/log lane. The
+    /// dense arm always runs first (it is the parity reference and the
+    /// throughput baseline); a mid-race traffic return aborts the
+    /// remaining arms with the arms already landed kept. Store rows
+    /// (loras, draft pick) are read by the caller - this fn never
+    /// holds a store connection across an await (rusqlite handles are
+    /// !Send), landing each receipt through a fresh per-use open.
+    async fn autotune_race_model(
+        self: &Arc<Self>,
+        row: &ModelRow,
+        gguf: &blazar_core::GgufMeta,
+        engine_row: &blazar_core::store::EngineRow,
+        manifest: &crate::Manifest,
+        bench_bin: &std::path::PathBuf,
+        draft_pick: DraftPick,
+        loras: &[(String, f64)],
+    ) -> Result<RacePassSummary> {
+        let cfg = self.cfg();
+        // Candidate arms exactly as the manual race builds them:
+        // manifest-advertised modes only.
+        let mut modes = vec!["dense".to_string()];
+        if manifest.spec_types.iter().any(|s| s == "ngram-simple") {
+            modes.push("ngram".to_string());
+        }
+        if manifest.spec_types.iter().any(|s| s == "draft-dflash") {
+            modes.push("dflash".to_string());
+        }
+        // Draft arm: resolve the catalog pair and verify the planner
+        // actually engages it (identical compile-degrade guards as the
+        // manual lane - a degraded pair must never reach the race).
+        let overlay = cfg.overlay_for(&row.name);
+        let data_dir = self.dirs.data_dir.to_string_lossy().into_owned();
+        let hw = self.live_hardware();
+        let base_input = crate::bench::build_input(
+            &row.name,
+            &row.path,
+            u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+            blazar_core::ModelMeta::Gguf(gguf),
+            &hw,
+            &cfg,
+            &overlay,
+            &loras,
+            None,
+            &engine_row.tag,
+            &manifest.flags,
+            &manifest.spec_types,
+            &manifest.cache_types,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            &data_dir,
+            blazar_core::engine_kind::EngineKind::LlamaCpp,
+        );
+        let mut draft_pair: Option<(String, u32)> = None;
+        if let DraftPick::Paired(dp) = &draft_pick
+            && manifest.spec_types.iter().any(|s| s == "draft-simple")
+        {
+            let input_d = crate::bench::build_input(
+                &row.name,
+                &row.path,
+                u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX),
+                blazar_core::ModelMeta::Gguf(gguf),
+                &hw,
+                &cfg,
+                &overlay,
+                &loras,
+                Some(dp),
+                &engine_row.tag,
+                &manifest.flags,
+                &manifest.spec_types,
+                &manifest.cache_types,
+                Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 0,
+                },
+                &data_dir,
+                blazar_core::engine_kind::EngineKind::LlamaCpp,
+            );
+            if let Ok(prof_d) = profile::compile(&input_d, &blazar_core::TuningOverrides::default())
+            {
+                let engaged = prof_d
+                    .argv
+                    .windows(2)
+                    .any(|w| w == ["--spec-type", "draft-simple"]);
+                if engaged {
+                    let n_max = prof_d
+                        .argv
+                        .iter()
+                        .position(|a| a == "--spec-draft-n-max")
+                        .and_then(|i| prof_d.argv.get(i + 1))
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(3);
+                    draft_pair = Some((dp.clone(), n_max));
+                    modes.push("draft".to_string());
+                } else {
+                    tracing::debug!(
+                        model = %row.name,
+                        "autotune race: draft arm skipped - planner degraded the pair"
+                    );
+                }
+            }
+        }
+        let base_race = profile::compile(&base_input, &blazar_core::TuningOverrides::default())
+            .map_err(|e| anyhow!("profile: {e}"))?;
+        let ngram_knobs = (cfg.ngram_size_m, cfg.ngram_size_n, cfg.ngram_min_hits);
+        let mut summary = RacePassSummary {
+            arms: 0,
+            parity_failures: 0,
+            best_mode: None,
+            best_gain_pct: None,
+        };
+        let mut dense_tps = 0.0_f64;
+        let mut dense_reference: Vec<String> = Vec::new();
+        for mode in &modes {
+            // In-flight abort: traffic that arrived since the last arm
+            // stops the pass for this model - the arms already landed
+            // stay, the remaining arms wait for the next stale pass.
+            if summary.arms > 0 && !self.model_lane_idle(&row.name) {
+                anyhow::bail!(
+                    "traffic returned after {} arm(s) - aborting remaining arms",
+                    summary.arms
+                );
+            }
+            let race_argv = base_race.argv.clone();
+            let mode_for_task = mode.clone();
+            let draft = draft_pair.as_ref().map(|(p, n)| (p.clone(), *n));
+            let dirs = self.dirs.clone();
+            let bin = bench_bin.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let tuner = crate::bench::Tuner {
+                    dirs: &dirs,
+                    bench_bin: bin,
+                };
+                tuner.race_one_mode(
+                    &race_argv,
+                    &mode_for_task,
+                    draft.as_ref().map(|(p, n)| (p.as_str(), *n)),
+                    Some(ngram_knobs),
+                    None,
+                    &Self::AUTOTUNE_PARITY_PROMPTS,
+                )
+            })
+            .await
+            .map_err(|e| anyhow!("race task join failed: {e}"))??;
+            if mode == "dense" {
+                dense_tps = outcome.tok_per_s;
+                dense_reference = outcome.greedy_outputs;
+            } else {
+                let parity_total = dense_reference.len().min(outcome.greedy_outputs.len());
+                let parity_pass = dense_reference
+                    .iter()
+                    .zip(outcome.greedy_outputs.iter())
+                    .take(Self::AUTOTUNE_PARITY_PROMPTS.len())
+                    .filter(|(d, s)| d == s)
+                    .count();
+                let parity_ok = parity_total > 0 && parity_pass == parity_total;
+                if !parity_ok {
+                    summary.parity_failures += 1;
+                }
+                // Receipt params mirror the manual lane's provenance,
+                // extended with the parity verdict the resolver's gate
+                // reads. A parity-failed arm is recorded tuned=false:
+                // untuned evidence must never adopt, whatever the
+                // throughput said.
+                let (params, tuned_arm) = match mode.as_str() {
+                    "ngram" => {
+                        let (size_m, size_n, min_hits) = ngram_knobs;
+                        if size_m > 0 {
+                            (
+                                Some(format!(
+                                    "{{\"size_m\":{size_m},\"size_n\":{size_n},\"min_hits\":{min_hits}}}"
+                                )),
+                                true,
+                            )
+                        } else {
+                            (None, false)
+                        }
+                    }
+                    "draft" => draft_pair.as_ref().map_or((None, false), |(path, n)| {
+                        (
+                            Some(format!("{{\"draft\":\"{path}\",\"draft_len\":{n}}}")),
+                            true,
+                        )
+                    }),
+                    _ => (None, true),
+                };
+                let params = Some(match params {
+                    Some(p) => format!(
+                        "{},\"parity_pass\":{parity_pass},\"parity_total\":{parity_total}}}",
+                        p.trim_end_matches('}')
+                    ),
+                    None => {
+                        format!("{{\"parity_pass\":{parity_pass},\"parity_total\":{parity_total}}}")
+                    }
+                });
+                let tuned_arm = tuned_arm && parity_ok;
+                Store::open(&self.dirs)?.put_spec_receipt(
+                    &row.name,
+                    &engine_row.tag,
+                    &mode,
+                    outcome.tok_per_s,
+                    dense_tps,
+                    &blazar_core::store::SpecProvenance {
+                        hw_fingerprint: race_hw_for(engine_row).as_deref(),
+                        spec_params: params.as_deref(),
+                        tuned: tuned_arm,
+                        reps: 1,
+                    },
+                )?;
+                summary.arms += 1;
+                let gain = if dense_tps > 0.0 {
+                    Some(((outcome.tok_per_s / dense_tps - 1.0) * 100.0).round() as i64)
+                } else {
+                    None
+                };
+                if summary
+                    .best_gain_pct
+                    .as_ref()
+                    .is_none_or(|best| gain.is_some_and(|g| g > *best))
+                {
+                    summary.best_mode = Some(mode.clone());
+                    summary.best_gain_pct = gain;
+                }
+            }
+        }
+        // Dense receipt lands last-shape-identical to the manual lane:
+        // the baseline with no knobs to record. It carries no parity
+        // keys - the resolver skips dense by construction.
+        Store::open(&self.dirs)?.put_spec_receipt(
+            &row.name,
+            &engine_row.tag,
+            "dense",
+            dense_tps,
+            dense_tps,
+            &blazar_core::store::SpecProvenance {
+                hw_fingerprint: race_hw_for(engine_row).as_deref(),
+                spec_params: None,
+                tuned: true,
+                reps: 1,
+            },
+        )?;
+        summary.arms += 1;
+        Ok(summary)
+    }
+
     /// Measured-pressure feedback loop (#28b): re-probe the GPU census
     /// Live hardware view: CPU/RAM via sysinfo + a REAL `--list-devices`
     /// census from the engine binary (llama lane; mistral.rs has no
@@ -14116,6 +14687,56 @@ mod routing_tests {
             best(&dflash, &["draft-dflash".to_string()], false),
             Some(("dflash", 1.40))
         );
+    }
+
+    #[test]
+    fn unit__best_measured_spec_mode__parity_failure_is_not_selectable() {
+        use super::best_measured_spec_mode as best;
+        let receipt = |ratio: f64, spec_params: &str| blazar_core::store::SpecReceiptRow {
+            model: "m".into(),
+            engine_tag: "e".into(),
+            mode: "ngram".into(),
+            tok_per_s: ratio * 40.0,
+            dense_tps: 40.0,
+            ratio,
+            measured_at: 100,
+            hw_fingerprint: None,
+            spec_params: Some(spec_params.into()),
+            tuned: true,
+            reps: 1,
+        };
+        let advertised = ["ngram-simple".to_string()].to_vec();
+        // A loud winner whose greedy probes diverged from dense (2 of 3
+        // probes matched): the throughput is real but the outputs are
+        // not, so the receipt must never adopt.
+        let failed = vec![
+            receipt(1.50, r#"{"parity_pass":2,"parity_total":3,"n":256}"#),
+            receipt(1.12, r#"{"parity_pass":3,"parity_total":3,"n":256}"#),
+        ];
+        assert_eq!(
+            best(&failed, &advertised, false),
+            Some(("ngram", 1.12)),
+            "parity-failed receipt must lose to the clean arm despite the higher ratio"
+        );
+        // Parity-failed-only evidence: no selection, the heuristic auto
+        // chain keeps deciding.
+        let failed_only = vec![receipt(1.50, r#"{"parity_pass":0,"parity_total":3}"#)];
+        assert_eq!(
+            best(&failed_only, &advertised, false),
+            None,
+            "a parity-failed-only history must not pin the mode"
+        );
+        // Missing keys (manual CLI race receipts), non-numeric shapes
+        // and malformed JSON all mean "no parity evidence" - eligible,
+        // preserving historical receipt semantics.
+        for params in ["{}", r#"{"n":256}"#, r#"{"parity_pass":"2"}"#, "not json"] {
+            let legacy = vec![receipt(1.30, params)];
+            assert_eq!(
+                best(&legacy, &advertised, false),
+                Some(("ngram", 1.30)),
+                "params {params} must stay eligible"
+            );
+        }
     }
 
     #[test]

@@ -273,6 +273,158 @@ async fn integration__routed_engine__workload_derived_policy_keeps_gguf_lane_sta
     sup.shutdown_all().await.unwrap();
 }
 
+/// `autotune = "scheduled"` end-to-end against the real stub engine:
+/// the reaper tick detaches a race pass that spawns real children for
+/// the advertised spec arms, lands receipts carrying parity evidence,
+/// publishes the AutotuneRace event, and releases the single-flight
+/// guard. The engine row + engine dir wear the stub binary as both
+/// llama-bench and llama-server - exactly the asset layout
+/// `find_bench_bin` demands.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__autotune_schedule__lands_parity_receipts_and_event() {
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    autotune_engine_assets(&dirs);
+    let store = Store::open(&dirs).unwrap();
+
+    let mut cfg = base_config();
+    cfg.autotune = Some("scheduled".into());
+    let mut engine = LlamaCppEngine::new(stub_manifest());
+    engine.child_env = vec![
+        (
+            "STUB_ARGV_FILE".into(),
+            dirs.run_dir().join("argv.json").display().to_string(),
+        ),
+        (
+            "STUB_DEVICES".into(),
+            "stub-gpu: STUB GPU (24000 MiB, 24000 MiB free)".into(),
+        ),
+    ];
+    let bus = EventBus::default();
+    let mut events = bus.subscribe();
+    let mut s = Supervisor::new(
+        dirs.clone(),
+        cfg,
+        bus,
+        Hardware {
+            physical_cores: 4,
+            total_ram_mib: 16_000,
+            mem_available_mib: None,
+            gpus: vec![GpuInfo {
+                name: "stub-gpu".into(),
+                description: "STUB GPU".into(),
+                total_mib: 24_000,
+                free_mib: 24_000,
+            }],
+        },
+        Arc::new(engine),
+    );
+    s.load_timeout_secs = Some(4);
+    let sup = Arc::new(s);
+
+    sup.autotune_schedule_tick().await;
+    // The pass is detached; poll the store until the dense baseline
+    // and at least one spec arm land (the stub advertises ngram-simple,
+    // so the ngram arm must race) or the deadline faults.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut receipts = Vec::new();
+    loop {
+        receipts = store.list_spec_receipts("m1", "stub").unwrap();
+        let dense = receipts.iter().any(|r| r.mode == "dense");
+        let spec_arm = receipts
+            .iter()
+            .any(|r| r.mode != "dense" && r.spec_params.is_some());
+        if dense && spec_arm {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scheduled race never landed receipts; got: {receipts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Every spec-arm receipt carries the parity verdict the adoption
+    // gate reads.
+    for r in receipts.iter().filter(|r| r.mode != "dense") {
+        let params: serde_json::Value =
+            serde_json::from_str(r.spec_params.as_deref().unwrap_or("null")).unwrap();
+        assert!(
+            params.get("parity_total").is_some(),
+            "spec arm {} lacks parity evidence: {params}",
+            r.mode
+        );
+    }
+    // The event lane saw the pass summary.
+    let mut saw_race = false;
+    while let Ok(ev) = events.try_recv() {
+        if let blazar_runtime::BlazarEvent::AutotuneRace { model, arms, .. } = ev {
+            assert_eq!(model, "m1");
+            assert!(arms >= 2, "dense + at least one spec arm, got {arms}");
+            saw_race = true;
+        }
+    }
+    assert!(saw_race, "AutotuneRace event never published");
+    // Single-flight released after the pass.
+    assert!(!sup.autotune_race_busy_for_test());
+    sup.shutdown_all().await.unwrap();
+}
+
+/// Shared scheduled-race fixtures: engine row (llamacpp kind, stub
+/// manifest) plus the on-disk asset pair `find_bench_bin` demands -
+/// llama-bench anchors the dir, llama-server (the stub) is what
+/// actually spawns.
+fn autotune_engine_assets(dirs: &BlazarDirs) {
+    let engine_dir = dirs.engines_dir().join("stub");
+    std::fs::create_dir_all(&engine_dir).unwrap();
+    for name in ["llama-server", "llama-bench"] {
+        let p = engine_dir.join(name);
+        std::fs::copy(stub_bin(), &p).unwrap();
+        #[allow(unsafe_code, reason = "chmod on a fresh tempdir copy")]
+        unsafe {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    Store::open(dirs)
+        .unwrap()
+        .upsert_engine(&blazar_core::store::EngineRow {
+            tag: "stub".into(),
+            asset: "stub".into(),
+            sha256: String::new(),
+            installed_at: 1,
+            active: true,
+            manifest: serde_json::to_string(&stub_manifest()).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        })
+        .unwrap();
+}
+
+/// The scheduled pass never races under traffic: a model carrying an
+/// in-flight request is skipped wholesale - no evict, no receipts, the
+/// serving instance untouched.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__autotune_schedule__busy_lane_skips_model() {
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    autotune_engine_assets(&dirs);
+    let mut cfg = base_config();
+    cfg.autotune = Some("scheduled".into());
+    let sup = supervisor(&dirs, cfg, true);
+    sup.ensure("m1").await.expect("serve m1");
+    // One in-flight request pins the lane busy.
+    sup.begin_request("m1");
+    sup.autotune_schedule_tick().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let store = Store::open(&dirs).unwrap();
+    assert!(
+        store.list_spec_receipts("m1", "stub").unwrap().is_empty(),
+        "busy lane must not race"
+    );
+    assert_eq!(sup.ps().len(), 1, "serving instance must survive");
+    assert_eq!(sup.ps()[0].state, "ready");
+    sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {

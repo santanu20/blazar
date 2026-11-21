@@ -73,6 +73,20 @@ pub struct Tuner<'a> {
     pub bench_bin: PathBuf,
 }
 
+/// One measured arm of a spec-mode race ([`Tuner::race_one_mode`]):
+/// single-stream wall tok/s plus, when the caller asked for parity
+/// probes, the greedy completion text per probe prompt (empty on the
+/// manual `tune --spec-race` lane, which passes no prompts).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RaceArmOutcome {
+    pub tok_per_s: f64,
+    pub greedy_outputs: Vec<String>,
+}
+
+/// Generation cap for the parity probes: long enough that a diverging
+/// arm has room to show it, short enough to keep the race bounded.
+pub const PARITY_PROBE_TOKENS: u32 = 32;
+
 /// One `tune --load` A/B measurement: wall seconds (spawn->ready +
 /// first-chat) for the warmup and no-warmup variants of the same argv.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -435,104 +449,142 @@ impl Tuner<'_> {
         ngram_knobs: Option<(u32, u32, u32)>,
         slo_ms: Option<f64>,
     ) -> Result<Vec<(String, f64)>> {
-        let server_bin = self
-            .bench_bin
-            .parent()
-            .map(|p| p.join("llama-server"))
-            .filter(|p| p.exists())
-            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
         let mut out = Vec::new();
         for mode in modes {
-            let port = ephemeral_port()?;
-            let mut argv = strip_spec_axis(base_argv);
-            argv.extend([
-                "--host".to_string(),
-                "127.0.0.1".to_string(),
-                "--port".to_string(),
-                port.to_string(),
-            ]);
-            match mode.as_str() {
-                "dense" => {}
-                "ngram" => {
-                    argv.extend(["--spec-type".to_string(), "ngram-simple".to_string()]);
-                    // Tuned n-gram shape (from `tune --ngram` /
-                    // ngram_* config): without it the arm races engine
-                    // defaults, which measured as a dead tie against
-                    // dense and biased every later spec=auto resolution.
-                    if let Some((size_m, size_n, min_hits)) = ngram_knobs.filter(|(m, _, _)| *m > 0)
-                    {
-                        argv.extend([
-                            "--spec-ngram-simple-size-m".to_string(),
-                            size_m.to_string(),
-                            "--spec-ngram-simple-size-n".to_string(),
-                            size_n.to_string(),
-                            "--spec-ngram-simple-min-hits".to_string(),
-                            min_hits.to_string(),
-                        ]);
-                    }
-                }
-                "dflash" => {
-                    argv.extend(["--spec-type".to_string(), "draft-dflash".to_string()]);
-                }
-                "draft" => {
-                    let (path, n_max) = draft.ok_or_else(|| {
-                        anyhow!("spec race: draft mode requested but no draft pair resolved")
-                    })?;
-                    argv.extend([
-                        "--spec-type".to_string(),
-                        "draft-simple".to_string(),
-                        "--spec-draft-model".to_string(),
-                        path.to_string(),
-                        "--spec-draft-n-max".to_string(),
-                        n_max.to_string(),
-                    ]);
-                }
-                other => anyhow::bail!("spec race: unknown mode {other:?}"),
-            }
-            let err_log = search_stderr_log(port);
-            let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
-            let ok = wait_ready(&mut child, port, 120.0);
-            let report = if ok {
-                drive_concurrent_multi(&[port], 1, 1).ok()
-            } else {
-                None
-            };
-            // Single pid we spawned; never a group.
-            let _ = child.kill();
-            let _ = child.wait();
-            let Some(report) = report else {
-                // Quote the child's own stderr (captured per-port): an
-                // early death is usually OOM or a rejected flag, and the
-                // child's words beat a generic readiness timeout.
-                let tail: String = std::fs::read_to_string(&err_log)
-                    .map(|s| {
-                        s.lines()
-                            .rev()
-                            .take(8)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                anyhow::bail!(
-                    "spec race: server in mode {mode} never became ready or served; \
-                     child stderr tail:\n{tail}"
-                );
-            };
-            let t = report.tok_per_s;
-            println!("  spec mode {mode}: {t:.1} tok/s");
-            if let Some(slo_ms) = slo_ms {
-                print_slo_receipt(&report.request_ms, report.wall_secs, slo_ms);
-            }
-            out.push((mode.clone(), t));
+            let arm = self.race_one_mode(base_argv, mode, draft, ngram_knobs, slo_ms, &[])?;
+            out.push((mode.to_string(), arm.tok_per_s));
             std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
         }
         if out.is_empty() {
             anyhow::bail!("no spec modes ran ({modes:?})");
         }
         Ok(out)
+    }
+
+    /// One arm of a spec-mode race: spawn the real llama-server in
+    /// `mode`, measure single-stream wall tokens/s, then - when
+    /// `parity_prompts` is non-empty - capture one greedy completion
+    /// per prompt BEFORE the child dies. The parity outputs feed the
+    /// scheduled autotune loop's quality gate: verified speculation is
+    /// output-equivalent by construction, so a divergence between a
+    /// speculation arm and the dense reference is a numerical
+    /// regression the adoption decision must refuse. The manual
+    /// `tune --spec-race` lane passes no prompts and gets exactly the
+    /// historical behavior.
+    pub fn race_one_mode(
+        &self,
+        base_argv: &[String],
+        mode: &str,
+        draft: Option<(&str, u32)>,
+        ngram_knobs: Option<(u32, u32, u32)>,
+        slo_ms: Option<f64>,
+        parity_prompts: &[&str],
+    ) -> Result<RaceArmOutcome> {
+        let server_bin = self
+            .bench_bin
+            .parent()
+            .map(|p| p.join("llama-server"))
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("llama-server not found next to llama-bench"))?;
+        let port = ephemeral_port()?;
+        let mut argv = strip_spec_axis(base_argv);
+        argv.extend([
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+        ]);
+        match mode {
+            "dense" => {}
+            "ngram" => {
+                argv.extend(["--spec-type".to_string(), "ngram-simple".to_string()]);
+                // Tuned n-gram shape (from `tune --ngram` /
+                // ngram_* config): without it the arm races engine
+                // defaults, which measured as a dead tie against
+                // dense and biased every later spec=auto resolution.
+                if let Some((size_m, size_n, min_hits)) = ngram_knobs.filter(|(m, _, _)| *m > 0) {
+                    argv.extend([
+                        "--spec-ngram-simple-size-m".to_string(),
+                        size_m.to_string(),
+                        "--spec-ngram-simple-size-n".to_string(),
+                        size_n.to_string(),
+                        "--spec-ngram-simple-min-hits".to_string(),
+                        min_hits.to_string(),
+                    ]);
+                }
+            }
+            "dflash" => {
+                argv.extend(["--spec-type".to_string(), "draft-dflash".to_string()]);
+            }
+            "draft" => {
+                let (path, n_max) = draft.ok_or_else(|| {
+                    anyhow!("spec race: draft mode requested but no draft pair resolved")
+                })?;
+                argv.extend([
+                    "--spec-type".to_string(),
+                    "draft-simple".to_string(),
+                    "--spec-draft-model".to_string(),
+                    path.to_string(),
+                    "--spec-draft-n-max".to_string(),
+                    n_max.to_string(),
+                ]);
+            }
+            other => anyhow::bail!("spec race: unknown mode {other:?}"),
+        }
+        let err_log = search_stderr_log(port);
+        let mut child = spawn_search_server(&server_bin, &argv, &err_log)?;
+        let ok = wait_ready(&mut child, port, 120.0);
+        let report = if ok {
+            drive_concurrent_multi(&[port], 1, 1).ok()
+        } else {
+            None
+        };
+        // Parity probes ride the still-warm child (after the timing
+        // drive, before the kill): each probe is one greedy completion
+        // whose text the caller compares against the dense reference.
+        // A probe failure fails the arm - an unreadable output is not
+        // parity evidence.
+        let greedy_outputs = if report.is_some() && !parity_prompts.is_empty() {
+            parity_prompts
+                .iter()
+                .map(|p| chat_greedy_text(port, p, PARITY_PROBE_TOKENS))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        // Single pid we spawned; never a group.
+        let _ = child.kill();
+        let _ = child.wait();
+        let Some(report) = report else {
+            // Quote the child's own stderr (captured per-port): an
+            // early death is usually OOM or a rejected flag, and the
+            // child's words beat a generic readiness timeout.
+            let tail: String = std::fs::read_to_string(&err_log)
+                .map(|s| {
+                    s.lines()
+                        .rev()
+                        .take(8)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "spec race: server in mode {mode} never became ready or served; \
+                 child stderr tail:\n{tail}"
+            );
+        };
+        let t = report.tok_per_s;
+        println!("  spec mode {mode}: {t:.1} tok/s");
+        if let Some(slo_ms) = slo_ms {
+            print_slo_receipt(&report.request_ms, report.wall_secs, slo_ms);
+        }
+        Ok(RaceArmOutcome {
+            tok_per_s: t,
+            greedy_outputs,
+        })
     }
 
     /// `--cache-reuse N` grid search (`tune --cache-reuse`): for each N in
@@ -1727,6 +1779,55 @@ fn chat_completion_tokens(port: u16, content: &str) -> Result<u64> {
         .ok_or_else(|| {
             anyhow!(
                 "replica search: no completion_tokens in the :{port} response: {}",
+                head_bytes(&text, 120)
+            )
+        })
+}
+
+/// One greedy non-stream chat returning the assistant text - the
+/// parity probe for scheduled spec races. The same prompt under dense
+/// and a speculation arm must produce the SAME greedy text (verified
+/// speculation is output-equivalent by construction), so the text -
+/// not just the wall time - is the measurement. Deterministic by
+/// design: temperature 0, no sampling knobs.
+#[allow(clippy::items_after_statements)] // io trait imports sit near their single use
+fn chat_greedy_text(port: u16, content: &str, max_tokens: u32) -> Result<String> {
+    let body = serde_json::json!({
+        "model": "spec-parity", "max_tokens": max_tokens, "stream": false,
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": content}],
+    });
+    let payload = serde_json::to_vec(&body)?;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connect :{port}"))?;
+    use std::io::{Read, Write};
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        payload.len()
+    );
+    s.write_all(req.as_bytes())?;
+    s.write_all(&payload)?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    if !(text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")) {
+        anyhow::bail!(
+            "spec parity probe: chat failed on :{port}: {}",
+            head_bytes(&text, 120)
+        );
+    }
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| anyhow!("spec parity probe: no HTTP body on :{port}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(body.trim()).context("spec parity probe: body is not JSON")?;
+    v["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "spec parity probe: no choices[0].message.content on :{port}: {}",
                 head_bytes(&text, 120)
             )
         })

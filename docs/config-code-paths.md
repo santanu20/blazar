@@ -290,7 +290,7 @@ token quality are surfaced as drift.
 | sdcpp_high_noise_diffusion_model | - | engine-argv | `crates/blazar-core/src/profile.rs:3528` (high-noise MMDiT companion) |
 | sdcpp_uncond_diffusion_model | - | engine-argv | `crates/blazar-core/src/profile.rs:3533` (uncond branch for cfg-distilled flows) |
 | sdcpp_backend | - | engine-argv | `crates/blazar-core/src/profile.rs:3535` (-> `--backend`, per-device placement map) |
-| autotune | None | runtime | `crates/blazar-runtime/src/supervisor.rs` (`autotune_advise_tick` on the reaper tail; `autotune_advise` posture gate - scheduled autonomy only under manual `optimize --run`/`--apply` lease cycles) |
+| autotune | None | runtime | `crates/blazar-runtime/src/supervisor.rs` (`autotune_advise_tick` on the reaper tail for the `advise` posture; `autotune_schedule_tick` for `scheduled` - idle-gated spec-race pass landing parity-gated receipts, adoption still resolves at spawn via `best_measured_spec_mode`) |
 | fleet_enabled | true | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (404s join/invite/heartbeat/leave when off); `crates/blazar-runtime/src/supervisor.rs` (spawn planning skips announced-worker merge when off) |
 | fleet_heartbeat_secs | 15 | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (join ack cadence + workers listing echo); `crates/blazar-runtime/src/fleet.rs` (`FleetRegistry::prune` TTL) |
 | fleet_ttl_secs | 45 | gateway+runtime | `crates/blazar-gateway/src/fleet.rs` (join ack + workers listing echo); `crates/blazar-runtime/src/fleet.rs` (`FleetRegistry::prune` expiry window) |

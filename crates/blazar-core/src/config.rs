@@ -163,11 +163,13 @@ pub struct Config {
     /// Autotune steward posture. `"off"` (default) = no background
     /// optimization work at all; `"advise"` = the daemon periodically
     /// scans stored evidence per model (`optimize --plan` logic) and
-    /// logs the findings - still zero mutations. `"scheduled"`
-    /// (unattended adoption) is REFUSED at parse with a teaching error:
-    /// scheduled autonomy is unlocked only after repeated successful
-    /// manual `optimize --run` / `--apply` cycles prove the lease,
-    /// verification and rollback paths.
+    /// logs the findings - still zero mutations; `"scheduled"` = the
+    /// daemon additionally runs idle-gated speculative-decoding races
+    /// (a bounded, abortable subset of the manual `optimize --run`
+    /// pipeline) and lands measured receipts. Adoption of a raced
+    /// mode still happens only at spawn through the same receipt
+    /// resolver the manual path uses - receipts with parity failures
+    /// are recorded but never adopted. See `autotune_schedule_tick`.
     #[serde(default)]
     pub autotune: Option<String>,
     /// Pull a missing draft model on first spawn instead of degrading to
@@ -4816,6 +4818,15 @@ impl Config {
         self.autotune.as_deref() == Some("advise")
     }
 
+    /// Whether the daemon's scheduled spec-race loop is on. Implies the
+    /// advise scan too - racing without recording findings would hide
+    /// half the loop's value. The race itself is idle-gated and
+    /// aborts mid-flight when real traffic returns.
+    #[must_use]
+    pub fn autotune_scheduled(&self) -> bool {
+        self.autotune.as_deref() == Some("scheduled")
+    }
+
     /// Load config from `<config_dir>/config.toml`, creating it with defaults
     /// if absent. Then apply `BLAZAR_*` env overrides.
     pub fn load(dirs: &BlazarDirs) -> CoreResult<Self> {
@@ -5730,23 +5741,16 @@ impl Config {
                 self.lazy_mode
             )));
         }
-        // Staged autonomy (docs/research §7.6): advise-only today. The
-        // scheduled posture stays a parse error with teaching until
-        // repeated manual `optimize --run` + `--apply` cycles earn it.
+        // Staged autonomy (docs/research §7.6): advise scans, scheduled
+        // races. The scheduled posture is deliberately narrow - it runs
+        // the same spec-race the manual `optimize --run` path runs,
+        // gated on idle lanes and aborting the moment traffic returns.
+        // Anything outside the vocabulary is still a plain error.
         match self.autotune.as_deref() {
-            None | Some("off" | "advise") => {}
-            Some("scheduled") => {
-                return Err(CoreError::Config(
-                    "autotune = \"scheduled\" is not available yet - run `blazar optimize <model> --run` \
-                     and adopt verified candidates with `blazar optimize <model> --apply <experiment-id>` \
-                     manually first; scheduled autonomy unlocks only after those cycles prove reliable"
-                        .to_string(),
-                ));
-            }
+            None | Some("off" | "advise" | "scheduled") => {}
             Some(other) => {
                 return Err(CoreError::Config(format!(
-                    "autotune must be one of \"off\" or \"advise\" (\"scheduled\" arrives with a proven \
-                     manual track record), got {other:?}"
+                    "autotune must be one of \"off\", \"advise\" or \"scheduled\", got {other:?}"
                 )));
             }
         }
@@ -8635,18 +8639,18 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn unit__wire_validation__enum_and_range_rejects() {
-        // autotune: scheduled is a planned posture refused with a
-        // TEACHING error (staged autonomy); typos get the plain
-        // vocabulary error; off/advise/default all validate.
-        let scheduled = Config {
-            autotune: Some("scheduled".into()),
-            ..Default::default()
+        // autotune: scheduled is now a real posture (idle-gated
+        // spec-race loop); typos get the plain vocabulary error;
+        // off/advise/scheduled/default all validate and the
+        // accessors map their postures.
+        for good in [None, Some("off"), Some("advise"), Some("scheduled")] {
+            Config {
+                autotune: good.map(str::to_string),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
         }
-        .validate()
-        .unwrap_err()
-        .to_string();
-        assert!(scheduled.contains("not available yet"), "{scheduled}");
-        assert!(scheduled.contains("--apply"), "{scheduled}");
         for bad in ["auto", "always"] {
             let err = Config {
                 autotune: Some(bad.into()),
@@ -8657,21 +8661,21 @@ mod tests {
             .to_string();
             assert!(err.contains("autotune must be one of"), "{bad}: {err}");
         }
-        for good in [None, Some("off"), Some("advise")] {
-            Config {
-                autotune: good.map(str::to_string),
-                ..Default::default()
-            }
-            .validate()
-            .unwrap();
-        }
         assert!(!Config::default().autotune_advise());
+        assert!(!Config::default().autotune_scheduled());
         assert!(
             Config {
                 autotune: Some("advise".into()),
                 ..Default::default()
             }
             .autotune_advise()
+        );
+        assert!(
+            Config {
+                autotune: Some("scheduled".into()),
+                ..Default::default()
+            }
+            .autotune_scheduled()
         );
         for bad in ["turbo", "ultra"] {
             let cfg = Config {

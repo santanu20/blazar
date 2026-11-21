@@ -125,6 +125,21 @@ pub enum BlazarEvent {
         recommendations: u32,
         next: Option<String>,
     },
+    /// Scheduled autotune (`autotune = "scheduled"`) finished a spec-mode
+    /// race on an idle lane and landed receipts: `arms` raced, of which
+    /// `parity_failures` diverged from the dense reference under greedy
+    /// parity probes (those arms land non-adoption-grade evidence). The
+    /// winning mode and its gain over dense are advisory context - actual
+    /// adoption happens later, at spawn, via the receipt resolver.
+    AutotuneRace {
+        model: String,
+        arms: u32,
+        parity_failures: u32,
+        best_mode: Option<String>,
+        /// (best tok/s / dense tok/s - 1) * 100, rounded; None when dense
+        /// did not run or measured zero.
+        best_gain_pct: Option<i64>,
+    },
     ModelPulled {
         name: String,
         /// Post-download GGUF health check: set when the header did not
