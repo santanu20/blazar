@@ -21,6 +21,7 @@ pub mod degrades;
 pub mod diffusion;
 pub mod discovery;
 pub mod draft_registry;
+pub mod effective;
 pub mod engine;
 pub mod engine_impl;
 pub mod events;

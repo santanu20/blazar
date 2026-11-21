@@ -4638,12 +4638,12 @@ fn kv_import_forward(
     // identity: the HF dir path string, block size 64, one block per file,
     // flash-attn canonical layout. A drift here reads nothing back
     // (fail-cold), never corrupts.
-    let spec = blazar_runtime::kv::repack::VllmFsSpec {
-        model_name: to_row.path.clone(),
-        tokens_per_hash: 64,
-        blocks_per_file: 1,
-        canonical_format: "v1-nhd".into(),
-    };
+    let spec = blazar_runtime::kv::repack::VllmFsSpec::direct(
+        to_row.path.clone(),
+        64,
+        geo.layers,
+        hf_meta.dtype.as_deref().unwrap_or("bfloat16"),
+    );
     let root = d.data_dir.join("kv").join("vllm");
     let outcome = blazar_runtime::kv::interchange::carrier_into_vllm_tier(&carrier, &spec, &root)
         .map_err(|e| anyhow!("kv import: {e}"))?;
@@ -4850,12 +4850,12 @@ fn kv_import_from_sglang(
         "no HiCache page files matched this prefix in {} - the sglang lane never wrote it ([sglang] hicache_enable + a matching --hicache-storage-backend-extra-config file_storage_path)",
         storage_dir.display()
     );
-    let tier_spec = blazar_runtime::kv::repack::VllmFsSpec {
-        model_name: to_row.path.clone(),
-        tokens_per_hash: page_tokens,
-        blocks_per_file: 1,
-        canonical_format: "v1-nhd".into(),
-    };
+    let tier_spec = blazar_runtime::kv::repack::VllmFsSpec::direct(
+        to_row.path.clone(),
+        page_tokens,
+        geo.layers,
+        hf_meta.dtype.as_deref().unwrap_or("bfloat16"),
+    );
     let outcome = bkic::carrier_into_vllm_tier(&carrier, &tier_spec, &d.data_dir.join("kv/vllm"))
         .map_err(|e| anyhow!("vllm tier write failed: {e}"))?;
     println!(
@@ -4936,12 +4936,12 @@ fn kv_import_to_sglang(
     {
         anyhow::bail!("lane pair refused: {reason}");
     }
-    let tier_spec = blazar_runtime::kv::repack::VllmFsSpec {
-        model_name: from_row.path.clone(),
-        tokens_per_hash: page_tokens,
-        blocks_per_file: 1,
-        canonical_format: "v1-nhd".into(),
-    };
+    let tier_spec = blazar_runtime::kv::repack::VllmFsSpec::direct(
+        from_row.path.clone(),
+        page_tokens,
+        geo.layers,
+        hf_meta.dtype.as_deref().unwrap_or("bfloat16"),
+    );
     let (carrier, report) =
         bkic::vllm_tier_to_carrier(&d.data_dir.join("kv/vllm"), &tier_spec, &ids, &geo)
             .map_err(|e| anyhow!("vllm tier read failed: {e}"))?;
@@ -5029,12 +5029,12 @@ name different directories",
     };
     // Tier identity = the vllm-side model path the engine folded into the
     // FileMapper digest when it wrote the blocks.
-    let spec = blazar_runtime::kv::repack::VllmFsSpec {
-        model_name: from_row.path.clone(),
-        tokens_per_hash: 64,
-        blocks_per_file: 1,
-        canonical_format: "v1-nhd".into(),
-    };
+    let spec = blazar_runtime::kv::repack::VllmFsSpec::direct(
+        from_row.path.clone(),
+        64,
+        geo.layers,
+        hf_meta.dtype.as_deref().unwrap_or("bfloat16"),
+    );
     let root = d.data_dir.join("kv").join("vllm");
     let (carrier, report) = bkic::vllm_tier_to_carrier(&root, &spec, &tokens, &geo)
         .map_err(|e| anyhow!("kv import: {e}"))?;
@@ -5114,7 +5114,6 @@ fn kv_import_mlx(
     use blazar_runtime::kv::interchange::{
         CodecLane, admitted_pairs, carrier_into_vllm_tier, mlx_cache_to_carrier,
     };
-    use blazar_runtime::kv::repack::VllmFsSpec;
     anyhow::ensure!(
         admitted_pairs(&cfg.kv.translation).contains(&CodecLane::MlxToVllm),
         "the mlx -> vllm codec is gated on [kv.translation] enabled = true"
@@ -5157,12 +5156,19 @@ fn kv_import_mlx(
         &to_row.path,
     )?;
 
-    let spec = VllmFsSpec {
-        model_name: to_row.path.clone(),
-        tokens_per_hash: 64,
-        blocks_per_file: 1,
-        canonical_format: "v1-nhd".into(),
+    let target_hf = blazar_core::hfmeta::read_hf_config(std::path::Path::new(&to_row.path))
+        .map_err(|e| anyhow!("cannot read the HF config at {}: {e}", to_row.path))?;
+    let target_geo = blazar_runtime::kv::repack::RepackGeometry {
+        layers: u32::try_from(target_hf.kv.layers.unwrap_or(0)).unwrap_or(0),
+        kv_heads: u32::try_from(target_hf.kv.kv_heads.unwrap_or(0)).unwrap_or(0),
+        head_dim: u32::try_from(target_hf.kv.head_dim.unwrap_or(0)).unwrap_or(0),
     };
+    let spec = blazar_runtime::kv::repack::VllmFsSpec::direct(
+        to_row.path.clone(),
+        64,
+        target_geo.layers,
+        target_hf.dtype.as_deref().unwrap_or("bfloat16"),
+    );
     let root = d.data_dir.join("kv").join("vllm");
     let outcome = carrier_into_vllm_tier(&carrier, &spec, &root)
         .map_err(|e| anyhow!("vllm tier write: {e}"))?;
@@ -5516,12 +5522,12 @@ fn kv_import_reverse(
 
     // Tier identity = the vllm-side model path, exactly what compile_vllm
     // folded into the FileMapper digest when the engine wrote the blocks.
-    let spec = blazar_runtime::kv::repack::VllmFsSpec {
-        model_name: from_row.path.clone(),
-        tokens_per_hash: 64,
-        blocks_per_file: 1,
-        canonical_format: "v1-nhd".into(),
-    };
+    let spec = blazar_runtime::kv::repack::VllmFsSpec::direct(
+        from_row.path.clone(),
+        64,
+        geo.layers,
+        hf_meta.dtype.as_deref().unwrap_or("bfloat16"),
+    );
     let root = d.data_dir.join("kv").join("vllm");
     let (carrier, report) = bkic::vllm_tier_to_carrier(&root, &spec, &ids, &geo)
         .map_err(|e| anyhow!("kv import: {e}"))?;
@@ -14046,12 +14052,109 @@ fn admission_refusal_line(v: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Build the canonical execution plan for a pulled model: the same
+/// lane router the daemon consults, wrapped with the typed decision
+/// facets (context, slots, KV, speculation, confidence, alternatives).
+/// Offline-safe: no daemon round-trip, no engine spawn; the only
+/// subprocesses are the hardware census the resource facts need.
+fn canonical_plan_for(
+    store: &Store,
+    row: &blazar_core::store::ModelRow,
+) -> Result<blazar_core::execution_plan::ExecutionPlan, String> {
+    use blazar_core::engine_kind::{LaneClass, serving_lane_typed};
+
+    let cfg = config().map_err(|e| e.to_string())?;
+    let engine_rows = store.list_engines().map_err(|e| e.to_string())?;
+    let installed: Vec<(String, blazar_core::engine_kind::EngineKind, LaneClass)> = engine_rows
+        .iter()
+        .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
+        .collect();
+    let global_row = store.active_engine().ok().flatten();
+    let global = global_row
+        .as_ref()
+        .map_or(blazar_core::engine_kind::EngineKind::LlamaCpp, |r| r.kind);
+    let overlay = cfg.overlay_for(&row.name);
+    let pin = overlay.engine.as_deref();
+    let shape = blazar_core::engine_kind::FormatShape {
+        diffusion: row.has_component_set(),
+        shards: blazar_core::engine_kind::ShardFormat::detect(
+            std::path::Path::new(&row.path).is_dir(),
+            row.is_quantized_safetensors(),
+            row.is_mlx(),
+            row.is_litert_bundle(),
+        ),
+    };
+    // Receipt axis: a bench row for THIS model on the lane the router
+    // will pick (adapter tag when routed, else the active global tag).
+    // The lookup must not perturb selection - the planner re-runs the
+    // router internally on identical inputs.
+    let routing_tag = serving_lane_typed(
+        cfg.engine_routing.mode,
+        cfg.engine_routing.policy,
+        pin,
+        shape,
+        global,
+        &installed,
+    )
+    .ok()
+    .flatten()
+    .map(|(tag, _)| tag)
+    .or_else(|| global_row.as_ref().map(|g| g.tag.clone()));
+    let has_bench_receipt = routing_tag
+        .as_deref()
+        .and_then(|t| {
+            store
+                .latest_bench_result_with_axes(&row.name, Some(t))
+                .ok()
+                .flatten()
+                .map(|_| true)
+        })
+        .unwrap_or(false);
+    let hw = blazar_runtime::probe_hardware(None);
+    let hardware = blazar_core::execution_plan::HardwareBudget {
+        gpu_name: hw.gpus.first().map(|g| g.name.clone()),
+        vram_bytes: hw.total_vram_mib().checked_mul(1024 * 1024),
+        ram_bytes: hw.total_ram_mib.checked_mul(1024 * 1024),
+    };
+    let spec_mode = overlay.spec.clone().unwrap_or_else(|| cfg.spec.clone());
+    let cache_type = overlay
+        .cache_type
+        .clone()
+        .unwrap_or_else(|| cfg.cache_type.clone());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    #[allow(clippy::cast_sign_loss)] // epoch seconds fit i64 by construction
+    let now = now as i64;
+    let inputs = blazar_core::execution_plan::ExecutionPlanInputs {
+        row,
+        installed: &installed,
+        global_kind: global,
+        global_tag: global_row.as_ref().map(|g| g.tag.as_str()),
+        mode: cfg.engine_routing.mode,
+        policy: cfg.engine_routing.policy,
+        pin,
+        shape,
+        hardware,
+        config_ctx: overlay.ctx.unwrap_or(cfg.default_ctx),
+        config_slots: overlay.slots.unwrap_or(cfg.slots),
+        spec_mode: spec_mode.as_str(),
+        cache_type: cache_type.as_str(),
+        has_bench_receipt,
+        now,
+    };
+    blazar_core::execution_plan::plan_execution(&inputs)
+}
+
 /// `blazar plan <model>` - read-only pre-run assembly: identity, the
-/// daemon's live decision card (when up), the measured profile, the
-/// capability certificate, and next actions. Never pulls, never probes,
-/// never boots a daemon. A target that is not local but parses as a
-/// pull target falls through to the upstream fit preview (network) plus
-/// a pull hint.
+/// canonical execution plan, the daemon's live decision card (when
+/// up), the measured profile, the capability certificate, and next
+/// actions. Never pulls, never spawns an engine, never boots a daemon
+/// (hardware census subprocesses may run for the planner's resource
+/// facts, same as fit/engine-recommend). A target that is not local
+/// but parses as a pull target falls through to the upstream fit
+/// preview (network) plus a pull hint.
 #[allow(clippy::too_many_lines)] // card assembly: one block per section
 async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     let d = dirs();
@@ -14088,6 +14191,10 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
         Measured::Absent => predict_for_plan(&store, &row),
         _ => None,
     };
+    // The canonical plan is computed locally even when the daemon is
+    // up: the agreement check between planner and live card is itself
+    // a diagnostic (the two must never disagree).
+    let canonical = canonical_plan_for(&store, &row);
 
     if json {
         let measured_json = measured_json_value(&measured);
@@ -14137,6 +14244,11 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
                 "measured": measured_json,
                 "predicted": predicted_json,
                 "certificate": cert_json,
+                "canonical_plan": match &canonical {
+                    Ok(plan) => serde_json::to_value(plan)
+                        .unwrap_or(serde_json::Value::Null),
+                    Err(teaching) => serde_json::json!({ "error": teaching }),
+                },
             })
         );
         return Ok(());
@@ -14168,6 +14280,84 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
         (None, None) => println!(
             "  daemon not running - start it with `blazar serve` to see the live routing card"
         ),
+    }
+
+    println!();
+    println!("PLANNER (canonical execution plan)");
+    match &canonical {
+        Ok(plan) => {
+            let lane = plan
+                .tag
+                .as_deref()
+                .map(|t| format!("{t} ({:?})", plan.engine))
+                .unwrap_or_else(|| format!("{:?}", plan.engine));
+            println!(
+                "  engine    {lane} via {:?} - confidence {:?}",
+                plan.source, plan.confidence
+            );
+            println!("  context   {}", plan.context_size);
+            match &plan.slots {
+                blazar_core::execution_plan::PlanSlots::Auto { hint } => {
+                    println!("  slots     auto ({hint})");
+                }
+                blazar_core::execution_plan::PlanSlots::Pinned(n) => {
+                    println!("  slots     {n} (pinned)");
+                }
+            }
+            match &plan.kv {
+                blazar_core::execution_plan::PlanKv::AutoLadder { eligible, .. } => {
+                    println!("  kv        auto ladder (lane eligible: {eligible})");
+                }
+                blazar_core::execution_plan::PlanKv::Pinned { cache_type, .. } => {
+                    println!("  kv        {cache_type} (pinned)");
+                }
+            }
+            match &plan.speculation {
+                blazar_core::execution_plan::PlanSpec::Auto { supported, .. } => {
+                    println!("  spec      auto (lane supported: {supported})");
+                }
+                blazar_core::execution_plan::PlanSpec::Off => {
+                    println!("  spec      off");
+                }
+                blazar_core::execution_plan::PlanSpec::Pinned { mode, .. } => {
+                    println!("  spec      {mode} (pinned)");
+                }
+            }
+            for reason in &plan.reasons {
+                println!("  why       - {reason}");
+            }
+            for warning in &plan.warnings {
+                println!("  note      - {warning}");
+            }
+            for alt in &plan.alternatives {
+                println!("  passed    {} ({:?}): {}", alt.tag, alt.kind, alt.why);
+            }
+            // Agreement check: the daemon card and the local planner
+            // consult the same router - a mismatch means one of them
+            // is stale and must be investigated, never ignored. The
+            // card's kind is null when the global engine serves, so
+            // tag comparison is the always-present fallback.
+            if let Some(card) = &decision {
+                let card_engine = card.get("engine");
+                let card_kind = card_engine
+                    .and_then(|e| e.get("kind"))
+                    .and_then(|k| k.as_str());
+                let card_tag = card_engine
+                    .and_then(|e| e.get("tag"))
+                    .and_then(|t| t.as_str());
+                let agree = card_kind.is_some_and(|k| k.eq_ignore_ascii_case(plan.engine.as_str()))
+                    || card_tag.is_some_and(|t| plan.tag.as_deref() == Some(t));
+                if card_kind.is_some() || card_tag.is_some() {
+                    let shown = card_kind.unwrap_or_else(|| card_tag.unwrap_or("?"));
+                    let planner = plan.tag.as_deref().unwrap_or_else(|| plan.engine.as_str());
+                    println!(
+                        "  agreement daemon '{shown}' vs planner '{planner}' - {}",
+                        if agree { "agree" } else { "MISMATCH" }
+                    );
+                }
+            }
+        }
+        Err(teaching) => println!("  no plan: {teaching}"),
     }
 
     println!();

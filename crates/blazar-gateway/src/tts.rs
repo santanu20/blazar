@@ -857,7 +857,12 @@ async fn llamacpp_tts_lane(
         state,
         &row.name,
         crate::queue::Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        crate::workload::classify(
+            state,
+            crate::workload::WorkloadSurface::SpeechSynthesis,
+            false,
+            false,
+        ),
         None,
         true, // sidecar-attached instance (audio codec rides mmproj)
         false,
@@ -1070,6 +1075,16 @@ async fn kokoro_speech(
              takes \"speed\" and a voice (model) like af_sarah (or \"kokoro\" for the default)",
         );
     }
+    // Workload accounting: the kokoro child admits lazily (no engine
+    // spawn up front), so the descriptor bump lives at entry like every
+    // other single-admission handler.
+    crate::workload::note(
+        state,
+        crate::workload::WorkloadSurface::SpeechSynthesis,
+        false,
+        false,
+    );
+
     // Same admission the piper lane pays (audit MM1): scope on the
     // voice id + rpm/tpm/daily + request charge.
     if let Err(resp) = state.admit_or_respond(key_ext, voice) {

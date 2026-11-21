@@ -1843,7 +1843,9 @@ pub async fn chat(
     // even under ollama_compat, so they keep their interactive class
     // (and are exactly the mixed traffic that makes reserved capacity
     // reachable on a compat model).
-    let class = crate::queue::classify_work(
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Chat,
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.cfg().effective_prompt_recipe(&model_field) == crate::prompt_recipe::OLLAMA_COMPAT
             && !crate::prompt_recipe::has_images(&req),
@@ -3450,6 +3452,12 @@ pub async fn embeddings(
     {
         return rej.to_response();
     }
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Rerank,
+        false,
+        false,
+    );
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots - park at the ceiling instead of piling
     // onto the engine's internal queue.
@@ -3457,7 +3465,7 @@ pub async fn embeddings(
         &state,
         &row.name,
         Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        class,
         body.len(),
         false, // no sampling on this surface: exclusivity never applies
     )
@@ -3470,7 +3478,7 @@ pub async fn embeddings(
         &state,
         &model,
         Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        class,
         None,
         false,
         false, // text surface: diffusion rows teach the images lane
@@ -3603,6 +3611,12 @@ pub async fn embed(
     {
         return rej.to_response();
     }
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Embeddings,
+        false,
+        false,
+    );
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots - park at the ceiling instead of piling
     // onto the engine's internal queue.
@@ -3610,7 +3624,7 @@ pub async fn embed(
         &state,
         &row.name,
         Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        class,
         body.len(),
         false, // no sampling on this surface: exclusivity never applies
     )
@@ -3623,7 +3637,7 @@ pub async fn embed(
         &state,
         &model,
         Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        class,
         None,
         false,
         false, // text surface: diffusion rows teach the images lane
@@ -3788,6 +3802,12 @@ pub async fn rerank(
     {
         return rej.to_response();
     }
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Embeddings,
+        false,
+        false,
+    );
     // Request-level admission (chat parity): embeddings are cheap but
     // still occupy child slots - park at the ceiling instead of piling
     // onto the engine's internal queue.
@@ -3795,7 +3815,7 @@ pub async fn rerank(
         &state,
         &row.name,
         Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        class,
         body.len(),
         false, // no sampling on this surface: exclusivity never applies
     )
@@ -3808,7 +3828,7 @@ pub async fn rerank(
         &state,
         &model,
         Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        class,
         None,
         false,
         false, // text surface: diffusion rows teach the images lane
@@ -4040,7 +4060,9 @@ pub async fn generate(
             "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
-    let class = crate::queue::classify_work(
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Chat,
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.cfg().effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,
     );
@@ -4881,6 +4903,13 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             u8::from(spec_on && saturated)
         );
     }
+    // Workload mix per kind (B6): request counts by the dialect-neutral
+    // descriptor every admission site derives.
+    let _ = write!(
+        merged,
+        "# HELP blazar_workload_requests_total Requests admitted per workload kind\n# TYPE blazar_workload_requests_total counter\n"
+    );
+    crate::workload::render(&state, &mut merged);
     // Prefix heat per loaded model (why a capacity eviction chose its
     // victim - hot caches survive).
     let _ = write!(
@@ -4896,6 +4925,8 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     }
     state.ttft.render(&mut merged);
     state.tpot.render(&mut merged);
+    // Request stage timing (F5): gateway-overhead split per stage.
+    state.stage.render(&mut merged);
     // SLO burn (F4): waiters admitted past their deadline class.
     let _ = write!(
         merged,

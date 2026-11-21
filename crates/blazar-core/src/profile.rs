@@ -4890,12 +4890,41 @@ fn openaihost_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String
 
 /// vllm profile: minimal v0 ladder mirroring `compile_mlx`'s honesty
 /// contract. The numbers this profile owns: ctx window (overlay >
+/// Model family -> vllm tool-call parser for auto tool choice.
+///
+/// Only families whose parser semantics are stable AND registered in the
+/// engine builds Blazar ships (62 parsers in vllm 0.34.0) map here;
+/// everything else returns [`None`] and the spawn stays without the
+/// pair, so `tools` requests keep the engine's explicit 400 instead of
+/// a wrong parser corrupting calls. Prefix order matters: the coder
+/// variant is checked before the generic Qwen arm.
+fn vllm_tool_parser_for(architecture: &str) -> Option<&'static str> {
+    const TABLE: &[(&str, &str)] = &[
+        ("Qwen3Coder", "qwen3_coder"),
+        ("Qwen", "hermes"),
+        ("Llama4", "llama4_json"),
+        ("Llama3", "llama3_json"),
+        ("Mistral", "mistral"),
+        ("DeepseekV3", "deepseek_v3"),
+        ("Jamba", "jamba"),
+        ("InternLM", "internlm"),
+        ("Granite", "granite"),
+    ];
+    TABLE
+        .iter()
+        .find(|(prefix, _)| architecture.starts_with(prefix))
+        .map(|(_, parser)| *parser)
+}
+
 /// config default, clamped to the trained ceiling), GPU memory
 /// fraction (ALWAYS emitted - vllm's 0.9 default claims nearly the
 /// whole card and starves co-tenants on shared GPUs), and the
 /// concurrency cap when the model row pins slots. Everything else
 /// rides vllm's own admission (it self-refuses loudly when weights +
 /// KV do not fit the fraction).
+// The arm teaches ctx/memory/concurrency/tool/KV posture inline; splitting
+// it would scatter the per-flag reasoning the lane's teaching depends on.
+#[allow(clippy::too_many_lines)]
 fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
     let hf = match input.meta {
         ModelMeta::Hf(h) => h,
@@ -4948,6 +4977,38 @@ fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
     // warm/cold TTFT split and prompt_eval_cached_count read) when
     // asked. Reporting is free, so the flag rides every spawn.
     argv.push("--enable-prompt-tokens-details".to_string());
+
+    // --- tool calling: vllm only serves `tools` requests when the
+    // server itself booted with the parser pair (live receipt
+    // bench-artifacts/2026-11-21-vllm-sglang-lanes: every tools cell
+    // 400s without it). The pair is atomic - vllm's argparse rejects
+    // `--enable-auto-tool-choice` outright when no parser rides along -
+    // so both emit together or not at all: an explicit
+    // `[vllm] tool_call_parser` pin wins, else the model family picks,
+    // else nothing. Auto-selection is silent like sglang's reasoning
+    // default: it is the intended posture, not a condition to flag.
+    let tool_parser = tun
+        .tool_call_parser
+        .clone()
+        .or_else(|| vllm_tool_parser_for(&hf.architecture).map(str::to_string));
+    if let Some(parser) = tool_parser {
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "vllm tuning",
+            "--enable-auto-tool-choice",
+            "",
+            &mut warnings,
+        );
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "vllm tuning",
+            "--tool-call-parser",
+            &parser,
+            &mut warnings,
+        );
+    }
 
     // --- persistent KV offload (opt-in): tier completed blocks into a
     // pinned CPU buffer + a content-addressed fs store so a restarted
@@ -5029,6 +5090,12 @@ fn vllm_extra_args(input: &ProfileInput<'_>) -> Result<Vec<String>, String> {
         // extra_args pin can never fight the compiler's emission.
         "--kv-transfer-config",
         "--enable-prompt-tokens-details",
+        // Tool calling is compiler-owned: the pair emits together when
+        // the family maps (or [vllm] tool_call_parser pins it), and the
+        // knob is the escape hatch for unmapped families - extra_args
+        // can never fight the compiler's atomic emission.
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
     ];
     let Some(extra) = &input.overlay.extra_args else {
         return Ok(Vec::new());
@@ -20562,6 +20629,10 @@ mod tests {
             "--max-num-seqs",
             "--enable-prefix-caching",
             "--kv-cache-dtype",
+            "--enable-prompt-tokens-details",
+            "--kv-transfer-config",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
         ]
         .iter()
         .map(|f| (*f).to_string())
@@ -20632,8 +20703,13 @@ mod tests {
                 // Reporting flag rides every spawn: cached_tokens feeds
                 // the gateway's warm/cold TTFT split.
                 "--enable-prompt-tokens-details",
+                // Tool pair auto-selected from the family (Qwen2 ->
+                // hermes): without it every tools request 400s.
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                "hermes",
             ],
-            "default compile is exactly ctx + utilization + reuse reporting"
+            "default compile is ctx + utilization + reuse reporting + tool pair"
         );
         assert_eq!(p.ctx, 16384);
         // KV byte estimation is GGUF-geometry-only today; HF lanes ride
@@ -20643,6 +20719,85 @@ mod tests {
             p.warnings.is_empty(),
             "no warnings by default: {:?}",
             p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__vllm_tool_parser_for__family_table() {
+        // Prefix order matters: the coder arm must beat generic Qwen.
+        let cases = [
+            ("Qwen2ForCausalLM", Some("hermes")),
+            ("Qwen2MoeForCausalLM", Some("hermes")),
+            ("Qwen3ForCausalLM", Some("hermes")),
+            ("Qwen3CoderForCausalLM", Some("qwen3_coder")),
+            ("Llama3ForCausalLM", Some("llama3_json")),
+            ("Llama4ForCausalLM", Some("llama4_json")),
+            ("MistralForCausalLM", Some("mistral")),
+            ("DeepseekV32ForCausalLM", Some("deepseek_v3")),
+            ("JambaForCausalLM", Some("jamba")),
+            ("InternLM2ForCausalLM", Some("internlm")),
+            ("GraniteForCausalLM", Some("granite")),
+            // Unmapped families stay honest: None = no pair on the spawn.
+            ("Gemma3ForCausalLM", None),
+            ("GptOssForCausalLM", None),
+            ("Phi4ForCausalLM", None),
+        ];
+        for (arch, want) in cases {
+            assert_eq!(vllm_tool_parser_for(arch), want, "family {arch}");
+        }
+    }
+
+    #[test]
+    fn unit__vllm_compile__tool_parser_pin_wins_over_family_default() {
+        // An explicit [vllm] tool_call_parser rides verbatim; the family
+        // auto-detect must not fight it.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta(); // Qwen2ForCausalLM -> hermes
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            gpu_memory_utilization: None,
+            kv_offload: crate::config::VllmKvOffload::default(),
+            tool_call_parser: Some("pythonic".into()),
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tool-call-parser" && w[1] == "pythonic"),
+            "pin rides verbatim: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv.contains(&"--enable-auto-tool-choice".to_string()),
+            "the pair is atomic: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv
+                .windows(2)
+                .any(|w| w[0] == "--tool-call-parser" && w[1] == "hermes"),
+            "family default must not double-ride: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__unmapped_family_spawns_without_tool_pair() {
+        // Gemma has no stable parser in the table: the spawn carries
+        // neither flag and tools requests keep the engine's 400.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let mut hf = hf_meta();
+        hf.architecture = "Gemma3ForCausalLM".into();
+        let inp = vllm_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--enable-auto-tool-choice".to_string())
+                && !p.argv.contains(&"--tool-call-parser".to_string()),
+            "unmapped family stays without the pair: {:?}",
+            p.argv
         );
     }
 
@@ -20678,6 +20833,7 @@ mod tests {
             vllm: crate::config::VllmTuning {
                 gpu_memory_utilization: Some(0.6),
                 kv_offload: crate::config::VllmKvOffload::default(),
+                tool_call_parser: None,
             },
             ..Config::default()
         };
@@ -20697,6 +20853,7 @@ mod tests {
         overlay.vllm = Some(crate::config::VllmTuning {
             gpu_memory_utilization: Some(0.3),
             kv_offload: crate::config::VllmKvOffload::default(),
+            tool_call_parser: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -20762,6 +20919,7 @@ mod tests {
                 root_dir: None,
                 connector: crate::config::KvConnectorChoice::default(),
             },
+            tool_call_parser: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -20805,6 +20963,7 @@ mod tests {
                 root_dir: Some("/store/kv-custom".into()),
                 connector: crate::config::KvConnectorChoice::default(),
             },
+            tool_call_parser: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -20852,6 +21011,7 @@ mod tests {
                 connector: crate::config::KvConnectorChoice::Lmcache,
                 ..Default::default()
             },
+            tool_call_parser: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
@@ -20981,7 +21141,12 @@ mod tests {
 
         // KV plumbing stays compiler-owned even with offload disabled -
         // an extra_args pin can never fight the compiler's emission.
-        for reserved in ["--kv-transfer-config", "--enable-prompt-tokens-details"] {
+        for reserved in [
+            "--kv-transfer-config",
+            "--enable-prompt-tokens-details",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+        ] {
             let mut overlay = DEFAULT_OVERLAY.clone();
             overlay.extra_args = Some(vec![reserved.into(), "{}".into()]);
             let inp = vllm_input(&hf, &hw, &cfg, &overlay);

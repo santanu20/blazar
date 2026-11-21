@@ -45,6 +45,7 @@ pub async fn quantiles(State(state): State<Arc<AppState>>) -> Json<Value> {
         "object": "blazar.quantiles",
         "ttft_ms": latency_block(&state.ttft),
         "tpot_ms": latency_block(&state.tpot),
+        "stages": state.stage.quantile_blocks(),
         "ttft_warm_ms": latency_block(&obs.ttft_warm),
         "ttft_cold_ms": latency_block(&obs.ttft_cold),
         "prompt_cache": {

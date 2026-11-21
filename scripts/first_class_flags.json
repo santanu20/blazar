@@ -1,4 +1,958 @@
 {
+  "capabilities": {
+    "kokoro": [
+      {
+        "evidence": "unsupported",
+        "family": "batching_scheduling",
+        "flags": [],
+        "note": "single /tts shim child; concurrency is gateway-side",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "kv_cache_quantization",
+        "flags": [],
+        "note": "no KV cache on the TTS lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "prefix_caching",
+        "flags": [],
+        "note": "no decode cache on the TTS lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "speculative_decoding",
+        "flags": [],
+        "note": "not applicable to synthesis",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "CPU ONNX lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "memory_offload",
+        "flags": [],
+        "note": "82M-param model is device-memory-sized by design",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "structured_output",
+        "flags": [],
+        "note": "audio out; no grammar surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "lora",
+        "flags": [],
+        "note": "no adapter surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multimodal",
+        "flags": [],
+        "note": "single-modality audio-out lane (see speech_synthesis)",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned job cancel",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "speech_synthesis",
+        "flags": [],
+        "note": "zero-CLI-flag python shim: Blazar composes the whole serving path (venv + ONNX model + /tts endpoint); af_heart 24 kHz wav certified live 2026-11-20",
+        "receipt": "bench-artifacts/20261120-kokoro-vllm-cert/README.md"
+      }
+    ],
+    "llamacpp": [
+      {
+        "evidence": "first_class",
+        "family": "batching_scheduling",
+        "flags": [
+          "-np",
+          "--batch-size",
+          "--ubatch-size",
+          "--no-cont-batching"
+        ],
+        "note": "slots=0 capacity-aware sizing, adaptive_slots governor and the decode gate manage batching",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "kv_cache_quantization",
+        "flags": [
+          "--cache-type-k",
+          "--cache-type-v"
+        ],
+        "note": "q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven",
+        "receipt": "bench-artifacts/20261111-fp8-kv-quality/README.md"
+      },
+      {
+        "evidence": "first_class",
+        "family": "prefix_caching",
+        "flags": [
+          "--no-cache-prompt"
+        ],
+        "note": "prompt cache default-on; cache_hit_rate hint feeds the spec/cache governors",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "speculative_decoding",
+        "flags": [
+          "--spec-default",
+          "--spec-draft-n-min",
+          "--spec-draft-p-min"
+        ],
+        "note": "spec=auto family selection, ngram fallback and the adaptive spec governor",
+        "receipt": null
+      },
+      {
+        "evidence": "passthrough",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "rpc/multi-node surface is extra_args-only; single-box layer splits auto-derive",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "memory_offload",
+        "flags": [
+          "--no-kv-offload",
+          "--op-offload",
+          "--cache-ram"
+        ],
+        "note": "KV/operator offload and cache-ram budget are config knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "structured_output",
+        "flags": [
+          "--grammar",
+          "--json-schema",
+          "--json-schema-file"
+        ],
+        "note": "GGUF grammars and JSON-schema pins ride the launch line",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "lora",
+        "flags": [
+          "--lora-scaled",
+          "--lora-init-without-apply"
+        ],
+        "note": "adapter scaling and no-apply load are first-class knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "multimodal",
+        "flags": [
+          "--media-path",
+          "--no-mmproj-auto",
+          "--no-mmproj-offload"
+        ],
+        "note": "mmproj auto-detect and offload knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned SSE stream and cancel path",
+        "receipt": null
+      }
+    ],
+    "mistralrs": [
+      {
+        "evidence": "first_class",
+        "family": "batching_scheduling",
+        "flags": [
+          "-np",
+          "--max-batch-size",
+          "--max-seqs",
+          "--max-num-batched-tokens"
+        ],
+        "note": "paged-attention admission knobs derived from capacity",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "kv_cache_quantization",
+        "flags": [
+          "--pa-cache-type"
+        ],
+        "note": "paged-attn cache dtype knob",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "prefix_caching",
+        "flags": [
+          "--prefix-cache-n"
+        ],
+        "note": "prefix retention count knob",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "speculative_decoding",
+        "flags": [
+          "--mtp",
+          "--mtp-model",
+          "--mtp-n-predict"
+        ],
+        "note": "MTP draft surface is wired through the tuning knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "v0.9.5 advertises no TP/PP surface; single-device lane",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "memory_offload",
+        "flags": [
+          "--device-layers",
+          "--pa-memory-mb",
+          "--encoder-cache-memory-mb"
+        ],
+        "note": "layer split and memory fraction knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "structured_output",
+        "flags": [],
+        "note": "request-side grammar only; no launch flag on this lane",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "lora",
+        "flags": [
+          "--enable-lora"
+        ],
+        "note": "live child --isq/--enable-lora qwen3-1.7b run; adapter caps are knobs",
+        "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md"
+      },
+      {
+        "evidence": "first_class",
+        "family": "multimodal",
+        "flags": [
+          "--mmproj",
+          "--max-image-length"
+        ],
+        "note": "vision projector routing is first-class",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned stream and cancel",
+        "receipt": null
+      }
+    ],
+    "mlx": [
+      {
+        "evidence": "first_class",
+        "family": "batching_scheduling",
+        "flags": [
+          "--decode-concurrency",
+          "--prompt-concurrency"
+        ],
+        "note": "decode/prompt concurrency knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "kv_cache_quantization",
+        "flags": [
+          "--kv-bits",
+          "--kv-group-size",
+          "--quantized-kv-start"
+        ],
+        "note": "A/B: 1.9x slower decode, 108MiB saved - memory lever, opt-in",
+        "receipt": "bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md"
+      },
+      {
+        "evidence": "first_class",
+        "family": "prefix_caching",
+        "flags": [
+          "--prompt-cache-size",
+          "--prompt-cache-bytes"
+        ],
+        "note": "prompt cache budget knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "speculative_decoding",
+        "flags": [
+          "--draft-model",
+          "--num-draft-tokens"
+        ],
+        "note": "draft model + token count knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "single-device MLX runtime",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "memory_offload",
+        "flags": [],
+        "note": "mlx manages memory internally; kv-bits is the memory lever",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "structured_output",
+        "flags": [],
+        "note": "request-side only on this lane",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "lora",
+        "flags": [
+          "--adapter-path"
+        ],
+        "note": "adapter path knob",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "multimodal",
+        "flags": [],
+        "note": "mlx-vl exists upstream; no tower routing wired",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned stream and cancel",
+        "receipt": null
+      }
+    ],
+    "openaihost": [
+      {
+        "evidence": "unsupported",
+        "family": "batching_scheduling",
+        "flags": [],
+        "note": "child owns its serving config; Blazar spawns one shared child",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "kv_cache_quantization",
+        "flags": [],
+        "note": "child-internal, not argv-configurable",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "prefix_caching",
+        "flags": [],
+        "note": "child-internal",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "speculative_decoding",
+        "flags": [],
+        "note": "child-internal",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "child-internal",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "memory_offload",
+        "flags": [],
+        "note": "child-internal",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "structured_output",
+        "flags": [],
+        "note": "request-side via the OpenAI surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "lora",
+        "flags": [],
+        "note": "child-internal model registry",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "multimodal",
+        "flags": [],
+        "note": "depends on the child's imported models",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned stream and cancel over the child's OpenAI surface",
+        "receipt": null
+      }
+    ],
+    "piper": [
+      {
+        "evidence": "unsupported",
+        "family": "batching_scheduling",
+        "flags": [],
+        "note": "one-shot synthesis spawns; concurrency is gateway-side",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "kv_cache_quantization",
+        "flags": [],
+        "note": "no KV cache on the TTS lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "prefix_caching",
+        "flags": [],
+        "note": "no decode cache on the TTS lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "speculative_decoding",
+        "flags": [],
+        "note": "not applicable to synthesis",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "CPU synthesis lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "memory_offload",
+        "flags": [],
+        "note": "voice models are device-memory-sized by design",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "structured_output",
+        "flags": [],
+        "note": "audio out; no grammar surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "lora",
+        "flags": [],
+        "note": "no adapter surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multimodal",
+        "flags": [],
+        "note": "single-modality audio-out lane (see speech_synthesis)",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned job cancel",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "speech_synthesis",
+        "flags": [
+          "--model",
+          "--output_raw",
+          "--length_scale",
+          "--speaker"
+        ],
+        "note": "piper-TTS wav synthesized and round-trip transcribed by whisper beam-5 child",
+        "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md"
+      }
+    ],
+    "sdcpp": [
+      {
+        "evidence": "unsupported",
+        "family": "batching_scheduling",
+        "flags": [],
+        "note": "one-shot diffusion generation; no batch admission surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "kv_cache_quantization",
+        "flags": [],
+        "note": "no KV cache on a diffusion lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "prefix_caching",
+        "flags": [],
+        "note": "no decode cache on a diffusion lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "speculative_decoding",
+        "flags": [],
+        "note": "not applicable to diffusion",
+        "receipt": null
+      },
+      {
+        "evidence": "passthrough",
+        "family": "multi_gpu_parallelism",
+        "flags": [
+          "--rpc-servers"
+        ],
+        "note": "rpc server list is extra_args-reachable; not auto-planned",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "memory_offload",
+        "flags": [
+          "--offload-to-cpu",
+          "--max-vram"
+        ],
+        "note": "CPU offload and VRAM ceiling knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "structured_output",
+        "flags": [],
+        "note": "image bytes, not constrained text",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "lora",
+        "flags": [
+          "--lora-model-dir"
+        ],
+        "note": "LoRA directory knob for diffusion adapters",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "multimodal",
+        "flags": [
+          "--llm",
+          "--clip_vision",
+          "--qwen2vl_vision"
+        ],
+        "note": "the lane IS multimodal generation; component sets are first-class",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "job ledger + gateway cancel own the lifecycle",
+        "receipt": null
+      }
+    ],
+    "sglang": [
+      {
+        "evidence": "first_class",
+        "family": "batching_scheduling",
+        "flags": [
+          "--schedule-policy",
+          "--schedule-conservativeness",
+          "--max-total-tokens",
+          "--max-prefill-tokens"
+        ],
+        "note": "scheduler policy and token budget knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "kv_cache_quantization",
+        "flags": [
+          "--kv-cache-dtype"
+        ],
+        "note": "KV dtype knob on the paged cache",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "prefix_caching",
+        "flags": [
+          "--enable-hierarchical-cache",
+          "--hicache-ratio",
+          "--hicache-size",
+          "--enable-session-radix-cache"
+        ],
+        "note": "radix + hierarchical cache knobs; hicache L3 codec translates across engines",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "speculative_decoding",
+        "flags": [
+          "--speculative-algorithm",
+          "--speculative-num-draft-tokens"
+        ],
+        "note": "live spec battery: +7% on repetitive traffic, negative on diverse - kept opt-in",
+        "receipt": "bench-artifacts/20261009-sglang-spec/spec_race_lane.md"
+      },
+      {
+        "evidence": "first_class",
+        "family": "multi_gpu_parallelism",
+        "flags": [
+          "--tp-size",
+          "--dp-size",
+          "--pp-size",
+          "--ep-size"
+        ],
+        "note": "all four parallel axes are sized by the multi-GPU planner",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "memory_offload",
+        "flags": [
+          "--cpu-offload-gb",
+          "--mem-fraction-static"
+        ],
+        "note": "CPU offload and static memory fraction knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "structured_output",
+        "flags": [],
+        "note": "xgrammar rides requests; the launch-side grammar backend is not pinned",
+        "receipt": null
+      },
+      {
+        "evidence": "live_certified",
+        "family": "lora",
+        "flags": [
+          "--enable-lora",
+          "--lora-paths"
+        ],
+        "note": "one-child colon routing + hot-attach on the same pid",
+        "receipt": "docs/research/2026-10-09-sglang-lora-one-child.md"
+      },
+      {
+        "evidence": "first_class",
+        "family": "multimodal",
+        "flags": [
+          "--mm-attention-backend"
+        ],
+        "note": "multimodal attention backend knob",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned stream and cancel",
+        "receipt": null
+      }
+    ],
+    "vllm": [
+      {
+        "evidence": "first_class",
+        "family": "batching_scheduling",
+        "flags": [
+          "--max-num-seqs"
+        ],
+        "note": "slots pin caps admissions; absent rides vllm's continuous batching",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "kv_cache_quantization",
+        "flags": [],
+        "note": "--kv-cache-dtype is in the supported grammar; the compiler does not pin it yet",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "prefix_caching",
+        "flags": [],
+        "note": "vllm enables prefix caching by default upstream; no explicit pin is emitted",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "speculative_decoding",
+        "flags": [],
+        "note": "spec decode surface not wired on this lane yet",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "upstream tensor parallelism exists; no first-class knob on this lane yet",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "memory_offload",
+        "flags": [
+          "--gpu-memory-utilization",
+          "--kv-transfer-config"
+        ],
+        "note": "memory fraction always emitted; persistent KV offload is opt-in with a tiered store",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "structured_output",
+        "flags": [],
+        "note": "guided decoding is request-side on this lane",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "lora",
+        "flags": [],
+        "note": "upstream LoRA surface not wired on this lane yet",
+        "receipt": null
+      },
+      {
+        "evidence": "probed",
+        "family": "multimodal",
+        "flags": [],
+        "note": "HF vision towers route upstream; no launch knob is pinned",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned stream and cancel; /health readiness probe",
+        "receipt": null
+      }
+    ],
+    "whisper": [
+      {
+        "evidence": "unsupported",
+        "family": "batching_scheduling",
+        "flags": [],
+        "note": "single-utterance transcription; no batch surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "kv_cache_quantization",
+        "flags": [],
+        "note": "no persistent KV on the audio lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "prefix_caching",
+        "flags": [],
+        "note": "no decode cache on the audio lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "speculative_decoding",
+        "flags": [],
+        "note": "encoder-decoder; no speculation surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "multi_gpu_parallelism",
+        "flags": [],
+        "note": "single-device audio lane",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "memory_offload",
+        "flags": [],
+        "note": "model fits device memory by admission design",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "structured_output",
+        "flags": [],
+        "note": "plain text/json output; no grammar surface",
+        "receipt": null
+      },
+      {
+        "evidence": "unsupported",
+        "family": "lora",
+        "flags": [],
+        "note": "no adapter surface advertised",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "multimodal",
+        "flags": [
+          "--diarize",
+          "--tinydiarize",
+          "--vad",
+          "--vad-model"
+        ],
+        "note": "audio-in lane; diarization and VAD are first-class knobs",
+        "receipt": null
+      },
+      {
+        "evidence": "first_class",
+        "family": "cancellation_streaming",
+        "flags": [],
+        "note": "gateway-owned job cancel",
+        "receipt": null
+      }
+    ]
+  },
+  "kv_matrix": [
+    {
+      "note": "slot-save bank round trip - the native restore path",
+      "pair": "llama.cpp -> llama.cpp",
+      "receipt": null,
+      "status": "exact"
+    },
+    {
+      "note": "fs offload tier round trip - content-addressed reload",
+      "pair": "vllm -> vllm",
+      "receipt": null,
+      "status": "exact"
+    },
+    {
+      "note": "hicache L3 file tier round trip",
+      "pair": "sglang -> sglang",
+      "receipt": null,
+      "status": "exact"
+    },
+    {
+      "note": "mlx-lm prompt-cache file round trip",
+      "pair": "mlx -> mlx",
+      "receipt": null,
+      "status": "exact"
+    },
+    {
+      "note": "gateway chat through the imported prefix reported cached_tokens > 0 on live engines",
+      "pair": "llama.cpp -> vllm",
+      "receipt": "docs/research/2026-11-19-llamacpp-vllm-kv-import-data-plane.md",
+      "status": "live_certified"
+    },
+    {
+      "note": "tier -> bank -> native slot restore proven live (qwen2.5-coder-0.5b pair: 24 blocks x 64 tokens imported; slot restore of 1536 tokens logged before first use)",
+      "pair": "vllm -> llama.cpp",
+      "receipt": "bench-artifacts/2026-11-21-kv-codec-live-certs/README.md",
+      "status": "live_certified"
+    },
+    {
+      "note": "mlx-lm export codec landed; live pair certificate needs a Metal host for the mlx lane",
+      "pair": "mlx -> vllm",
+      "receipt": null,
+      "status": "codec_shipped"
+    },
+    {
+      "note": "staged preload landed; live pair certificate needs a Metal host for the mlx lane",
+      "pair": "vllm -> mlx",
+      "receipt": null,
+      "status": "codec_shipped"
+    },
+    {
+      "note": "hicache L3 page codec landed; live pair certificate (both engines, proven reuse) pending - the hicache host-tier guard needs a RAM class with ~15 GiB headroom (guard refusal verified live on the 13.7 GiB cert box)",
+      "pair": "sglang -> vllm",
+      "receipt": null,
+      "status": "codec_shipped"
+    },
+    {
+      "note": "hicache L3 page codec landed; live pair certificate (both engines, proven reuse) pending - the hicache host-tier guard needs a RAM class with ~15 GiB headroom (guard refusal verified live on the 13.7 GiB cert box)",
+      "pair": "vllm -> sglang",
+      "receipt": null,
+      "status": "codec_shipped"
+    },
+    {
+      "note": "no codec lane exists for this pair today",
+      "pair": "llama.cpp -> mlx",
+      "receipt": null,
+      "status": "unavailable"
+    },
+    {
+      "note": "no codec lane exists for this pair today",
+      "pair": "mlx -> llama.cpp",
+      "receipt": null,
+      "status": "unavailable"
+    },
+    {
+      "note": "no codec lane exists for this pair today",
+      "pair": "llama.cpp -> sglang",
+      "receipt": null,
+      "status": "unavailable"
+    },
+    {
+      "note": "no codec lane exists for this pair today",
+      "pair": "sglang -> llama.cpp",
+      "receipt": null,
+      "status": "unavailable"
+    },
+    {
+      "note": "no codec lane exists for this pair today",
+      "pair": "sglang -> mlx",
+      "receipt": null,
+      "status": "unavailable"
+    },
+    {
+      "note": "no codec lane exists for this pair today",
+      "pair": "mlx -> sglang",
+      "receipt": null,
+      "status": "unavailable"
+    }
+  ],
   "lanes": {
     "llamacpp": [
       "--alias",
@@ -290,6 +1244,18 @@
       "--tp-size",
       "--watchdog-timeout"
     ],
+    "vllm": [
+      "--enable-auto-tool-choice",
+      "--enable-prompt-tokens-details",
+      "--gpu-memory-utilization",
+      "--host",
+      "--kv-transfer-config",
+      "--max-model-len",
+      "--max-num-seqs",
+      "--port",
+      "--served-model-name",
+      "--tool-call-parser"
+    ],
     "whisper": [
       "--beam-size",
       "--best-of",
@@ -308,5 +1274,5 @@
       "--word-thold"
     ]
   },
-  "version": 1
+  "version": 3
 }

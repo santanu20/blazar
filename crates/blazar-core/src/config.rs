@@ -2197,6 +2197,14 @@ pub struct VllmTuning {
     /// Persistent KV offloading (opt-in). See [`VllmKvOffload`].
     #[serde(default)]
     pub kv_offload: VllmKvOffload,
+    /// `--tool-call-parser` + `--enable-auto-tool-choice`: the parser
+    /// name rides the spawn verbatim (flag-gated at profile-compile).
+    /// When unset, the profile compiler auto-detects from the model
+    /// family (Qwen -> `hermes`, Llama-3 -> `llama3_json`, ...) and
+    /// emits the pair; families without a stable parser spawn without
+    /// it and `tools` requests keep the engine's explicit 400 instead
+    /// of a wrong parser corrupting calls. An explicit pin always wins.
+    pub tool_call_parser: Option<String>,
 }
 
 /// `[vllm.kv_offload]`: persistent KV reuse for the vllm lane.

@@ -381,6 +381,9 @@ pub async fn ensure_with_admission(
         None => row.name.clone(),
     };
     let lane = lane.as_str();
+    // Stage timing: model resolved + lane chosen - closes the "body"
+    // stage (request parse through routing decision).
+    crate::stage_timing::mark_model_resolved();
 
     let ensure_first = |needs: bool| -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<EngineRef, SupervisionError>> + Send>,
@@ -440,6 +443,9 @@ pub async fn ensure_with_admission(
         }
         Err(e) => return Err(Box::new(supervision_error(&e))),
     };
+    // Stage timing: slot granted (immediately or after queue wait) -
+    // closes the "admission" stage.
+    crate::stage_timing::mark_admitted();
     Ok((engine, started.elapsed().as_millis()))
 }
 
@@ -946,9 +952,14 @@ pub(crate) async fn child_send(
         )
     };
     match ceiling {
-        0 => send.await.map_err(ChildSendError::Transport),
+        0 => send
+            .await
+            .inspect(|_| crate::stage_timing::mark_child_dispatched())
+            .map_err(ChildSendError::Transport),
         secs => match tokio::time::timeout(std::time::Duration::from_secs(secs), send).await {
-            Ok(result) => result.map_err(ChildSendError::Transport),
+            Ok(result) => result
+                .inspect(|_| crate::stage_timing::mark_child_dispatched())
+                .map_err(ChildSendError::Transport),
             Err(_elapsed) => {
                 // Wedged or busy? A buffered (non-stream) long generation
                 // emits headers only at completion - byte-identical to a

@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proxy::{child_auth, child_base, ensure_with_admission, openai_error, resolve_model};
-use crate::queue::{Priority, WorkClass};
+use crate::queue::Priority;
 use crate::state::AppState;
 
 /// How a generations request rides the child.
@@ -1101,6 +1101,7 @@ async fn forward_images(
 }
 
 /// POST /v1/images/generations - text-to-image on a diffusion set.
+#[allow(clippy::too_many_lines)] // validation ladder + admission + child shapes in one handler
 pub async fn generations(
     State(state): State<Arc<AppState>>,
     key_ext: Option<axum::Extension<crate::keys::KeyCtx>>,
@@ -1170,7 +1171,12 @@ pub async fn generations(
         &state,
         &model,
         Priority::Normal,
-        WorkClass::Interactive,
+        crate::workload::classify(
+            &state,
+            crate::workload::WorkloadSurface::ImageGeneration,
+            false,
+            false,
+        ),
         None,
         false, // images: no mmproj lane - the vision encoder rides argv
         true,  // images lane: component sets are its cargo
@@ -1449,7 +1455,12 @@ pub async fn video_generations(
         &state,
         &model,
         Priority::Normal,
-        WorkClass::Interactive,
+        crate::workload::classify(
+            &state,
+            crate::workload::WorkloadSurface::VideoGeneration,
+            false,
+            false,
+        ),
         None,
         false,
         true, // videos lane: component sets are its cargo
@@ -1531,7 +1542,12 @@ pub async fn edits(
         &state,
         &model,
         Priority::Normal,
-        WorkClass::Interactive,
+        crate::workload::classify(
+            &state,
+            crate::workload::WorkloadSurface::ImageGeneration,
+            false,
+            false,
+        ),
         None,
         false,
         true, // images lane: component sets are its cargo
@@ -1711,7 +1727,12 @@ pub async fn variations(
         &state,
         &model,
         Priority::Normal,
-        WorkClass::Interactive,
+        crate::workload::classify(
+            &state,
+            crate::workload::WorkloadSurface::ImageGeneration,
+            false,
+            false,
+        ),
         None,
         false, // img2img needs no vision-encoder sidecar (that is edits cargo)
         true,  // images lane: component sets are its cargo
@@ -2877,7 +2898,12 @@ pub async fn upscale(
             &state,
             model,
             Priority::Normal,
-            WorkClass::Interactive,
+            crate::workload::classify(
+                &state,
+                crate::workload::WorkloadSurface::ImageGeneration,
+                false,
+                false,
+            ),
             None,
             false, // no mmproj lane
             true,  // component sets are the diffusion lane's cargo

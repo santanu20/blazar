@@ -21,7 +21,7 @@ use blazar_core::ModelRow;
 use blazar_core::knob_registry::{MISTRALRS_SUPPORTED, is_flag_token};
 use blazar_core::profile::Endpoint;
 
-use crate::engine_impl::{mistralrs_argv, mlx_argv, sglang_argv};
+use crate::engine_impl::{mistralrs_argv, mlx_argv, sglang_argv, vllm_argv};
 use crate::piper;
 use crate::whisper;
 
@@ -86,6 +86,19 @@ pub fn lane_flags() -> BTreeMap<&'static str, Vec<String>> {
         );
     }
     lanes.insert("mlx", union.into_iter().collect());
+
+    // vLLM: builder pins transport + served name; profile argv rides
+    // after the quintet.
+    let vllm_row = model_row("/models/qwen2.5-0.5b-instruct.d", None, None);
+    let mut union: BTreeSet<String> = lanes["vllm"].iter().cloned().collect();
+    for profile in &profiles["vllm"] {
+        union.extend(
+            vllm_argv(&vllm_row, profile, &endpoint)
+                .into_iter()
+                .filter(|t| is_flag_token(t)),
+        );
+    }
+    lanes.insert("vllm", union.into_iter().collect());
 
     // Whisper: composed directly at spawn, no profile compiler.
     lanes.insert("whisper", whisper::knob_surface());

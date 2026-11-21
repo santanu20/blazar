@@ -482,6 +482,10 @@ def engine_exclusion_reasons(data_dir: Path) -> dict[str, str]:
             "no DB-registered HF safetensors text model on this box - "
             "sglang cells need one (pull a safetensors checkpoint)"
         )
+        reasons["vllm"] = (
+            "no DB-registered HF safetensors text model on this box - "
+            "vllm cells need one (pull a safetensors checkpoint)"
+        )
     if not has_litertlm_model(data_dir):
         reasons["openaihost"] = (
             "no DB-registered .litertlm bundle on this box - openaihost "
@@ -642,12 +646,27 @@ def load_engines(data_dir: Path) -> list[Engine]:
             # + stamps only (same contract as the other media lanes).
             out.append(Engine(tag, kind, edir, None, None, None))
             continue
+        if kind == "kokoro":
+            # Lazy media lane (piper contract): the gateway synthesizes
+            # through the engine-bundled kokoro child on demand; weights
+            # and voices ship inside the engine dir, so the harness only
+            # needs the tag for activation + stamps.
+            out.append(Engine(tag, kind, edir, None, None, None))
+            continue
         if kind == "sglang":
             # venv lane: the gateway spawns the python child through the
             # engine manager; the harness needs the tag for activation
             # + stamps only (same contract as the media lanes, text-
             # side). Swept exactly when a servable safetensors model
             # exists; otherwise excluded with the store-driven reason.
+            if has_text_safetensors_model(data_dir):
+                out.append(Engine(tag, kind, edir, None, None, None))
+            continue
+        if kind == "vllm":
+            # venv lane (sglang contract): the gateway spawns the vllm
+            # child through the engine manager. Swept exactly when a
+            # servable safetensors model exists; otherwise excluded with
+            # the store-driven reason.
             if has_text_safetensors_model(data_dir):
                 out.append(Engine(tag, kind, edir, None, None, None))
             continue
@@ -1850,6 +1869,74 @@ def _tts_input_text(n_chars: int) -> str:
         out.append(s)
         total += len(s) + 1
     return " ".join(out)
+
+
+def run_media_tts_kokoro_cell(cfg: dict) -> dict:
+    """Kokoro TTS lane: engine-bundled synthesizer reached through the
+    gateway's lazy child. Buffered wav only - the kokoro lane rejects
+    streamed formats by design, so there is no pcm/first-chunk number
+    (the piper cell carries that axis).
+
+    The first request pays the lazy child spawn (same cold_request
+    contract as the other lazy media lanes); audio_s comes from the wav
+    layout so RTF is comparable with the piper lane."""
+    voice = "af_heart"
+    rec: dict = {"lane": "tts", "voice": voice, "input_chars": MEDIA_TTS_CHARS}
+    with media_family("tts", ("sdcpp",)) as fam:
+        sampler = Sampler(None)
+        sampler.start()
+        port = fam["port"]
+        try:
+            rec.update(_media_env_stamps())
+            text = _tts_input_text(MEDIA_TTS_CHARS)
+            body = {
+                "model": "kokoro",
+                "input": text,
+                "voice": voice,
+                "response_format": "wav",
+            }
+            wav_runs = []
+            wav_body = b""
+            for i in range(cfg["runs"]):
+                got = http_timed(port, "/v1/audio/speech", body, timeout=300.0)
+                wav_body = got["body"]
+                wav_runs.append(
+                    {
+                        "status": got["status"],
+                        "total_s": got["total_s"],
+                        "bytes": got["bytes"],
+                        "cold_request": i == 0,
+                    }
+                )
+            rec["wav_runs"] = wav_runs
+            lay = wav_layout(wav_body) if wav_body else None
+            if lay:
+                rec["audio_s"] = round(lay["audio_s"], 2)
+                rec["wav_rate"] = lay["rate"]
+                rec["wav_channels"] = lay["channels"]
+                rec["wav_bits"] = lay["bits"]
+            ok_wav = [r for r in wav_runs if r["status"] == 200]
+            if ok_wav:
+                cold = next((r for r in ok_wav if r["cold_request"]), None)
+                if cold:
+                    rec["cold_request_s"] = round(cold["total_s"], 3)
+                warm = [r["total_s"] for r in ok_wav if not r["cold_request"]]
+                if warm:
+                    rec["wav_total_s_median"] = round(
+                        statistics.median(warm), 3
+                    )
+                elif ok_wav:
+                    rec["wav_total_s_median"] = round(
+                        statistics.median([r["total_s"] for r in ok_wav]), 3
+                    )
+                if rec.get("audio_s") and rec.get("wav_total_s_median"):
+                    rec["wav_rtf"] = round(
+                        rec["wav_total_s_median"] / rec["audio_s"], 4
+                    )
+        finally:
+            sampler.stop_evt.set()
+            rec["daemon_log_tail"] = getattr(media_family, "last_log_tail", None)
+    return rec
 
 
 def run_media_tts_cell(cfg: dict) -> dict:
@@ -3157,6 +3244,9 @@ CHILD_ARGV_ELEMENTS: dict[str, tuple[str, ...]] = {
 # [venv/bin/python, venv/bin/litert-lm, serve, --host, ...].
 CHILD_ARGV_BASENAMES: dict[str, tuple[str, ...]] = {
     "openaihost": ("litert-lm",),
+    # vLLM venv shim launches the `vllm` console entry point; the
+    # EngineCore workers inherit the same argv head.
+    "vllm": ("vllm",),
 }
 
 # Everything the /proc pid scan accepts as an engine child (raw bytes,
@@ -7772,8 +7862,8 @@ def main() -> int:
         text_engines = [
             e
             for e in engines
-            if e.kind in ("llamacpp", "mistralrs", "sglang")
-            and (e.kind == "sglang") == model_is_dir
+            if e.kind in ("llamacpp", "mistralrs", "sglang", "vllm")
+            and (e.kind in ("sglang", "vllm")) == model_is_dir
         ]
     if not engines:
         log("no benchable engines discovered")
@@ -8189,6 +8279,7 @@ def main() -> int:
         sdcpp_eng = next((e for e in engines if e.kind == "sdcpp"), None)
         whisper_eng = next((e for e in engines if e.kind == "whisper"), None)
         piper_eng = next((e for e in engines if e.kind == "piper"), None)
+        kokoro_eng = next((e for e in engines if e.kind == "kokoro"), None)
         media_cfg = {"runs": args.media_runs, "art_dir": str(art)}
 
         def store_models() -> dict[str, list]:
@@ -8382,6 +8473,37 @@ def main() -> int:
                 )
         else:
             log("[media tts] no piper engine + voices pair - skipping")
+
+        if kokoro_eng is not None:
+            kokoro_params = {
+                "chars": MEDIA_TTS_CHARS,
+                "runs": media_cfg["runs"],
+            }
+            kokoro_key = cell_key(
+                kokoro_eng.tag, "media-tts", kokoro_params, "af_heart"
+            )
+            if kokoro_key in done:
+                log("[media tts kokoro] resumed - skipping")
+            else:
+                log(
+                    f"[media tts kokoro] af_heart {MEDIA_TTS_CHARS} chars "
+                    "wav (engine-bundled lazy child)"
+                )
+                try:
+                    krec = run_media_tts_kokoro_cell(media_cfg)
+                except Exception as exc:
+                    krec = {"error": f"kokoro tts cell crashed: {exc}"}
+                emit(
+                    kokoro_eng.tag,
+                    "kokoro",
+                    "media-tts",
+                    kokoro_params,
+                    kokoro_key,
+                    krec,
+                    model_name_override="af_heart",
+                )
+        else:
+            log("[media tts kokoro] no kokoro engine - skipping")
 
         whisper_models = Path(args.data_dir).expanduser() / "whisper" / "models"
         if whisper_eng is not None and any(whisper_models.glob("ggml-*.bin")):
@@ -9209,6 +9331,12 @@ def main() -> int:
                     "model-format sweep: this campaign sweeps a GGUF "
                     "file; sglang serves HF safetensors checkpoints "
                     "(rerun with --model <safetensors-row>)"
+                )
+            if kind == "vllm" and "vllm" not in excl_reasons:
+                return (
+                    "model-format sweep: this campaign sweeps a GGUF "
+                    "file; the vllm lane serves HF safetensors "
+                    "checkpoints (rerun with --model <safetensors-row>)"
                 )
             if kind == "openaihost" and "openaihost" not in excl_reasons:
                 return (
@@ -11778,9 +11906,11 @@ def engine_coverage(recs: list[dict]) -> list[str]:
         "sglang": "text (direct venv + gateway)",
         "openaihost": "text (direct venv + gateway)",
         "mlx": "text (direct venv + gateway)",
+        "vllm": "text (gateway venv)",
         "sdcpp": "media",
         "whisper": "media",
         "piper": "media (tts)",
+        "kokoro": "media (tts)",
     }
     out: list[str] = []
     policy = inv.get("engine_policy")

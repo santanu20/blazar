@@ -2,12 +2,15 @@
 //! network - exhaustively unit-testable. Async lifetimes (process
 //! supervision, downloads, HTTP) live in `blazar-runtime`.
 
+pub mod capability_matrix;
 pub mod catalog;
 pub mod config;
 pub mod coreside;
 pub mod dirs;
 pub mod engine_kind;
 pub mod error;
+pub mod execution_plan;
+pub mod feature_policy;
 pub mod fs_safety;
 pub mod gguf;
 pub mod hardware;

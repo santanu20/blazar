@@ -188,9 +188,12 @@ pub fn vllm_block_key(hash: [u8; 32], group_id: u32) -> [u8; 36] {
 // vllm fs-tier layout replica (FileMapper)
 // ---------------------------------------------------------------------------
 
-/// The spawn parameters vllm folds into a tier's identity digest. These
-/// mirror `FileMapper.from_offloading_spec(..., parallel_agnostic=True)`:
-/// tp/pp are pinned to 1 and the agnostic keys are omitted entirely.
+/// The spawn parameters vllm folds into a tier's identity digest -
+/// the exact field set `FileMapper` serializes into `config.json`
+/// beside the tier (vllm 0.34.0, live-captured receipt in
+/// bench-artifacts/2026-11-21-kv-codec-live-certs/). Blazar spawns run
+/// single-rank (tp=pp=pcp=dcp=1, rank 0), so those four stay constants;
+/// the digest still folds them because the engine does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VllmFsSpec {
     /// Model name exactly as passed to vllm - for blazar spawns this is
@@ -201,9 +204,43 @@ pub struct VllmFsSpec {
     pub tokens_per_hash: u32,
     /// Blocks per written file (offloading spec `blocks_per_chunk`).
     pub blocks_per_file: u32,
-    /// Canonical format id (`v1-nhd` for the LBNHC layout flash-attn
-    /// resolves to; present in the digest once the layout resolves).
-    pub canonical_format: String,
+    /// Canonical format id, folded in ONLY when the engine resolved a
+    /// canonical layout (direct spawns carry no such key).
+    pub canonical_format: Option<String>,
+    /// KV dtype the engine runs (`config.model.dtype`, e.g. `bfloat16`).
+    pub dtype: String,
+    /// Attention layer count - becomes the single `kv_cache_group`'s
+    /// `model.layers.{i}.self_attn.attn` name list.
+    pub layers: u32,
+    /// Context/draft parallel sizes (constants on single-rank spawns).
+    pub pcp_size: u32,
+    pub dcp_size: u32,
+    /// Always `vllm` for engine-written tiers.
+    pub inference_engine: String,
+    /// False on real spawns: the key is written with `false`, exactly
+    /// like the engine (only agnostic collapses omit it).
+    pub parallel_agnostic: bool,
+}
+
+impl VllmFsSpec {
+    /// Direct-layout spec for a single-rank spawn: the field set the
+    /// vllm 0.34 `FileMapper` digests for an unsharded `serve` with the
+    /// offloading connector's default (non-canonical) block layout.
+    #[must_use]
+    pub fn direct(model_name: String, tokens_per_hash: u32, layers: u32, dtype: &str) -> Self {
+        Self {
+            model_name,
+            tokens_per_hash,
+            blocks_per_file: 1,
+            canonical_format: None,
+            dtype: dtype.to_string(),
+            layers,
+            pcp_size: 1,
+            dcp_size: 1,
+            inference_engine: "vllm".into(),
+            parallel_agnostic: false,
+        }
+    }
 }
 
 impl VllmFsSpec {
@@ -212,8 +249,20 @@ impl VllmFsSpec {
     /// `config.json`.
     #[must_use]
     pub fn fields_json(&self) -> String {
+        let layer_names: Vec<String> = (0..self.layers)
+            .map(|i| format!("\"model.layers.{i}.self_attn.attn\""))
+            .collect();
+        let groups = format!(
+            "[{{\"layer_names\":[{}],\"tokens_per_block\":{}}}]",
+            layer_names.join(","),
+            self.tokens_per_hash
+        );
         let mut fields: Vec<(&str, String)> = vec![
             ("blocks_per_file", self.blocks_per_file.to_string()),
+            ("dcp_size", self.dcp_size.to_string()),
+            ("dtype", format!("\"{}\"", self.dtype)),
+            ("inference_engine", format!("\"{}\"", self.inference_engine)),
+            ("kv_cache_groups", groups),
             (
                 "model_name",
                 format!(
@@ -221,11 +270,17 @@ impl VllmFsSpec {
                     self.model_name.replace('\\', "\\\\").replace('"', "\\\"")
                 ),
             ),
+            ("pcp_size", self.pcp_size.to_string()),
             ("pp_size", "1".into()),
             ("tokens_per_hash", self.tokens_per_hash.to_string()),
             ("tp_size", "1".into()),
         ];
-        fields.push(("canonical_format", format!("\"{}\"", self.canonical_format)));
+        if !self.parallel_agnostic {
+            fields.push(("parallel_agnostic", "false".into()));
+        }
+        if let Some(cf) = &self.canonical_format {
+            fields.push(("canonical_format", format!("\"{cf}\"")));
+        }
         fields.sort_by(|a, b| a.0.cmp(b.0));
         let body: Vec<String> = fields.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
         format!("{{{}}}", body.join(","))
@@ -250,12 +305,15 @@ impl VllmFsSpec {
     /// Relative path of one block file inside the rank dir.
     #[must_use]
     pub fn block_rel_path(hash_hex: &str, group_idx: u32) -> PathBuf {
+        // Engine layout (vllm 0.34.0, live-captured): the group marker
+        // rides the MIDDLE dir (`<h3>/<h2>_g<N>/<hash>.bin`), not the
+        // file name.
         PathBuf::from(format!(
-            "{}/{}/{}_g{}.bin",
+            "{}/{}_g{}/{}.bin",
             &hash_hex[..3],
             &hash_hex[3..5],
-            hash_hex,
-            group_idx
+            group_idx,
+            hash_hex
         ))
     }
 }
@@ -804,6 +862,42 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn unit__vllm_fs_spec__digest_matches_live_vllm_034_engine_config() {
+        // Golden pin: the canonical JSON and 12-hex digest vllm
+        // 0.34.0's FileMapper actually wrote for the qwen2.5-coder-0.5b
+        // spawn during the 2026-11-21 live codec certification (config
+        // json captured beside the tier, receipt in
+        // bench-artifacts/2026-11-21-kv-codec-live-certs/). Any field
+        // drift here reads the wrong rank dir and the import fails cold.
+        let spec = super::VllmFsSpec::direct(
+            "/home/santanu/.local/share/blazar/models/qwen2.5-coder-0.5b-instruct.d".into(),
+            64,
+            24,
+            "bfloat16",
+        );
+        assert_eq!(spec.digest12(), "22d6ff76ec48");
+        assert_eq!(
+            spec.fields_json(),
+            "{\"blocks_per_file\":1,\"dcp_size\":1,\"dtype\":\"bfloat16\",\"inference_engine\":\"vllm\",\"kv_cache_groups\":[{\"layer_names\":[\"model.layers.0.self_attn.attn\",\"model.layers.1.self_attn.attn\",\"model.layers.2.self_attn.attn\",\"model.layers.3.self_attn.attn\",\"model.layers.4.self_attn.attn\",\"model.layers.5.self_attn.attn\",\"model.layers.6.self_attn.attn\",\"model.layers.7.self_attn.attn\",\"model.layers.8.self_attn.attn\",\"model.layers.9.self_attn.attn\",\"model.layers.10.self_attn.attn\",\"model.layers.11.self_attn.attn\",\"model.layers.12.self_attn.attn\",\"model.layers.13.self_attn.attn\",\"model.layers.14.self_attn.attn\",\"model.layers.15.self_attn.attn\",\"model.layers.16.self_attn.attn\",\"model.layers.17.self_attn.attn\",\"model.layers.18.self_attn.attn\",\"model.layers.19.self_attn.attn\",\"model.layers.20.self_attn.attn\",\"model.layers.21.self_attn.attn\",\"model.layers.22.self_attn.attn\",\"model.layers.23.self_attn.attn\"],\"tokens_per_block\":64}],\"model_name\":\"/home/santanu/.local/share/blazar/models/qwen2.5-coder-0.5b-instruct.d\",\"parallel_agnostic\":false,\"pcp_size\":1,\"pp_size\":1,\"tokens_per_hash\":64,\"tp_size\":1}"
+        );
+    }
+
+    #[test]
+    fn unit__vllm_fs_spec__block_rel_path_matches_engine_layout() {
+        // Live-captured from the same tier: the group marker rides the
+        // middle dir, the file name is the bare hash.
+        assert_eq!(
+            super::VllmFsSpec::block_rel_path(
+                "02b7fc3c7f0ae24ef8ebbdfbc05d11f0b1992752e46cdeff8a356240a86d0676",
+                0
+            )
+            .to_str()
+            .unwrap(),
+            "02b/7f_g0/02b7fc3c7f0ae24ef8ebbdfbc05d11f0b1992752e46cdeff8a356240a86d0676.bin"
+        );
+    }
+
     fn hexhash(s: &str) -> String {
         let mut h = Sha256::new();
         h.update(s.as_bytes());
@@ -863,28 +957,19 @@ mod tests {
 
     #[test]
     fn unit__vllm_fs_spec__digest_matches_vllm_canonical_json() {
-        // Digest computed by vllm's FileMapper over these fields.
-        let spec = VllmFsSpec {
-            model_name: "qwen".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
-        assert_eq!(spec.digest12(), "b3bb9d5340d7");
+        // Digest recomputed over the engine's full field set (vllm
+        // 0.34.0 FileMapper): canonical json.dumps sort_keys shape.
+        let spec = VllmFsSpec::direct("qwen".into(), 64, 2, "bfloat16");
+        assert_eq!(spec.digest12(), "49c303656ca2");
         assert_eq!(
             spec.fields_json(),
-            "{\"blocks_per_file\":1,\"canonical_format\":\"v1-nhd\",\"model_name\":\"qwen\",\"pp_size\":1,\"tokens_per_hash\":64,\"tp_size\":1}"
+            "{\"blocks_per_file\":1,\"dcp_size\":1,\"dtype\":\"bfloat16\",\"inference_engine\":\"vllm\",\"kv_cache_groups\":[{\"layer_names\":[\"model.layers.0.self_attn.attn\",\"model.layers.1.self_attn.attn\"],\"tokens_per_block\":64}],\"model_name\":\"qwen\",\"parallel_agnostic\":false,\"pcp_size\":1,\"pp_size\":1,\"tokens_per_hash\":64,\"tp_size\":1}"
         );
     }
 
     #[test]
     fn unit__vllm_fs_spec__model_paths_are_slash_safe_and_ranked() {
-        let spec = VllmFsSpec {
-            model_name: "/data/models/qwen.d".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("/data/models/qwen.d".into(), 64, 2, "bfloat16");
         let d = spec.rank_dir(Path::new("/kv"));
         // rank_dir joins a real host directory, so the separator between
         // root and name is platform-owned; assert on the separator-stable
@@ -895,7 +980,7 @@ mod tests {
         assert!(name.to_string_lossy().ends_with("_r0"));
         assert_eq!(
             VllmFsSpec::block_rel_path("abcdef0123456789", 0),
-            PathBuf::from("abc/de/abcdef0123456789_g0.bin")
+            PathBuf::from("abc/de_g0/abcdef0123456789.bin")
         );
     }
 
@@ -1180,12 +1265,7 @@ mod tests {
         let cells = 130u32; // 2 full 64-blocks + 2 tail tokens
         let buf = synthetic_bank(cells, false);
         let bank = parse_slot_save(&buf, &geo()).expect("walk");
-        let spec = VllmFsSpec {
-            model_name: "m".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("m".into(), 64, 2, "bfloat16");
         let out = repack_into_fs_tier(&bank, &geo(), &spec, dir.path()).expect("repack");
         assert_eq!(out.blocks_written, 2);
         assert_eq!(out.tail_tokens_dropped, 2);
@@ -1208,7 +1288,15 @@ mod tests {
         ));
         assert_eq!(
             out.files[0].file_name().unwrap().to_string_lossy(),
-            format!("{h1}_g0.bin")
+            format!("{h1}.bin")
+        );
+        assert!(
+            out.files[0]
+                .parent()
+                .and_then(|d| d.file_name())
+                .is_some_and(|n| n.to_string_lossy().ends_with("_g0")),
+            "group marker rides the middle dir: {:?}",
+            out.files[0]
         );
         let _ = hexhash("unused");
     }
@@ -1218,12 +1306,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let buf = synthetic_bank(64, false);
         let bank = parse_slot_save(&buf, &geo()).expect("walk");
-        let spec = VllmFsSpec {
-            model_name: "m".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("m".into(), 64, 2, "bfloat16");
         repack_into_fs_tier(&bank, &geo(), &spec, dir.path()).expect("first");
         // Same digest, hand-tampered identity file: the defense catches
         // a tier dir whose config.json disagrees with the spec.

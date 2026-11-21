@@ -72,6 +72,30 @@
       "flag": "--beam-size",
       "receipt": "bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md",
       "note": "beam-5 child; piper-TTS wav transcribed exactly"
+    },
+    {
+      "lane": "vllm",
+      "flag": "--served-model-name",
+      "receipt": "bench-artifacts/20261120-kokoro-vllm-cert/README.md",
+      "note": "E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): child argv observed with sanitized name; request model string resolved"
+    },
+    {
+      "lane": "vllm",
+      "flag": "--max-model-len",
+      "receipt": "bench-artifacts/20261120-kokoro-vllm-cert/README.md",
+      "note": "E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): clamped 32768->16384 per ctx policy, child argv observed"
+    },
+    {
+      "lane": "vllm",
+      "flag": "--gpu-memory-utilization",
+      "receipt": "bench-artifacts/20261120-kokoro-vllm-cert/README.md",
+      "note": "E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): default 0.85 in child argv; 8 GB lane served + idle reaped to 16 MiB"
+    },
+    {
+      "lane": "vllm",
+      "flag": "--enable-prompt-tokens-details",
+      "receipt": "bench-artifacts/20261120-kokoro-vllm-cert/README.md",
+      "note": "E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): usage.prompt_tokens_details.cached_tokens present in gateway response"
     }
   ]
 }

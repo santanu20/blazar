@@ -1275,12 +1275,7 @@ mod tests {
     #[test]
     fn unit__carrier__vllm_export_is_byte_identical_to_repack() {
         let b = bank();
-        let spec = VllmFsSpec {
-            model_name: "m".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("m".into(), 64, 2, "bfloat16");
         let left = tempfile::tempdir().unwrap();
         let right = tempfile::tempdir().unwrap();
         let via_carrier = carrier_into_vllm_tier(
@@ -1333,12 +1328,7 @@ mod tests {
     #[test]
     fn unit__reverse_codec__tier_roundtrip_restores_the_original_bank() {
         let b = bank();
-        let spec = VllmFsSpec {
-            model_name: "m".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("m".into(), 64, 2, "bfloat16");
         let geo = geo();
         let dir = tempfile::tempdir().unwrap();
         // Forward: bank -> tier (two full blocks).
@@ -1363,12 +1353,7 @@ mod tests {
     #[test]
     fn unit__reverse_codec__stops_at_first_missing_block_and_reports() {
         let b = bank();
-        let spec = VllmFsSpec {
-            model_name: "m".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("m".into(), 64, 2, "bfloat16");
         let geo = geo();
         let dir = tempfile::tempdir().unwrap();
         repack_into_fs_tier(&b, &geo, &spec, dir.path()).unwrap();
@@ -1408,12 +1393,7 @@ mod tests {
 
     #[test]
     fn unit__reverse_codec__empty_tier_refuses_with_a_teaching() {
-        let spec = VllmFsSpec {
-            model_name: "m".into(),
-            tokens_per_hash: 64,
-            blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
-        };
+        let spec = VllmFsSpec::direct("m".into(), 64, 2, "bfloat16");
         let dir = tempfile::tempdir().unwrap();
         let tokens: Vec<u32> = (0..128).collect();
         let err = vllm_tier_to_carrier(dir.path(), &spec, &tokens, &geo()).unwrap_err();
@@ -1653,7 +1633,13 @@ mod tests {
             model_name: "/models/qwen.d".into(),
             tokens_per_hash: 64,
             blocks_per_file: 1,
-            canonical_format: "v1-nhd".into(),
+            canonical_format: None,
+            dtype: "bfloat16".into(),
+            layers: 2,
+            pcp_size: 1,
+            dcp_size: 1,
+            inference_engine: "vllm".into(),
+            parallel_agnostic: false,
         };
         let outcome = carrier_into_vllm_tier(&carrier, &spec, &dir).unwrap();
         assert_eq!(outcome.blocks_written, 1);

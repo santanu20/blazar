@@ -266,7 +266,12 @@ pub async fn embeddings(
         &state,
         &model,
         crate::queue::Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        crate::workload::classify(
+            &state,
+            crate::workload::WorkloadSurface::Embeddings,
+            false,
+            false,
+        ),
         None,
         false, // embeddings: text-only
         false, // text surface: diffusion rows teach the images lane
@@ -1056,6 +1061,22 @@ pub async fn openai_proxy(
         // dispatch carries enough state to push those past the size lint.
         return Box::pin(crate::pd::pd_two_phase(&state, &model, &body)).await;
     }
+    // One workload classification per request. The surface derives
+    // from the URI (the embeddings and rerank/score/decisions family
+    // ride this proxy too), and both admission points below reuse the
+    // descriptor so the request is counted exactly once.
+    let workload_surface = if uri.path().ends_with("/embeddings") {
+        crate::workload::WorkloadSurface::Embeddings
+    } else if uri.path().contains("rerank")
+        || uri.path().ends_with("/score")
+        || uri.path().ends_with("/decisions")
+    {
+        crate::workload::WorkloadSurface::Rerank
+    } else {
+        crate::workload::WorkloadSurface::Chat
+    };
+    let workload_class =
+        crate::workload::classify(&state, workload_surface, body_has_tools(&body), false);
     let prefix = if chat_family {
         affinity_hash_bytes(&body)
     } else {
@@ -1065,7 +1086,7 @@ pub async fn openai_proxy(
         &state,
         &model,
         priority,
-        crate::queue::classify_work(body_has_tools(&body), false),
+        workload_class,
         prefix,
         parsed_body
             .as_ref()
@@ -1236,7 +1257,7 @@ pub async fn openai_proxy(
         &state,
         &model_name,
         priority,
-        crate::queue::classify_work(body_has_tools(&body), false),
+        workload_class,
         deadline_ms,
         body.len(),
         wfq_of(key_ext.as_ref()),
@@ -1997,7 +2018,12 @@ pub async fn scoped_proxy(
             .get("x-blazar-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let class = crate::queue::classify_work(body_has_tools(&body), false);
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Chat,
+        body_has_tools(&body),
+        false,
+    );
     let (engine, load_ms) = match ensure_with_admission(
         &state, &model, priority, class, None, false, false, false, true,
     )
@@ -2015,7 +2041,7 @@ pub async fn scoped_proxy(
         &state,
         &model_name,
         priority,
-        crate::queue::classify_work(body_has_tools(&body), false),
+        class,
         deadline_ms,
         body.len(),
         wfq_of(key_ext.as_ref()),
@@ -2244,11 +2270,17 @@ pub async fn responses_api(
             .get("x-blazar-priority")
             .and_then(|v| v.to_str().ok()),
     );
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Chat,
+        body_has_tools(&body),
+        false,
+    );
     let (engine, load_ms) = match ensure_with_admission(
         &state,
         &model,
         priority,
-        crate::queue::classify_work(body_has_tools(&body), false),
+        class,
         affinity_hash_bytes(&body),
         serde_json::from_slice::<serde_json::Value>(&body)
             .is_ok_and(|b| crate::proxy::body_needs_vision(&b, false)),
@@ -2266,7 +2298,7 @@ pub async fn responses_api(
         &state,
         &model_name,
         priority,
-        crate::queue::classify_work(body_has_tools(&body), false),
+        class,
         None,
         0,
         wfq_of(key_ext.as_ref()),

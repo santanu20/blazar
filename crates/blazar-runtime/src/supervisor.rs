@@ -63,7 +63,7 @@ fn local_http() -> &'static reqwest::Client {
 /// socket-pinned client - these calls run once per spawn or idle
 /// transition, so there is no pool worth warming. The unix base's host
 /// is a placeholder the connector ignores; only the path is dialed.
-fn child_dial(endpoint: &blazar_core::Endpoint) -> (reqwest::Client, String) {
+pub(crate) fn child_dial(endpoint: &blazar_core::Endpoint) -> (reqwest::Client, String) {
     match endpoint {
         blazar_core::Endpoint::Tcp { host, port } => {
             (local_http().clone(), format!("http://{host}:{port}"))
@@ -7189,6 +7189,32 @@ impl Supervisor {
                         let _ = child.reap().await;
                         continue;
                     }
+                    // Effective-config verification (llama.cpp lane):
+                    // the child's /props is the runtime truth of what it
+                    // booted with; the argv is only what we asked for.
+                    // Inline + bounded (one loopback GET) so a mismatch
+                    // is named BEFORE any traffic, bank restore or warmup
+                    // touches the child. Warn-only: a healthy child with
+                    // drifted shape is reported, never rejected.
+                    let effective_warnings =
+                        if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp {
+                            crate::effective::probe_llamacpp(
+                                &endpoint,
+                                auth.as_ref().map(|a| a.secret.as_str()),
+                                &argv,
+                            )
+                            .await
+                        } else {
+                            Vec::new()
+                        };
+                    if effective_warnings.is_empty() {
+                        tracing::debug!(model = name, "effective config verified against /props");
+                    } else {
+                        for w in &effective_warnings {
+                            tracing::warn!(target: "blazar::effective", model = name, "{w}");
+                        }
+                    }
+
                     // Bank restore, choke point #2 - SYNCHRONOUS and
                     // BEFORE any generation touches the child (the
                     // warm-peg below included): a slot restore that
@@ -7310,6 +7336,11 @@ impl Supervisor {
                     }
                     let autofit_model_name = model.name.clone();
                     let np_at_spawn = argv_np(&argv);
+                    // Profile-compile warnings first, then any effective-
+                    // config findings from the /props probe above - one
+                    // list, surfaced through ps/show + tracing.
+                    let mut instance_warnings = profile.warnings.clone();
+                    instance_warnings.extend(effective_warnings);
                     let inst = Arc::new(Instance {
                         name: key.to_string(),
                         // routed adapter or daemon global - whichever
@@ -7340,7 +7371,7 @@ impl Supervisor {
                             placement_device_id.clone()
                         },
                         kv_est_bytes: profile.kv_est_bytes,
-                        warnings: profile.warnings.clone(),
+                        warnings: instance_warnings,
                         spec_mode: spec_mode.clone(),
                         draft: draft_path.as_deref().map(|p| {
                             std::path::Path::new(p)

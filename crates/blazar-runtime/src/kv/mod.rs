@@ -6,6 +6,7 @@
 //! other engine kind. Unsupported is a *capability statement*: callers
 //! fall back to cold prefill, never to a simulated transfer.
 
+pub mod certification;
 pub mod compatibility;
 pub mod interchange;
 pub mod inventory;

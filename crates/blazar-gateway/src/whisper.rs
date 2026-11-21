@@ -1704,7 +1704,12 @@ async fn engine_asr_lane(
         state,
         &row.name,
         crate::queue::Priority::Normal,
-        crate::queue::WorkClass::Interactive,
+        crate::workload::classify(
+            state,
+            crate::workload::WorkloadSurface::Transcription,
+            false,
+            false,
+        ),
         None,
         true, // sidecar-attached instance (audio tower rides mmproj)
         false,

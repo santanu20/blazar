@@ -235,7 +235,9 @@ pub async fn messages(
     let prefix = crate::proxy::affinity_hash_bytes(
         &serde_json::to_vec(&openai_body).unwrap_or_else(|_| body.to_vec()),
     );
-    let class = crate::queue::classify_work(
+    let class = crate::workload::classify(
+        &state,
+        crate::workload::WorkloadSurface::Chat,
         openai_body
             .get("tools")
             .is_some_and(serde_json::Value::is_array),

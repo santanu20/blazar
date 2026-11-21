@@ -177,6 +177,13 @@ pub struct AppState {
     /// vLLM-style evidence loop: measured at the proxy, owned by the gateway.
     pub ttft: Histogram,
     pub tpot: Histogram,
+    /// Request stage timing (F5): per-request boundary stamps from the
+    /// middleware chokepoints, aggregated here - splits gateway overhead
+    /// (auth/body/admission/dispatch) from engine time (ttft/stream).
+    pub stage: crate::stage_timing::StageTimings,
+    /// Workload descriptor counters (B6): one per request, labeled by
+    /// the dialect-neutral kind - `blazar_workload_requests_total`.
+    pub workload: [std::sync::atomic::AtomicU64; crate::workload::WorkloadKind::ALL.len()],
     /// Prompt-cache observability (R6/R7-lite): gateway-side usage
     /// classification + warm/cold TTFT split. Arc so stream closures and
     /// drop-finishers can own it without the whole state.
@@ -626,6 +633,8 @@ impl AppState {
             cache_bust: Arc::new(crate::cache_bust::CacheBustTracker::new()),
             ttft: crate::histogram::ttft(),
             tpot: crate::histogram::tpot(),
+            stage: crate::stage_timing::StageTimings::new(),
+            workload: core::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             obs: Arc::new(CacheObs::new()),
             semcache: Arc::new(SemanticCache::new()),
             sem: Arc::new(SemMetrics::default()),

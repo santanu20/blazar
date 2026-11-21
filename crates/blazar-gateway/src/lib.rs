@@ -29,8 +29,10 @@ pub mod pd;
 pub mod quantiles;
 pub mod requests;
 pub mod sglang_native;
+pub mod stage_timing;
 pub mod usage;
 pub mod voice_tee;
+pub mod workload;
 
 pub mod failover;
 pub mod keys;
@@ -142,6 +144,9 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
                         name: k.name.clone(),
                         weight: k.effective_weight(),
                     });
+                    // Stage timing: key resolved + lease held - everything
+                    // before this was the auth stage proper.
+                    stage_timing::mark_auth_done();
                     let resp = next.run(req).await;
                     let mut resp = keys::guard_response(resp, lease);
                     // F64: request_log now runs OUTSIDE auth and can no
@@ -164,6 +169,9 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
             }
         }
     }
+    // Keyless gateway (or self-gated route): the auth stage is the
+    // pass-through check itself, and it just completed.
+    stage_timing::mark_auth_done();
     next.run(req).await
 }
 
@@ -292,7 +300,12 @@ async fn request_log(
     let span_start_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let mut resp = next.run(req).await;
+    // Stage timing: boundaries for this request travel on the task for
+    // the shared chokepoints (auth, admission, dispatch) to stamp; the
+    // tap and finalize closures below keep clones for the token stages.
+    let stage_trace = std::sync::Arc::new(stage_timing::StageTrace::new());
+    let mut resp =
+        stage_timing::StageTrace::scope(std::sync::Arc::clone(&stage_trace), next.run(req)).await;
     let ms = started.elapsed().as_millis();
     let status = resp.status().as_u16();
     if let Ok(v) = axum::http::HeaderValue::from_str(&trace) {
@@ -385,6 +398,14 @@ async fn request_log(
             "request"
         );
     }
+    // Stage timing: lanes WITHOUT the usage tap (non-generation or
+    // non-2xx) observe here at header time - their stages end at
+    // dispatch or earlier, and the missing token boundaries leave those
+    // stages unobserved rather than extrapolated. Tapped lanes observe
+    // in the finalize closure instead (it sees the token boundaries).
+    if !(usage_lane && (200..300).contains(&status)) {
+        state.stage.observe(&stage_trace);
+    }
     // F4 usage: re-stream successful generation-lane responses through
     // a tap that keeps the last 8 KiB (usage JSON rides the final
     // chunk in every dialect) plus first/last chunk timings. The meter
@@ -424,12 +445,17 @@ async fn request_log(
             ..UsageTap::default()
         }));
         let tap_map = std::sync::Arc::clone(&tap);
+        // Stage timing: the tap polls on the connection's task, past the
+        // task-local scope - it stamps the token boundaries on this
+        // captured handle directly.
+        let stage_tap = std::sync::Arc::clone(&stage_trace);
         let metered = futures::StreamExt::map(body.into_data_stream(), move |chunk| {
             if let Ok(bytes) = chunk.as_ref() {
                 let mut t = tap_map.lock().expect("usage tap poisoned");
                 let now = std::time::Instant::now();
                 t.first.get_or_insert(now);
                 t.last = Some(now);
+                stage_timing::note_chunk(&stage_tap, t.first, now);
                 // Keep the trailing window; the usage object is in the
                 // final SSE/NDJSON line, never the head.
                 t.tail.extend_from_slice(bytes);
@@ -449,6 +475,11 @@ async fn request_log(
         // per-model EWMA (see `pools::score_members_core`). Cloned
         // here because the finalize closure below owns its world.
         let ttft_map = std::sync::Arc::clone(&state.ttft_ewma_local);
+        // Stage timing: same ownership rule - the finalize closure runs
+        // on the connection task, past the request's task-local scope,
+        // so it observes the captured trace handle directly.
+        let stage_close = std::sync::Arc::clone(&stage_trace);
+        let gateway_state = std::sync::Arc::clone(&state);
         let finalized = futures::StreamExt::chain(
             metered,
             futures::stream::once(async move {
@@ -505,6 +536,10 @@ async fn request_log(
                         entry.1 = std::time::Instant::now();
                     }
                 }
+                // Stream-lane requests skip the mid-handler observe;
+                // this is where their trace lands (last_token is final
+                // by now - the chain's end runs after the body closed).
+                gateway_state.stage.observe(&stage_close);
                 Ok::<axum::body::Bytes, axum::Error>(axum::body::Bytes::new())
             }),
         );

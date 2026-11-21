@@ -27,7 +27,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{
-    Config, MistralrsTuning, MlxTuning, ModelOverride, SamplerDefaults, SglangTuning,
+    Config, KvConnectorChoice, MistralrsTuning, MlxTuning, ModelOverride, SamplerDefaults,
+    SglangTuning, VllmKvOffload, VllmTuning,
 };
 use crate::engine_kind::EngineKind;
 use crate::gguf::GgufMeta;
@@ -485,13 +486,32 @@ const SGLANG_SUPPORTED: &[&str] = &[
     "-np",
 ];
 
+/// Manifest superset for the vllm lane: the connection quintet plus the
+/// compile grammar (`compile_vllm`). Fixture posture, same rule as the
+/// other lanes - inert extras never emit, which keeps them harmless.
+const VLLM_SUPPORTED: &[&str] = &[
+    "--host",
+    "--port",
+    "--served-model-name",
+    "--api-key",
+    "--max-model-len",
+    "--gpu-memory-utilization",
+    "--max-num-seqs",
+    "--enable-prefix-caching",
+    "--kv-cache-dtype",
+    "--enable-prompt-tokens-details",
+    "--kv-transfer-config",
+    "--enable-auto-tool-choice",
+    "--tool-call-parser",
+];
+
 /// First-class flag tokens per lane, in sorted order, as compiled from the
 /// fixture matrix in this module. Keys are the engine lane names used by
 /// `scripts/first_class_flags.json` and the capability auditor.
 ///
 /// This is the COMPILE-time slice only: llama.cpp and stable-diffusion.cpp
-/// children spawn `profile.argv` verbatim, but mistral.rs, `SGLang` and `MLX`
-/// add flags in their spawn-time argv builders -
+/// children spawn `profile.argv` verbatim, but mistral.rs, `SGLang`, `MLX`
+/// and `vLLM` add flags in their spawn-time argv builders -
 /// `blazar_runtime::knob_registry::lane_flags` folds those in and is the
 /// function behind the committed registry JSON.
 #[must_use]
@@ -502,11 +522,13 @@ pub fn lane_flags() -> BTreeMap<&'static str, Vec<String>> {
         ("sglang", sglang_lane()),
         ("sdcpp", sdcpp_lane()),
         ("mlx", mlx_lane()),
+        ("vllm", vllm_lane()),
     ])
 }
 
-/// Compiled fixture profiles for the three lanes whose spawn-time argv
-/// builders translate or extend the profile (mistral.rs, `SGLang`, `MLX`).
+/// Compiled fixture profiles for the four lanes whose spawn-time argv
+/// builders translate or extend the profile (mistral.rs, `SGLang`, `MLX`,
+/// `vLLM`).
 /// llama.cpp and stable-diffusion.cpp children run `profile.argv`
 /// verbatim, so for those lanes the compile-time token union in
 /// [`lane_flags`] is already the full spawn truth. The runtime registry
@@ -518,6 +540,7 @@ pub fn lane_profiles() -> BTreeMap<&'static str, Vec<Profile>> {
         ("mistralrs", mistralrs_profiles()),
         ("sglang", sglang_profiles()),
         ("mlx", mlx_profiles()),
+        ("vllm", vllm_profiles()),
     ])
 }
 
@@ -1561,6 +1584,90 @@ fn mlx_profiles() -> Vec<Profile> {
     profiles
 }
 
+fn vllm_lane() -> Vec<String> {
+    lane_tokens(&vllm_profiles())
+}
+
+/// vllm emission postures. The compile grammar pins geometry and the
+/// memory fraction on every spawn, the reuse-reporting flag rides along,
+/// concurrency emits only on a slots pin, and the persistent-KV offload
+/// connector is opt-in. The runtime half adds the connection quintet
+/// (`vllm_argv`), so the compile slice here is deliberately small -
+/// emission truth, not the upstream help surface.
+fn vllm_profiles() -> Vec<Profile> {
+    let hf = hf_meta();
+    let hw = gpu_hw(12_000, 32_000, 8);
+    let flags = supported(VLLM_SUPPORTED);
+    let base = Config::default();
+    let plain = ModelOverride::default();
+    let mut profiles = Vec::new();
+
+    // Baseline: geometry + memory fraction + reuse reporting only.
+    absorb(
+        &mut profiles,
+        &base_input(
+            EngineKind::Vllm,
+            ModelMeta::Hf(&hf),
+            988 * MIB,
+            &hw,
+            &base,
+            &plain,
+            &flags,
+        ),
+        &TuningOverrides::default(),
+    );
+
+    // Slots pin posture: --max-num-seqs rides the admission cap.
+    let slots_pin = ModelOverride {
+        slots: Some(4),
+        ..ModelOverride::default()
+    };
+    absorb(
+        &mut profiles,
+        &base_input(
+            EngineKind::Vllm,
+            ModelMeta::Hf(&hf),
+            988 * MIB,
+            &hw,
+            &base,
+            &slots_pin,
+            &flags,
+        ),
+        &TuningOverrides::default(),
+    );
+
+    // Tuning posture: utilization pin plus the persistent-KV offload
+    // connector (OffloadingConnector with a pinned CPU tier).
+    let knobs = Config {
+        vllm: VllmTuning {
+            gpu_memory_utilization: Some(0.6),
+            kv_offload: VllmKvOffload {
+                enabled: true,
+                cpu_bytes_gib: 2,
+                root_dir: None,
+                connector: KvConnectorChoice::default(),
+            },
+            tool_call_parser: None,
+        },
+        ..Config::default()
+    };
+    absorb(
+        &mut profiles,
+        &base_input(
+            EngineKind::Vllm,
+            ModelMeta::Hf(&hf),
+            988 * MIB,
+            &hw,
+            &knobs,
+            &plain,
+            &flags,
+        ),
+        &TuningOverrides::default(),
+    );
+
+    profiles
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -1569,7 +1676,7 @@ mod tests {
     #[test]
     fn unit__knob_registry__every_lane_emits_flags() {
         let lanes = lane_flags();
-        assert_eq!(lanes.len(), 5, "five compile lanes");
+        assert_eq!(lanes.len(), 6, "six compile lanes");
         for (lane, flags) in &lanes {
             assert!(
                 !flags.is_empty(),
@@ -1577,6 +1684,26 @@ mod tests {
             );
             // Tokens are flags, sorted, unique by construction (BTreeSet).
             assert!(flags.iter().all(|f| is_flag_token(f)));
+        }
+    }
+
+    #[test]
+    fn unit__knob_registry__vllm_first_class_knobs_present() {
+        // The vllm lane is new to the registry: pin the headline members
+        // so the lane can never silently regress to empty.
+        let lanes = lane_flags();
+        let vllm = &lanes["vllm"];
+        for expected in [
+            "--max-model-len",
+            "--gpu-memory-utilization",
+            "--max-num-seqs",
+            "--enable-prompt-tokens-details",
+            "--kv-transfer-config",
+        ] {
+            assert!(
+                vllm.contains(&expected.to_string()),
+                "vllm registry missing {expected}: {vllm:?}"
+            );
         }
     }
 

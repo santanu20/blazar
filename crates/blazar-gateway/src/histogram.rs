@@ -62,6 +62,25 @@ impl Histogram {
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one observation in nanoseconds - the unit stage stamps
+    /// already carry (elapsed-nanos boundaries), so the caller avoids a
+    /// lossy ns->f64->ns round trip. Same validation as `observe_secs`.
+    pub fn observe_ns(&self, ns: u64) {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "bucket lookup needs f64; ns values here are latency-scale, well inside exact range"
+        )]
+        let secs = ns as f64 / 1e9;
+        if !(secs.is_finite() && secs >= 0.0) {
+            return;
+        }
+        if let Some(i) = self.bounds.iter().position(|b| secs <= *b) {
+            self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Append `# HELP/# TYPE`, cumulative `_bucket{le=...}` lines, `_sum`,
     /// `_count` in Prometheus exposition format.
     #[allow(

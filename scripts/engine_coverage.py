@@ -59,16 +59,28 @@ Non-flag scope dispositions (documented, not flag-level):
     pinned by the registry, per-component behavior against real models is
     tracked by the benchmark harness, not this audit.
 
+Capability matrix: alongside per-flag dispositions, the registry's
+`capabilities` section (from
+crates/blazar-core/src/capability_matrix.rs) dispositions each lane
+against the canonical capability families with an evidence status
+(probed / first_class / live_certified / passthrough / unsupported) and,
+for live_certified rows, a receipt artifact. The --check gate validates
+family completeness and ordering, receipt existence, and that matrix
+flags are actually reachable (emitted or probed) on their lane.
+
 Modes:
   (default)   human-readable matrix to stdout
   --json      machine-readable dump (disposition per flag)
   --markdown  regenerate docs/engine-coverage.md (byte-stable, no
               timestamps - the --check gate compares bytes)
   --refresh   snapshot the live store's engine manifests into
-              scripts/manifest_flag_fixtures.json, then regenerate the
+              scripts/manifest_flag_fixtures.json, print a
+              capability-difference report (engine churn + disposition
+              deltas vs the committed fixtures), then regenerate the
               doc from the new fixtures (commit both together)
-  --check     CI gate: fixtures + registry + generated doc are present,
-              valid, and mutually consistent (doc matches regeneration)
+  --check     CI gate: fixtures + registry + capabilities + generated
+              doc are present, valid, and mutually consistent (doc
+              matches regeneration)
 
 Store discovery for --refresh: $BLAZAR_DB, else XDG-style data dir
 (XDG_DATA_HOME, falling back to the platform default), matching
@@ -149,17 +161,14 @@ RESERVED: dict[str, list[str]] = {
     # llamacpp: no reserved set - extra_args ride verbatim.
 }
 
-# Lanes the emission-truth registry does not cover yet. knob_registry.rs
-# owns llamacpp/mistralrs/sglang/sdcpp/mlx; whisper and piper ride
-# knob_surface(). Kokoro composes its argv inside the lazily-spawned
-# python shim (kokoro-onnx), outside both - its fixture probes flags,
-# but Blazar emits none first-class, and a zero-flag lane is not a valid
-# registry entry. vLLM is the newest lane: compile_vllm owns a small
-# grammar (--max-model-len, --gpu-memory-utilization, --max-num-seqs)
-# validated at unit tier, and the per-lane registry emission +
-# certification receipts land with the incremental vllm wave - until
-# then every probed vllm flag reports unverified, not passthrough.
-LANES_WITHOUT_REGISTRY: set[str] = {"kokoro", "vllm"}
+# Lanes whose flags cannot earn a disposition from the registry yet.
+# knob_registry.rs owns llamacpp/mistralrs/sglang/sdcpp/mlx/vllm;
+# whisper and piper ride knob_surface(). Kokoro composes its argv
+# inside the lazily-spawned python shim (kokoro-onnx), outside both -
+# its fixture probes flags, but Blazar emits none first-class, and a
+# zero-flag lane is not a valid registry entry. Every probed kokoro
+# flag therefore reports unverified, not passthrough.
+LANES_DISPOSITION_ONLY: set[str] = {"kokoro"}
 # Lanes with NO extra_args surface: argv is composed per call by Blazar,
 # so a non-first-class flag is unreachable, not passthrough. Piper is a
 # one-shot synthesizer spawn (no config knob, no user argv tail).
@@ -378,7 +387,7 @@ def default_store() -> Path:
 
 def load_registry() -> dict[str, list[str]]:
     doc = json.loads(REGISTRY.read_text())
-    if doc.get("version") != 1:
+    if doc.get("version") != 3:
         raise SystemExit(f"{REGISTRY}: unsupported schema version")
     lanes = doc["lanes"]
     for lane, flags in lanes.items():
@@ -387,6 +396,192 @@ def load_registry() -> dict[str, list[str]]:
         if flags != sorted(set(flags)):
             raise SystemExit(f"{REGISTRY}: lane {lane} is not sorted-unique")
     return lanes
+
+
+# The ten capability families every lane's matrix must disposition
+# exactly once, in this order (mirrors CANONICAL_FAMILIES in
+# crates/blazar-core/src/capability_matrix.rs - update both together).
+CANONICAL_FAMILIES: list[str] = [
+    "batching_scheduling",
+    "kv_cache_quantization",
+    "prefix_caching",
+    "speculative_decoding",
+    "multi_gpu_parallelism",
+    "memory_offload",
+    "structured_output",
+    "lora",
+    "multimodal",
+    "cancellation_streaming",
+]
+CAPABILITY_EVIDENCE: set[str] = {
+    "probed",
+    "first_class",
+    "live_certified",
+    "passthrough",
+    "unsupported",
+}
+
+
+def load_capabilities() -> dict[str, list[dict[str, object]]]:
+    """Structural parse of the capability matrix riding the registry.
+
+    Semantic checks (receipt existence, family completeness, flag
+    reachability) live in check_capabilities so --check can report them
+    as gate failures instead of aborts.
+    """
+    doc = json.loads(REGISTRY.read_text())
+    if doc.get("version") != 3:
+        raise SystemExit(f"{REGISTRY}: capabilities need schema version 3")
+    caps = doc.get("capabilities")
+    if not isinstance(caps, dict) or not caps:
+        raise SystemExit(f"{REGISTRY}: capabilities section missing")
+    for lane, rows in caps.items():
+        if not isinstance(rows, list) or not rows:
+            raise SystemExit(f"{REGISTRY}: capability lane {lane} is empty")
+        for row in rows:
+            if not isinstance(row, dict):
+                raise SystemExit(f"{REGISTRY}: {lane} capability row not an object")
+            if row.get("evidence") not in CAPABILITY_EVIDENCE:
+                raise SystemExit(
+                    f"{REGISTRY}: {lane} family {row.get('family')!r} has "
+                    f"unknown evidence {row.get('evidence')!r}"
+                )
+    return caps
+
+
+# Cross-engine KV interop verdicts (mirrors KvCertStatus in
+# crates/blazar-runtime/src/kv/certification.rs - update both together).
+KV_CERT_STATUSES: set[str] = {
+    "exact",
+    "live_certified",
+    "codec_shipped",
+    "unavailable",
+}
+KV_CERT_ENGINES: list[str] = ["llama.cpp", "vllm", "sglang", "mlx"]
+
+
+def load_kv_matrix() -> list[dict[str, object]]:
+    """Structural parse of the KV certification matrix."""
+    doc = json.loads(REGISTRY.read_text())
+    rows = doc.get("kv_matrix")
+    if not isinstance(rows, list) or not rows:
+        raise SystemExit(f"{REGISTRY}: kv_matrix section missing")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise SystemExit(f"{REGISTRY}: kv_matrix row not an object")
+        if row.get("status") not in KV_CERT_STATUSES:
+            raise SystemExit(
+                f"{REGISTRY}: kv pair {row.get('pair')!r} has unknown "
+                f"status {row.get('status')!r}"
+            )
+    return rows
+
+
+def check_kv_matrix(
+    kv_matrix: list[dict[str, object]], problems: list[str]
+) -> None:
+    """Semantic gate on the KV certification matrix.
+
+    - all 4x4 engine pairs dispositioned exactly once
+    - live_certified implies a receipt artifact that exists; no other
+      status carries a receipt
+    """
+    seen: dict[str, int] = {}
+    for row in kv_matrix:
+        pair = str(row["pair"])
+        seen[pair] = seen.get(pair, 0) + 1
+        status = str(row["status"])
+        receipt = row.get("receipt")
+        if status == "live_certified":
+            if not isinstance(receipt, str) or not receipt:
+                problems.append(f"kv pair {pair}: live_certified without a receipt")
+            elif not (REPO / receipt).is_file():
+                problems.append(f"kv pair {pair}: receipt artifact missing: {receipt}")
+        elif receipt:
+            problems.append(
+                f"kv pair {pair}: receipt set but status is {status}, not live_certified"
+            )
+    for src in KV_CERT_ENGINES:
+        for dst in KV_CERT_ENGINES:
+            pair = f"{src} -> {dst}"
+            hits = seen.get(pair, 0)
+            if hits != 1:
+                problems.append(f"kv pair {pair}: {hits} rows (expected exactly 1)")
+
+
+def check_capabilities(
+    capabilities: dict[str, list[dict[str, object]]],
+    lanes: dict[str, list[str]],
+    fixtures: list[dict[str, object]],
+    problems: list[str],
+) -> None:
+    """Semantic gate on the capability matrix.
+
+    - every census lane has a matrix
+    - canonical families appear exactly once, in canonical order
+    - live_certified implies a receipt artifact that exists
+    - matrix flags are reachable: emitted by the registry lane or
+      advertised by a probed engine manifest on that lane
+    """
+    for lane in CENSUS_LANE_TOKENS:
+        if lane not in capabilities:
+            problems.append(f"capability matrix missing census lane {lane}")
+    probed: dict[str, set[str]] = {}
+    fixture_kinds: set[str] = set()
+    for engine in fixtures:
+        kind = str(engine["kind"])
+        fixture_kinds.add(kind)
+        raw_flags = engine["flags"]
+        if isinstance(raw_flags, list):
+            probed.setdefault(kind, set()).update(str(f) for f in raw_flags)
+    for lane, rows in capabilities.items():
+        if lane not in fixture_kinds:
+            problems.append(f"capability lane {lane} has no engine fixture")
+        families = [str(row["family"]) for row in rows]
+        canonical = [f for f in families if f in CANONICAL_FAMILIES]
+        if sorted(canonical) != sorted(CANONICAL_FAMILIES):
+            problems.append(
+                f"capability lane {lane}: every canonical family exactly once "
+                f"(have {canonical})"
+            )
+        elif canonical != [f for f in CANONICAL_FAMILIES if f in set(canonical)]:
+            problems.append(f"capability lane {lane}: canonical families out of order")
+        extras = [f for f in families if f not in CANONICAL_FAMILIES]
+        if len(extras) != len(set(extras)):
+            problems.append(f"capability lane {lane}: duplicate extra family")
+        reachable = set(lanes.get(lane, [])) | probed.get(lane, set())
+        for row in rows:
+            evidence = str(row["evidence"])
+            receipt = row.get("receipt")
+            if evidence == "live_certified":
+                if not isinstance(receipt, str) or not receipt:
+                    problems.append(
+                        f"capability {lane}/{row['family']}: live_certified "
+                        "without a receipt path"
+                    )
+                elif not (REPO / receipt).is_file():
+                    problems.append(
+                        f"capability {lane}/{row['family']}: receipt artifact "
+                        f"missing: {receipt}"
+                    )
+            elif receipt:
+                problems.append(
+                    f"capability {lane}/{row['family']}: receipt set but "
+                    f"evidence is {evidence}, not live_certified"
+                )
+            raw_flags = row.get("flags")
+            if not isinstance(raw_flags, list):
+                problems.append(
+                    f"capability {lane}/{row['family']}: flags must be a list"
+                )
+                continue
+            for flag in raw_flags:
+                if flag not in reachable:
+                    problems.append(
+                        f"capability {lane}/{row['family']}: flag {flag} is "
+                        "neither emitted by the registry lane nor probed in "
+                        "any manifest fixture"
+                    )
 
 
 def load_fixtures() -> list[dict[str, object]]:
@@ -426,7 +621,7 @@ def disposition(
     registry: dict[str, list[str]],
     receipts: dict[str, dict[str, dict[str, str]]],
 ) -> str:
-    if lane in LANES_WITHOUT_REGISTRY:
+    if lane in LANES_DISPOSITION_ONLY:
         return "unverified"
     if flag in registry.get(lane, []):
         if flag in receipts.get(lane, {}):
@@ -463,9 +658,10 @@ class EngineAudit:
 def audit(
     registry: dict[str, list[str]],
     receipts: dict[str, dict[str, dict[str, str]]],
+    engines: list[dict[str, object]] | None = None,
 ) -> list[EngineAudit]:
     out: list[EngineAudit] = []
-    for engine in load_fixtures():
+    for engine in engines if engines is not None else load_fixtures():
         lane = str(engine["kind"])
         raw_flags = engine["flags"]
         if not isinstance(raw_flags, list):
@@ -483,6 +679,8 @@ def render_markdown(
     audited: list[EngineAudit],
     registry: dict[str, list[str]],
     receipts: dict[str, dict[str, dict[str, str]]],
+    capabilities: dict[str, list[dict[str, object]]],
+    kv_matrix: list[dict[str, object]] | None = None,
 ) -> str:
     lines = [
         DOC_HEADER,
@@ -495,6 +693,9 @@ def render_markdown(
         "- registry: `scripts/first_class_flags.json` (live emission;",
         "  regenerate via `cargo run -p blazar-runtime --example",
         "  knob_registry`)",
+        "- capabilities: the registry's `capabilities` section - the per-lane",
+        "  capability matrix (family dispositions, evidence status, receipts)",
+        "  generated from crates/blazar-core/src/capability_matrix.rs",
         "- receipts: `scripts/certification_receipts.json` (live-engine runs",
         "  that upgrade first-class flags to certified)",
         "- gate: `python3 scripts/engine_coverage.py --check` fails CI when",
@@ -514,6 +715,11 @@ def render_markdown(
         "| intentionally-unsupported | gateway-owned; `extra_args` refuses it |",
         "| not-applicable | not a capability Blazar could integrate |",
         "| unverified | no verified reach through Blazar on this lane |",
+        "",
+        "Capability matrix evidence: `live-certified` (receipt-backed),",
+        "`first-class` (typed knob), `probed` (manifest truth only),",
+        "`passthrough` (reachable, unmanaged), `unsupported` (refused or",
+        "engine-internal).",
         "",
         "Policy: promotion from passthrough to a first-class knob requires",
         "workload evidence - a receipt linking the flag to a live-engine",
@@ -546,6 +752,27 @@ def render_markdown(
                 f"Registry lane `{lane}` pins {reg_n} first-class flags "
                 "(compile + spawn-time emission)."
             )
+            lines.append("")
+        caps = capabilities.get(lane)
+        if caps is not None:
+            lines.append("### Capability matrix")
+            lines.append("")
+            lines.append("| Family | Evidence | Flags | Notes |")
+            lines.append("|---|---|---|---|")
+            for row in caps:
+                raw_flags = row.get("flags")
+                flag_list = (
+                    [str(f) for f in raw_flags] if isinstance(raw_flags, list) else []
+                )
+                rendered_flags = ", ".join(f"`{f}`" for f in flag_list) or "-"
+                note = str(row["note"])
+                receipt = row.get("receipt")
+                if isinstance(receipt, str) and receipt:
+                    note = f"{note} ([proof]({receipt}))"
+                evidence = str(row["evidence"]).replace("_", "-")
+                lines.append(
+                    f"| {row['family']} | {evidence} | {rendered_flags} | {note} |"
+                )
             lines.append("")
         certified_hit = {
             f: receipts[lane][f] for f, d in sorted(flags.items()) if d == "certified"
@@ -588,7 +815,7 @@ def render_markdown(
             for f in na_hit:
                 lines.append(f"- {f}: {NOT_APPLICABLE[lane][f]}")
             lines.append("")
-        if lane in LANES_WITHOUT_REGISTRY:
+        if lane in LANES_DISPOSITION_ONLY:
             lines.append(
                 "Unverified: this lane has no emission-truth registry "
                 "entry yet - every flag above is listed as unverified "
@@ -605,6 +832,30 @@ def render_markdown(
         if lane in SCOPE_NOTES:
             lines.append(SCOPE_NOTES[lane])
             lines.append("")
+    if kv_matrix is not None:
+        lines.append("## Cross-engine KV interoperability")
+        lines.append("")
+        lines.append(
+            "Pair-wise certification verdicts for KV cache interchange "
+            "(source -> target). `live-certified` cites a receipt from real "
+            "engines proving token reuse; `codec-shipped` means the codec "
+            "and its byte-identity unit proofs landed but the live pair "
+            "certificate is pending; `unavailable` pairs have no codec "
+            "lane. Cross-engine admission stays gated on "
+            "`[kv.translation] enabled` (default off) - the matrix tracks "
+            "promotion evidence, it never presumes compatibility."
+        )
+        lines.append("")
+        lines.append("| Pair | Verdict | Notes |")
+        lines.append("|---|---|---|")
+        for row in kv_matrix:
+            status = str(row["status"]).replace("_", "-")
+            note = str(row["note"])
+            receipt = row.get("receipt")
+            if isinstance(receipt, str) and receipt:
+                note = f"{note} ([proof]({receipt}))"
+            lines.append(f"| {row['pair']} | {status} | {note} |")
+        lines.append("")
     lines.append(
         "Fixtures refreshed from a live store via `--refresh`; they carry "
         "tag/kind/flags only (no machine paths). Dispositions are derived, "
@@ -618,6 +869,10 @@ def cmd_refresh(store: Path) -> int:
     if not store.is_file():
         print(f"no store at {store}", file=sys.stderr)
         return 1
+    registry = load_registry()
+    receipts = load_receipts()
+    old_fixtures = load_fixtures()
+    old_audit = audit(registry, receipts)
     db = sqlite3.connect(store)
     rows = db.execute("select tag, kind, manifest from engines").fetchall()
     engines = []
@@ -634,10 +889,40 @@ def cmd_refresh(store: Path) -> int:
     if not engines:
         print(f"no engine manifests in {store}", file=sys.stderr)
         return 1
+    # Capability-difference report: engine churn and disposition deltas
+    # between the committed fixtures and this refresh, so a version bump
+    # or regression is visible at refresh time instead of lurking in the
+    # regenerated doc.
+    old_by_tag = {str(e["tag"]): e for e in old_fixtures}
+    new_by_tag = {str(e["tag"]): e for e in engines}
+    for tag in sorted(set(new_by_tag) - set(old_by_tag)):
+        print(f"engine added: {tag} ({new_by_tag[tag]['kind']})")
+    for tag in sorted(set(old_by_tag) - set(new_by_tag)):
+        print(f"engine removed: {tag} ({old_by_tag[tag]['kind']})")
+    old_counts = {a.tag: a.counts for a in old_audit}
+    old_totals = {a.tag: a.total for a in old_audit}
+    new_audit = audit(registry, receipts, engines)
+    new_counts = {a.tag: a.counts for a in new_audit}
+    new_totals = {a.tag: a.total for a in new_audit}
+    for tag in sorted(set(old_counts) & set(new_counts)):
+        if old_totals[tag] != new_totals[tag]:
+            print(
+                f"engine changed: {tag} {old_totals[tag]} -> {new_totals[tag]} "
+                "flags probed"
+            )
+        deltas = {
+            d: new_counts[tag].get(d, 0) - old_counts[tag].get(d, 0)
+            for d in set(new_counts[tag]) | set(old_counts[tag])
+            if new_counts[tag].get(d, 0) != old_counts[tag].get(d, 0)
+        }
+        for d, delta in sorted(deltas.items()):
+            arrow = "+" if delta > 0 else ""
+            print(f"  {tag}: {d} {arrow}{delta}")
     FIXTURES.write_text(json.dumps({"version": 1, "engines": engines}, indent=2) + "\n")
-    registry = load_registry()
-    receipts = load_receipts()
-    DOC.write_text(render_markdown(audit(registry, receipts), registry, receipts))
+    capabilities = load_capabilities()
+    DOC.write_text(
+        render_markdown(audit(registry, receipts), registry, receipts, capabilities)
+    )
     print(f"{FIXTURES}: {len(engines)} engines")
     print(f"{DOC}: regenerated")
     return 0
@@ -690,14 +975,28 @@ def cmd_check() -> int:
                 )
     for engine in fixtures:
         lane = str(engine["kind"])
-        if lane in LANES_WITHOUT_REGISTRY:
+        if lane in LANES_DISPOSITION_ONLY:
             continue
         if lane not in registry:
             problems.append(f"fixture kind {lane} missing from registry")
+    try:
+        capabilities = load_capabilities()
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, SystemExit) as e:
+        print(f"FAIL capabilities: {e}", file=sys.stderr)
+        return 1
+    check_capabilities(capabilities, registry, fixtures, problems)
+    try:
+        kv_matrix = load_kv_matrix()
+    except (OSError, ValueError, KeyError, json.JSONDecodeError, SystemExit) as e:
+        print(f"FAIL kv_matrix: {e}", file=sys.stderr)
+        return 1
+    check_kv_matrix(kv_matrix, problems)
     if not DOC.is_file():
         problems.append(f"{DOC} missing (run --markdown)")
     else:
-        want = render_markdown(audit(registry, receipts), registry, receipts)
+        want = render_markdown(
+            audit(registry, receipts), registry, receipts, capabilities, kv_matrix
+        )
         have = DOC.read_text()
         if have != want:
             problems.append(
@@ -747,8 +1046,10 @@ def main() -> int:
     registry = load_registry()
     receipts = load_receipts()
     audited = audit(registry, receipts)
+    capabilities = load_capabilities()
+    kv_matrix = load_kv_matrix()
     if args.markdown:
-        DOC.write_text(render_markdown(audited, registry, receipts))
+        DOC.write_text(render_markdown(audited, registry, receipts, capabilities, kv_matrix))
         print(f"{DOC}: regenerated")
         return 0
     if args.json:
