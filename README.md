@@ -12,13 +12,13 @@ Unified OpenAI, Ollama and Anthropic gateway · Multi-engine serving · Resource
 
 <div align="center">
 
-![Blazar — the control plane for local AI inference](docs/assets/BLAZAR_Banner.webp)
+![Blazar — the control plane for local AI inference](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/BLAZAR_Banner.webp)
 
 ![Blazar in action](https://raw.githubusercontent.com/santanu20/blazar/main/docs/assets/blazar-demo.svg)
 
 *Live CLI session: generation, engine inventory, speculation state and model-routing decisions from one daemon.*
 
-**[Get started in 60 seconds](#60-second-quickstart)** · **[Why Blazar](#why-use-blazar)** · **[Features](#features)** · **[Benchmark evidence](#benchmark-snapshot)** · **[API reference](docs/4.API_SPEC.md)**
+**[Get started in 60 seconds](#60-second-quickstart)** · **[Why Blazar](#why-use-blazar)** · **[Features](#features)** · **[Benchmark evidence](#benchmark-snapshot)** · **[API reference](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md)**
 
 </div>
 
@@ -116,7 +116,7 @@ No application rewrite is required: point clients at the compatible Blazar surfa
 | SGLang-native clients | `http://127.0.0.1:11435` | Native `/generate` passthrough for SGLang-lane models |
 | Blazar Python SDK | `BLAZAR_URL=http://127.0.0.1:11435` | Chat, streaming, best-of/MCP tools, process listing, explain, failover, realtime voice and Anthropic batches |
 
-The first-party Python SDK lives in [`sdk/python`](sdk/python); an independently packaged, zero-dependency TypeScript client lives in [`sdk/ts`](sdk/ts). They are separate clients with different coverage: the Python SDK includes realtime voice and Anthropic batch workflows, while the TypeScript SDK currently focuses on chat/streaming and core operations. See each SDK README for its exact surface.
+The first-party Python SDK lives in [`sdk/python`](https://github.com/santanu20/blazar/tree/main/sdk/python); an independently packaged, zero-dependency TypeScript client lives in [`sdk/ts`](https://github.com/santanu20/blazar/tree/main/sdk/ts). They are separate clients with different coverage: the Python SDK includes realtime voice and Anthropic batch workflows, while the TypeScript SDK currently focuses on chat/streaming and core operations. See each SDK README for its exact surface.
 
 Blazar can run alongside an existing Ollama installation and can later serve on port `11434` as a port-level replacement.
 
@@ -132,7 +132,7 @@ blazar connect pi --write
 
 `blazar connect` prepares or applies integrations for Codex, Claude Code, Continue, Cline, Open WebUI, opencode and pi (oh-my-pi). Writes are backed up and rolled back if the test request fails. Other OpenAI-compatible, Ollama-compatible or Anthropic-compatible clients can connect directly to the gateway.
 
-Blazar-rendered errors on OpenAI-shaped gateway surfaces include a stable machine-readable `blazar_code`; engine errors forwarded verbatim and the Ollama-native error shape are exceptions. See [`docs/error-codes.md`](docs/error-codes.md) or `GET /api/errors`.
+Blazar-rendered errors on OpenAI-shaped gateway surfaces include a stable machine-readable `blazar_code`; engine errors forwarded verbatim and the Ollama-native error shape are exceptions. See [`docs/error-codes.md`](https://github.com/santanu20/blazar/blob/main/docs/error-codes.md) or `GET /api/errors`.
 
 ### MCP tool calling for any supported client
 
@@ -150,7 +150,7 @@ url = "http://mcp.internal:8808/mcp"
 mcp_default = "all"
 ```
 
-A request can opt in with the `mcp` field or `x-blazar-mcp` header. Configuration owners declare servers; keyed clients can select only among configured servers. See [`docs/7.SETUP.md`](docs/7.SETUP.md).
+A request can opt in with the `mcp` field or `x-blazar-mcp` header. Configuration owners declare servers; keyed clients can select only among configured servers. See [`docs/7.SETUP.md`](https://github.com/santanu20/blazar/blob/main/docs/7.SETUP.md).
 
 ---
 
@@ -186,11 +186,11 @@ Blazar's README lists these 10 engine lanes:
 | **Kokoro** | Neural speech synthesis | Kokoro-82M ONNX voices |
 | **LiteRT-LM** (`openaihost`) | Edge-optimized text serving | `.litertlm` bundles |
 
-Full lane inventory and channel policy: [`docs/engines.md`](docs/engines.md).
+Full lane inventory and channel policy: [`docs/engines.md`](https://github.com/santanu20/blazar/blob/main/docs/engines.md).
 
 Routing follows model format and engine capability. The default preserves single-active-engine behavior; per-model engine pins provide deterministic placement. Curated capability lanes cover GGUF architectures not yet supported by the mainstream llama.cpp lane.
 
-For newly released GGUF architectures, Blazar can build a matching active curated registry lane. Automatic capability-lane installation is configurable and uses reviewed, immutable, signature-verified registry entries; arbitrary GitHub forks are not discovered or compiled automatically. See [automatic capability-lane installation](docs/9.USAGE.md).
+For newly released GGUF architectures, Blazar can build a matching active curated registry lane. Automatic capability-lane installation is configurable and uses reviewed, immutable, signature-verified registry entries; arbitrary GitHub forks are not discovered or compiled automatically. See [automatic capability-lane installation](https://github.com/santanu20/blazar/blob/main/docs/9.USAGE.md).
 
 ---
 
@@ -200,7 +200,7 @@ For newly released GGUF architectures, Blazar can build a matching active curate
 
 Three native API dialects: OpenAI, Ollama and Anthropic. Request-path features include thinking-effort mapping, `<think>` leak suppression, structured-output receipts, forced-tool-choice handling, Anthropic cache accounting and Batch API, Responses API conversation chains and background jobs, plus engine passthrough utilities such as tokenize, detokenize, apply-template and infill.
 
-Reference: [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md).
+Reference: [`docs/4.API_SPEC.md`](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md).
 
 ### 2. Intelligent routing and advanced orchestration
 
@@ -222,13 +222,13 @@ Search, pull, import, inspect, pin, snapshot, restore, quantize and tune models.
 
 Remote federation is opt-in through `[[remotes]]`; without remotes, traffic stays local. Blazar can warm and replicate models to remote gateways, explain cross-node placement, and use model pools (`[[model_pools]]`) to expose one logical model name over local and remote replicas. Pool strategies include `ordered`, `least_wait`, `warm_first` and `adaptive`, with cache-affinity signals and operator controls to drain, undrain, pin or unpin members.
 
-GPU workers can join a gateway dynamically instead of being listed only in static `rpc_servers`. Joining supports a shared `fleet_token`, one-use expiring invites and per-worker session credentials; optional LAN discovery is off by default. These membership controls protect the fleet control plane, not the underlying RPC data protocol: llama.cpp RPC worker traffic itself has no authentication and must stay on a trusted network or protected tunnel. See [fleet setup](docs/7.SETUP.md) and the model-pool section there.
+GPU workers can join a gateway dynamically instead of being listed only in static `rpc_servers`. Joining supports a shared `fleet_token`, one-use expiring invites and per-worker session credentials; optional LAN discovery is off by default. These membership controls protect the fleet control plane, not the underlying RPC data protocol: llama.cpp RPC worker traffic itself has no authentication and must stay on a trusted network or protected tunnel. See [fleet setup](https://github.com/santanu20/blazar/blob/main/docs/7.SETUP.md) and the model-pool section there.
 
 ### 7. Sessions, persistent KV and cache
 
 Session save/restore and automatic session banking preserve eligible llama.cpp slot KV across graceful unloads and restarts. `blazar kv status` and `blazar kv inspect <model>` report bank identity, size and state; `blazar kv gc --dry-run` identifies orphaned KV data, and `--apply` moves candidates to a timestamped backup directory rather than hard-deleting them.
 
-Persistent vLLM KV offload is configured separately under `[vllm.kv_offload]` and managed by vLLM's OffloadingConnector; Blazar observes reuse (for example, through `cached_tokens`) rather than moving individual blocks through a gateway API. Cross-engine interchange is a separate, opt-in capability under `[kv.translation]` and requires an explicit `blazar kv import`. It is not universal or automatic. A live-certified example imports a 1,536-token prefix from the vLLM filesystem tier into a llama.cpp session bank; SGLang↔vLLM and MLX↔vLLM require different hardware/host conditions and are not claimed as universally live-certified. See [`docs/7.SETUP.md`](docs/7.SETUP.md) and the [KV certification receipt](bench-artifacts/2026-11-21-kv-codec-live-certs/README.md).
+Persistent vLLM KV offload is configured separately under `[vllm.kv_offload]` and managed by vLLM's OffloadingConnector; Blazar observes reuse (for example, through `cached_tokens`) rather than moving individual blocks through a gateway API. Cross-engine interchange is a separate, opt-in capability under `[kv.translation]` and requires an explicit `blazar kv import`. It is not universal or automatic. A live-certified example imports a 1,536-token prefix from the vLLM filesystem tier into a llama.cpp session bank; SGLang↔vLLM and MLX↔vLLM require different hardware/host conditions and are not claimed as universally live-certified. See [`docs/7.SETUP.md`](https://github.com/santanu20/blazar/blob/main/docs/7.SETUP.md) and the [KV certification receipt](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-21-kv-codec-live-certs/README.md).
 
 ### 8. Multimodal inference and realtime voice
 
@@ -272,17 +272,17 @@ A November 21 saturation campaign compared Blazar with the same llama.cpp child 
 | 8 | 0.999x | At parity |
 | 16 | 0.943x | 5.7% below direct at saturation |
 
-Every rung completed with zero failed requests. The campaign used only two rounds on one machine, so treat these ratios as a measured diagnostic rather than a general speed claim. Its stage timings also record a cold-spawn admission outlier at low concurrency; at higher concurrency, dispatch and engine-slot queueing dominate the tail. See the [full saturation report and caveats](bench-artifacts/2026-11-21-gateway-saturation/README.md).
+Every rung completed with zero failed requests. The campaign used only two rounds on one machine, so treat these ratios as a measured diagnostic rather than a general speed claim. Its stage timings also record a cold-spawn admission outlier at low concurrency; at higher concurrency, dispatch and engine-slot queueing dominate the tail. See the [full saturation report and caveats](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-21-gateway-saturation/README.md).
 
 ### Current vLLM and SGLang lane evidence
 
-A separate November 21 campaign exercised vLLM 0.34.0 and SGLang 0.5.23 with a 953 MiB Qwen2.5-Coder-0.5B safetensors model on the same 8 GiB RTX 4070 Laptop host. Default-profile single-stream results were approximately 190 tokens/s for vLLM and 202 tokens/s for SGLang; measured TTFT was about 19 ms and 18 ms, respectively. The Ollama reference in that report uses a different GGUF runtime/model path and is not a like-for-like comparison. The campaign has documented error and environment cells and does not certify every configuration. See the [lane report](bench-artifacts/2026-11-21-vllm-sglang-lanes/README.md) and [vLLM tool-call fix receipt](bench-artifacts/2026-11-21-vllm-tools-fix/README.md).
+A separate November 21 campaign exercised vLLM 0.34.0 and SGLang 0.5.23 with a 953 MiB Qwen2.5-Coder-0.5B safetensors model on the same 8 GiB RTX 4070 Laptop host. Default-profile single-stream results were approximately 190 tokens/s for vLLM and 202 tokens/s for SGLang; measured TTFT was about 19 ms and 18 ms, respectively. The Ollama reference in that report uses a different GGUF runtime/model path and is not a like-for-like comparison. The campaign has documented error and environment cells and does not certify every configuration. See the [lane report](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-21-vllm-sglang-lanes/README.md) and [vLLM tool-call fix receipt](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-21-vllm-tools-fix/README.md).
 
 ### KV interchange proof
 
-A live certification imported 24 complete 64-token blocks (1,536 tokens) from vLLM's persistent filesystem tier into a llama.cpp session bank for a matching F16 GGUF/HF model pair; the next llama.cpp spawn restored the prefix into slot KV. This proves that specific conversion path, not generic or automatic KV portability across all engines. See the [live certification](bench-artifacts/2026-11-21-kv-codec-live-certs/README.md).
+A live certification imported 24 complete 64-token blocks (1,536 tokens) from vLLM's persistent filesystem tier into a llama.cpp session bank for a matching F16 GGUF/HF model pair; the next llama.cpp spawn restored the prefix into slot KV. This proves that specific conversion path, not generic or automatic KV portability across all engines. See the [live certification](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-21-kv-codec-live-certs/README.md).
 
-The benchmark archive is indexed in [`bench-artifacts/INDEX.md`](bench-artifacts/INDEX.md). [`BENCHMARK.md`](BENCHMARK.md) is machine-rendered; its header identifies the **last render**, not necessarily the newest campaign. Check the campaign index and individual receipts before quoting a result.
+The benchmark archive is indexed in [`bench-artifacts/INDEX.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/INDEX.md). [`BENCHMARK.md`](https://github.com/santanu20/blazar/blob/main/BENCHMARK.md) is machine-rendered; its header identifies the **last render**, not necessarily the newest campaign. Check the campaign index and individual receipts before quoting a result.
 
 ## Configuration
 
@@ -311,7 +311,7 @@ blazar config unset <key>
 | Observability | `audit_log`, `pii_scrub`, `otlp_endpoint` |
 | Media | diffusion tuning, RPC, audio-lane timeouts |
 
-`blazar config defaults` and [`docs/7.SETUP.md`](docs/7.SETUP.md) are the authoritative live configuration references. Authentication remains optional for a default local deployment.
+`blazar config defaults` and [`docs/7.SETUP.md`](https://github.com/santanu20/blazar/blob/main/docs/7.SETUP.md) are the authoritative live configuration references. Authentication remains optional for a default local deployment.
 
 ## Common commands
 
@@ -348,7 +348,7 @@ blazar config unset <key>
 | Keys / snapshots / registry | `blazar keys ...`, `blazar snapshot`, `blazar registry keygen/sign/verify` |
 | Search / self-update | `blazar search ...`, `blazar upgrade` |
 
-Full CLI surface: `blazar --help`. Complete route contract: [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md).
+Full CLI surface: `blazar --help`. Complete route contract: [`docs/4.API_SPEC.md`](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md).
 
 ---
 
@@ -387,7 +387,7 @@ irm https://raw.githubusercontent.com/santanu20/blazar/main/scripts/install.ps1 
 .\install.ps1 -Build
 ```
 
-Package-manager integrations: [Homebrew](packaging/homebrew), [Scoop](packaging/scoop), [Winget](packaging/winget) and the [AUR PKGBUILD](packaging/PKGBUILD). The workspace requires **Rust 1.95 or newer** (edition 2024) when building from source. The Linux/macOS shell installer installs the default llama.cpp engine unless `BLAZAR_INSTALL_ENGINE=0`; the Windows installer installs the CLI only, so run `blazar engine update` before serving a model.
+Package-manager integrations: [Homebrew](https://github.com/santanu20/blazar/tree/main/packaging/homebrew), [Scoop](https://github.com/santanu20/blazar/tree/main/packaging/scoop), [Winget](https://github.com/santanu20/blazar/tree/main/packaging/winget) and the [AUR PKGBUILD](https://github.com/santanu20/blazar/blob/main/packaging/PKGBUILD). The workspace requires **Rust 1.95 or newer** (edition 2024) when building from source. The Linux/macOS shell installer installs the default llama.cpp engine unless `BLAZAR_INSTALL_ENGINE=0`; the Windows installer installs the CLI only, so run `blazar engine update` before serving a model.
 
 ---
 
@@ -414,28 +414,28 @@ This README is the product entry point; implementation and operational detail li
 
 | Document | Purpose |
 |---|---|
-| [`docs/1.SYSTEM_OVERVIEW.md`](docs/1.SYSTEM_OVERVIEW.md) | Product shape and system overview |
-| [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) | Internal architecture and lifecycle |
-| [`docs/3.DATA_MODEL.md`](docs/3.DATA_MODEL.md) | SQLite schema and invariants |
-| [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) | HTTP API and CLI reference |
-| [`docs/engines.md`](docs/engines.md) | Ten engine lanes, format routing, engine lifecycle and capability cards |
-| [`docs/engine-coverage.md`](docs/engine-coverage.md) | Machine-checked engine capability and inventory coverage |
-| [`docs/error-codes.md`](docs/error-codes.md) | Stable gateway error classifications and remediation |
-| [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark methodology and selected campaign results |
-| [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) | Routing, admission, validation and eviction rules |
-| [`docs/7.SETUP.md`](docs/7.SETUP.md) | Installation, deployment and configuration |
-| [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md) | Maintainer invariants and compatibility rules |
-| [`docs/9.USAGE.md`](docs/9.USAGE.md) | End-user workflows and troubleshooting |
-| [`docs/10.SCIENTIFIC.md`](docs/10.SCIENTIFIC.md) | VRAM/KV math, GGUF parsing and numerical methods |
-| [`BENCHMARK.md`](BENCHMARK.md) | Benchmark methodology and results |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release history |
+| [`docs/1.SYSTEM_OVERVIEW.md`](https://github.com/santanu20/blazar/blob/main/docs/1.SYSTEM_OVERVIEW.md) | Product shape and system overview |
+| [`docs/2.ARCHITECTURE.md`](https://github.com/santanu20/blazar/blob/main/docs/2.ARCHITECTURE.md) | Internal architecture and lifecycle |
+| [`docs/3.DATA_MODEL.md`](https://github.com/santanu20/blazar/blob/main/docs/3.DATA_MODEL.md) | SQLite schema and invariants |
+| [`docs/4.API_SPEC.md`](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md) | HTTP API and CLI reference |
+| [`docs/engines.md`](https://github.com/santanu20/blazar/blob/main/docs/engines.md) | Ten engine lanes, format routing, engine lifecycle and capability cards |
+| [`docs/engine-coverage.md`](https://github.com/santanu20/blazar/blob/main/docs/engine-coverage.md) | Machine-checked engine capability and inventory coverage |
+| [`docs/error-codes.md`](https://github.com/santanu20/blazar/blob/main/docs/error-codes.md) | Stable gateway error classifications and remediation |
+| [`docs/benchmarks.md`](https://github.com/santanu20/blazar/blob/main/docs/benchmarks.md) | Benchmark methodology and selected campaign results |
+| [`docs/6.BUSINESS_RULES.md`](https://github.com/santanu20/blazar/blob/main/docs/6.BUSINESS_RULES.md) | Routing, admission, validation and eviction rules |
+| [`docs/7.SETUP.md`](https://github.com/santanu20/blazar/blob/main/docs/7.SETUP.md) | Installation, deployment and configuration |
+| [`docs/8.DO_NOT_BREAK.md`](https://github.com/santanu20/blazar/blob/main/docs/8.DO_NOT_BREAK.md) | Maintainer invariants and compatibility rules |
+| [`docs/9.USAGE.md`](https://github.com/santanu20/blazar/blob/main/docs/9.USAGE.md) | End-user workflows and troubleshooting |
+| [`docs/10.SCIENTIFIC.md`](https://github.com/santanu20/blazar/blob/main/docs/10.SCIENTIFIC.md) | VRAM/KV math, GGUF parsing and numerical methods |
+| [`BENCHMARK.md`](https://github.com/santanu20/blazar/blob/main/BENCHMARK.md) | Benchmark methodology and results |
+| [`CHANGELOG.md`](https://github.com/santanu20/blazar/blob/main/CHANGELOG.md) | Release history |
 
 ---
 
 ## Contributing
 
-1. Read [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md).
-2. For architectural changes, read [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) and [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md).
+1. Read [`docs/8.DO_NOT_BREAK.md`](https://github.com/santanu20/blazar/blob/main/docs/8.DO_NOT_BREAK.md).
+2. For architectural changes, read [`docs/2.ARCHITECTURE.md`](https://github.com/santanu20/blazar/blob/main/docs/2.ARCHITECTURE.md) and [`docs/6.BUSINESS_RULES.md`](https://github.com/santanu20/blazar/blob/main/docs/6.BUSINESS_RULES.md).
 3. Run formatting, Clippy, tests and installer checks. The CI workflow is the source of truth.
 
 ---
@@ -453,4 +453,4 @@ Those projects provide inference runtimes and supporting components. Model weigh
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+Dual-licensed under [MIT](https://github.com/santanu20/blazar/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/santanu20/blazar/blob/main/LICENSE-APACHE).
