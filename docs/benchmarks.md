@@ -103,6 +103,16 @@ sampling, append-only JSONL receipts + per-lane CSV, direct-engine baselines
 wired from each store row's own component set). Nine batteries banked with
 every failed run kept in the receipts alongside its environment block.
 
+Invocation shape - global flags come BEFORE the battery subcommand:
+
+```sh
+python3 scripts/bench_media.py --gateway http://127.0.0.1:11435 --out bench-artifacts/<dir>/ speech --lane-speech kokoro --direct
+```
+
+`--gateway` defaults to the harness port 11599, not a production daemon -
+point it at the daemon you intend to measure. `--direct` runs the
+direct-engine arm alongside the gateway arm in the same run (true A/B).
+
 | Lane | Receipt | Baseline |
 |---|---|---|
 | bert text embeddings via gateway | 80.7 req/s at C=1, 126.4 at C=8 | bare llama-server flatlines near 71 - gateway overhead within noise |
@@ -110,6 +120,7 @@ every failed run kept in the receipts alongside its environment block.
 | child multimodal embeddings (qwen3vl, content-array) | 6.68 req/s | direct child |
 | piper speech | 12.0x realtime | - |
 | engine speech (pocket-tts) | 38.7x realtime | 9.8x for a CPU-pinned direct baseline (placement-policy asymmetry, documented) |
+| kokoro speech | 1.668 req/s at C=4, rtf 1.74 | direct shim 1.58 req/s - gateway overhead within the +/-5% noise band at every rung |
 | qwen-image-2.1 | 46.0 s mean, seed-deterministic (byte-identical PNGs across 15 gateway reps) | 39.7 s direct (+16% - the conservative offload profile on an 8 GiB card, not proxy overhead) |
 | wan2.1 t2v | ~35 s per 1 s clip | - |
 
