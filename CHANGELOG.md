@@ -4,6 +4,12 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [0.34.2] - 2026-11-21
+
+### Fixed
+
+- **The crates.io page rendered without the README banner.** crates.io renders the packaged README standalone, so the repo-relative banner path introduced by the self-contained-banner rewrite resolved against crates.io and returned 404. The banner (and 43 repo-relative document links with the same defect) now use absolute github.com URLs, matching the form that already worked for v0.33.0. No code changes.
+
 ## [0.34.1] - 2026-11-21
 
 ### Fixed
