@@ -60,14 +60,14 @@ Blazar is the control plane around inference engines. The engines still perform 
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/santanu20/blazar/v0.33.0/scripts/install.sh \
+  https://raw.githubusercontent.com/santanu20/blazar/v0.34.1/scripts/install.sh \
   | BLAZAR_REPO=santanu20/blazar sh
 ```
 
 #### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/santanu20/blazar/v0.33.0/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/blazar/v0.34.1/scripts/install.ps1 | iex
 ```
 
 Also available: `cargo binstall blazar` for the prebuilt binary, `cargo install blazar` to compile it, or [build from source](#installation).
