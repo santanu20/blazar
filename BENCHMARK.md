@@ -490,7 +490,7 @@ _These knobs crashed the engine child on this test bed; the crash signature is t
 ## Reproduce
 
 ```bash
-python3 scripts/bench_matrix.py --blazar-bin /tmp/opencode/relbuild/target/release/blazar --model qwen2.5-0.5b-instruct --artifacts-dir bench-artifacts/2026-11-20-v0.33-wave-final --md BENCHMARK.md
+python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --model qwen2.5-0.5b-instruct --artifacts-dir bench-artifacts/2026-11-20-v0.33-wave-final --md BENCHMARK.md
 python3 scripts/bench_matrix.py --render-only --artifacts-dir <dir> [--append-campaign <sibling-campaign-dir>] --md BENCHMARK.md
 ```
 

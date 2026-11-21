@@ -1,6 +1,6 @@
 # 2026-11-21 gateway saturation (issue 009 + issue 004 evidence)
 
-Harness: `/tmp/opencode/waveE/sat_harness.py` (session scratch; methodology below is
+Harness: a scratch saturation harness (not committed); methodology below is
 the reproducible part). Model `qwen2.5-0.5b-instruct:q4_k_m`, sandbox daemon on 8199
 (tree release binary), matched direct `llama-server` on 8299, rungs C=1,2,4,8,16,
 2 rounds each, `tg=128` unique-prompt streaming threads.

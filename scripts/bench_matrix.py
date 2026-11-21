@@ -345,7 +345,17 @@ def portable_path(text: str) -> str:
     (tag, provider, params) tuples and never carry paths."""
     home = str(Path.home())
     if home not in ("", "/") and home in text:
-        return text.replace(home, "~")
+        text = text.replace(home, "~")
+    # A --blazar-bin living outside the repo (scratch release builds)
+    # would pin the receipt to one machine; the canonical reproduce form
+    # is the repo-relative binary, and the `blazar` version bullet above
+    # it carries the exact build identity.
+    text = re.sub(
+        r"--blazar-bin\s+(\S+)",
+        lambda m: "--blazar-bin "
+        + (m.group(1) if m.group(1).startswith(("target/", "./", "~")) else "target/release/blazar"),
+        text,
+    )
     return text
 
 

@@ -2,7 +2,7 @@
 
 - Date: 2026-11-21
 - Binary: tree debug build (post double-count fix), `blazar 0.33.0` dev tree
-- Daemon: XDG-isolated sandbox (`/tmp/opencode/workload-cert`), port 8199,
+- Daemon: XDG-isolated sandbox (scratch data/config dirs), port 8199,
   sqlite-consistent store snapshot + engines symlink (relative `server_path`
   rows re-root under the sandbox data dir without it)
 - Model: qwen2.5-0.5b-instruct:q4_k_m (llama.cpp lane b12578-cuda)

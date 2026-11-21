@@ -4,7 +4,7 @@
 - **model**: `qwen2.5-0.5b-instruct-q4_k_m.gguf` (468 MiB)
 - **gpu**: NVIDIA GeForce RTX 4070 Laptop GPU / driver 595.99.02
 - **engines**: 2023.11.14-2, b5454, fork-GuideboardLabs_llama.cpp-sensenova-loop-a7f77a78-cuda, inventory, litert-0.19.2, master-1043-3be2378, mlx-0.32.2, ollama-host, probe, sglang-0.5.23, v0.9.5
-- **harness**: bench_matrix v4 - `--model qwen2.5-0.5b-instruct --providers --skip-ppl --skip-greedy --skip-features --skip-conc --skip-idle --skip-quality --skip-variants --skip-media --skip-ctxcurve --probes cancel,evict,store --probe-reps 5 --artifacts-dir bench-artifacts/2026-11-20-probes --blazar-bin /tmp/opencode/relbuild2/target/release/blazar`
+- **harness**: bench_matrix v4 - `--model qwen2.5-0.5b-instruct --providers --skip-ppl --skip-greedy --skip-features --skip-conc --skip-idle --skip-quality --skip-variants --skip-media --skip-ctxcurve --probes cancel,evict,store --probe-reps 5 --artifacts-dir bench-artifacts/2026-11-20-probes --blazar-bin target/release/blazar`
 - **blazar**: `blazar 0.33.0` (sandbox daemon binary)
 - **quality lane**: skipped - --skip-quality: no checker-verified receipts back any speed number in this campaign
 - all blazar-owned rows measured by `blazar 0.33.0`

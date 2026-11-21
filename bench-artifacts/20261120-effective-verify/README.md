@@ -31,7 +31,7 @@ Fix: `KvGeometry { Classic, Unified, UnifiedPerSlot }` detected from argv tokens
 
 ```bash
 # sandbox daemon (snapshot store + engines symlink per 20261120-kokoro-vllm-cert pattern)
-XDG_DATA_HOME=/tmp/opencode/effective-cert/data XDG_CONFIG_HOME=/tmp/opencode/effective-cert/config \
+XDG_DATA_HOME=<scratch>/data XDG_CONFIG_HOME=<scratch>/config \
   RUST_LOG=debug setsid ./target/debug/blazar serve &
 curl -s -X POST http://127.0.0.1:8199/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"qwen2.5-0.5b-instruct:q4_k_m","messages":[{"role":"user","content":"ping"}],"max_tokens":8}'
