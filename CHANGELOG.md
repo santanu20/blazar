@@ -4,6 +4,16 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Fixed
+
+- **The sglang spawn path now prepares a boot instead of refusing it.** Three planner gaps, found live when `blazar run qwen3-8b-awq` on an 8 GiB card went 507 → 400 → 502 under the model's own pins, are closed:
+  - A speculative-algorithm pin the installed lane's probed vocabulary does not list (e.g. `spec = "dspine"` against a stock sglang lane) is no longer a hard `MODEL_UNSUPPORTED_ENGINE` refusal - the spawn falls back dense with a warning that names the missing algorithm and the plugin lane that carries it. Speculation is a speed knob, not a capability gate.
+  - A pinned `cpu_offload_gb` larger than live RAM can carry is trimmed to what `MemAvailable` actually holds (J3 floor math), with a warning naming the original and applied values - instead of a 507 at the spawn memory guard. The supervisor's offload accounting uses the same clamp, so the guard and the emitted argv can no longer disagree.
+  - The fit tiers gated on a 92% budget while the mem-fraction governance ceiling capped the static pool lower - a window where "Tier A fits" still spawned a child that died with zero KV memory. The tier budget is now capped at the ceiling pool (one authority for both), weights carry a 512 MiB device-overhead charge (CUDA context + quant-kernel workspaces, receipt-calibrated on the live AWQ crash where 5816 MiB of file bytes consumed ~6314 MiB), and a pinned `mem_fraction_static` that cannot cover weights+KV is raised to the demand fraction (with a warning) or refused with teaching when even the ceiling cannot cover it - never spawned doomed.
+  - The spawn memory guard's refusal text now says the planner already trims offload to live RAM, so reaching it means the box is truly starved.
+
 ## [0.34.2] - 2026-11-21
 
 ### Fixed

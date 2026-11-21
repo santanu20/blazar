@@ -435,6 +435,7 @@ pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
             return Hardware {
                 physical_cores: 1,
                 total_ram_mib: 0,
+                mem_available_mib: None,
                 gpus,
             };
         }
@@ -446,10 +447,16 @@ pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
         .map_or(1, |c| u32::try_from(c).unwrap_or(1))
         .max(1);
     let total_ram_mib = sys.total_memory() / (1024 * 1024); // sysinfo returns bytes
+    // Same refreshed snapshot as total_ram_mib - no second census pass.
+    // available_memory() is the kernel's real allocatable figure, not
+    // total minus cached (the spawn-time host-offload planner clamps
+    // against exactly this number).
+    let mem_available_mib = Some(sys.available_memory() / (1024 * 1024));
     Hardware {
         physical_cores,
         total_ram_mib,
         gpus,
+        mem_available_mib,
     }
 }
 

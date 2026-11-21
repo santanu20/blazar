@@ -57,6 +57,11 @@ pub struct Hardware {
     pub physical_cores: u32,
     pub total_ram_mib: u64,
     pub gpus: Vec<GpuInfo>,
+    /// Live `MemAvailable` (MiB) at census time. `None` = not probed
+    /// (legacy snapshots, hand-built test fixtures) - capacity planners
+    /// treat None as "host headroom unknown" and fall back to
+    /// total-RAM-based math instead of clamping against it.
+    pub mem_available_mib: Option<u64>,
 }
 
 impl Hardware {
@@ -120,6 +125,7 @@ mod tests {
         let hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 32_000,
+            mem_available_mib: None,
             gpus: vec![
                 GpuInfo {
                     name: "a".into(),
@@ -148,6 +154,7 @@ mod tests {
         let hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 13_000,
+            mem_available_mib: None,
             gpus: vec![
                 GpuInfo {
                     name: "Intel".into(),
@@ -171,6 +178,7 @@ mod tests {
         let hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "i".into(),
                 description: "Intel(R) Iris(R) Xe Graphics".into(),
@@ -189,6 +197,7 @@ mod tests {
         let hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 13_000,
+            mem_available_mib: None,
             gpus: vec![
                 GpuInfo {
                     name: "Intel".into(),
@@ -209,6 +218,7 @@ mod tests {
         let igpu = Hardware {
             physical_cores: 8,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "i".into(),
                 description: "Intel(R) Iris(R) Xe Graphics".into(),

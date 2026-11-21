@@ -119,6 +119,7 @@ async fn start(config: Config, stub_env: &[(&str, &str)], bare_template: bool) -
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "g".into(),
                 description: "STUB".into(),

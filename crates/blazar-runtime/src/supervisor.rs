@@ -6325,10 +6325,32 @@ impl Supervisor {
                 .filter_map(|c| self.device_budget_bytes(c))
                 .max()
                 .unwrap_or(0);
+            // Live-RAM clamp shared with the compile-side ladder
+            // (sglang_clamp_offload_to_live_ram): a pin sized against
+            // total RAM would trip the J3 host floor at spawn. Clamp
+            // the pin to what the kernel can actually allocate so the
+            // guard and the argv agree on one number.
+            let cpu_offload_gb = tun_probe.cpu_offload_gb.map(|pin| {
+                let requested_whole = pin.ceil();
+                let clamped = blazar_core::profile::sglang_clamp_offload_to_live_ram(
+                    requested_whole,
+                    row_weights,
+                    crate::probe::mem_available_mib(),
+                );
+                if clamped + 1e-3 < requested_whole {
+                    tracing::warn!(
+                        "sglang cpu_offload_gb {pin} reduced to {clamped} - \
+                         MemAvailable cannot carry the requested offload; \
+                         keeping the spawn viable instead of refusing at the \
+                         memory guard"
+                    );
+                }
+                clamped
+            });
             let offload = blazar_core::profile::sglang_effective_offload_bytes(
                 standing,
                 largest_budget,
-                tun_probe.cpu_offload_gb,
+                cpu_offload_gb,
             );
             (standing.saturating_sub(offload), offload, draft_bytes)
         } else {
@@ -6596,11 +6618,13 @@ impl Supervisor {
             if avail < need {
                 return Err(SupervisionError::InsufficientMemory(format!(
                     "insufficient memory to load {:?}: MemAvailable {avail} MiB < floor {need} MiB \
-                     (model {} MiB + {offload_mib} MiB host offload). Stop co-resident engines \
-                     (blazar ps / ollama stop) or free RAM; disable this guard with \
-                     spawn_mem_guard = false. This per-spawn host check precedes VRAM \
-                     admission, so a starved box can refuse here before any pair-fit \
-                     verdict (multi-role spawns: freeing RAM reaches the numbers)",
+                     (model {} MiB + {offload_mib} MiB host offload). The planner already trims a \
+                     pinned offload to what live RAM can carry - reaching this refusal means even \
+                     that relief left no headroom. Stop co-resident engines (blazar ps / ollama \
+                     stop) or free RAM; disable this guard with spawn_mem_guard = false. This \
+                     per-spawn host check precedes VRAM admission, so a starved box can refuse \
+                     here before any pair-fit verdict (multi-role spawns: freeing RAM reaches \
+                     the numbers)",
                     name,
                     model.bytes / (1024 * 1024)
                 )));
@@ -10902,6 +10926,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 1024,
+                mem_available_mib: None,
                 gpus: vec![],
             },
             Arc::new(FakeEngine(Manifest::default())),
@@ -11178,6 +11203,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 1024,
+                mem_available_mib: None,
                 gpus: vec![],
             },
             Arc::new(FakeEngine(manifest)),
@@ -11221,6 +11247,7 @@ mod routing_tests {
                 Hardware {
                     physical_cores: 1,
                     total_ram_mib: 1024,
+                    mem_available_mib: None,
                     gpus: vec![],
                 },
                 Arc::new(FakeEngine(manifest(&[]))),
@@ -11337,6 +11364,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 1024,
+                mem_available_mib: None,
                 gpus: vec![],
             },
             Arc::new(FakeEngine(manifest)),
@@ -11506,6 +11534,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 1024,
+                mem_available_mib: None,
                 gpus: vec![],
             },
             Arc::new(FakeEngine(Manifest {
@@ -11758,6 +11787,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 1024,
+                mem_available_mib: None,
                 gpus: vec![],
             },
             Arc::new(FakeEngine(Manifest {
@@ -11831,6 +11861,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 16_000,
+                mem_available_mib: None,
                 gpus,
             },
             Arc::new(FakeEngine(Manifest {
@@ -12876,6 +12907,7 @@ mod routing_tests {
         let hw = Hardware {
             physical_cores: 1,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus,
         };
         // 7000 MiB weights + 500 MiB KV: over the best single free card
@@ -12987,6 +13019,7 @@ mod routing_tests {
             Hardware {
                 physical_cores: 1,
                 total_ram_mib: 32_000,
+                mem_available_mib: None,
                 gpus: vec![
                     gpu("GPU0", "NVIDIA GeForce RTX 4070", 8_188, 8_188),
                     gpu("GPU1", "NVIDIA GeForce RTX 5070", 8_188, 8_188),
@@ -16255,6 +16288,7 @@ mod routing_tests {
         Hardware {
             physical_cores: 8,
             total_ram_mib: 32_000,
+            mem_available_mib: None,
             gpus,
         }
     }

@@ -3031,6 +3031,33 @@ pub fn sglang_effective_offload_bytes(
     }
 }
 
+/// Clamp a whole-GB offload emission to what the host can actually
+/// stage: the spawn-time J3 guard floors `MemAvailable` at
+/// `model/2 + 512 MiB + offload` (half the checkpoint streams through
+/// host memory during load even when the rest rides the GPU). A pin
+/// sized against TOTAL RAM starves that floor on a busy desktop and
+/// the spawn refuses - clamping here lets the planner emit a bootable
+/// offload instead. Shared by the compile-side Tier C and the
+/// supervisor's spawn guard so argv, admission, and J3 never disagree
+/// about the posture. `None` avail = unprobed (legacy fixtures,
+/// degraded census) - the emission passes through untouched.
+#[must_use]
+pub fn sglang_clamp_offload_to_live_ram(
+    emitted_gb: f32,
+    model_bytes: u64,
+    mem_available_mib: Option<u64>,
+) -> f32 {
+    let Some(avail_mib) = mem_available_mib else {
+        return emitted_gb;
+    };
+    let model_mib = model_bytes / (1024 * 1024);
+    let headroom_mib = avail_mib.saturating_sub(model_mib / 2).saturating_sub(512);
+    // integer GiB then widened to f32: whole-GB precision is the contract
+    #[allow(clippy::cast_precision_loss)]
+    let max_whole_gb = (headroom_mib / 1024) as f32;
+    emitted_gb.min(max_whole_gb).max(0.0)
+}
+
 /// VRAM that ctx-scaled compute buffers cost per token of TOTAL ctx on
 /// vulkan-class builds (mixed integrated+discrete census) when a
 /// projector is attached - the one combination whose allocation footprint
@@ -4580,6 +4607,18 @@ const SGLANG_MIN_KV_POOL_BYTES: u64 = 256 * 1024 * 1024;
 /// in `MemAvailable - 10 GiB` at pool-init time.
 const SGLANG_HICACHE_HOST_RESERVE_MIB: u64 = 10_240;
 
+/// Device-side overhead the checkpoint bytes never include: the CUDA
+/// context, cuBLAS workspaces, and kernel-marlin dequant scratch an
+/// sglang child allocates before the KV pool is sized. Receipt
+/// (2026-11-21, qwen3-8b-awq on an 8 GiB RTX 4070 Laptop): weights
+/// estimated at 5816 MiB (file bytes) consumed ~6314 MiB before the
+/// pool - the engine's load check then found "no GPU memory for the KV
+/// cache" and crashed a spawn the ladder had called a full fit.
+/// Charged into the per-shard weights so every tier gate, the
+/// tight-fit knobs, and the mem-fraction derive all see real device
+/// demand instead of file size.
+const SGLANG_DEVICE_OVERHEAD_MIB: u64 = 512;
+
 /// Host RAM the sglang child itself occupies before the hierarchical KV
 /// tier is sized: interpreter + torch import + weights staged through
 /// host memory on this lane (composition probe 2026-09-29; the 1.7B
@@ -5148,7 +5187,7 @@ fn compile_sglang(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<
     // (EAGLE3 / DSPINE by spec mode); the engage verdict (and draft
     // dir) feeds the fit ladder's reserve and static-side draft
     // charge. A probed-algorithm mismatch hard-errors here.
-    let spec = push_sglang_speculative(input, &tun, &mut argv, &mut warnings)?;
+    let spec = push_sglang_speculative(input, &tun, &mut argv, &mut warnings);
     // --- llama-vocabulary knobs that do NOT translate: teach here.
     push_sglang_vocab_teaching(input, &mut warnings);
     // --- the fit ladder: tier selection + mem-fraction derive.
@@ -6697,7 +6736,9 @@ impl SpecEngagement<'_> {
 /// `SpeculativeAlgorithm` enum names plus plugin-registered names).
 /// An empty vocabulary = a lane probed before the column existed (or a
 /// probe that failed leniently): keep the historical flag-presence
-/// gating - never a silent refusal on old rows.
+/// gating - never a silent refusal on old rows. A miss is NOT a spawn
+/// refusal: both call sites surface the `Err` text as a warning and
+/// boot dense (speculation is a speed knob, not a capability gate).
 fn sglang_lane_supports_spec(input: &ProfileInput<'_>, upstream: &str) -> Result<(), String> {
     if input.spec_types.is_empty() || input.spec_types.iter().any(|t| t == upstream) {
         return Ok(());
@@ -6777,10 +6818,8 @@ fn push_sglang_spec_knob_lane<'a>(
     tun: &'a SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> Result<Option<SpecEngagement<'a>>, String> {
-    let Some(algorithm) = tun.spec_algorithm.as_deref() else {
-        return Ok(None);
-    };
+) -> Option<SpecEngagement<'a>> {
+    let algorithm = tun.spec_algorithm.as_deref()?;
     // blazar spelling -> upstream wire name. Config validation
     // rejects unknown spellings at load; this arm is the defensive
     // net for programmatically built tunings (tests, future
@@ -6811,21 +6850,27 @@ fn push_sglang_spec_knob_lane<'a>(
                  spawning dense - the EAGLE family rides the draft-pair lane \
                  (spec = \"eagle3\")"
             ));
-            return Ok(Some(SpecEngagement::dense()));
+            return Some(SpecEngagement::dense());
         }
     };
-    sglang_lane_supports_spec(input, upstream)?;
+    if let Err(reason) = sglang_lane_supports_spec(input, upstream) {
+        warnings.push(format!(
+            "{reason} - spawning dense instead (speculation is a speed \
+             knob, not a capability gate)"
+        ));
+        return Some(SpecEngagement::dense());
+    }
     if !input.supported_flags.contains("--speculative-algorithm") {
         warnings.push(format!(
             "sglang.spec_algorithm {algorithm} set but this engine lacks \
              --speculative-algorithm; spawning dense (a blazar engine update \
              revives it)"
         ));
-        return Ok(Some(SpecEngagement::dense()));
+        return Some(SpecEngagement::dense());
     }
     let draft = if needs_draft {
         let Some(d) = sglang_spec_draft_dir(input, tun, algorithm, warnings) else {
-            return Ok(Some(SpecEngagement::dense()));
+            return Some(SpecEngagement::dense());
         };
         Some(d)
     } else {
@@ -6861,10 +6906,10 @@ fn push_sglang_spec_knob_lane<'a>(
         );
     }
     push_sglang_spec_depth_knobs(input, tun, argv, warnings);
-    Ok(Some(SpecEngagement {
+    Some(SpecEngagement {
         engaged: true,
         draft_dir: draft,
-    }))
+    })
 }
 
 fn push_sglang_speculative<'a>(
@@ -6872,9 +6917,9 @@ fn push_sglang_speculative<'a>(
     tun: &'a SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-) -> Result<SpecEngagement<'a>, String> {
-    if let Some(engagement) = push_sglang_spec_knob_lane(input, tun, argv, warnings)? {
-        return Ok(engagement);
+) -> SpecEngagement<'a> {
+    if let Some(engagement) = push_sglang_spec_knob_lane(input, tun, argv, warnings) {
+        return engagement;
     }
     if let Some(draft) = input.draft_path {
         if draft
@@ -6894,23 +6939,36 @@ fn push_sglang_speculative<'a>(
         {
             // Pair lane: the resolved spec mode picks the wire name -
             // DSpine drafts pair with DSPINE, every other resolved
-            // draft is an EAGLE-family head.
+            // draft is an EAGLE-family head. A probed-vocabulary miss
+            // warns and falls through to dense (see
+            // sglang_lane_supports_spec): the pair stays banked for a
+            // lane that can serve it.
             let upstream = if input.spec_mode == "dspine" {
                 "DSPINE"
             } else {
                 "EAGLE3"
             };
-            sglang_lane_supports_spec(input, upstream)?;
-            argv.push("--speculative-algorithm".into());
-            argv.push(upstream.into());
-            argv.push("--speculative-draft-model-path".into());
-            argv.push(draft.to_string());
-            warn_dspine_lm_head_requirement(input, upstream, warnings);
-            push_sglang_spec_depth_knobs(input, tun, argv, warnings);
-            return Ok(SpecEngagement {
-                engaged: true,
-                draft_dir: Some(draft),
-            });
+            match sglang_lane_supports_spec(input, upstream) {
+                Ok(()) => {
+                    argv.push("--speculative-algorithm".into());
+                    argv.push(upstream.into());
+                    argv.push("--speculative-draft-model-path".into());
+                    argv.push(draft.to_string());
+                    warn_dspine_lm_head_requirement(input, upstream, warnings);
+                    push_sglang_spec_depth_knobs(input, tun, argv, warnings);
+                    return SpecEngagement {
+                        engaged: true,
+                        draft_dir: Some(draft),
+                    };
+                }
+                Err(reason) => {
+                    warnings.push(format!(
+                        "{reason} - spawning dense instead (speculation \
+                         is a speed knob, not a capability gate; the pair \
+                         stays banked)"
+                    ));
+                }
+            }
         } else {
             warnings.push(format!(
                 "spec draft {draft} resolved but this sglang engine lacks the \
@@ -6918,7 +6976,7 @@ fn push_sglang_speculative<'a>(
             ));
         }
     }
-    Ok(SpecEngagement::dense())
+    SpecEngagement::dense()
 }
 
 /// llama-vocabulary knobs that do NOT translate: `cache_type` is
@@ -7052,7 +7110,14 @@ fn sglang_run_fit_ladder(
             }
             Some(kv16_v) => {
                 let kv8_v = kv8.unwrap_or(kv16_v / 2);
-                let weights = ceil_div(input.model_bytes, shard);
+                // File bytes + device overhead (CUDA ctx, cuBLAS,
+                // marlin scratch): the engine allocates all of it
+                // before sizing the KV pool, so the ladder must gate on
+                // the real footprint, not the checkpoint size (receipt
+                // 2026-11-21: AWQ file 5816 MiB consumed ~6314 MiB,
+                // pool went to zero, child crashed at load).
+                let weights = ceil_div(input.model_bytes, shard)
+                    .saturating_add(Hardware::bytes(SGLANG_DEVICE_OVERHEAD_MIB));
                 // Draft weights are STATIC-side: sglang loads them
                 // before sizing the KV pool and counts them in
                 // pre_model_load ("If using speculative decoding, draft
@@ -7075,6 +7140,28 @@ fn sglang_run_fit_ladder(
                 } else {
                     0
                 };
+                // One static-side authority: the tiers may not gate on
+                // more VRAM than the mem-fraction ceiling ever lets the
+                // static pool claim. Tiers used to gate on the 92%
+                // usable budget while the ceiling (VRAM minus dynamic
+                // reserves) held the pool lower - the gap is where a
+                // "full fit" spawned a KV-zero pool and crashed at load
+                // (2026-11-21: 8 GiB AWQ, budget ~7.5 GiB, ceiling pool
+                // ~6.3 GiB = weights alone). Capping the budget here
+                // routes that overflow to Tier C offload instead.
+                let spec_dynamic_reserve_mib = if spec.engaged {
+                    SGLANG_SPEC_DYNAMIC_RESERVE_MIB
+                } else {
+                    0
+                };
+                let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss
+                )]
+                let ceiling_pool = (f64::from(ceiling) * vram as f64).round() as u64;
+                let budget = budget.min(ceiling_pool);
                 let geom = SglangFitGeometry {
                     shard,
                     vram,
@@ -7083,9 +7170,11 @@ fn sglang_run_fit_ladder(
                     draft_weights,
                     kv16_v,
                     kv8_v,
+                    slots,
+                    ctx,
+                    spec_engaged: spec.engaged,
                 };
-                let fit =
-                    sglang_gpu_fit(input, tun, argv, warnings, slots, ctx, spec.engaged, &geom)?;
+                let fit = sglang_gpu_fit(input, tun, argv, warnings, &geom)?;
                 gpu_label = fit.gpu_label;
                 kv_est_bytes = fit.kv_est_bytes;
                 sglang_push_mem_fraction(
@@ -7096,12 +7185,8 @@ fn sglang_run_fit_ladder(
                     &geom,
                     fit.kv_est_bytes,
                     fit.offload_gb,
-                    if spec.engaged {
-                        SGLANG_SPEC_DYNAMIC_RESERVE_MIB
-                    } else {
-                        0
-                    },
-                );
+                    spec_dynamic_reserve_mib,
+                )?;
             }
         }
     } else {
@@ -7137,6 +7222,12 @@ struct SglangFitGeometry {
     draft_weights: u64,
     kv16_v: u64,
     kv8_v: u64,
+    /// Spawn-wide facts the tier helpers need (graph sizing, teaching
+    /// text, tight-fit gating) - carried here so the fit fns stay at
+    /// argument-count lint limits.
+    slots: u32,
+    ctx: u32,
+    spec_engaged: bool,
 }
 
 /// What the chosen fit tier decided: the serving-tier label, the KV
@@ -7214,43 +7305,78 @@ fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u6
 /// when unpinned) and rides into the outcome for the mem-fraction
 /// derive.
 #[allow(clippy::too_many_arguments)]
+/// Emit the pinned `--cpu-offload-gb` flag (whole-GB, live-RAM clamped)
+/// and return the offload total every downstream consumer must agree on.
+/// Unpinned spawns emit nothing here (Tier C derives its own offload).
+fn sglang_push_pinned_offload(
+    input: &ProfileInput<'_>,
+    tun: &SglangTuning,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> f32 {
+    let Some(pin) = tun.cpu_offload_gb else {
+        return 0.0;
+    };
+    // The engine flag is integer-GB (0.5.21 argparse rejects "5.5":
+    // invalid int value) - a fractional pin rounds UP, never down:
+    // under-offloading would OOM the spawn the pin exists to save.
+    let whole = pin.ceil();
+    // Equality is exact here by construction: ceil() is whole, so the
+    // comparison only answers "was the pin already whole" - no
+    // tolerance semantics involved.
+    #[allow(clippy::float_cmp)]
+    if whole != pin {
+        warnings.push(format!(
+            "sglang.cpu_offload_gb {pin} rounded up to {whole} - the \
+             engine's --cpu-offload-gb accepts whole GB only"
+        ));
+    }
+    // Live-RAM clamp (J3 alignment) at the flag's one emission
+    // site: the spawn guard floors MemAvailable at model/2 +
+    // 512 MiB + offload, and a pin sized against TOTAL RAM
+    // starves it on a busy desktop - a guaranteed 507. The most
+    // offload the box can actually stage is what every consumer
+    // (argv, tier math, mem-fraction derive, supervisor J3)
+    // should agree on. Warned, never silent; reducing offload
+    // moves weights back onto the GPU, which the mem-fraction
+    // feasibility check refuses with teaching if it no longer
+    // fits.
+    let clamped = sglang_clamp_offload_to_live_ram(
+        whole,
+        input.model_bytes,
+        input.hardware.mem_available_mib,
+    );
+    if clamped + f32::EPSILON < whole {
+        warnings.push(format!(
+            "sglang.cpu_offload_gb {pin} reduced to {clamped}: live \
+             MemAvailable is {} MiB and the spawn stages model/2 + \
+             512 MiB of it during load - clamped so the spawn boots \
+             instead of refusing at the memory guard (free RAM or \
+             lower the pin for more offload)",
+            input.hardware.mem_available_mib.unwrap_or(0),
+        ));
+    }
+    push_tuned(
+        argv,
+        input.supported_flags,
+        "sglang.cpu_offload_gb",
+        "--cpu-offload-gb",
+        &format!("{clamped}"),
+        warnings,
+    );
+    clamped
+}
+
 fn sglang_gpu_fit(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-    slots: u32,
-    ctx: u32,
-    spec_engaged: bool,
     geom: &SglangFitGeometry,
 ) -> Result<SglangFitOutcome, String> {
-    let mut offload_total_gb = 0.0f32;
-    if let Some(pin) = tun.cpu_offload_gb {
-        // The engine flag is integer-GB (0.5.21 argparse rejects "5.5":
-        // invalid int value) - a fractional pin rounds UP, never down:
-        // under-offloading would OOM the spawn the pin exists to save.
-        let whole = pin.ceil();
-        // Equality is exact here by construction: ceil() is whole, so the
-        // comparison only answers "was the pin already whole" - no
-        // tolerance semantics involved.
-        #[allow(clippy::float_cmp)]
-        if whole != pin {
-            warnings.push(format!(
-                "sglang.cpu_offload_gb {pin} rounded up to {whole} - the \
-                 engine's --cpu-offload-gb accepts whole GB only"
-            ));
-        }
-        push_tuned(
-            argv,
-            input.supported_flags,
-            "sglang.cpu_offload_gb",
-            "--cpu-offload-gb",
-            &format!("{whole}"),
-            warnings,
-        );
-        offload_total_gb = whole;
-    }
+    let offload_total_gb = sglang_push_pinned_offload(input, tun, argv, warnings);
     let (weights, budget, kv16_v, kv8_v) = (geom.weights, geom.budget, geom.kv16_v, geom.kv8_v);
+    let (slots, spec_engaged) = (geom.slots, geom.spec_engaged);
     if weights.saturating_add(kv16_v) <= budget {
         // Tier A: full GPU, f16 KV.
         if tun.kv_cache_dtype.is_none() && input.overlay.cache_type.is_none() {
@@ -7314,7 +7440,7 @@ fn sglang_gpu_fit(
             offload_gb: offload_total_gb,
         })
     } else {
-        sglang_tier_c_host_offload(input, tun, argv, warnings, slots, ctx, spec_engaged, geom)
+        sglang_tier_c_host_offload(input, tun, argv, warnings, geom, offload_total_gb)
     }
 }
 
@@ -7323,18 +7449,16 @@ fn sglang_gpu_fit(
 /// host budget matters: every TP rank offloads independently into the
 /// same host RAM. Tier D refusal when even that budget cannot absorb
 /// it.
-#[allow(clippy::too_many_arguments)]
 fn sglang_tier_c_host_offload(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
-    slots: u32,
-    ctx: u32,
-    spec_engaged: bool,
     geom: &SglangFitGeometry,
+    pinned_offload_gb: f32,
 ) -> Result<SglangFitOutcome, String> {
     let (shard, budget, weights, kv8_v) = (geom.shard, geom.budget, geom.weights, geom.kv8_v);
+    let (slots, ctx, spec_engaged) = (geom.slots, geom.ctx, geom.spec_engaged);
     let overflow = weights.saturating_add(kv8_v).saturating_sub(budget);
     let offload_gb = ceil_gb(overflow);
     let host_budget = input
@@ -7343,12 +7467,12 @@ fn sglang_tier_c_host_offload(
         .saturating_mul(4)
         .saturating_div(10)
         .saturating_div(u64::from(shard));
-    // The pin (already quantized to whole GB at its own emission
-    // site) overrides the ladder's derive for BOTH the flag and the
-    // headroom math - offload_bytes derived from the same value the
-    // engine receives keeps them from disagreeing.
-    let emitted = if let Some(pin) = tun.cpu_offload_gb {
-        pin.ceil()
+    // The pin was quantized AND live-RAM-clamped at its one flag
+    // emission site (`sglang_gpu_fit`) - reuse exactly that value so
+    // the headroom math and the argv can never disagree. Unpinned
+    // spawns derive here instead.
+    let requested = if tun.cpu_offload_gb.is_some() {
+        pinned_offload_gb
     } else {
         warnings.push(format!(
             "fit ladder Tier C: weights {:.2} GiB + KV {:.2} GiB \
@@ -7361,6 +7485,28 @@ fn sglang_tier_c_host_offload(
             bytes_gib(budget),
         ));
         offload_gb
+    };
+    // Live-RAM clamp (J3 alignment) for the DERIVED emission (pins
+    // were clamped at their flag site above; the clamp is idempotent
+    // so re-applying is safe). The spawn guard floors MemAvailable at
+    // model/2 + 512 MiB + offload - an emission the host cannot stage
+    // is a 507 refusal at spawn time. Warned, never silent.
+    let emitted = {
+        let clamped = sglang_clamp_offload_to_live_ram(
+            requested,
+            input.model_bytes,
+            input.hardware.mem_available_mib,
+        );
+        if clamped + f32::EPSILON < requested {
+            warnings.push(format!(
+                "sglang cpu offload {requested} GB reduced to {clamped} GB: \
+                 live MemAvailable is {} MiB and the spawn stages model/2 + \
+                 512 MiB of it during load - clamped so the spawn boots \
+                 instead of refusing at the memory guard",
+                input.hardware.mem_available_mib.unwrap_or(0),
+            ));
+        }
+        clamped
     };
     let offload_bytes = gb_to_bytes(emitted);
     if offload_bytes > 0 && offload_bytes <= Hardware::bytes(host_budget) {
@@ -7425,6 +7571,29 @@ fn sglang_tier_c_host_offload(
     }
 }
 
+/// The static-pool fraction ceiling for a spawn: `frac <= ceiling`
+/// guarantees the dynamic remainder (`vram * (1 - frac)`) holds the
+/// dynamic reserves (activations, CUDA graphs, the spec chain). Shared
+/// authority for the tier-budget cap and the mem-fraction derive so the
+/// ladder can never "fit" a static side the ceiling then starves - the
+/// 2026-11-21 live 502: tiers gated on the 92% budget while the ceiling
+/// held the pool to 77% of VRAM.
+fn sglang_static_ceiling_frac(vram: u64, spec_dynamic_reserve_mib: u64) -> f32 {
+    if vram > 0 {
+        let reserves = Hardware::bytes(sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0))
+            .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
+        if vram > reserves {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let frac = ((vram - reserves) as f64 / vram as f64) as f32;
+            frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
+        } else {
+            SGLANG_MEM_FRACTION_MIN
+        }
+    } else {
+        SGLANG_MEM_FRACTION_MAX
+    }
+}
+
 /// mem-fraction-static: the anti-OOM heart. sglang bounds only the
 /// static pool (weights + draft + KV) by the fraction; every dynamic
 /// allocation - CUDA graphs, the spec verify/prewarm chain,
@@ -7441,6 +7610,11 @@ fn sglang_tier_c_host_offload(
 /// (`sglang_dynamic_reserve_mib` receipts) or the hard band - an
 /// over-budget pin is a mid-boot crash (capture assert ->
 /// `kill_process_tree` -> opaque 502), never a usable configuration.
+/// Feasibility: a governed fraction that cannot cover the static
+/// demand spawns a child that dies at pool allocation - the pin arm
+/// raises such a fraction to the demand (warned) when the ceiling
+/// allows it, and refuses with teaching when even the ceiling cannot
+/// (physics, not policy).
 #[allow(clippy::too_many_arguments)]
 fn sglang_push_mem_fraction(
     input: &ProfileInput<'_>,
@@ -7451,7 +7625,7 @@ fn sglang_push_mem_fraction(
     kv_est_bytes: Option<u64>,
     offload_total_gb: f32,
     spec_dynamic_reserve_mib: u64,
-) {
+) -> Result<(), String> {
     let (vram, weights) = (geom.vram, geom.weights);
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let gpu_static = weights.saturating_sub((f64::from(offload_total_gb) * 1e9).round() as u64);
@@ -7466,27 +7640,12 @@ fn sglang_push_mem_fraction(
     let static_demand = gpu_static
         .saturating_add(kv_charge)
         .saturating_add(geom.draft_weights);
-    // The dynamic side = vram * (1 - frac) must hold activations +
-    // graphs + the spec chain. Guaranteeing that means the RESERVE
-    // LOWERS THE CEILING (frac <= 1 - reserves/vram) - never a
-    // numerator add or a shrunken denominator: both RAISE frac, grow
-    // the static pool, and starve the dynamic side they claim to
-    // protect (that inversion OOM'd the 2026-10-16 DFLASH spawn at
-    // prewarm_sampling).
-    let ceiling = if vram > 0 {
-        let reserves = Hardware::bytes(sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0))
-            .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
-        if vram > reserves {
-            let reserve_vram = vram - reserves;
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let frac = (reserve_vram as f64 / vram as f64) as f32;
-            frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
-        } else {
-            SGLANG_MEM_FRACTION_MIN
-        }
-    } else {
-        SGLANG_MEM_FRACTION_MAX
-    };
+    let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib);
+    // Fraction the static demand actually needs. Half a thousandth of
+    // VRAM is below the emitted precision (3 decimals) - the raise
+    // check ignores it so a warn-raise never fires on rounding dust.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let demand_frac = (static_demand as f64 / vram.max(1) as f64) as f32;
     let frac = if let Some(pin) = tun.mem_fraction_static {
         let governed = pin.clamp(SGLANG_MEM_FRACTION_MIN, ceiling);
         if (governed - pin).abs() > f32::EPSILON {
@@ -7509,7 +7668,40 @@ fn sglang_push_mem_fraction(
                 }
             ));
         }
-        governed
+        if governed + 5e-4 < demand_frac && demand_frac <= ceiling {
+            // A pin below the demand spawns a child that dies at pool
+            // allocation ("Loaded weights leave no GPU memory for the
+            // KV cache", 2026-11-21 receipt). Raise to the demand -
+            // warned, never silent - when the ceiling still allows it;
+            // the ceiling itself keeps the dynamic side safe.
+            warnings.push(format!(
+                "sglang.mem_fraction_static {governed:.3} raised to \
+                 {demand_frac:.3}: the static side (weights {:.2} GiB \
+                 on-device + minimum KV pool) needs it - a lower \
+                 fraction dies at pool allocation",
+                bytes_gib(gpu_static),
+            ));
+            demand_frac.clamp(SGLANG_MEM_FRACTION_MIN, SGLANG_MEM_FRACTION_MAX)
+        } else if demand_frac > ceiling {
+            return Err(format!(
+                "model {} cannot boot with sglang.mem_fraction_static \
+                 {pin:.3}: the static side (weights {:.2} GiB on-device \
+                 + minimum KV pool + draft) needs {demand_frac:.3} of \
+                 VRAM but the dynamic-side ceiling is {ceiling:.3} \
+                 (activations/graphs{} must live in the remainder). \
+                 Raise models.<name>.sglang.cpu_offload_gb to move \
+                 weights off-device, or use a smaller checkpoint",
+                input.model_name,
+                bytes_gib(gpu_static),
+                if spec_dynamic_reserve_mib > 0 {
+                    " plus the speculative verify chain"
+                } else {
+                    ""
+                },
+            ));
+        } else {
+            governed
+        }
     } else {
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         let raw = (static_demand as f64 / vram.max(1) as f64) as f32;
@@ -7525,6 +7717,7 @@ fn sglang_push_mem_fraction(
             warnings,
         );
     }
+    Ok(())
 }
 
 /// VRAM that must stay OUT of the static pool when speculation engages:
@@ -9260,6 +9453,7 @@ mod tests {
         Hardware {
             physical_cores: cores,
             total_ram_mib: ram_mib,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "RTX".into(),
                 description: "NVIDIA CUDA".into(),
@@ -12932,6 +13126,7 @@ mod tests {
         let hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 32_000,
+            mem_available_mib: None,
             gpus: vec![],
         };
         let g = meta();
@@ -15070,6 +15265,7 @@ mod tests {
         let vulkan_hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 64_000,
+            mem_available_mib: None,
             gpus: vec![
                 GpuInfo {
                     name: "iGPU".into(),
@@ -15157,6 +15353,7 @@ mod tests {
         let scoped_hw = Hardware {
             physical_cores: 8,
             total_ram_mib: 64_000,
+            mem_available_mib: None,
             gpus: vec![mixed_census[1].clone()],
         };
         let mmproj = std::env::temp_dir().join("blazar-test-mmproj-scoped.gguf");
@@ -18536,7 +18733,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.741")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.784")
         );
     }
 
@@ -18546,7 +18743,9 @@ mod tests {
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        let mut inp = sglang_input(&hf, &hw, &cfg, 9_400 * MIB);
+        // model bytes net of the 512 MiB device-overhead charge keep the
+        // weights total (and thus the 168 MiB headroom receipt) unchanged
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_888 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "full");
@@ -18592,18 +18791,19 @@ mod tests {
         Hardware {
             physical_cores: 8,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![
                 GpuInfo {
                     name: "GPU0".into(),
                     description: "NVIDIA CUDA".into(),
-                    total_mib: 8_188,
-                    free_mib: 8_188,
+                    total_mib: 10_240,
+                    free_mib: 10_240,
                 },
                 GpuInfo {
                     name: "GPU1".into(),
                     description: "NVIDIA CUDA".into(),
-                    total_mib: 8_188,
-                    free_mib: 8_188,
+                    total_mib: 10_240,
+                    free_mib: 10_240,
                 },
             ],
         }
@@ -18621,9 +18821,11 @@ mod tests {
         inp.supported_flags = &flags;
         inp.auto_tp_size = Some(2);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        // 12 GiB weights / 2 ranks = 6 GiB per rank + 469,762,048 B
-        // per-rank f16 KV <= the 6,825,139,240 B per-card budget:
-        // Tier A holds per-rank where the summed pool would have said D.
+        // 12 GiB weights / 2 ranks = 6 GiB + 512 MiB device overhead
+        // per rank + 469,762,048 B per-rank f16 KV <= the 8,804,682,956 B
+        // per-card budget (92% - 1 GiB on a 10 GiB card; the ceiling cap
+        // sits higher at 8.9 GB): Tier A holds per-rank where the summed
+        // pool would have said D.
         assert_eq!(p.gpu, "full");
         assert_eq!(p.kv_est_bytes, Some(469_762_048));
         assert!(
@@ -18637,13 +18839,13 @@ mod tests {
                 .any(|w| w.contains("auto tensor-parallelism"))
         );
         // Per-rank demand against the bottleneck card's RAW VRAM
-        // (8,585,740,288 B), activation reserve clamps 0.7875 -> 0.786
-        // (dense reserve 1750 MiB since 2026-11-09; was 0.756 under the
-        // flat 2000 MiB posture).
+        // (10,737,418,240 B): (6 GiB weights + 512 MiB overhead + KV)
+        // / 10 GiB -> 0.680, under the dense ceiling 0.829 so the
+        // derive emits the demand itself.
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.786")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.680")
         );
         assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
     }
@@ -18695,11 +18897,11 @@ mod tests {
         inp.overlay = &overlay;
         inp.supported_flags = &flags;
         inp.auto_tp_size = Some(2);
-        // 9 GiB per rank vs 6.36 GiB per-card budget: sharding alone
-        // cannot hold it - per-rank overflow (2.85 GB with fp8 KV)
-        // lands in Tier C against the PER-RANK host share
-        // (16000*4/10/2 = 3200 MiB), so the spawn is honest "partial",
-        // never a blind NCCL death.
+        // 9 GiB + 512 MiB overhead per rank vs the 8.8 GiB per-card
+        // budget: sharding alone cannot hold it - per-rank overflow
+        // (1.4 GB with fp8 KV, ceil -> 2 GB) lands in Tier C against
+        // the PER-RANK host share (16000*4/10/2 = 3200 MiB), so the
+        // spawn is honest "partial", never a blind NCCL death.
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "partial");
         assert!(
@@ -18710,7 +18912,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3")
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
         );
         assert!(p.warnings.iter().any(|w| w.contains("Tier C")));
     }
@@ -18729,7 +18931,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "1")
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
         );
         assert!(
             p.argv
@@ -18741,7 +18943,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.833")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.796")
         );
     }
 
@@ -18751,11 +18953,12 @@ mod tests {
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        let mut inp = sglang_input(&hf, &hw, &cfg, 9_500 * MIB);
+        // model net of the 512 MiB overhead charge keeps the 68 MiB
+        // headroom receipt: per-size = 9.2773 * 0.335 = 3.1079;
+        // ceiling = 34 / 3.1079 = 10
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_988 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        // headroom = 68 MiB; per-size = 9.2773 * 0.335 = 3.1079;
-        // ceiling = 34 / 3.1079 = 10
         assert!(
             p.argv
                 .windows(2)
@@ -18769,11 +18972,11 @@ mod tests {
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        let mut inp = sglang_input(&hf, &hw, &cfg, 9_560 * MIB);
+        // model net of the 512 MiB overhead charge keeps the 8 MiB
+        // headroom receipt: raw ceiling 1.28 clamps up to the floor of 4
+        let mut inp = sglang_input(&hf, &hw, &cfg, 9_048 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        // weights + kv8 = 10,494,140,416 still fits Tier B, but headroom is
-        // 8 MiB -> raw ceiling 1.28 clamps up to the floor of 4
         assert!(
             p.argv
                 .windows(2)
@@ -18790,25 +18993,27 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 11_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // the 512 MiB device-overhead charge pushes the per-rank overflow
+        // past 2 GB, so Tier C now emits a 3 GB offload
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3")
         );
-        // slope follows TOTAL weights (10.7422 GiB -> 3.5986 MiB/size) while
-        // headroom counts only the on-GPU share (11,534,336,000 - 2e9
-        // weights + kv8 -> 475 MiB): 237.5 / 3.5986 = 65. A naive
-        // implementation that slopes the on-GPU share would print 75.
+        // slope follows TOTAL weights (11.24 GiB -> 3.77 MiB/size) while
+        // headroom counts only the on-GPU share (weights - 3e9 + kv8
+        // -> 917 MiB): 917 / 3.77 / 2 = 121. A naive implementation that
+        // slopes the on-GPU share would print higher.
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "65")
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "121")
         );
         // the derivation warning the doctor check surfaces verbatim
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("cuda-graph capture list <= 65"))
+                .any(|w| w.contains("cuda-graph capture list <= 121"))
         );
     }
 
@@ -18861,11 +19066,12 @@ mod tests {
         let hf = hf_meta();
         let flags = SGLANG_FLAGS_0521.clone();
         let overlay = sglang_ctx_overlay();
-        let mut inp = sglang_input(&hf, &hw, &cfg, 9_500 * MIB);
+        // model net of the 512 MiB overhead charge keeps the legacy
+        // Tier B headroom receipt: ceiling 10
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_988 * MIB);
         inp.overlay = &overlay;
         inp.supported_flags = &flags;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        // same headroom math as the legacy Tier B receipt: ceiling 10
         assert!(
             p.argv
                 .windows(2)
@@ -19185,6 +19391,7 @@ mod tests {
         let hw = Hardware {
             physical_cores: 4,
             total_ram_mib: 8_000,
+            mem_available_mib: None,
             gpus: vec![],
         };
         let hf = hf_meta();
@@ -19539,7 +19746,11 @@ mod tests {
             ctx: Some(512),
             ..DEFAULT_OVERLAY.clone()
         };
-        let weights = 5_936 * MIB;
+        // 5.6 GiB weights: with the 512 MiB device-overhead charge the
+        // demand (weights + overhead + 256 MiB floor = 0.778 of VRAM)
+        // stays under the dense ceiling, so the derive emits the demand
+        // itself - a demand-side floor test, not a ceiling clamp.
+        let weights = 5_600 * MIB;
         let mut inp = sglang_input(&hf, &hw, &cfg, weights);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -19659,12 +19870,15 @@ mod tests {
     }
 
     #[test]
-    fn unit__sglang_spec__probed_vocab_gates_algorithm_presence() {
+    fn unit__sglang_spec__probed_vocab_miss_falls_back_dense_with_warning() {
         // A lane with a PROBED algorithm vocabulary (non-empty
-        // spec_types) hard-errors when the requested algorithm is not
-        // registered - the honest "this lane cannot serve it" instead
-        // of a spawn the engine would refuse. Empty vocabulary (legacy
-        // rows) keeps flag-presence gating: dspine engages as above.
+        // spec_types) whose registry lacks the requested algorithm no
+        // longer refuses the spawn: speculation is a speed knob, not a
+        // capability gate, so the miss warns and boots dense (the
+        // 2026-11-21 live receipt: a stale dspine pin on a stock lane
+        // hard-errored instead of preparing a dense boot). Empty
+        // vocabulary (legacy rows) keeps flag-presence gating: dspine
+        // engages when the lane registers it.
         static PROBED_WITHOUT_DSPINE: LazyLock<Vec<String>> = LazyLock::new(|| {
             vec![
                 "NGRAM".to_string(),
@@ -19698,14 +19912,22 @@ mod tests {
             inp.spec_types = spec_types;
             inp
         };
-        let err = compile(
+        let p = compile(
             &mk_input(&PROBED_WITHOUT_DSPINE),
             &TuningOverrides::default(),
         )
-        .expect_err("unprobed algorithm must hard-error");
+        .expect("vocabulary miss must fall back to a dense spawn");
         assert!(
-            err.contains("DSPINE") && err.contains("not registered"),
-            "teaching error must name the algorithm: {err}"
+            !p.argv.iter().any(|a| a == "--speculative-algorithm"),
+            "dense fallback must not emit a spec flag: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("DSPINE")
+                && w.contains("not registered")
+                && w.contains("dense")),
+            "fallback warning must name the algorithm and the dense boot: {:?}",
+            p.warnings
         );
         let p = compile(&mk_input(&PROBED_WITH_DSPINE), &TuningOverrides::default())
             .expect("probed lane with DSPINE engages");
@@ -19713,6 +19935,172 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPINE")
+        );
+    }
+
+    #[test]
+    fn unit__sglang_fit__live_8gib_awq_pins_prepare_boot() {
+        // The 2026-11-21 live receipt, as a fixture: RTX 4070 Laptop
+        // (8188 MiB), 13.7 GiB RAM with a busy desktop (MemAvailable
+        // 7684 MiB), qwen3-8b-awq (5816 MiB) with the user's original
+        // pins - cpu_offload_gb 5, mem_fraction_static 0.85, a dspine
+        // pin the stock lane's probed vocabulary does not carry. The
+        // old planner refused (507 at the guard, then a doomed 0.85
+        // spawn that crashed with KV=0); the prepared plan must boot:
+        // offload clamped to what live RAM can stage (4 GB), the spec
+        // miss fallen back to dense, the fraction governed to the
+        // dense ceiling (0.786 on this card) - every relief warned.
+        static PROBED_STOCK: LazyLock<Vec<String>> = LazyLock::new(|| {
+            vec![
+                "NGRAM".to_string(),
+                "EAGLE3".to_string(),
+                "DFLASH".to_string(),
+            ]
+        });
+        let cfg = Config::default();
+        let mut hw = gpu_hw(8_188, 13_675, 8);
+        hw.mem_available_mib = Some(7_684);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(2_048),
+            sglang: Some(crate::config::SglangTuning {
+                cpu_offload_gb: Some(5.0),
+                mem_fraction_static: Some(0.85),
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 5_816 * MIB);
+        inp.overlay = &overlay;
+        inp.spec_types = &PROBED_STOCK;
+        let p = compile(&inp, &TuningOverrides::default())
+            .expect("the live 8 GiB pins must prepare a bootable plan");
+        // Offload relief: 5 GB pin -> 4 GB (MemAvailable 7684 - model/2
+        // 2908 - 512 = 4264 MiB -> 4 whole GB), warned.
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "4"),
+            "offload must be clamped to the 4 GB live RAM can stage: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("cpu_offload_gb 5 reduced to 4")),
+            "the offload clamp must be surfaced: {:?}",
+            p.warnings
+        );
+        // Spec relief: vocabulary miss -> dense boot, warned.
+        assert!(
+            !p.argv.iter().any(|a| a == "--speculative-algorithm"),
+            "dense fallback must not emit a spec flag: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("DSPINE") && w.contains("dense")),
+            "the dense fallback must be surfaced: {:?}",
+            p.warnings
+        );
+        // Fraction relief: 0.85 pin governed down to the dense ceiling
+        // (1750 MiB reserve on 8188 MiB -> 0.786), warned; Tier A keeps
+        // f16 KV (no fp8 push) because weights+kv16 fit the capped
+        // budget once 4 GB of weights moved to host.
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.786"),
+            "fraction must be governed to the dense ceiling: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("mem_fraction_static 0.850 clamped to 0.786")),
+            "the fraction clamp must be surfaced: {:?}",
+            p.warnings
+        );
+        assert!(
+            !p.argv.iter().any(|a| a == "--kv-cache-dtype"),
+            "Tier A must keep f16 KV: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__sglang_mem_fraction__pin_under_demand_raised_with_warning() {
+        // A mem_fraction pin below the static demand spawns a child
+        // that dies at pool allocation ("Loaded weights leave no GPU
+        // memory for the KV cache"). The planner raises the governed
+        // fraction to the demand when the ceiling allows it - warned,
+        // never silent. Fixture: 12 GiB card, 8000 MiB weights -> Tier
+        // A full fit, demand 0.784 of VRAM, pin 0.5 -> raised.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                mem_fraction_static: Some(0.5),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default())
+            .expect("an under-demand pin must raise, not refuse");
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.784"),
+            "the fraction must be raised to the demand: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("0.500 raised to 0.784")),
+            "the raise must be surfaced: {:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
+    fn unit__sglang_mem_fraction__demand_over_ceiling_refuses_with_teaching() {
+        // Physics, not policy: when even the ceiling cannot cover the
+        // static side (tiny card, big weights, pin keeping too much
+        // on-device), the planner refuses with teaching instead of
+        // spawning a child that dies at pool allocation. 4 GiB card,
+        // 4000 MiB weights, 1 GB offload pin: demand ~1.002 of VRAM vs
+        // dense ceiling 0.5625.
+        let cfg = Config::default();
+        let hw = gpu_hw(4_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(crate::config::SglangTuning {
+                cpu_offload_gb: Some(1.0),
+                mem_fraction_static: Some(0.85),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 4_000 * MIB);
+        inp.overlay = &overlay;
+        let err = compile(&inp, &TuningOverrides::default())
+            .expect_err("a demand the ceiling cannot cover must refuse");
+        assert!(
+            err.contains("cannot boot with sglang.mem_fraction_static"),
+            "the refusal must name the knob: {err}"
+        );
+        assert!(
+            err.contains("cpu_offload_gb"),
+            "the refusal must teach the offload relief: {err}"
         );
     }
 
@@ -21329,7 +21717,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.582")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.625")
         );
     }
 

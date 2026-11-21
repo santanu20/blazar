@@ -162,6 +162,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "g".into(),
                 description: "STUB".into(),

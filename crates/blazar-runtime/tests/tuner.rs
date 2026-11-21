@@ -29,6 +29,7 @@ fn gpu_hw(cores: u32, vram_mib: u64, ram_mib: u64) -> Hardware {
     Hardware {
         physical_cores: cores,
         total_ram_mib: ram_mib,
+        mem_available_mib: None,
         gpus: vec![GpuInfo {
             name: "g".into(),
             description: "CUDA".into(),
@@ -375,6 +376,7 @@ fn integration__tune_search_cpu__keeps_legacy_grid_and_q8_winner() {
     let hw = Hardware {
         physical_cores: 8,
         total_ram_mib: 32_000,
+        mem_available_mib: None,
         gpus: vec![],
     };
     let flags = all_flags();

@@ -330,6 +330,7 @@ mod tests {
         Hardware {
             physical_cores: 8,
             total_ram_mib: 32768,
+            mem_available_mib: None,
             gpus,
         }
     }

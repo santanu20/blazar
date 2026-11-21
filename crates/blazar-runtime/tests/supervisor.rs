@@ -109,6 +109,7 @@ fn supervisor(dirs: &BlazarDirs, config: Config, gpu: bool) -> Arc<Supervisor> {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "stub-gpu".into(),
                 description: "STUB GPU".into(),
@@ -120,6 +121,7 @@ fn supervisor(dirs: &BlazarDirs, config: Config, gpu: bool) -> Arc<Supervisor> {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![],
         }
     };
@@ -354,6 +356,7 @@ async fn integration__ladder__sleep_then_evict() {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "g".into(),
                 description: "S".into(),
@@ -460,6 +463,7 @@ async fn integration__crash__spawn_phase_death_counts_toward_circuit() {
     let hw = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
+        mem_available_mib: None,
         gpus: vec![],
     };
     let mut s = Supervisor::new(
@@ -678,6 +682,7 @@ async fn integration__load_timeout__never_healthy_stub() {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![],
         },
         Arc::new(engine),
@@ -715,6 +720,7 @@ async fn integration__ensure_fail_fast__child_death_beats_load_timeout() {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![],
         },
         Arc::new(engine),
@@ -749,6 +755,7 @@ fn unit__capacity_auto__cpu_one_gpu_bytes_admission() {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![],
         },
         Arc::new(LlamaCppEngine::new(stub_manifest())),
@@ -761,6 +768,7 @@ fn unit__capacity_auto__cpu_one_gpu_bytes_admission() {
     let gpu_hw = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
+        mem_available_mib: None,
         gpus: vec![GpuInfo {
             name: "g".into(),
             description: "S".into(),
@@ -789,6 +797,7 @@ fn unit__capacity_auto__cpu_one_gpu_bytes_admission() {
     let hw_234 = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
+        mem_available_mib: None,
         gpus: vec![GpuInfo {
             name: "g".into(),
             description: "S".into(),
@@ -840,6 +849,7 @@ fn unit__bytes_admission__heterogeneous_pair_coresides() {
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![GpuInfo {
                 name: "g".into(),
                 description: "S".into(),

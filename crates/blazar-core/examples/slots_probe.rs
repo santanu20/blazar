@@ -14,6 +14,7 @@ fn laptop_dual_gpu() -> Hardware {
     Hardware {
         physical_cores: 16,
         total_ram_mib: 13_675,
+        mem_available_mib: None,
         gpus: vec![
             GpuInfo {
                 name: "Vulkan0".into(),

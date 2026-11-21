@@ -157,6 +157,7 @@ pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer 
         blazar_core::hardware::Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
+            mem_available_mib: None,
             gpus: vec![blazar_core::hardware::GpuInfo {
                 name: "g".into(),
                 description: "STUB".into(),

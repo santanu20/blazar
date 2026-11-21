@@ -569,6 +569,7 @@ fn gpu_hw(vram_mib: u64, ram_mib: u64, cores: u32) -> Hardware {
     Hardware {
         physical_cores: cores,
         total_ram_mib: ram_mib,
+        mem_available_mib: None,
         gpus: vec![GpuInfo {
             name: "RTX".into(),
             description: "NVIDIA CUDA".into(),
@@ -582,6 +583,7 @@ fn gpu4_hw(vram_mib: u64, ram_mib: u64) -> Hardware {
     Hardware {
         physical_cores: 16,
         total_ram_mib: ram_mib,
+        mem_available_mib: None,
         gpus: (0..4)
             .map(|_| GpuInfo {
                 name: "RTX".into(),

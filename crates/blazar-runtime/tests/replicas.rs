@@ -92,6 +92,7 @@ fn supervisor(dirs: &BlazarDirs, replicas: Option<u32>) -> Arc<Supervisor> {
     let hw = Hardware {
         physical_cores: 4,
         total_ram_mib: 16_000,
+        mem_available_mib: None,
         gpus: vec![GpuInfo {
             name: "stub-gpu".into(),
             description: "STUB GPU".into(),
