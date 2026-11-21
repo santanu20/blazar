@@ -612,6 +612,13 @@ def lane_speech(args, rc: Receipts, env: dict) -> None:
         no_direct = (
             "piper is a local in-process synthesizer; no separate server to baseline"
         )
+    elif args.lane_speech == "kokoro":
+        # The kokoro lane ships a standalone shim server the gateway's
+        # lazy runtime spawns with the same `kokoro-server --port N`
+        # contract - the direct arm below baselines it standalone, so
+        # gateway overhead isolates exactly like the llama-server lane.
+        model, mode = args.model or "kokoro", "gateway-kokoro"
+        no_direct = None
     else:
         row = store_row(args.store, args.model or "pocket-tts")
         if not row:
@@ -658,7 +665,74 @@ def lane_speech(args, rc: Receipts, env: dict) -> None:
     )
 
 
+def lane_speech_direct_kokoro(args, rc: Receipts, env: dict) -> None:
+    """Direct kokoro-shim baseline: spawn the lane's standalone server
+    with the same `kokoro-server --port N` contract the gateway's lazy
+    runtime uses (the wrapper resolves its own lane venv python, so cwd
+    does not matter), then drive POST /tts with the lane-native body."""
+    _shim_dir, shim = find_binary(args.engines_root, "kokoro", ["kokoro-server"])
+    port = args.direct_port
+    child = spawn_child([shim, "--port", str(port)], {}, port, args.log_dir)
+    text = SPEECH_TEXT
+
+    def synth():
+        return http_json(
+            f"http://127.0.0.1:{port}/tts",
+            {"input": text, "voice": "kokoro", "speed": 1.0},
+            timeout=args.timeout,
+        )
+
+    def one() -> float:
+        st, raw, wall, _ = synth()
+        if st != 200 or not isinstance(raw, (bytes, bytearray)) or raw[:4] != b"RIFF":
+            raise RuntimeError(f"status {st}")
+        return wall
+
+    try:
+        one()  # warmup (first synthesis also warms the voice pack load)
+        rows = []
+        for c in [int(x) for x in args.conc.split(",")]:
+            m = run_ladder(one, c, args.reps)
+            _st2, raw2, _, _ = synth()
+            audio_s = (
+                wav_seconds(bytes(raw2))
+                if isinstance(raw2, (bytes, bytearray))
+                else 0.0
+            ) or 0.0
+            m.update(
+                {
+                    "lane_mode": "direct-shim",
+                    "audio_s_mean": round(audio_s, 3),
+                    "rtf_mean": round(audio_s / m["mean_ms"] * 1000, 4)
+                    if m["mean_ms"]
+                    else None,
+                    "chars_per_s": round(len(text) / (m["mean_ms"] / 1000), 1)
+                    if m["mean_ms"]
+                    else None,
+                }
+            )
+            rows.append(m)
+            print(f"  shim-direct C={c}: {m['req_per_s']} req/s rtf={m['rtf_mean']}")
+        rc.lane(
+            {
+                "lane": "speech",
+                "mode": "direct-shim",
+                "model": "kokoro",
+                "engine": shim,
+                "env": env,
+                "rows": rows,
+            },
+            SPEECH_CSV,
+            rows,
+        )
+    finally:
+        child.kill()
+
+
 def lane_speech_direct(args, rc: Receipts, env: dict) -> None:
+    if args.lane_speech == "kokoro":
+        lane_speech_direct_kokoro(args, rc, env)
+        return
     row = store_row(args.store, args.model or "pocket-tts")
     if not row:
         sys.exit("store row not found for direct engine-tts baseline")
@@ -997,12 +1071,12 @@ def main() -> None:
         help="direct llama-server baseline (text-bert only)",
     )
 
-    sp = sub.add_parser("speech", help="piper | engine lanes")
+    sp = sub.add_parser("speech", help="piper | kokoro | engine lanes")
     sp.add_argument(
         "--lane-speech",
         dest="lane_speech",
         default="piper",
-        choices=["piper", "engine"],
+        choices=["piper", "kokoro", "engine"],
     )
     sp.add_argument("--model", default=None)
     sp.add_argument("--conc", default="1,2,4")
