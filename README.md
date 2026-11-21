@@ -26,11 +26,9 @@ Unified OpenAI, Ollama and Anthropic gateway · Multi-engine serving · Resource
 
 ## What is Blazar?
 
-Blazar is a **local AI gateway and runtime orchestrator** in one Rust binary. Applications connect to one endpoint; Blazar manages model storage, selects or pins inference engines, plans workloads against available hardware, and controls admission, concurrency, lifecycle and diagnostics.
+Blazar is a **local-first control plane for model serving**, distributed as one Rust binary. Applications connect to one endpoint; Blazar manages model storage, chooses or pins inference engines, plans workloads against available hardware, and coordinates admission, concurrency, routing, lifecycle and diagnostics.
 
-**Bring your client. Bring your model. Blazar handles the serving stack.**
-
-Blazar is the control plane around inference engines. The engines still perform inference: Blazar does not replace them, train models, or require a hosted service.
+The inference engines still execute the model. Blazar coordinates the serving stack around them; it does not train models or require a hosted control plane.
 
 ### Product capabilities at a glance
 
@@ -39,16 +37,16 @@ Blazar is the control plane around inference engines. The engines still perform 
 | One endpoint for existing AI applications | Native OpenAI, Ollama and Anthropic API dialects, plus a Python SDK |
 | Multiple model/runtime families | Capability-aware routing across 10 inference-engine lanes |
 | Hardware-aware serving | VRAM/KV fit planning, admission control, adaptive slots and co-residency |
-| Better throughput and latency | Speculative decoding (MTP/EAGLE/draft pairs), cache/session management and workload-aware scheduling |
-| Model operations | Search, pull, import, inspect, pin, tune, snapshot, restore and engine version management |
+| Better throughput and latency | Speculative decoding, cache/session management, workload-aware scheduling and measured optimization |
+| Model operations | Search, pull, import, inspect, pin, tune, snapshot, restore, KV inventory/import and engine version management |
 | Reuse existing model files | Scan and reuse Ollama, Hugging Face Hub and LM Studio caches; verify bytes and hardlink instead of downloading again where possible |
-| Several machines as one pool | Opt-in federation with capacity-aware warm, replicate and route operations |
+| Several machines as one pool | Remote federation, dynamically joined RPC workers, and logical model pools with ordered, least-wait, warm-first or adaptive replica selection |
 | Other machines' GPUs | Opt-in cluster joining and remote RPC workers; remote capacity participates in spawn planning |
 | Agent and tool workflows | Server-mediated MCP tool calling for OpenAI, Ollama and Anthropic clients |
 | Multimodal workloads | Text, embeddings, reranking, image generation/editing/upscaling, video, speech-to-text, text-to-speech and realtime voice |
 | Work that survives restarts | SQLite-backed durable jobs, cancellation, artifacts and restart-safe response chains |
-| Operability | CLI diagnostics, explainable routing, read-only web console, metrics, OTLP and audit logs |
-| Local security controls | Loopback-by-default serving, optional scoped API keys, TLS, explicit CORS and PII scrubbing |
+| Operability | CLI diagnostics, derived engine capability cards, explainable routing, read-only web console, metrics, OTLP and audit logs |
+| Local security controls | Loopback-by-default serving, optional scoped API keys, TLS, explicit CORS, audit controls and PII scrubbing |
 
 ---
 
@@ -60,19 +58,19 @@ Blazar is the control plane around inference engines. The engines still perform 
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/santanu20/blazar/v0.34.1/scripts/install.sh \
+  https://raw.githubusercontent.com/santanu20/blazar/main/scripts/install.sh \
   | BLAZAR_REPO=santanu20/blazar sh
 ```
 
 #### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/santanu20/blazar/v0.34.1/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/santanu20/blazar/main/scripts/install.ps1 | iex
 ```
 
 Also available: `cargo binstall blazar` for the prebuilt binary, `cargo install blazar` to compile it, or [build from source](#installation).
 
-The Blazar binary and inference engines are separate artifacts. The installer can bootstrap the default engine; manage it explicitly with `blazar engine update`. Set `BLAZAR_INSTALL_ENGINE=0` to skip engine bootstrap.
+The Blazar binary and inference engines are separate artifacts. The Linux/macOS shell installer bootstraps the default llama.cpp engine; the Windows installer installs the CLI, so run `blazar engine update` there before serving a model. Set `BLAZAR_INSTALL_ENGINE=0` to skip the Linux/macOS engine bootstrap. Set `BLAZAR_VERSION` to pin an installer run to a release.
 
 ### 2. Pull or reuse a model
 
@@ -118,7 +116,7 @@ No application rewrite is required: point clients at the compatible Blazar surfa
 | SGLang-native clients | `http://127.0.0.1:11435` | Native `/generate` passthrough for SGLang-lane models |
 | Blazar Python SDK | `BLAZAR_URL=http://127.0.0.1:11435` | Chat, streaming, best-of/MCP tools, process listing, explain, failover, realtime voice and Anthropic batches |
 
-The Python SDK lives in [`sdk/python`](sdk/python). This README does not claim feature parity for an independently documented TypeScript SDK.
+The first-party Python SDK lives in [`sdk/python`](sdk/python); an independently packaged, zero-dependency TypeScript client lives in [`sdk/ts`](sdk/ts). They are separate clients with different coverage: the Python SDK includes realtime voice and Anthropic batch workflows, while the TypeScript SDK currently focuses on chat/streaming and core operations. See each SDK README for its exact surface.
 
 Blazar can run alongside an existing Ollama installation and can later serve on port `11434` as a port-level replacement.
 
@@ -134,7 +132,7 @@ blazar connect pi --write
 
 `blazar connect` prepares or applies integrations for Codex, Claude Code, Continue, Cline, Open WebUI, opencode and pi (oh-my-pi). Writes are backed up and rolled back if the test request fails. Other OpenAI-compatible, Ollama-compatible or Anthropic-compatible clients can connect directly to the gateway.
 
-Every gateway-rendered error carries a stable machine-readable `blazar_code`; see [`docs/error-codes.md`](docs/error-codes.md) or `GET /api/errors`.
+Blazar-rendered errors on OpenAI-shaped gateway surfaces include a stable machine-readable `blazar_code`; engine errors forwarded verbatim and the Ollama-native error shape are exceptions. See [`docs/error-codes.md`](docs/error-codes.md) or `GET /api/errors`.
 
 ### MCP tool calling for any supported client
 
@@ -220,13 +218,17 @@ Speculative decoding supports MTP, EAGLE and draft-pair modes, with lane-aware d
 
 Search, pull, import, inspect, pin, snapshot, restore, quantize and tune models. `import --scan` finds reusable models in Ollama, Hugging Face Hub and LM Studio caches. Matching files are checked by size and SHA-256 before hardlink reuse. Engine installs are versioned side-by-side, verified, capability-probed and protected by regression gates and rollback.
 
-### 6. Federation and opt-in GPU clusters
+### 6. Federation, GPU fleets and logical model pools
 
-Federation is strictly opt-in: without `[[remotes]]`, requests stay on the local machine. Peers publish capacity; routing can prefer warm models, queue wait and free VRAM. `warm`, `replicate` and `route` manage placement. Opt-in cluster joining allows donor machines to contribute GPU capacity to spawn planning. Remote RPC workers are available for trusted networks; the RPC protocol itself has no authentication.
+Remote federation is opt-in through `[[remotes]]`; without remotes, traffic stays local. Blazar can warm and replicate models to remote gateways, explain cross-node placement, and use model pools (`[[model_pools]]`) to expose one logical model name over local and remote replicas. Pool strategies include `ordered`, `least_wait`, `warm_first` and `adaptive`, with cache-affinity signals and operator controls to drain, undrain, pin or unpin members.
+
+GPU workers can join a gateway dynamically instead of being listed only in static `rpc_servers`. Joining supports a shared `fleet_token`, one-use expiring invites and per-worker session credentials; optional LAN discovery is off by default. These membership controls protect the fleet control plane, not the underlying RPC data protocol: llama.cpp RPC worker traffic itself has no authentication and must stay on a trusted network or protected tunnel. See [fleet setup](docs/7.SETUP.md) and the model-pool section there.
 
 ### 7. Sessions, persistent KV and cache
 
-Session save/restore, automatic KV session banking on graceful stop, prefix-cache visibility, opt-in semantic cache and warm-on-pull. The README describes session banking and cache visibility; cache features remain dependent on the configured engine and supported path.
+Session save/restore and automatic session banking preserve eligible llama.cpp slot KV across graceful unloads and restarts. `blazar kv status` and `blazar kv inspect <model>` report bank identity, size and state; `blazar kv gc --dry-run` identifies orphaned KV data, and `--apply` moves candidates to a timestamped backup directory rather than hard-deleting them.
+
+Persistent vLLM KV offload is configured separately under `[vllm.kv_offload]` and managed by vLLM's OffloadingConnector; Blazar observes reuse (for example, through `cached_tokens`) rather than moving individual blocks through a gateway API. Cross-engine interchange is a separate, opt-in capability under `[kv.translation]` and requires an explicit `blazar kv import`. It is not universal or automatic. A live-certified example imports a 1,536-token prefix from the vLLM filesystem tier into a llama.cpp session bank; SGLang↔vLLM and MLX↔vLLM require different hardware/host conditions and are not claimed as universally live-certified. See [`docs/7.SETUP.md`](docs/7.SETUP.md) and the [KV certification receipt](bench-artifacts/2026-11-21-kv-codec-live-certs/README.md).
 
 ### 8. Multimodal inference and realtime voice
 
@@ -246,56 +248,47 @@ A SQLite ledger persists durable jobs, events, cancellation state and artifacts.
 
 ### 12. Diagnostics, observability and read-only web console
 
-CLI diagnostics include `doctor`, `why`, `watch`, `explain` and `model-doctor`. The gateway exposes capacity and fit read models, metrics, OTLP, audit JSONL and request-level engine-degradation warnings. `/ui` is a zero-dependency, read-only operations console with TTFT/TPOT, models, engines, compute census, benchmarks, jobs and sessions.
+CLI diagnostics include `doctor`, `why`, `watch`, `explain` and `model-doctor`. The gateway exposes capacity and fit read models, request-stage timing, metrics, OTLP, audit JSONL and request-level engine-degradation warnings. `blazar engine card` and `GET /api/engines` expose derived capability cards backed by lane predicates and install-time probes; `GET /api/fit` adds confidence, current media pressure and supported parallelism advice. `/ui` is a zero-dependency, read-only operations console with dashboard, models, engines, compute, benchmarks, jobs and sessions.
 
 ### 13. Local-first security and network controls
 
-Loopback by default; optional scoped API keys, TLS, explicit CORS, DNS-rebinding hardening on loopback binds, a guard against keyless non-loopback serving unless explicitly enabled, audit logging, PII scrubbing and opt-in OTLP. These are configurable controls, not a claim that every deployment is automatically hardened.
+Loopback is the default serving posture. Optional controls include scoped API keys, TLS, explicit CORS, DNS-rebinding hardening on loopback binds, a guard against keyless non-loopback serving unless explicitly enabled, audit logging and PII scrubbing. Fleet membership can be protected by a shared token or one-use invites, but this does not authenticate the underlying RPC worker protocol. Remote HTTP credentials are subject to URL-scheme validation; use HTTPS for remote public endpoints. These are configurable controls, not a claim that every deployment is automatically hardened.
 
 ---
 
 ## Benchmark snapshot
 
-Two committed campaigns and their full receipts are documented in [`BENCHMARK.md`](BENCHMARK.md). The results below describe specific tested configurations, not universal guarantees.
+Benchmark figures are workload-, engine-, model- and hardware-specific. The receipts below are from November 21, 2026; they are evidence for the tested configurations, not universal performance guarantees.
 
-| Workload | Blazar | Reference | Interpretation |
-|---|---:|---:|---|
-| Single-stream decode | **41.07 t/s** | 41.64 t/s direct engine | **~1.4%** gateway overhead |
-| Single-stream TTFT p50 / ITL p99 | **120 ms / 25.8 ms** | 121 / 25.2 ms direct; 122 / **75.0 ms** Ollama | parity with direct; **~3x** lower tail than Ollama |
-| Cached prefill | **7,494 t/s** | 7,359 t/s direct | parity-better |
-| Long-context hold (2k -> 16k) | 41.1 -> 40.6 t/s | 6,145 MiB peak vs Ollama 6,829 | -1.2% across the ladder, leaner memory |
-| Cold start (page cache dropped) | **4.8 s** | 4.6 s Ollama (warm daemon) | parity incl. full spawn |
-| Idle wake | **2.4-3.5 s** | 6.2 s Ollama | **~2x** faster wake |
-| Tool-call TTFT p50 | **117 ms** | 285 ms Ollama | **~2.4x** lower |
-| Concurrent, matched slots, C=1 | **423.7 t/s** | 373.3 t/s direct engine | **1.14x** - parity-to-better (singleflight default-off) |
-| Concurrent, matched slots, C=4 | **604.9 t/s** | 594.7 t/s direct engine | **1.02x** aggregate at load |
-| Concurrent, matched slots, C=8 | **597.2 t/s** | 605.8 t/s direct engine | **0.99x** at saturation (was **0.72x** before the serialization fix) |
-| Concurrent throughput, C=4 | **104.8 t/s** | 33.6 t/s Ollama lane | **~3.1x** system throughput |
-| Concurrent TTFT p99, C=4 | **554 ms** | 15.9 s Ollama lane | Lower tail latency |
-| Adaptive serving | **49 -> 63 t/s** | - | **~28%** gain, 0 failed requests |
+### Gateway overhead under matched concurrency
 
-Concurrency rows above the Ollama block are the current-release ladder (8 x 64-token bodies, temp 0, identical child argv both sides; methodology and the pre-fix ladder live in the committed audit report [`bench-artifacts/20261031-benchmark-audit/report.md`](bench-artifacts/20261031-benchmark-audit/report.md), the post-serialization-fix ladder - C1 1.135, C4 1.017, C8 0.986 - in [`docs/research/2026-10-31-recursive-self-improvement-research.md`](docs/research/2026-10-31-recursive-self-improvement-research.md) with fix commit `299bf5a`; raw receipts also persist in the daemon store via `blazar bench` history).
+A November 21 saturation campaign compared Blazar with the same llama.cpp child binary, model and serving arguments on an RTX 4070 Laptop GPU (8 GiB), using Qwen2.5-0.5B, two rounds at each concurrency rung, and 128 generated tokens per stream. Aggregate gateway/direct throughput ratios were:
 
-Where the gateway can matter - scheduling, residency, cache, tail control, tools - Blazar leads Ollama by receipt:
+| Concurrent streams | Gateway / direct throughput | Interpretation |
+|---:|---:|---|
+| 1 | 1.204x | Gateway ran second; warmer page cache can flatter this result |
+| 2 | 0.970x | 3.0% below direct |
+| 4 | 1.051x | 5.1% above direct |
+| 8 | 0.999x | At parity |
+| 16 | 0.943x | 5.7% below direct at saturation |
 
-| Surface | Blazar | Ollama | Margin |
-|---|---:|---:|---|
-| ITL p99 (tail smoothness) | **25.8 ms** | 75.0 ms | **~3x** |
-| Idle wake | **2.4-3.5 s** | 6.2 s | **~2x** |
-| Tool-call TTFT p50 | **117 ms** | 285 ms | **~2.4x** |
-| TTFT p99 under load, C=4 | **554 ms** | 15.9 s | **~28x** |
-| Cached-path TTFT | **~0.4 s** | 6.1-6.5 s | **~15x** |
-| Throughput under load, C=4 | **104.8 t/s** | 33.6 t/s | **~3.1x** |
+Every rung completed with zero failed requests. The campaign used only two rounds on one machine, so treat these ratios as a measured diagnostic rather than a general speed claim. Its stage timings also record a cold-spawn admission outlier at low concurrency; at higher concurrency, dispatch and engine-slot queueing dominate the tail. See the [full saturation report and caveats](bench-artifacts/2026-11-21-gateway-saturation/README.md).
 
-The two parity rows in the table above are physics, not lost ground: single-stream TTFT is the same engine doing prefill in every lane (the relay adds ~0 ms), and cold start is disk-bandwidth-bound model loading - where Ollama's 4.6 s reference even ran on a warm daemon while Blazar's 4.8 s included the full gateway boot.
+### Current vLLM and SGLang lane evidence
 
-The matched-concurrency rows pin the gateway child to the direct lane's own slot count, isolating orchestration cost from slot-capacity differences; the default lane (slots=4, unified 64k KV) legitimately trades decode speed for context capacity on an 8 GiB card. Campaigns measure more than tokens/s: prefill, saturation, cache reuse, tool-call and structured-output quality, cold starts, scheduling, lifecycle, and media lanes - per-campaign environments and dates are recorded with each receipt in BENCHMARK.md. Reproduce with `blazar bench <model>` or `python3 scripts/bench_matrix.py --blazar-bin target/release/blazar --md BENCHMARK.md`.
+A separate November 21 campaign exercised vLLM 0.34.0 and SGLang 0.5.23 with a 953 MiB Qwen2.5-Coder-0.5B safetensors model on the same 8 GiB RTX 4070 Laptop host. Default-profile single-stream results were approximately 190 tokens/s for vLLM and 202 tokens/s for SGLang; measured TTFT was about 19 ms and 18 ms, respectively. The Ollama reference in that report uses a different GGUF runtime/model path and is not a like-for-like comparison. The campaign has documented error and environment cells and does not certify every configuration. See the [lane report](bench-artifacts/2026-11-21-vllm-sglang-lanes/README.md) and [vLLM tool-call fix receipt](bench-artifacts/2026-11-21-vllm-tools-fix/README.md).
 
----
+### KV interchange proof
+
+A live certification imported 24 complete 64-token blocks (1,536 tokens) from vLLM's persistent filesystem tier into a llama.cpp session bank for a matching F16 GGUF/HF model pair; the next llama.cpp spawn restored the prefix into slot KV. This proves that specific conversion path, not generic or automatic KV portability across all engines. See the [live certification](bench-artifacts/2026-11-21-kv-codec-live-certs/README.md).
+
+The benchmark archive is indexed in [`bench-artifacts/INDEX.md`](bench-artifacts/INDEX.md). [`BENCHMARK.md`](BENCHMARK.md) is machine-rendered; its header identifies the **last render**, not necessarily the newest campaign. Check the campaign index and individual receipts before quoting a result.
 
 ## Configuration
 
-Configuration lives at `~/.config/blazar/config.toml`; prefer the CLI for routine changes.
+Blazar reads `config.toml` from its platform config directory. On Linux the default is `~/.config/blazar/config.toml`; macOS and Windows use their native per-user config locations. An explicitly set `XDG_CONFIG_HOME` overrides the config root on every platform. The data directory follows the same platform/XDG rules (`~/.local/share/blazar` on Linux). On Unix, Blazar sets the config directory to owner-only permissions because it can contain API-key secrets.
+
+Prefer the CLI for routine changes:
 
 ```sh
 blazar config defaults
@@ -308,17 +301,17 @@ blazar config unset <key>
 | Area | Examples |
 |---|---|
 | Serving | `host`, `port`, `default_ctx`, `slots`, `max_loaded_models` |
-| Memory / quality | `cache_type`, `kv_unified`, `ctx_extend` |
+| Memory / quality | `cache_type`, `kv_unified`, `ctx_extend`, `cache_ram_mb` |
 | Scheduling | `singleflight`, `adaptive_slots`, admission, priorities |
 | Speculation | `spec`, draft selection, n-gram lookup |
-| Routing | `engine_routing`, per-model overrides, replicas |
-| Access | keys, TLS, CORS, remotes |
+| Routing / pools | `engine_routing`, per-model overrides, replicas, `[[model_pools]]` |
+| KV | `session_bank`, `[vllm.kv_offload]`, opt-in `[kv.translation]` |
+| Fleet / network | `rpc_servers`, `fleet_token`, `fleet_open`, `discovery_enabled`, `[[remotes]]` |
+| Access | API keys, TLS, CORS, per-key MCP access |
 | Observability | `audit_log`, `pii_scrub`, `otlp_endpoint` |
 | Media | diffusion tuning, RPC, audio-lane timeouts |
 
-`blazar config defaults` is the authoritative live reference. Authentication is optional for a default local deployment.
-
----
+`blazar config defaults` and [`docs/7.SETUP.md`](docs/7.SETUP.md) are the authoritative live configuration references. Authentication remains optional for a default local deployment.
 
 ## Common commands
 
@@ -346,12 +339,13 @@ blazar config unset <key>
 | Distributed inference worker | `blazar rpc` |
 | Health / diagnostics | `blazar doctor`, `blazar doctor --fix`, `blazar why`, `blazar watch` |
 | Preview fit / co-residency | `blazar fit <target>`, `blazar coreside` |
-| Manage engines | `blazar engine update / list / use / rollback / install / build / prune / delta` |
-| Federation | `blazar warm`, `blazar replicate`, `blazar route` |
-| Sessions / LoRA | `blazar session save/restore`, `blazar lora add/rm/list` |
+| Manage engines and inspect capabilities | `blazar engine update / list / use / rollback / install / build / prune / delta`; `blazar engine card [tag|--kind]` |
+| Federation and fleets | `blazar warm`, `blazar replicate`, `blazar route`, `blazar rpc status`, `blazar init`, `blazar join`, `blazar agent run`, `blazar adopt` |
+| Sessions / KV / LoRA | `blazar session save/restore`, `blazar kv status/inspect/gc/import`, `blazar lora add/rm/list` |
+| Pools / operations | `blazar pool status/watch/drain/undrain/pin/unpin` |
 | Audio | `blazar whisper <file>`, `blazar tts "<text>"` |
 | Disk | `blazar storage`, `blazar prune --orphans/--unused` |
-| Keys / snapshots | `blazar keys ...`, `blazar snapshot` |
+| Keys / snapshots / registry | `blazar keys ...`, `blazar snapshot`, `blazar registry keygen/sign/verify` |
 | Search / self-update | `blazar search ...`, `blazar upgrade` |
 
 Full CLI surface: `blazar --help`. Complete route contract: [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md).
@@ -393,13 +387,13 @@ irm https://raw.githubusercontent.com/santanu20/blazar/main/scripts/install.ps1 
 .\install.ps1 -Build
 ```
 
-Package-manager integrations: [Homebrew](packaging/homebrew), [Scoop](packaging/scoop), [Winget](packaging/winget) and the [AUR PKGBUILD](packaging/PKGBUILD).
+Package-manager integrations: [Homebrew](packaging/homebrew), [Scoop](packaging/scoop), [Winget](packaging/winget) and the [AUR PKGBUILD](packaging/PKGBUILD). The workspace requires **Rust 1.95 or newer** (edition 2024) when building from source. The Linux/macOS shell installer installs the default llama.cpp engine unless `BLAZAR_INSTALL_ENGINE=0`; the Windows installer installs the CLI only, so run `blazar engine update` before serving a model.
 
 ---
 
 ## Architecture
 
-Blazar is a Rust workspace with explicit boundaries; unsafe code is denied by default. CI runs formatting, Clippy, tests and installer checks.
+Blazar is a four-crate Rust workspace with explicit boundaries; the workspace denies unsafe code by default. CI runs formatting, Clippy with warnings denied, workspace tests via nextest, an MSRV check, Linux/Windows/macOS test jobs, and installer/script checks.
 
 ```text
 crates/
@@ -424,6 +418,10 @@ This README is the product entry point; implementation and operational detail li
 | [`docs/2.ARCHITECTURE.md`](docs/2.ARCHITECTURE.md) | Internal architecture and lifecycle |
 | [`docs/3.DATA_MODEL.md`](docs/3.DATA_MODEL.md) | SQLite schema and invariants |
 | [`docs/4.API_SPEC.md`](docs/4.API_SPEC.md) | HTTP API and CLI reference |
+| [`docs/engines.md`](docs/engines.md) | Ten engine lanes, format routing, engine lifecycle and capability cards |
+| [`docs/engine-coverage.md`](docs/engine-coverage.md) | Machine-checked engine capability and inventory coverage |
+| [`docs/error-codes.md`](docs/error-codes.md) | Stable gateway error classifications and remediation |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark methodology and selected campaign results |
 | [`docs/6.BUSINESS_RULES.md`](docs/6.BUSINESS_RULES.md) | Routing, admission, validation and eviction rules |
 | [`docs/7.SETUP.md`](docs/7.SETUP.md) | Installation, deployment and configuration |
 | [`docs/8.DO_NOT_BREAK.md`](docs/8.DO_NOT_BREAK.md) | Maintainer invariants and compatibility rules |
