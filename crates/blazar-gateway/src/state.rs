@@ -880,6 +880,8 @@ mod tests {
             bytes,
             heat: 0,
             keep_alive_secs: None,
+            host_rss_mib: 0,
+            host_charge_bytes: 0,
         }
     }
 

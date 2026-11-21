@@ -206,6 +206,93 @@ pub fn mem_available_mib() -> Option<u64> {
     Some(sys.available_memory() / (1024 * 1024))
 }
 
+/// One host-memory snapshot: installed total and live `MemAvailable`,
+/// both MiB. Feeds the capacity/explain host cards. `None` when the
+/// platform refuses a memory snapshot - callers surface the absence,
+/// never a guess (same contract as [`mem_available_mib`]).
+pub struct HostMemSnapshot {
+    pub total_mib: u64,
+    pub available_mib: u64,
+}
+
+#[must_use]
+pub fn host_mem_snapshot() -> Option<HostMemSnapshot> {
+    let mut sys = sysinfo::System::new().ok()?;
+    sys.refresh_memory();
+    Some(HostMemSnapshot {
+        total_mib: sys.total_memory() / (1024 * 1024),
+        available_mib: sys.available_memory() / (1024 * 1024),
+    })
+}
+
+/// Resident memory of one process group (the engine child plus any
+/// helpers it forked), MiB - the host ledger's settle measurement.
+///
+/// Linux: sums `Rss:` from `/proc/<pid>/smaps_rollup` across every
+/// live member of the group (the child runs as its own process-group
+/// leader, so the pgid walk cannot pick up unrelated processes).
+/// Per-process RSS counts shared pages per member, so a forked helper
+/// double-counts its shared slice; the ledger charge caps at the
+/// weights size, which bounds that error. Non-Linux: `None` - the
+/// ledger keeps its estimate charge and says so, no guessed numbers.
+#[must_use]
+pub fn pgid_rss_mib(pgid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::fs::read_dir("/proc").ok()?;
+        let mut total_kb: u64 = 0;
+        let mut members = 0u32;
+        for entry in dir.flatten() {
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            let Ok(entry_pid) = name.parse::<u32>() else {
+                continue;
+            };
+            // /proc/<pid>/stat: pid (comm) state ppid pgrp ... - comm
+            // may contain spaces and parens, so fields parse AFTER the
+            // last ')' (the comm block's real closing paren).
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{entry_pid}/stat")) else {
+                continue;
+            };
+            let Some(rest) = stat.rsplit(')').next() else {
+                continue;
+            };
+            let mut fields = rest.split_whitespace();
+            let _state = fields.next();
+            let _ppid = fields.next();
+            let Some(pgrp) = fields.next().and_then(|f| f.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pgrp != pgid {
+                continue;
+            }
+            members += 1;
+            if let Ok(roll) = std::fs::read_to_string(format!("/proc/{entry_pid}/smaps_rollup")) {
+                for line in roll.lines() {
+                    if let Some(v) = line.strip_prefix("Rss:") {
+                        // "Rss:  2784 kB" - the number is the FIRST
+                        // token; parsing the whole remainder would
+                        // trip on the unit and silently read 0.
+                        total_kb += v
+                            .split_whitespace()
+                            .next()
+                            .and_then(|n| n.parse::<u64>().ok())
+                            .unwrap_or(0);
+                    }
+                }
+            }
+        }
+        (members > 0).then_some(total_kb / 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pgid;
+        None
+    }
+}
+
 use blazar_core::{GpuInfo, Hardware};
 
 use crate::engine::manifest::Manifest;
@@ -833,5 +920,30 @@ mod tests {
         });
         assert!(r.is_err());
         assert_eq!(attempts.get(), 1, "permanent errors are never retried");
+    }
+
+    #[test]
+    fn unit__pgid_rss_mib__measures_the_own_process_group() {
+        // The test runner walks its OWN group: at least this process is
+        // a member, and a live rust test holds real resident pages, so
+        // the sum must be positive. A zero here means the /proc walk
+        // matches members but loses their Rss lines - the exact
+        // regression this pins (settle measured 0 MiB live while the
+        // group held hundreds).
+        let pgid = {
+            // group id of THIS process, straight from /proc/self/stat
+            // (field 5, after the comm block) - the same shape the
+            // supervisor captures at spawn.
+            let stat = std::fs::read_to_string("/proc/self/stat").expect("self stat");
+            let rest = stat.rsplit(')').next().expect("fields after comm");
+            rest.split_whitespace()
+                .nth(2)
+                .and_then(|f| f.parse::<u32>().ok())
+                .expect("pgrp parses")
+        };
+        match pgid_rss_mib(pgid) {
+            Some(rss) => assert!(rss > 0, "own group must hold resident pages, got {rss}"),
+            None => panic!("own process group must be measurable on this platform"),
+        }
     }
 }

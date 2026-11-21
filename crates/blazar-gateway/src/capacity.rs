@@ -207,6 +207,8 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
                     }
                 }
             }
+            v["host_rss_mib"] = serde_json::json!(p.host_rss_mib);
+            v["host_charge_bytes"] = serde_json::json!(p.host_charge_bytes);
             v
         })
         .collect();
@@ -229,11 +231,43 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
          not estimated here",
     );
 
+    // Host ledger: the RAM twin of the device census above. `committed`
+    // is what the spawn guard subtracts from MemAvailable (resident
+    // file-backed shares + in-flight spawn reservations); `reserved` is
+    // just the in-flight slice of that.
+    let snapshot = blazar_runtime::probe::host_mem_snapshot();
+    let host = if let Some(s) = snapshot {
+        let committed = state.sup.host_committed_bytes();
+        serde_json::json!({
+            "total_mib": s.total_mib,
+            "available_mib": s.available_mib,
+            "committed_bytes": committed,
+            "reserved_bytes": state.sup.host_reserved_bytes(),
+            "effective_available_mib": s.available_mib.saturating_sub(committed / (1024 * 1024)),
+            "pressure": state.sup.host_pressure_label(),
+        })
+    } else {
+        notes.push(
+            "host memory snapshot unavailable on this platform - the spawn \
+             guard still refuses loads below its floor, only this report \
+             is blind",
+        );
+        serde_json::json!({
+            "total_mib": serde_json::Value::Null,
+            "available_mib": serde_json::Value::Null,
+            "committed_bytes": state.sup.host_committed_bytes(),
+            "reserved_bytes": state.sup.host_reserved_bytes(),
+            "effective_available_mib": serde_json::Value::Null,
+            "pressure": state.sup.host_pressure_label(),
+        })
+    };
+
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
             "object": "blazar.capacity",
             "devices": devices,
+            "host": host,
             "residents": residents,
             "external": external,
             "notes": notes,

@@ -67,6 +67,33 @@ Ask Blazar why a model landed on a lane:
 blazar explain <model>            # the routing decision, with reasons
 ```
 
+## Host memory ledger
+
+Host RAM gets the same treatment as VRAM: a reservation ledger, per-resident
+accounting, and a pressure watcher - not just a spawn-time floor.
+
+- **One floor, two lanes.** The spawn floor (`model/2 + 512 MiB + CPU offload`,
+  `blazar-core` `host_floor_mib`) is engine-agnostic. What differs by lane is
+  what a *resident* charges against the ledger: mmap-streaming lanes
+  (llama.cpp & friends) hold file-backed pages the kernel would happily reclaim,
+  so they charge `min(measured RSS, weights)`; python-runtime lanes (sglang,
+  vLLM) hold anonymous pages already excluded from MemAvailable by the kernel,
+  so they charge zero - subtracting their RSS too would double-count and
+  over-refuse.
+- **Atomic window.** A spawn reserves its floor from guard to insertion
+  (file-backed lanes release at insert; python lanes hold until settle-measured
+  RSS lands), so concurrent launches cannot oversubscribe one host budget.
+- **Measured, then reconciled.** At settle, the child's process-group RSS is
+  walked from `/proc` (`smaps_rollup`) and logged against the prediction -
+  receipts that refine the model, not silent drift.
+- **Pressure watcher.** The reaper classifies MemAvailable every tick:
+  `normal` > 3 GiB effective, `degraded` <= 2 GiB (new spawns taught the ledger
+  numbers), `pressure` <= 1 GiB (evict coldest zero-in-flight resident, one per
+  tick, hysteresis on relief). Thresholds are documented constants, not knobs.
+- **Surfaced everywhere.** `GET /api/capacity` host block, `blazar explain`
+  host admission card, `blazar plan` HOST section, `GET /api/ps`
+  `host_rss_mib`/`host_charge_bytes` per resident.
+
 ## Engine integration contract
 
 Every lane - llama.cpp, mistral.rs, sglang, vLLM, MLX, sdcpp, OpenAI-host -

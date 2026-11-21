@@ -227,6 +227,26 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         }
     };
 
+    // Host-RAM twin of the admission preview (same before-the-engine-
+    // match discipline): the floor + committed arithmetic the spawn
+    // guard applies, stated per resolved lane so a RAM refusal is
+    // visible BEFORE a turn pays for it.
+    let host_admission = match &lane {
+        Some((_, Ok(Some((_, kind))), _)) => {
+            host_admission_for_lane(*kind, &state, row.bytes, row.mmproj_path.as_deref())
+        }
+        Some((Some((_, g_kind, _)), Ok(None), _)) => {
+            host_admission_for_lane(*g_kind, &state, row.bytes, row.mmproj_path.as_deref())
+        }
+        Some((None, Ok(None), _)) | None => json!({
+            "verdict": "no-lane",
+            "reason": "store unavailable - engine rows unreadable"
+        }),
+        Some((_, Err(teach), _)) => {
+            json!({ "verdict": "no-lane", "reason": teach })
+        }
+    };
+
     let engine = match lane {
         Some((_, Ok(Some((tag, kind))), _)) => json!({
             "tag": tag,
@@ -440,6 +460,7 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
         "speculation": speculation,
         "cache": cache,
         "admission": admission,
+        "host": host_admission,
         "residents": residents,
     });
     (StatusCode::OK, axum::Json(card)).into_response()
@@ -476,6 +497,76 @@ fn admission_for_lane(
                 "reason": "store unavailable - engine rows unreadable"
             })
         })
+}
+
+/// Host-RAM admission preview for a resolved lane: floor/peak/steady
+/// from the SAME core arithmetic the spawn guard refuses on, checked
+/// against live `MemAvailable` minus the ledger's committed charge
+/// (resident file-backed shares + in-flight spawn reservations).
+/// Read-only, like its GPU twin. The card's offload axis is 0: the
+/// spawn-time pin is argv-dependent and already clamped to live RAM by
+/// the planner, so the card names the lever instead of guessing a
+/// number.
+fn host_admission_for_lane(
+    kind: blazar_core::engine_kind::EngineKind,
+    state: &Arc<AppState>,
+    model_bytes_i64: i64,
+    mmproj_path: Option<&str>,
+) -> Value {
+    use blazar_core::profile::{
+        HostMemLane, host_floor_mib, host_levers, host_mem_lane, host_peak_bytes, host_steady_bytes,
+    };
+    let lane = host_mem_lane(kind);
+    let lane_label = match lane {
+        HostMemLane::MmapStreaming => "mmap-streaming",
+        HostMemLane::PythonRuntime => "python-runtime",
+    };
+    let model_bytes = u64::try_from(model_bytes_i64.max(0)).unwrap_or(u64::MAX);
+    let mmproj_bytes = mmproj_path
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    let floor_mib = host_floor_mib(model_bytes / (1024 * 1024), 0);
+    let peak_bytes = host_peak_bytes(lane, model_bytes, mmproj_bytes, 0);
+    let steady_bytes = host_steady_bytes(lane, model_bytes, 0);
+    let committed_bytes = state.sup.host_committed_bytes();
+    let base = json!({
+        "lane": lane_label,
+        "floor_mib": floor_mib,
+        "peak_bytes": peak_bytes,
+        "steady_bytes": steady_bytes,
+        "committed_bytes": committed_bytes,
+        "reserved_bytes": state.sup.host_reserved_bytes(),
+        "levers": host_levers(),
+        "offload_note": match lane {
+            HostMemLane::PythonRuntime =>
+                "sglang cpu-offload adds to the floor at spawn (planner clamps the pin to live RAM)",
+            HostMemLane::MmapStreaming =>
+                "weights fault in from the file as inference touches them (mmap streaming)",
+        },
+    });
+    if let Some(s) = blazar_runtime::probe::host_mem_snapshot() {
+        let effective_mib = s
+            .available_mib
+            .saturating_sub(committed_bytes / (1024 * 1024));
+        let mut v = base;
+        v["available_mib"] = json!(s.available_mib);
+        v["effective_available_mib"] = json!(effective_mib);
+        v["verdict"] = if effective_mib < floor_mib {
+            json!("refuse")
+        } else {
+            json!("fit")
+        };
+        v
+    } else {
+        let mut v = base;
+        v["available_mib"] = Value::Null;
+        v["effective_available_mib"] = Value::Null;
+        v["verdict"] = json!("unknown");
+        v["reason"] = json!(
+            "host memory snapshot unavailable on this platform - the spawn guard still enforces its floor"
+        );
+        v
+    }
 }
 
 /// The admission verdict a spawn on ONE engine lane would hit right

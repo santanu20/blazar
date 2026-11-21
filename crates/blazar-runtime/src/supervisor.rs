@@ -442,6 +442,21 @@ const BANK_SAVE_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// above the 10 s reaper tick plus the [`BANK_SAVE_TOTAL_BUDGET`] so
 /// the bank lands strictly before the sleep, not racing it.
 const BANK_LEADIN_SECS: u64 = 30;
+
+/// Host-pressure controller thresholds (MiB): arm DEGRADED at 2 GiB,
+/// escalate to eviction-grade PRESSURE at 1 GiB, relieve only above
+/// 3 GiB (hysteresis - a box bouncing across one threshold must not
+/// flap admissions). Documented constants, not config knobs - the
+/// values encode "a spawn still fits at 3 GiB; nothing should load
+/// into a 1 GiB box". Receipts before knobs.
+const HOST_PRESSURE_DEGRADED_MIB: u64 = 2_048;
+const HOST_PRESSURE_CRITICAL_MIB: u64 = 1_024;
+const HOST_PRESSURE_RELIEVED_MIB: u64 = 3_072;
+/// Host pressure pauses admissions only while Blazar's own ledger hold
+/// is at least this big - an externally starved box with no Blazar
+/// footprint keeps the pre-ledger behavior (floor-only refusals), and
+/// tiny test fixtures never trip the gate.
+const HOST_PRESSURE_ACTIONABLE_MIB: u64 = 256;
 /// F12: `keep_alive: -1` cap - 100 years, far enough to be forever in
 /// practice without risking `Instant` overflow arithmetic.
 const KEEP_ALIVE_FOREVER: Duration = Duration::from_hours(876_600);
@@ -1199,6 +1214,37 @@ impl Drop for DeviceReservation {
     }
 }
 
+/// RAII release for a host-RAM spawn reservation. Host memory is ONE
+/// pool (no per-device map): a single `AtomicU64` counter the guard
+/// adds to and this Drop subtracts from, saturating under races.
+/// Lifetime spans guard->insert for mmap lanes (the resident
+/// reclaimable charge takes over the moment the instance joins the
+/// map) and guard->settle for python-runtime lanes (their resident
+/// charge stays zero - the kernel accounts their anonymous pages - so
+/// the reservation is the only hold covering the staging window).
+struct HostReservation {
+    bytes: u64,
+    pool: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Drop for HostReservation {
+    fn drop(&mut self) {
+        let mut cur = self.pool.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let next = cur.saturating_sub(self.bytes);
+            match self.pool.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Instance {
     pub name: String,
@@ -1282,6 +1328,13 @@ pub struct Instance {
     /// the Arc out of the map, and any long-lived holder would starve
     /// that re-key.
     pub settled_mib: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Measured host RSS of the child's process group at settle (MiB,
+    /// 0 = not settled yet) - the reclaimable-share input to the host
+    /// ledger's charge for mmap-lane residents (`min(rss, weights)`)
+    /// and the reconciliation number for python lanes. Arc-wrapped for
+    /// the same reason as `settled_mib`: the detached settle task
+    /// writes without pinning the Instance.
+    pub host_rss_mib: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Per-child bearer secret (child `--api-key` hardening). Lifecycle
     /// = child lifecycle; `None` on UDS children (filesystem perms
     /// already gate the socket) and on engines lacking `--api-key`.
@@ -2387,6 +2440,15 @@ pub struct PsRow {
     /// instance follows the default idle policy. `ps` surfaces it as the
     /// countdown behind `expires_at`.
     pub keep_alive_secs: Option<u64>,
+    /// Measured host RSS of the child's process group at settle (MiB,
+    /// 0 = not settled) - host-ledger visibility alongside the VRAM
+    /// numbers.
+    pub host_rss_mib: u64,
+    /// This resident's host-ledger charge in bytes (mmap lanes: the
+    /// reclaimable file-backed share; python lanes: 0 - anonymous
+    /// pages are kernel-accounted). What the spawn guard subtracts
+    /// from `MemAvailable` for this instance.
+    pub host_charge_bytes: u64,
 }
 
 /// Throttle/dedup state for the measured-pressure feedback loop.
@@ -2642,6 +2704,21 @@ pub struct Supervisor {
     /// [`DeviceReservation`] releases; admission reads it through
     /// `device_load_bytes`.
     device_reservations: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// Host-RAM reservation pool (a single sum - host memory has no
+    /// cards): bytes held by in-flight spawns between the guard and
+    /// their insert (mmap lanes) or settle (python lanes) handoff.
+    /// RAII [`HostReservation`] releases; the guard reads the sum
+    /// through `host_committed_bytes`.
+    host_reservations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Host pressure state machine (0 normal / 1 degraded / 2
+    /// pressure), driven by the reaper tick against live `MemAvailable`
+    /// with hysteresis - see `host_pressure_tick`. Admissions pause in
+    /// the armed states (see the spawn guard).
+    host_pressure: std::sync::atomic::AtomicU8,
+    /// Test injection point for the host probes (cfg(test) only): the
+    /// live box's real `MemAvailable` is not steerable from a unit test.
+    #[cfg(test)]
+    test_mem_available_mib: Option<u64>,
     /// Session pins (R3): sessions that recently carried
     /// `x-blazar-session` per model. The idle ladder and capacity
     /// pressure consult this before evicting; force stop releases.
@@ -2922,6 +2999,10 @@ impl Supervisor {
             device_reservations: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            host_reservations: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host_pressure: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            test_mem_available_mib: None,
             sessions: crate::sessionreg::SessionRegistry::new(),
         }
     }
@@ -3064,6 +3145,115 @@ impl Supervisor {
             bytes,
             map: std::sync::Arc::clone(&self.device_reservations),
         }
+    }
+
+    /// Hold `bytes` against the host pool for the guard->insert (mmap
+    /// lanes) or guard->settle (python lanes) window. The returned
+    /// guard releases on drop; the handoff converts the reservation
+    /// into the resident charge.
+    fn reserve_host(&self, bytes: u64) -> HostReservation {
+        self.host_reservations
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        HostReservation {
+            bytes,
+            pool: std::sync::Arc::clone(&self.host_reservations),
+        }
+    }
+
+    /// Bytes held by in-flight spawns against host RAM right now.
+    #[must_use]
+    pub fn host_reserved_bytes(&self) -> u64 {
+        self.host_reservations
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The host-RAM reclaimable charge of one resident: what the spawn
+    /// guard subtracts from `MemAvailable` for this instance. Mmap lanes
+    /// charge their file-backed share (settled: `min(measured RSS,
+    /// weights)` - RSS beyond the file is anonymous and the kernel
+    /// already excludes it; unsettled: the half-weights streaming
+    /// estimate the floor itself uses). Python lanes charge zero -
+    /// their resident pages are anonymous and kernel-accounted (a
+    /// blanket RSS/PSS subtraction would double-count and over-refuse).
+    #[must_use]
+    pub fn instance_host_charge_bytes(inst: &Instance) -> u64 {
+        match blazar_core::profile::host_mem_lane(inst.kind) {
+            blazar_core::profile::HostMemLane::MmapStreaming => {
+                let weights = u64::try_from(inst.model.bytes.max(0)).unwrap_or(u64::MAX);
+                let rss = blazar_core::Hardware::bytes(
+                    inst.host_rss_mib.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                if rss > 0 {
+                    rss.min(weights)
+                } else {
+                    weights / 2
+                }
+            }
+            blazar_core::profile::HostMemLane::PythonRuntime => 0,
+        }
+    }
+
+    /// Total host-RAM commitment the guard enforces against: every
+    /// resident's reclaimable charge plus the in-flight reservation
+    /// pool. Zero residents and zero in-flight spawns = 0 = the guard
+    /// behaves exactly as before the ledger existed.
+    #[must_use]
+    pub fn host_committed_bytes(&self) -> u64 {
+        let resident: u64 = self
+            .instances
+            .iter()
+            .map(|e| Self::instance_host_charge_bytes(e.value()))
+            .sum();
+        resident.saturating_add(self.host_reserved_bytes())
+    }
+
+    /// Current host pressure label for observers (ps / capacity /
+    /// gateway cards).
+    #[must_use]
+    pub fn host_pressure_label(&self) -> &'static str {
+        match self.host_pressure.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => "normal",
+            1 => "degraded",
+            _ => "pressure",
+        }
+    }
+
+    /// Live `MemAvailable` through the test-injection shim: unit tests
+    /// steer the box's RAM reality, everything else probes the host.
+    /// `self` is read only under test - one call shape across builds.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn live_mem_available_mib(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(v) = self.test_mem_available_mib {
+            return Some(v);
+        }
+        crate::probe::mem_available_mib()
+    }
+
+    /// The refusal text for a host-floor failure - one fn so the
+    /// message the user sees and the message the tests pin can never
+    /// drift apart. Names every number the decision used, ledger
+    /// committed included. Keeps the `MemAvailable` token external
+    /// validators match on.
+    fn host_refusal_teaching(
+        name: &str,
+        model_mib: u64,
+        avail_mib: u64,
+        committed_mib: u64,
+        need_mib: u64,
+        offload_mib: u64,
+    ) -> String {
+        format!(
+            "insufficient memory to load {name:?}: MemAvailable {avail_mib} MiB - {committed_mib} \
+             MiB held by resident/in-flight loads = {effective} MiB effective, below the {need_mib} \
+             MiB floor (model {model_mib} MiB + {offload_mib} MiB host offload). The planner \
+             already trims a pinned offload to what live RAM can carry - reaching this refusal \
+             means even that relief left no headroom. Stop co-resident engines (blazar ps / \
+             ollama stop) or free RAM; disable this guard with spawn_mem_guard = false. This \
+             per-spawn host check precedes VRAM admission, so a starved box can refuse here \
+             before any pair-fit verdict (multi-role spawns: freeing RAM reaches the numbers)",
+            effective = avail_mib.saturating_sub(committed_mib),
+        )
     }
 
     /// Capacity-eviction victim: the coldest evictable instance - zero
@@ -3743,6 +3933,7 @@ impl Supervisor {
             spec_mode: String::new(),
             draft: None,
             settled_mib: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host_rss_mib: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth: None,
             child: tokio::sync::Mutex::new(child),
             pid,
@@ -5362,6 +5553,7 @@ impl Supervisor {
                         spec_mode: String::new(),
                         draft: None,
                         settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        host_rss_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -5574,6 +5766,7 @@ impl Supervisor {
                         spec_mode: String::new(),
                         draft: None,
                         settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        host_rss_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -6690,18 +6883,26 @@ impl Supervisor {
             }
         }
 
-        // Spawn-time memory guard (J3): below a hard floor the mmap
-        // engine will thrash swap for minutes instead of loading - fail
-        // fast with a named error. Floor = half the model + 512 MiB
-        // (zero-false-positive: mmap streaming needs roughly that
-        // resident even in the best case) PLUS the sglang host offload:
-        // offloaded weights live resident in RAM, and an offload pin
-        // sized against total rather than AVAILABLE RAM OOM'd this box
-        // mid-load on 2026-10-16.
+        // Spawn-time memory guard (J3 + unified host ledger): below a
+        // hard floor the mmap engine will thrash swap for minutes
+        // instead of loading - fail fast with a named error. Floor =
+        // half the model + 512 MiB (zero-false-positive: mmap streaming
+        // needs roughly that resident even in the best case) PLUS the
+        // sglang host offload: offloaded weights live resident in RAM,
+        // and an offload pin sized against total rather than AVAILABLE
+        // RAM OOM'd this box mid-load on 2026-10-16.
+        //
+        // The ledger corrects the supply side: MemAvailable counts
+        // reclaimable page cache as available, so our own residents'
+        // file-backed shares and in-flight spawns' predicted floors
+        // must come off the number before the comparison - otherwise
+        // Blazar's own pressure reads as free RAM (the 2026-11-21
+        // finding that motivated the unified host ledger).
+        let mut host_reservation: Option<HostReservation> = None;
         if self.cfg().spawn_mem_guard {
             // Unreadable memory = guard cannot enforce its floor; warn and
             // stand down (a refused snapshot must not brick every spawn).
-            let avail = crate::probe::mem_available_mib().unwrap_or_else(|| {
+            let avail = self.live_mem_available_mib().unwrap_or_else(|| {
                 tracing::warn!(
                     "spawn memory guard skipped for {:?}: MemAvailable unreadable",
                     name
@@ -6710,21 +6911,46 @@ impl Supervisor {
             });
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
             let offload_mib = sglang_offload_bytes / (1024 * 1024);
-            let need = (model_mib / 2) + 512 + offload_mib;
-            if avail < need {
+            let need = blazar_core::profile::host_floor_mib(model_mib, offload_mib);
+            let committed_mib = self.host_committed_bytes() / (1024 * 1024);
+            let effective = avail.saturating_sub(committed_mib);
+            if effective < need {
+                return Err(SupervisionError::InsufficientMemory(
+                    Self::host_refusal_teaching(
+                        name,
+                        model_mib,
+                        avail,
+                        committed_mib,
+                        need,
+                        offload_mib,
+                    ),
+                ));
+            }
+            // Pressure teach (P1 controller): once the reaper's pressure
+            // state machine has armed, new spawns stop adding load while
+            // relief catches up - but only while Blazar itself holds a
+            // meaningful slice (an externally-starved empty box keeps
+            // the pre-ledger behavior: the floor above already refused
+            // what genuinely cannot fit).
+            let pressure = self.host_pressure.load(std::sync::atomic::Ordering::SeqCst);
+            if pressure > 0
+                && self.host_committed_bytes()
+                    >= blazar_core::Hardware::bytes(HOST_PRESSURE_ACTIONABLE_MIB)
+            {
                 return Err(SupervisionError::InsufficientMemory(format!(
-                    "insufficient memory to load {:?}: MemAvailable {avail} MiB < floor {need} MiB \
-                     (model {} MiB + {offload_mib} MiB host offload). The planner already trims a \
-                     pinned offload to what live RAM can carry - reaching this refusal means even \
-                     that relief left no headroom. Stop co-resident engines (blazar ps / ollama \
-                     stop) or free RAM; disable this guard with spawn_mem_guard = false. This \
-                     per-spawn host check precedes VRAM admission, so a starved box can refuse \
-                     here before any pair-fit verdict (multi-role spawns: freeing RAM reaches \
-                     the numbers)",
-                    name,
-                    model.bytes / (1024 * 1024)
+                    "insufficient memory to load {name:?}: host memory pressure - MemAvailable \
+                     {avail} MiB has the box marked '{}' and the reaper is evicting for relief. \
+                     Stop co-resident engines (blazar ps / ollama stop) or free RAM; admissions \
+                     resume once pressure relieves. This per-spawn host check precedes VRAM \
+                     admission, so a starved box refuses here before any pair-fit verdict",
+                    self.host_pressure_label()
                 )));
             }
+            // Hold the floor against the pool for the load window: a
+            // concurrent spawn must see this footprint before the child
+            // settles into the resident charge (the insert/settle
+            // handoff below converts the hold).
+            host_reservation = Some(self.reserve_host(need.saturating_mul(1024 * 1024)));
         }
 
         let input_cfg = self.cfg();
@@ -7499,6 +7725,7 @@ impl Supervisor {
                                 .map_or_else(|| p.to_string(), |f| f.to_string_lossy().into_owned())
                         }),
                         settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        host_rss_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         auth: auth.as_ref().map(|a| a.secret.clone()),
                         child: tokio::sync::Mutex::new(child),
                         pid,
@@ -7546,6 +7773,27 @@ impl Supervisor {
                     // convert the reservation into that resident and stop
                     // double-charging the ledger.
                     drop(reservation);
+                    // Host-ledger handoff: an mmap-lane resident's charge
+                    // (pre-settle: the half-weights estimate) starts
+                    // counting the moment the instance joins the map, so
+                    // its reservation releases HERE - the spawn->settle
+                    // window for that lane stays covered without
+                    // double-charging. A python-runtime lane keeps its
+                    // reservation until the host settle task below
+                    // measures RSS: its resident charge stays zero
+                    // (anonymous pages are kernel-accounted), so the
+                    // reservation is the only hold spanning the staging
+                    // window.
+                    let host_res_for_settle =
+                        match blazar_core::profile::host_mem_lane(engine.kind()) {
+                            blazar_core::profile::HostMemLane::PythonRuntime => {
+                                host_reservation.take()
+                            }
+                            blazar_core::profile::HostMemLane::MmapStreaming => {
+                                drop(host_reservation.take());
+                                None
+                            }
+                        };
                     // A restart only counts when it follows an unclean
                     // death - churn (stop->run) is a cold start, not a
                     // crash loop (live-repro'd: 4 clean churns in 60s
@@ -7608,6 +7856,54 @@ impl Supervisor {
                                     );
                                 }
                             }
+                        });
+                    }
+                    // Host settle (unified ledger): measure the child's
+                    // process-group RSS now that health says the weights
+                    // are in, store it on the instance (the mmap charge
+                    // switches from the half-weights estimate to
+                    // min(rss, weights)), and release the python-lane
+                    // reservation this task carried. Detached and off the
+                    // request path, mirroring the VRAM settle task;
+                    // non-Linux boxes measure None and keep the estimate
+                    // (the documented fallback - never a guessed number).
+                    {
+                        let host_rss = std::sync::Arc::clone(&inst.value().host_rss_mib);
+                        let host_pgid = pid;
+                        let host_model_name = name.to_string();
+                        let host_pred_mib = model_bytes / (1024 * 1024);
+                        let host_res_to_release = host_res_for_settle;
+                        tokio::spawn(async move {
+                            let measured = tokio::task::spawn_blocking(move || {
+                                crate::probe::pgid_rss_mib(host_pgid)
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            match measured {
+                                Some(rss_mib) => {
+                                    host_rss.store(rss_mib, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::info!(
+                                        model = %host_model_name,
+                                        measured_host_rss_mib = rss_mib,
+                                        weights_mib = host_pred_mib,
+                                        "host settle: process-group RSS after load (ledger charge caps at the weights)"
+                                    );
+                                }
+                                None => {
+                                    // Non-Linux, or the group already
+                                    // exited: the estimate charge stays;
+                                    // the reservation (if any) still
+                                    // releases below.
+                                    tracing::debug!(
+                                        model = %host_model_name,
+                                        "host settle: process-group RSS unreadable - keeping the estimate charge"
+                                    );
+                                }
+                            }
+                            // Python-lane hold ends here (mmap lanes
+                            // released theirs at insert).
+                            drop(host_res_to_release);
                         });
                     }
                     // Engine proven healthy: clear the J2 crash-loop tracker.
@@ -8840,6 +9136,7 @@ drop them from rpc_servers in config.toml",
                 mgr.reap_dead_children().await;
                 mgr.reap_once().await;
                 mgr.reap_lmcache_daemon().await;
+                mgr.autotune_schedule_tick().await;
             }
         })
     }
@@ -8958,6 +9255,61 @@ drop them from rpc_servers in config.toml",
         self.adaptive_slots_reap().await;
         self.measured_pressure_tick();
         self.autotune_advise_tick();
+        self.host_pressure_tick().await;
+    }
+
+    /// Host-memory pressure state machine (P1 controller), one reaper
+    /// tick at a time. Arms at DEGRADED, escalates at CRITICAL, and
+    /// only relieves above RELIEVED (hysteresis - a box bouncing
+    /// across one threshold must not flap admissions). Under PRESSURE
+    /// the tick evicts exactly one coldest zero-in-flight resident via
+    /// the existing capacity victim picker (never a model mid-request,
+    /// never half a PD pair) - relief lands incrementally, not as a
+    /// purge. Unreadable `MemAvailable` stands the machine down (state
+    /// holds; the spawn guard still enforces its floor).
+    async fn host_pressure_tick(&self) {
+        let Some(avail_mib) = self.live_mem_available_mib() else {
+            return;
+        };
+        let cur = self.host_pressure.load(std::sync::atomic::Ordering::SeqCst);
+        let next = if avail_mib >= HOST_PRESSURE_RELIEVED_MIB {
+            0
+        } else if avail_mib <= HOST_PRESSURE_CRITICAL_MIB {
+            2
+        } else if avail_mib <= HOST_PRESSURE_DEGRADED_MIB {
+            cur.max(1)
+        } else {
+            // Hysteresis band between DEGRADED and RELIEVED: hold the
+            // armed state instead of flapping back to normal.
+            cur
+        };
+        if next != cur {
+            tracing::warn!(
+                mem_available_mib = avail_mib,
+                from = cur,
+                to = next,
+                "host memory pressure state changed (0 normal / 1 degraded / 2 pressure)"
+            );
+            self.host_pressure
+                .store(next, std::sync::atomic::Ordering::SeqCst);
+        }
+        if next == 2 {
+            if let Some(victim) = self.victim_key("") {
+                tracing::warn!(
+                    victim = %victim,
+                    mem_available_mib = avail_mib,
+                    "host pressure: evicting the coldest idle resident for RAM relief"
+                );
+                if let Err(e) = self.evict(&victim).await {
+                    tracing::error!(model = %victim, "host-pressure evict: {e:#}");
+                }
+            } else {
+                tracing::warn!(
+                    mem_available_mib = avail_mib,
+                    "host pressure: nothing evictable - all residents busy or pinned; admissions stay paused"
+                );
+            }
+        }
     }
 
     /// How often the `autotune = "advise"` scan re-runs the evidence
@@ -10925,6 +11277,8 @@ drop them from rpc_servers in config.toml",
                         .read()
                         .expect("idle lock")
                         .map(|t| t.saturating_duration_since(Instant::now()).as_secs()),
+                    host_rss_mib: i.host_rss_mib.load(Ordering::Relaxed),
+                    host_charge_bytes: Self::instance_host_charge_bytes(i),
                 }
             })
             .collect()
@@ -12537,6 +12891,7 @@ mod routing_tests {
             spec_mode: "off".into(),
             draft: None,
             settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(settled_mib)),
+            host_rss_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
             pid,
@@ -14039,6 +14394,174 @@ mod routing_tests {
         assert_eq!(sup.device_load_bytes("GPU0"), baseline);
     }
 
+    // ---- unified host-RAM ledger (mirrors the device suite above) ----
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__host_reservation__drop_releases_exact_bytes() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let baseline = sup.host_reserved_bytes();
+        let r = sup.reserve_host(mib(1_234));
+        assert_eq!(sup.host_reserved_bytes(), baseline + mib(1_234));
+        drop(r);
+        assert_eq!(sup.host_reserved_bytes(), baseline);
+        // Stacked in-flight spawns accumulate; releasing the inner one
+        // leaves the outer charged (no over-release, no under-release)
+        // - the guard->insert window may nest across concurrent lanes.
+        let outer = sup.reserve_host(mib(100));
+        {
+            let inner = sup.reserve_host(mib(50));
+            assert_eq!(sup.host_reserved_bytes(), baseline + mib(150));
+            drop(inner);
+            assert_eq!(sup.host_reserved_bytes(), baseline + mib(100));
+        }
+        drop(outer);
+        assert_eq!(sup.host_reserved_bytes(), baseline);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__host_reservation__concurrent_spawns_stack_into_committed() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        // No residents: committed is EXACTLY the reservation pool - the
+        // supply side the guard subtracts must not invent anything else.
+        let a = sup.reserve_host(mib(2_000));
+        let b = sup.reserve_host(mib(1_500));
+        assert_eq!(sup.host_committed_bytes(), mib(3_500));
+        drop(b);
+        assert_eq!(sup.host_committed_bytes(), mib(2_000));
+        drop(a);
+        assert_eq!(sup.host_committed_bytes(), 0);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__instance_host_charge__mmap_settled_capped_at_weights() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (inst, _pid) = gpu_instance("m", mib(4_000).cast_signed(), 0);
+        // Measured process-group RSS beyond the file is anonymous and
+        // kernel-accounted - the charge caps at the weights size.
+        inst.host_rss_mib
+            .store(9_000, std::sync::atomic::Ordering::Relaxed);
+        sup.instances.insert("m".to_string(), inst);
+        assert_eq!(sup.host_committed_bytes(), mib(4_000));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__instance_host_charge__mmap_unset_uses_half_weights() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        // Unsettled (no settle measurement yet): the same half-weights
+        // streaming estimate the floor itself uses.
+        let (inst, _pid) = gpu_instance("m", mib(4_000).cast_signed(), 0);
+        sup.instances.insert("m".to_string(), inst);
+        assert_eq!(sup.host_committed_bytes(), mib(2_000));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__instance_host_charge__python_lane_charges_zero() {
+        let (sup, _root) = dual_gpu_sup();
+        let (inst, _pid) = fake_instance_of_kind(
+            "sg",
+            InstanceState::Ready,
+            0,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            blazar_core::engine_kind::EngineKind::Sglang,
+        );
+        // Python-runtime residents are anonymous pages the kernel
+        // already excludes from MemAvailable - charging RSS here would
+        // double-count and over-refuse.
+        inst.host_rss_mib
+            .store(9_000, std::sync::atomic::Ordering::Relaxed);
+        sup.instances.insert("sg".to_string(), inst);
+        assert_eq!(sup.host_committed_bytes(), 0);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__host_committed__residents_plus_reservations() {
+        let mib = |m: u64| m * 1024 * 1024;
+        let (sup, _root) = dual_gpu_sup();
+        let (mmap_inst, _p1) = gpu_instance("m", mib(4_000).cast_signed(), 0);
+        mmap_inst
+            .host_rss_mib
+            .store(3_000, std::sync::atomic::Ordering::Relaxed);
+        sup.instances.insert("m".to_string(), mmap_inst);
+        let (py_inst, _p2) = fake_instance_of_kind(
+            "sg",
+            InstanceState::Ready,
+            0,
+            Endpoint::Tcp {
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            blazar_core::engine_kind::EngineKind::Sglang,
+        );
+        sup.instances.insert("sg".to_string(), py_inst);
+        let r = sup.reserve_host(mib(1_000));
+        // min(3000 measured, 4000 weights) mmap charge + 0 python + 1000
+        // in-flight reservation.
+        assert_eq!(sup.host_committed_bytes(), mib(3_000) + mib(1_000));
+        drop(r);
+        assert_eq!(sup.host_committed_bytes(), mib(3_000));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__host_committed__zero_when_empty() {
+        // Behavior-preservation invariant: zero residents and zero
+        // in-flight spawns = committed 0 = the guard sees the same
+        // MemAvailable it did before the ledger existed.
+        let (sup, _root) = dual_gpu_sup();
+        assert_eq!(sup.host_committed_bytes(), 0);
+        assert_eq!(sup.host_reserved_bytes(), 0);
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__host_pressure_tick__arms_escalates_relieves() {
+        let (mut sup, _root) = dual_gpu_sup();
+        // Arms at degraded: 1500 MiB <= 2048 arm threshold.
+        sup.test_mem_available_mib = Some(1_500);
+        sup.host_pressure_tick().await;
+        assert_eq!(sup.host_pressure_label(), "degraded");
+        // Escalates at critical: 500 MiB <= 1024 (no residents to
+        // evict - the tick warns and holds state, still pressure).
+        sup.test_mem_available_mib = Some(500);
+        sup.host_pressure_tick().await;
+        assert_eq!(sup.host_pressure_label(), "pressure");
+        // Relieves above the hysteresis band: 4000 >= 3072.
+        sup.test_mem_available_mib = Some(4_000);
+        sup.host_pressure_tick().await;
+        assert_eq!(sup.host_pressure_label(), "normal");
+        // Inside the hysteresis band (3072 > 2500 > 2048): holds.
+        sup.test_mem_available_mib = Some(2_500);
+        sup.host_pressure_tick().await;
+        assert_eq!(sup.host_pressure_label(), "normal");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__host_refusal_teaching__names_ledger_numbers() {
+        let t = Supervisor::host_refusal_teaching("qwen3:8b", 5_816, 4_100, 1_227, 5_327, 1_907);
+        // Every number the decision used is named - the receipt shape
+        // the 2026-11-21 Qwen3-8B refusal pinned, now with the ledger
+        // committed slice and the effective supply it implies.
+        assert!(t.contains("MemAvailable 4100 MiB"));
+        assert!(t.contains("1227 MiB held by resident/in-flight loads"));
+        assert!(t.contains("2873 MiB effective"));
+        assert!(t.contains("5327 MiB floor"));
+        assert!(t.contains("spawn_mem_guard = false"));
+    }
+
     #[tokio::test]
     #[allow(non_snake_case)]
     async fn unit__coresidency__counts_resident_by_backend_id_not_label() {
@@ -14185,6 +14708,7 @@ mod routing_tests {
             spec_mode: "off".into(),
             draft: None,
             settled_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            host_rss_mib: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             auth: None,
             child: tokio::sync::Mutex::new(ChildHandle::new(endpoint, proc)),
             pid,

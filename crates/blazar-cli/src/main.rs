@@ -14167,6 +14167,81 @@ fn canonical_plan_for(
 /// but parses as a pull target falls through to the upstream fit
 /// preview (network) plus a pull hint.
 #[allow(clippy::too_many_lines)] // card assembly: one block per section
+/// Locally-computed host-RAM feasibility block for `blazar plan`
+/// (daemon down): the SAME core arithmetic the spawn guard refuses
+/// on, checked against this box's live `MemAvailable` with an empty
+/// ledger - committed reads 0 because no supervisor is running to
+/// account residents, and the note says so. Engine kind comes from
+/// the canonical plan when one resolved; otherwise the store's active
+/// engine (llama.cpp as the product default when nothing is
+/// installed).
+fn local_host_plan(
+    store: &Store,
+    row: &blazar_core::store::ModelRow,
+    plan_kind: Option<blazar_core::engine_kind::EngineKind>,
+) -> serde_json::Value {
+    use blazar_core::profile::{
+        HostMemLane, host_floor_mib, host_levers, host_mem_lane, host_peak_bytes, host_steady_bytes,
+    };
+    let kind = plan_kind.unwrap_or_else(|| {
+        store
+            .list_engines()
+            .ok()
+            .and_then(|rows| rows.iter().find(|r| r.active).map(|r| r.kind))
+            .unwrap_or(blazar_core::engine_kind::EngineKind::LlamaCpp)
+    });
+    let lane = host_mem_lane(kind);
+    let lane_label = match lane {
+        HostMemLane::MmapStreaming => "mmap-streaming",
+        HostMemLane::PythonRuntime => "python-runtime",
+    };
+    let model_bytes = u64::try_from(row.bytes.max(0)).unwrap_or(u64::MAX);
+    let mmproj_bytes = row
+        .mmproj_path
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    let floor_mib = host_floor_mib(model_bytes / (1024 * 1024), 0);
+    match blazar_runtime::probe::host_mem_snapshot() {
+        Some(s) => {
+            // No daemon: the ledger is empty BY CONSTRUCTION here, and
+            // the effective number says so rather than implying a
+            // resident-free machine was measured.
+            let committed_bytes = 0u64;
+            let effective_mib = s.available_mib;
+            serde_json::json!({
+                "source": "local",
+                "lane": lane_label,
+                "floor_mib": floor_mib,
+                "peak_bytes": host_peak_bytes(lane, model_bytes, mmproj_bytes, 0),
+                "steady_bytes": host_steady_bytes(lane, model_bytes, 0),
+                "available_mib": s.available_mib,
+                "committed_bytes": committed_bytes,
+                "effective_available_mib": effective_mib,
+                "verdict": if effective_mib < floor_mib { "refuse" } else { "fit" },
+                "levers": host_levers(),
+                "note": "daemon down - committed is 0 (no resident ledger); start `blazar serve` for the accounted number",
+            })
+        }
+        None => serde_json::json!({
+            "source": "local",
+            "lane": lane_label,
+            "floor_mib": floor_mib,
+            "peak_bytes": host_peak_bytes(lane, model_bytes, mmproj_bytes, 0),
+            "steady_bytes": host_steady_bytes(lane, model_bytes, 0),
+            "available_mib": serde_json::Value::Null,
+            "committed_bytes": 0,
+            "effective_available_mib": serde_json::Value::Null,
+            "verdict": "unknown",
+            "levers": host_levers(),
+            "note": "host memory snapshot unavailable on this platform",
+        }),
+    }
+}
+
+/// One decision card per axis (lane, VRAM, host RAM), assembled top to
+/// bottom: cohesive by construction, hence the length allowance.
+#[allow(clippy::too_many_lines)]
 async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     let d = dirs();
     let store = Store::open(&d)?;
@@ -14207,6 +14282,18 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     // a diagnostic (the two must never disagree).
     let canonical = canonical_plan_for(&store, &row);
 
+    // Host-RAM feasibility (the ledger's twin of the GPU planner
+    // axes): the live explain card carries the supervisor's committed
+    // numbers; daemon down = computed locally against an empty ledger
+    // (nothing resident can be accounted from the CLI side, and the
+    // block says so instead of guessing).
+    let host = decision
+        .as_ref()
+        .and_then(|card| card.get("host").cloned())
+        .unwrap_or_else(|| {
+            local_host_plan(&store, &row, canonical.as_ref().ok().map(|p| p.engine))
+        });
+
     if json {
         let measured_json = measured_json_value(&measured);
         let predicted_json = predicted.as_ref().map(|(tag, p)| {
@@ -14236,6 +14323,7 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
                     "mmproj": row.mmproj_path,
                 },
                 "decision": decision,
+                "host": host,
                 "decision_evidence": decision.as_ref().map(|card| {
                     serde_json::json!({
                         "engine": evidence_class("engine", card),
@@ -14291,6 +14379,71 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
         (None, None) => println!(
             "  daemon not running - start it with `blazar serve` to see the live routing card"
         ),
+    }
+
+    println!();
+    println!("HOST (unified RAM ledger)");
+    {
+        let verdict = host.get("verdict").and_then(serde_json::Value::as_str);
+        let lane = host
+            .get("lane")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        match verdict {
+            Some("fit" | "refuse") => {
+                let floor = host.get("floor_mib").and_then(serde_json::Value::as_u64);
+                let avail = host
+                    .get("available_mib")
+                    .and_then(serde_json::Value::as_u64);
+                let committed = host
+                    .get("committed_bytes")
+                    .and_then(serde_json::Value::as_u64);
+                let effective = host
+                    .get("effective_available_mib")
+                    .and_then(serde_json::Value::as_u64);
+                let peak = host.get("peak_bytes").and_then(serde_json::Value::as_u64);
+                let steady = host.get("steady_bytes").and_then(serde_json::Value::as_u64);
+                println!("  lane      {lane}");
+                if let (Some(floor), Some(effective)) = (floor, effective) {
+                    println!("  floor     {floor} MiB vs {effective} MiB effective");
+                }
+                if let (Some(avail), Some(committed)) = (avail, committed) {
+                    println!(
+                        "  supply    MemAvailable {avail} MiB - {} MiB committed (ledger)",
+                        committed / (1024 * 1024)
+                    );
+                }
+                if let (Some(peak), Some(steady)) = (peak, steady) {
+                    println!(
+                        "  demand    peak {} MiB | steady {} MiB",
+                        peak / (1024 * 1024),
+                        steady / (1024 * 1024)
+                    );
+                }
+                if verdict == Some("fit") {
+                    println!("  verdict   fit");
+                } else {
+                    println!("  verdict   REFUSE - below the spawn floor");
+                    if let Some(levers) = host.get("levers").and_then(serde_json::Value::as_array) {
+                        for lever in levers.iter().filter_map(|l| l.as_str()) {
+                            println!("  lever     - {lever}");
+                        }
+                    }
+                }
+            }
+            Some("no-lane") => println!(
+                "  unavailable - {}",
+                host.get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("no lane")
+            ),
+            _ => println!(
+                "  unavailable - {}",
+                host.get("reason")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("host memory snapshot unreadable on this box")
+            ),
+        }
     }
 
     println!();

@@ -24,6 +24,8 @@ Usage:
   scripts/validate.py --phase config --phase api # only these phases
   scripts/validate.py --smoke         # fast pre-commit subset (~2-4 min)
   scripts/validate.py --self-test     # inject one failure, expect exit 1
+  scripts/validate.py --update-perf-baseline  # pin decode t/s reference
+                                         # (benchqc phase, clean tree only)
 
 Honest boundaries (printed, not hidden): rpc_servers needs a second box;
 child_transport="unix" is a documented unsupported proxy path; /api/pull runs
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import difflib
 import glob
 import hashlib
 import json
@@ -45,6 +48,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import statistics
 import struct
 import subprocess
 import sys
@@ -5567,6 +5571,67 @@ def phase_api() -> None:
         st == 200 and isinstance(v, dict) and "details" in v,
         f"status={st}",
     )
+
+    # Host-RAM ledger surfaces: the capacity census must carry the host
+    # block (MemAvailable truth + committed/reserved from the ledger),
+    # the explain card must render a host admission verdict, and any
+    # resident /api/ps row must carry its host footprint fields.
+    st, _, cap = http_json("GET", "/api/capacity")
+    host = cap.get("host") if isinstance(cap, dict) else None
+    if st == 200 and isinstance(host, dict):
+        need_keys = (
+            "total_mib",
+            "available_mib",
+            "committed_bytes",
+            "reserved_bytes",
+            "effective_available_mib",
+            "pressure",
+        )
+        check(
+            "api",
+            "/api/capacity host ledger block",
+            all(k in host for k in need_keys)
+            and host.get("pressure") in ("normal", "degraded", "pressure")
+            and host.get("committed_bytes", 0) >= host.get("reserved_bytes", 0),
+            f"pressure={host.get('pressure')} "
+            f"committed={host.get('committed_bytes')} reserved={host.get('reserved_bytes')}",
+        )
+    else:
+        boundary(
+            "api",
+            "/api/capacity host ledger block",
+            f"census unreachable or host block absent (status={st})",
+        )
+    st, _, card = http_json("GET", f"/api/explain/{MODEL}")
+    host_card = card.get("host") if isinstance(card, dict) else None
+    check(
+        "api",
+        "/api/explain host admission card",
+        st == 200
+        and isinstance(host_card, dict)
+        and host_card.get("verdict") in ("fit", "refuse", "unknown"),
+        f"status={st} verdict={host_card.get('verdict') if isinstance(host_card, dict) else '?'}",
+    )
+    _, _, ps = http_json("GET", "/api/ps")
+    rows = ps.get("models", []) if isinstance(ps, dict) else []
+    row = next((r for r in rows if MODEL in str(r.get("name", ""))), None)
+    if row is not None:
+        check(
+            "api",
+            "/api/ps row carries host footprint",
+            isinstance(row.get("host_rss_mib"), int)
+            and isinstance(row.get("host_charge_bytes"), int)
+            and row["host_rss_mib"] >= 0
+            and row["host_charge_bytes"] >= 0,
+            f"host_rss_mib={row.get('host_rss_mib')} host_charge_bytes={row.get('host_charge_bytes')}",
+        )
+    else:
+        boundary(
+            "api",
+            "/api/ps row carries host footprint",
+            f"{MODEL} not resident at check time (post-generate churn)",
+        )
+
     ev_ok, ev_text = sse_collect("/api/events", "event", 5)
     check(
         "api",
@@ -8510,6 +8575,725 @@ def _eng_sglang_pd_pair(
         d.stop()
 
 
+def _ocr_text_png_b64() -> str:
+    """Rendered-text PNG ('BLAZAR 2026') for the OCR battery.
+
+    Pure stdlib 5x7 bitmap font at 8x pixel scale, black on white
+    (document polarity - what OCR fixtures are trained on). Every byte
+    deterministic: no fontconfig, no imaging dependency, identical
+    input on every OS the harness runs on.
+    """
+    import zlib
+
+    font = {
+        "B": (0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110),
+        "L": (0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111),
+        "A": (0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001),
+        "Z": (0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111),
+        "R": (0b01110, 0b10001, 0b10001, 0b01110, 0b10100, 0b10010, 0b10001),
+        "2": (0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111),
+        "0": (0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110),
+        "6": (0b01110, 0b10000, 0b10000, 0b01110, 0b10001, 0b10001, 0b01110),
+        " ": (0,) * 7,
+    }
+    text = "BLAZAR 2026"
+    scale = 8
+    margin = 16
+    glyph_w, glyph_h, tracking = 5, 7, 1
+    w = margin * 2 + len(text) * (glyph_w + tracking) * scale - tracking * scale
+    h = margin * 2 + glyph_h * scale
+    lit = bytearray(w * h)
+    x0 = margin
+    for ch in text:
+        glyph = font[ch]
+        for gy, bits in enumerate(glyph):
+            for gx in range(glyph_w):
+                if bits & (1 << (glyph_w - 1 - gx)):
+                    for sy in range(scale):
+                        for sx in range(scale):
+                            px = x0 + gx * scale + sx
+                            py = margin + gy * scale + sy
+                            lit[py * w + px] = 1
+        x0 += (glyph_w + tracking) * scale
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    white = b"\xff\xff\xff"
+    black = b"\x00\x00\x00"
+    rows = []
+    for y in range(h):
+        base = y * w
+        row = bytearray()
+        for x in range(w):
+            row += black if lit[base + x] else white
+        rows.append(b"\x00" + bytes(row))
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(b"".join(rows)))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode()
+
+
+def _eng_ocr(kinds_by_tag: dict, disk_kinds: set) -> None:
+    """OCR-class fixture reads rendered text out of a real PNG.
+
+    The store's OCR rows are mmproj-attached chat models tuned for
+    document text; the battery renders deterministic pixel-font text,
+    sends it through the vision-chat surface, and asserts the digits
+    come back - the strictest OCR-verifiable claim a Q8 fixture can
+    hold (digit glyphs survive quantization; long prose does not).
+    """
+    ph = "engines/ocr"
+    if "llamacpp" not in set(kinds_by_tag.values()) or "llamacpp" not in disk_kinds:
+        boundary(ph, "OCR text round-trip", "llamacpp lane not installed on this box")
+        return
+    db = _sandbox_db()
+    try:
+        rows = db.execute("SELECT name, path, mmproj_path FROM models").fetchall()
+    finally:
+        db.close()
+    loadable: list[str] = []
+    projector_only: list[str] = []
+    for n, p, mm in rows:
+        if not (mm and re.search(r"ocr", n, re.IGNORECASE)):
+            continue
+        # A row whose MAIN path is the projector cannot load as a chat
+        # model: llama.cpp refuses CLIP as the primary weights ("CLIP
+        # cannot be used as main model, use it with --mmproj instead" -
+        # live 2026-11-21, chandra-ocr-2 registered on its mmproj alone).
+        if p and "mmproj" in os.path.basename(p).lower():
+            projector_only.append(n)
+        else:
+            loadable.append(n)
+    if projector_only:
+        boundary(
+            ph,
+            "OCR rows with projector-as-main skipped",
+            f"store rows {sorted(projector_only)} point their main path at "
+            "the mmproj projector - the engine aborts at load; pull the "
+            "chat weights for those rows or repoint them at the main GGUF",
+        )
+    if not loadable:
+        boundary(
+            ph,
+            "OCR text round-trip",
+            "no OCR-named model with attached mmproj and loadable main "
+            "weights in the store (pull an OCR fixture, e.g. glm-ocr)",
+        )
+        return
+    model = min(loadable, key=model_bytes_mib)
+    if FAST:
+        boundary(
+            ph,
+            "OCR text round-trip",
+            "FAST mode: full run loads the OCR fixture for real",
+        )
+        return
+    bytes_mib = model_bytes_mib(model)
+    free = _gpu_free_mib()
+    ok_env = (free is None or free == 0 or free >= bytes_mib) and (
+        mem_available_mib() >= bytes_mib
+    )
+    if not ok_env:
+        # Same posture as the vision lane: clear our own residue, then
+        # boundary on whatever an external holder keeps claimed.
+        for m in sorted({MODEL, model}):
+            try:
+                http_json("POST", "/api/evict", {"model": m})
+            except Exception:
+                pass
+        _reap_orphan_validate_engines()
+        time.sleep(3)
+        free = _gpu_free_mib()
+        ok_env = (free is None or free == 0 or free >= bytes_mib) and (
+            mem_available_mib() >= bytes_mib
+        )
+    if not ok_env:
+        holders = _gpu_compute_holders()
+        boundary(
+            ph,
+            "OCR text round-trip",
+            f"free VRAM {free} MiB / MemAvailable {mem_available_mib()} MiB vs "
+            f"{model} ~{bytes_mib} MiB after reaping this harness's engines - "
+            "spawn guard refuses the load by design; GPU holders now: "
+            + ("; ".join(holders) if holders else "none visible"),
+        )
+        return
+    d = DAEMON
+    try:
+        d.start({"port": PORT}, floor_model=model)
+    except RuntimeError as exc:
+        boundary(
+            ph, "OCR text round-trip", f"mem floor blocked the start: {str(exc)[-120:]}"
+        )
+        return
+    try:
+        st, _, v = http_json(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": model,
+                "stream": False,
+                "max_tokens": 96,
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Read the text in the image. "
+                                "Reply with the exact text only.",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,"
+                                    + _ocr_text_png_b64()
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+            timeout=420,
+        )
+        text = ""
+        ctoks = None
+        if st == 200 and isinstance(v, dict):
+            try:
+                msg = (v.get("choices") or [{}])[0].get("message") or {}
+                # OCR fixtures may emit the extraction into either field
+                # (thinking-tuned variants put it in reasoning_content).
+                text = str(msg.get("content") or msg.get("reasoning_content") or "")
+            except Exception:
+                pass
+            ctoks = (v.get("usage") or {}).get("completion_tokens")
+        digit_runs = re.findall(r"\d+", text)
+        norm = re.sub(r"[^a-z0-9 ]", " ", text.lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        fuzzy = difflib.SequenceMatcher(None, norm, "blazar 2026").ratio()
+        digits_ok = "2026" in digit_runs
+        fuzzy_ok = fuzzy >= 0.75
+        check(
+            ph,
+            "OCR text round-trip: rendered text read back",
+            st == 200
+            and isinstance(ctoks, int)
+            and ctoks > 0
+            and (digits_ok or fuzzy_ok),
+            f"model={model} status={st} ctok={ctoks} "
+            f"digits={digit_runs[:4]} fuzzy={fuzzy:.2f} txt={text[:80]!r}",
+        )
+    finally:
+        d.stop()
+
+
+def _eng_rerank(rows: list[dict], kinds_by_tag: dict, disk_kinds: set) -> None:
+    """Cross-encoder reranking through every mounted surface: OpenAI
+    /v1/rerank, the /rerank + /reranking aliases, and ollama-dialect
+    /api/rerank (string and {text} document forms). A relevant doc
+    buried among distractors must surface first with a monotonic score
+    order - the deterministic core of reranking that an
+    embedding-similarity fallback cannot fake. Score SCALE is
+    backend-dependent (llamacpp cross-encoders emit raw logits, live
+    2026-11-21: bge-reranker-v2-m3 returned [7.80, -10.98, -11.02]), so
+    ordering + count + top index are the asserted contract; the [0,1]
+    range is reported as evidence only."""
+    ph = "engines/rerank"
+    if "llamacpp" not in set(kinds_by_tag.values()) or "llamacpp" not in disk_kinds:
+        boundary(ph, "rerank ordering", "llamacpp lane not installed on this box")
+        return
+    cands = [r for r in rows if "rerank" in f"{r['name']} {r['repo']}".lower()]
+    row = _eng_smallest(cands)
+    if row is None:
+        boundary(ph, "rerank ordering", "no reranker model row in the store")
+        return
+    model = row["name"]
+    query = "What is the capital of France?"
+    documents = [
+        "Paris is the capital and largest city of France.",
+        "The Moon orbits the Earth at a distance of about 384,000 km.",
+        "Python is a programming language popular for data work.",
+    ]
+    d = DAEMON
+    try:
+        d.start({"port": PORT}, floor_model=model)
+    except RuntimeError as exc:
+        boundary(
+            ph, "rerank ordering", f"mem floor blocked the start: {str(exc)[-120:]}"
+        )
+        return
+    try:
+
+        def _assert_rerank(label: str, path: str, docs: list) -> None:
+            st, _, v = http_json(
+                "POST",
+                path,
+                {"model": model, "query": query, "documents": docs},
+                timeout=240,
+            )
+            results = v.get("results") if isinstance(v, dict) else None
+            scores: list[float] = []
+            if isinstance(results, list) and results:
+                try:
+                    scores = [
+                        float(
+                            r.get(
+                                "relevance_score",
+                                r.get("score", float("nan")),
+                            )
+                        )
+                        for r in results
+                    ]
+                except (TypeError, ValueError):
+                    scores = []
+            top_idx = results[0].get("index") if results else None
+            mono = all(
+                scores[i] >= scores[i + 1] - 1e-9 for i in range(len(scores) - 1)
+            )
+            in_range = all(-1e-6 <= s <= 1.0 + 1e-6 for s in scores)
+            ok = (
+                st == 200
+                and len(results or []) == len(docs)
+                and top_idx == 0
+                and mono
+                and len(scores) == len(docs)
+            )
+            check(
+                ph,
+                f"{label}: relevant doc ranks first, scores monotonic",
+                ok,
+                f"model={model} status={st} n={len(results or [])} "
+                f"top_index={top_idx} scores={[round(s, 4) for s in scores]} "
+                f"unit_range={in_range} (logit-scale scores are native "
+                "llamacpp reranker output; ordering is the contract)",
+            )
+
+        _assert_rerank("openai /v1/rerank", "/v1/rerank", documents)
+        _assert_rerank("alias /rerank", "/rerank", documents)
+        _assert_rerank("alias /reranking", "/reranking", documents)
+        _assert_rerank("ollama /api/rerank", "/api/rerank", documents)
+        _assert_rerank(
+            "ollama /api/rerank object documents",
+            "/api/rerank",
+            [{"text": t} for t in documents],
+        )
+    finally:
+        d.stop()
+
+
+def _gpu_total_mib() -> int | None:
+    """Total VRAM across GPUs (MiB); None when no GPU tooling/probe
+    fails - unknown, NOT zero."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        return sum(int(x) for x in out.stdout.split())
+    except (ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _eng_spec_draft(rows: list[dict], kinds_by_tag: dict, disk_kinds: set) -> None:
+    """Speculative-decoding lanes on sglang: dflash LIVE (draft weights
+    engaged - child argv + 200 + usage prove the mechanism end to end),
+    dspine parse-gated with an honest capacity boundary, and the parse
+    gates that keep draft knobs from silently dropping at boot."""
+    ph = "engines/sglang"
+    if "sglang" not in set(kinds_by_tag.values()) or "sglang" not in disk_kinds:
+        boundary(ph, "speculative draft lane", "sglang lane not installed on this box")
+        return
+    d = DAEMON
+    neg_floor = _eng_pick_gguf_chat(rows)
+
+    # Pure parse-gate cells (mirror the sglang_neg posture above).
+    for label, frag, want in (
+        (
+            "dflash without a draft path fails fast",
+            {"spec_algorithm": "dflash"},
+            "needs sglang.spec_draft_path",
+        ),
+        (
+            "dspine without a draft path fails fast",
+            {"spec_algorithm": "dspine"},
+            "needs sglang.spec_draft_path",
+        ),
+        (
+            "spec_algorithm vocab",
+            {"spec_algorithm": "medusa"},
+            "spec_algorithm must be one of",
+        ),
+    ):
+        try:
+            d.start(
+                {"port": PORT, "sglang": frag},
+                floor_model=neg_floor["name"] if neg_floor else MODEL,
+            )
+        except RuntimeError as e:
+            err = str(e)
+            if "MemAvailable" in err:
+                boundary(
+                    ph,
+                    f"spec parse gate: {label}",
+                    f"mem floor blocked the start before config parse: {err[-120:]}",
+                )
+                continue
+            check(
+                ph,
+                f"spec parse gate: {label}",
+                want in err,
+                f"want {want!r}; log tail: {err[-200:].replace(chr(10), ' | ')}",
+            )
+        else:
+            check(
+                ph,
+                f"spec parse gate: {label}",
+                False,
+                f"daemon ACCEPTED bad spec config {frag!r}",
+            )
+            d.stop()
+
+    # The parse-gate cells above write deliberately-invalid configs into
+    # the shared sandbox config.toml. The older sglang_neg cells survive
+    # on the next text lane's d.start overwriting the file - but nothing
+    # is scheduled to overwrite it between here and the live lanes below
+    # (a floor-blocked or absent draft pair skips every d.start), and
+    # every later CLI call in this campaign parses the same file (live
+    # 2026-11-21: the leftover 'medusa' cell broke the litert pull with
+    # a config parse error). Restore a minimal valid config immediately.
+    d.sb.write_config({"port": PORT})
+
+    def _draft_target(marker: str) -> tuple[dict | None, dict | None]:
+        """(draft, target) rows: draft = safetensors dir named for the
+        algorithm; target = the plain bf16 dir the draft extends
+        ('qwen3-4b-dflash-b16' extends 'qwen3-4b')."""
+        drafts = [
+            r for r in rows if marker in r["name"].lower() and Path(r["path"]).is_dir()
+        ]
+        draft = _eng_smallest(drafts)
+        if draft is None:
+            return None, None
+        targets = [
+            r
+            for r in rows
+            if draft["name"].startswith(r["name"] + "-")
+            and Path(r["path"]).is_dir()
+            and not _eng_has_components(r)
+            and "mlx" not in f"{r['name']} {r['path']}".lower()
+            and not ENG_NON_CHAT_RE.search(f"{r['name']} {r['repo']}")
+            and not ENG_QUANTIZED_ST_RE.search(f"{r['name']} {r['repo']}")
+        ]
+        return draft, _eng_smallest(targets)
+
+    def _spec_live(
+        algorithm: str,
+        draft: dict,
+        target: dict,
+        offload: float | None,
+        argv_offload: str | None,
+    ) -> None:
+        sglang_cfg = {
+            "spec_algorithm": algorithm,
+            "spec_draft_path": str(draft["path"]),
+        }
+        if offload is not None:
+            sglang_cfg["cpu_offload_gb"] = offload
+        cfg = {
+            "port": PORT,
+            "model_overrides": {
+                target["name"]: {
+                    "engine": "sglang",
+                    "ctx": 8192,
+                    "sglang": sglang_cfg,
+                }
+            },
+        }
+        # Offload-aware mem floor: with --cpu-offload-gb N the target's
+        # last N GiB stage in host RAM instead of the card, so the
+        # default bytes*1.25+1024 floor over-reserves and would boundary
+        # the receipt-proven 8 GiB recipe (2026-10-16: 4B bf16 + 0.5B
+        # draft hosted with 4 GiB offloaded). Compute the floor from the
+        # actually-resident set (target + draft - offload), never raise
+        # it above the default, scope the override to THIS start only,
+        # and let an explicit BLAZAR_VALIDATE_MEM_FLOOR_MIB pin win.
+        # The in-product spawn mem-guard still protects the box.
+        offload_mib = int((offload or 0) * 1024)
+        target_mib = model_bytes_mib(target["name"])
+        draft_mib = model_bytes_mib(draft["name"])
+        default_need = int(target_mib * 1.25) + 1024
+        offload_need = min(
+            int((target_mib + draft_mib - offload_mib) * 1.25) + 1024,
+            default_need,
+        )
+        prev_floor = os.environ.get("BLAZAR_VALIDATE_MEM_FLOOR_MIB")
+        set_floor = offload is not None and prev_floor is None
+        if set_floor:
+            os.environ["BLAZAR_VALIDATE_MEM_FLOOR_MIB"] = str(offload_need)
+
+        def _restore_floor() -> None:
+            if set_floor:
+                if prev_floor is None:
+                    os.environ.pop("BLAZAR_VALIDATE_MEM_FLOOR_MIB", None)
+                else:
+                    os.environ["BLAZAR_VALIDATE_MEM_FLOOR_MIB"] = prev_floor
+
+        try:
+            d.start(cfg, floor_model=target["name"])
+        except RuntimeError as exc:
+            if "MemAvailable" in str(exc):
+                boundary(
+                    ph,
+                    f"{algorithm} live lane",
+                    f"mem floor blocked the start: {str(exc)[-120:]}",
+                )
+            else:
+                check(ph, f"{algorithm} live lane ran", False, str(exc))
+            _restore_floor()
+            return
+        try:
+            model = target["name"]
+            try:
+                chat("Say ok", model=model, timeout=600)
+            except Exception:
+                pass
+            prow = wait_loaded(model=model, budget=600)
+            if prow is None:
+                check(
+                    ph,
+                    f"{algorithm}: draft-engaged model loads",
+                    False,
+                    f"no ps row for {model} - daemon log: {d.log_path}",
+                )
+                return
+            check(
+                ph,
+                f"{algorithm}: draft-engaged model loads",
+                True,
+                f"model={model} engine={prow.get('blazar_engine')}",
+            )
+            # argv audit: each spec flag present EXACTLY once with the
+            # exact value (receipt 2026-10-16: duplicate emission was a
+            # real bug class on the dflash path).
+            pid = child_pid(model)
+            argv = child_argv(pid) if pid else []
+            expected = {
+                "--speculative-algorithm": algorithm.upper(),
+                "--speculative-draft-model-path": str(draft["path"]),
+            }
+            if argv_offload is not None:
+                expected["--cpu-offload-gb"] = argv_offload
+            problems = []
+            for flag, val in expected.items():
+                idxs = [i for i, a in enumerate(argv) if a == flag]
+                if len(idxs) != 1:
+                    problems.append(f"{flag} x{len(idxs)}")
+                elif idxs[0] + 1 >= len(argv) or argv[idxs[0] + 1] != val:
+                    got = argv[idxs[0] + 1] if idxs[0] + 1 < len(argv) else "MISSING"
+                    problems.append(f"{flag} -> {got} != {val}")
+            check(
+                ph,
+                f"{algorithm}: child argv carries spec flags exactly once",
+                not problems and bool(argv),
+                f"problems={problems} argv={' '.join(argv)[:240]}"
+                if problems
+                else f"{len(expected)} spec pairs exact-once in argv",
+            )
+            st, _, v = chat("Say ok", model=model)
+            msg = {}
+            if st == 200 and isinstance(v, dict):
+                msg = (v.get("choices") or [{}])[0].get("message") or {}
+            usage_ok = isinstance(v, dict) and isinstance(v.get("usage"), dict)
+            check(
+                ph,
+                f"{algorithm}: speculative decode serves 200 + content + usage",
+                st == 200 and bool(str(msg.get("content") or "").strip()) and usage_ok,
+                f"status={st} usage={usage_ok}",
+            )
+            cov(
+                "sglang.spec_algorithm",
+                f"argv: --speculative-algorithm {algorithm.upper()}",
+                f"{algorithm} live lane model={model}",
+                True,
+            )
+            cov(
+                "sglang.spec_draft_path",
+                "argv: --speculative-draft-model-path <dir>",
+                f"{algorithm} live lane draft={draft['name']}",
+                True,
+            )
+            if argv_offload is not None:
+                cov(
+                    "sglang.cpu_offload_gb",
+                    f"argv: --cpu-offload-gb {argv_offload}",
+                    f"{algorithm} live lane (8 GiB card recipe)",
+                    True,
+                )
+        finally:
+            d.stop()
+            _restore_floor()
+
+    draft, target = _draft_target("dflash")
+    if draft is None or target is None:
+        boundary(
+            ph,
+            "dflash live lane",
+            "no dflash draft dir + bf16 target pair in the store (pull the "
+            "draft dir alongside its unquantized target)",
+        )
+    elif FAST:
+        boundary(
+            ph, "dflash live lane", "FAST mode: full run engages the draft for real"
+        )
+    else:
+        # Receipt recipe (2026-10-16, 8 GiB card): bf16 4B target +
+        # 0.5B draft hosts with 4 GiB offloaded - blazar clamps
+        # mem-fraction-static and caps cuda-graph decode bs on its own.
+        _spec_live("dflash", draft, target, 4.0, "4")
+
+    draft, target = _draft_target("dspine")
+    if draft is None or target is None:
+        boundary(
+            ph,
+            "dspine live lane",
+            "no dspine draft dir + bf16 target pair in the store",
+        )
+    else:
+        total = _gpu_total_mib()
+        if total is None:
+            boundary(
+                ph,
+                "dspine live lane",
+                "no GPU tooling on this box (nvidia-smi absent) - VRAM "
+                "capacity unknown, not guessing",
+            )
+        elif total < 12288:
+            boundary(
+                ph,
+                "dspine live lane",
+                f"dspine needs an unquantized bf16 lm_head and a >= 12 GiB card "
+                f"for full capacity (draft-pairings registry note; no quantized "
+                f"Qwen3-8B ships bf16 lm_head as of 2026-11-09) - this box has "
+                f"{total} MiB; parse gates above pin the config contract",
+            )
+        elif FAST:
+            boundary(
+                ph, "dspine live lane", "FAST mode: full run engages the draft for real"
+            )
+        else:
+            _spec_live("dspine", draft, target, None, None)
+
+
+def _eng_litert(kinds_by_tag: dict, disk_kinds: set) -> None:
+    """LiteRT host lane - the last EngineKind without a live load
+    anywhere in the battery: pull a real .litertlm bundle through the
+    sandbox CLI (store-managed bytes, nothing in temp dirs), load it on
+    the openaihost engine, serve a chat round-trip."""
+    ph = "engines/openaihost"
+    if "openaihost" not in set(kinds_by_tag.values()) or "openaihost" not in disk_kinds:
+        boundary(
+            ph, "litert bundle loads + chats", "litert engine not installed on this box"
+        )
+        return
+    if FAST:
+        boundary(
+            ph,
+            "litert bundle loads + chats",
+            "FAST mode: full run pulls the bundle for real (network lane)",
+        )
+        return
+    repo_ref = "litert-community/SmolLM2-360M-Instruct"
+    p = cli("pull", repo_ref, timeout=900)
+    if p.returncode != 0:
+        boundary(
+            ph,
+            "litert bundle loads + chats",
+            f"pull {repo_ref} rc={p.returncode}: "
+            f"{(p.stderr or p.stdout).strip()[-160:]}",
+        )
+        return
+    db = _sandbox_db()
+    try:
+        pulled = db.execute(
+            "SELECT name FROM models WHERE repo = ? OR name = ?",
+            (repo_ref, repo_ref.split("/")[-1]),
+        ).fetchall()
+    finally:
+        db.close()
+    if not pulled:
+        boundary(
+            ph,
+            "litert bundle loads + chats",
+            f"pull reported success but no store row matches {repo_ref}",
+        )
+        return
+    model = pulled[0][0]
+    d = DAEMON
+    try:
+        d.start({"port": PORT}, floor_model=model)
+    except RuntimeError as exc:
+        boundary(
+            ph,
+            "litert bundle loads + chats",
+            f"mem floor blocked the start: {str(exc)[-120:]}",
+        )
+        return
+    try:
+        try:
+            chat("Say ok", model=model, timeout=420)
+        except Exception:
+            pass
+        prow = wait_loaded(model=model, budget=420)
+        if prow is None:
+            check(
+                ph,
+                "litert bundle loads on the openaihost lane",
+                False,
+                f"no ps row for {model} - daemon log: {d.log_path}",
+            )
+            return
+        tag = str(prow.get("blazar_engine") or "")
+        served_kind = kinds_by_tag.get(tag, "?")
+        check(
+            ph,
+            "litert bundle loads on the openaihost lane",
+            served_kind == "openaihost",
+            f"model={model} engine={tag} -> kind {served_kind!r}",
+        )
+        st, _, v = chat("Say ok", model=model)
+        msg = {}
+        if st == 200 and isinstance(v, dict):
+            msg = (v.get("choices") or [{}])[0].get("message") or {}
+        usage_ok = isinstance(v, dict) and isinstance(v.get("usage"), dict)
+        check(
+            ph,
+            "litert chat completions 200 + content + usage",
+            st == 200 and bool(str(msg.get("content") or "").strip()) and usage_ok,
+            f"status={st} usage={usage_ok}",
+        )
+    finally:
+        d.stop()
+
+
 def phase_engines() -> None:
     print("\n== phase 4b: per-engine live battery (every installed kind) ==")
     rows, kinds_by_tag = _eng_store()
@@ -9086,6 +9870,17 @@ def phase_engines() -> None:
                         )
                 finally:
                     d.stop()
+
+        # Deep lanes: OCR text round-trip, rerank ordering,
+        # speculative drafts, and the litert host lane each need their
+        # own daemon posture - they cannot ride the shared lazy daemon.
+        if keep is None or "llamacpp" in keep:
+            _eng_ocr(kinds_by_tag, disk_kinds)
+            _eng_rerank(rows, kinds_by_tag, disk_kinds)
+        if keep is None or "sglang" in keep:
+            _eng_spec_draft(rows, kinds_by_tag, disk_kinds)
+        if keep is None or "openaihost" in keep:
+            _eng_litert(kinds_by_tag, disk_kinds)
     finally:
         d.stop()
 
@@ -11812,7 +12607,33 @@ def phase_commands() -> None:
     reg("coreside", p.returncode == 0, p.stdout.strip()[:80])
 
     p = cli("drafts", MODEL)
-    reg("drafts", p.returncode == 0, p.stdout.strip()[:80])
+    # The drafts surface must actually NAME the store's draft fixtures
+    # (rc0 with an empty table would hide a registry-link rot); rc0
+    # alone remains the floor when no draft family is installed.
+    try:
+        _db = _sandbox_db()
+        try:
+            _draft_names = [
+                r[0]
+                for r in _db.execute(
+                    "SELECT name FROM models WHERE name LIKE '%dflash%'"
+                    " OR name LIKE '%dspine%' OR name LIKE '%eagle%'"
+                    " OR name LIKE '%mtp%'"
+                )
+            ]
+        finally:
+            _db.close()
+    except sqlite3.Error:
+        _draft_names = []
+    drafts_ok = p.returncode == 0 and (
+        not _draft_names or any(n in p.stdout for n in _draft_names)
+    )
+    reg(
+        "drafts",
+        drafts_ok,
+        f"rc={p.returncode} store_drafts={_draft_names[:3] or 'none'} "
+        f"visible={any(n in p.stdout for n in _draft_names) if _draft_names else 'n/a'}",
+    )
 
     def _search():
         p = cli("search", "qwen", timeout=120)
@@ -15441,6 +16262,9 @@ def phase_realuser():
 # ---------------------------------------------------------------------------
 GOLDEN_DIR = os.path.join(dirname(abspath(__file__)), "goldens")
 UPDATE_GOLDENS = False  # set by main() from --update-goldens
+# Set by main() from --update-perf-baseline: benchqc appends the decode
+# t/s reference row instead of comparing against it (clean tree only).
+UPDATE_PERF_BASELINE = False
 
 
 def _gold_items() -> dict:
@@ -17377,14 +18201,286 @@ def phase_os() -> None:
     )
 
 
+def phase_benchqc() -> None:
+    """Quality + perf-regression gate: the deterministic tool-call QC
+    battery (scripts/toolcall_eval.py) against the live sandbox daemon,
+    a greedy-determinism pair, and decode-throughput regression
+    tracking against an append-only baseline. A quality failure or a
+    perf regression fails the run LOUDLY; a missing baseline is a named
+    boundary with the pinning command - never a silent green, never a
+    silent no-op."""
+    print("\n== phase 13b: benchmark + QC + perf-regression gate ==")
+    ph = "benchqc"
+    sublanes = (
+        "tool-call QC battery",
+        "greedy determinism pair",
+        "decode t/s regression gate",
+    )
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if FAST:
+        for name in sublanes:
+            boundary(ph, name, "FAST mode: full run executes this gate for real")
+        return
+    d = DAEMON
+    try:
+        d.start({"port": PORT})
+    except RuntimeError as exc:
+        for name in sublanes:
+            boundary(ph, name, f"mem floor blocked the daemon: {str(exc)[-120:]}")
+        return
+    try:
+        # Warm load so the t/s lane measures decode, not cold model load.
+        try:
+            chat("Say ok", timeout=300)
+        except Exception:
+            pass
+        prow = wait_loaded(model=MODEL, budget=300)
+        engine_tag = str((prow or {}).get("blazar_engine") or "unknown")
+
+        # -- tool-call QC: the project battery, driven as a subprocess
+        # against THIS daemon (BLAZAR_BASE pinned - never the script's
+        # default port, which would silently probe the wrong server).
+        env = dict(os.environ, BLAZAR_BASE=f"http://127.0.0.1:{PORT}")
+        t0 = time.time()
+        try:
+            tc = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.join(repo, "scripts", "toolcall_eval.py"),
+                    MODEL,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=env,
+                cwd=repo,
+                check=False,
+            )
+            rc, tail = tc.returncode, ((tc.stdout or "") + (tc.stderr or ""))[-400:]
+        except subprocess.TimeoutExpired:
+            rc, tail = -1, "toolcall_eval.py timed out after 1800s"
+        passed = total = None
+        fails: list[str] = []
+        results_path = None
+        cand = os.path.join(
+            repo,
+            "bench-artifacts",
+            time.strftime("%Y%m%d") + "-toolcall",
+            "results.json",
+        )
+        if os.path.exists(cand) and os.path.getmtime(cand) >= t0 - 5:
+            try:
+                with open(cand) as f:
+                    rec = json.load(f)
+                row = (rec.get("models") or {}).get(MODEL) or {}
+                passed, total = row.get("passed"), row.get("total")
+                fails = [
+                    str(r.get("test"))
+                    for r in (row.get("results") or [])
+                    if not r.get("ok")
+                ]
+                results_path = cand
+            except (ValueError, OSError):
+                pass
+        check(
+            ph,
+            "tool-call QC battery green (selection/args/schema/stream)",
+            rc == 0,
+            f"rc={rc} passed={passed}/{total} "
+            f"failing={fails[:4] or 'none'} results={results_path} "
+            f"tail={tail[-200:]!r}",
+        )
+
+        # -- greedy determinism: two identical temperature-0 requests.
+        bodies = []
+        for _ in range(2):
+            st, _, v = http_json(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": MODEL,
+                    "stream": False,
+                    "max_tokens": 64,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "List the first ten even numbers, "
+                            "comma separated.",
+                        }
+                    ],
+                },
+                timeout=240,
+            )
+            try:
+                bodies.append(str(v["choices"][0]["message"]["content"] or ""))
+            except Exception:
+                bodies.append("")
+        if bodies[0] and bodies[0] == bodies[1]:
+            check(
+                ph,
+                "greedy determinism (temperature=0 pair identical)",
+                True,
+                f"engine={engine_tag} len={len(bodies[0])}",
+            )
+        else:
+            boundary(
+                ph,
+                "greedy determinism (temperature=0 pair identical)",
+                f"engine {engine_tag} is not greedy-deterministic under "
+                "batching (upstream scheduler behavior - recorded, "
+                f"visible, not silently dropped): {bodies[0][:40]!r} vs "
+                f"{bodies[1][:40]!r}",
+            )
+
+        # -- decode t/s regression gate: median of 5 fixed-prompt greedy
+        # runs vs the append-only baseline row for (model, engine).
+        rates = []
+        prompt = "Write the numbers from one to thirty, one per line."
+        for _ in range(5):
+            run_t0 = time.monotonic()
+            st, _, v = http_json(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": MODEL,
+                    "stream": False,
+                    "max_tokens": 128,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=300,
+            )
+            dt = time.monotonic() - run_t0
+            ct = (
+                (v.get("usage") or {}).get("completion_tokens")
+                if isinstance(v, dict)
+                else None
+            )
+            if st == 200 and isinstance(ct, int) and ct > 0 and dt > 0:
+                rates.append(ct / dt)
+        if len(rates) < 3:
+            check(
+                ph,
+                "decode throughput measured (5 fixed greedy runs)",
+                False,
+                f"only {len(rates)}/5 runs produced usage - engine={engine_tag}",
+            )
+            return
+        cur = statistics.median(rates)
+        base_path = os.path.join(
+            repo, "bench-artifacts", "validate-perf-baseline.jsonl"
+        )
+        key = f"{MODEL}@{engine_tag}"
+        baselines: list[dict] = []
+        if os.path.exists(base_path):
+            with open(base_path, errors="replace") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if row.get("key") == key:
+                        baselines.append(row)
+        if UPDATE_PERF_BASELINE:
+            dirty = bool(
+                subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    cwd=repo,
+                    check=False,
+                ).stdout.strip()
+            )
+            if dirty and os.environ.get("BLAZAR_VALIDATE_PERF_ALLOW_DIRTY") != "1":
+                check(
+                    ph,
+                    "perf baseline append (clean tree only)",
+                    False,
+                    "refusing to append a baseline from a DIRTY tree - it would "
+                    "pin transient local state as the canonical reference; "
+                    "commit first or set BLAZAR_VALIDATE_PERF_ALLOW_DIRTY=1",
+                )
+            else:
+                sha = (
+                    subprocess.run(
+                        ["git", "rev-parse", "--short", "HEAD"],
+                        capture_output=True,
+                        text=True,
+                        cwd=repo,
+                        check=False,
+                    ).stdout.strip()
+                    or "unknown"
+                )
+                os.makedirs(os.path.dirname(base_path), exist_ok=True)
+                with open(base_path, "a") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "key": key,
+                                "model": MODEL,
+                                "engine": engine_tag,
+                                "commit": sha,
+                                "tps": round(cur, 3),
+                                "runs": [round(r, 3) for r in rates],
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                            }
+                        )
+                        + "\n"
+                    )
+                check(
+                    ph,
+                    "perf baseline appended",
+                    True,
+                    f"{key} median {cur:.2f} tok/s -> {base_path}",
+                )
+        elif not baselines:
+            boundary(
+                ph,
+                "decode t/s regression vs baseline",
+                f"no baseline row for {key} yet - run once with "
+                "--update-perf-baseline (clean tree) to pin the reference; "
+                f"this run measured median {cur:.2f} tok/s",
+            )
+        else:
+            try:
+                tol = float(os.environ.get("BLAZAR_VALIDATE_PERF_TOLERANCE", "0.15"))
+            except ValueError:
+                tol = -1.0
+            if tol < 0:
+                check(
+                    ph,
+                    "decode t/s regression tolerance parses",
+                    False,
+                    f"BLAZAR_VALIDATE_PERF_TOLERANCE="
+                    f"{os.environ.get('BLAZAR_VALIDATE_PERF_TOLERANCE')!r} "
+                    "is not a number",
+                )
+                return
+            base = float(baselines[-1]["tps"])
+            delta = (cur - base) / base if base > 0 else 0.0
+            check(
+                ph,
+                f"decode t/s within -{tol:.0%} of baseline",
+                delta >= -tol,
+                f"{key}: now {cur:.2f} vs base {base:.2f} tok/s "
+                f"({delta:+.1%}, engine={engine_tag}, baseline commit "
+                f"{baselines[-1].get('commit', '?')})",
+            )
+    finally:
+        d.stop()
+
+
 def main() -> int:
     global SANDBOX, DAEMON, USER_CONFIG_SHA, PHASE_FILTER, CRASHED
-    global UPDATE_GOLDENS
+    global UPDATE_GOLDENS, UPDATE_PERF_BASELINE
     args = sys.argv[1:]
     _pyspy_reexec_if_requested(args)
     self_test = "--self-test" in args
     if "--update-goldens" in args:
         UPDATE_GOLDENS = True
+    if "--update-perf-baseline" in args:
+        UPDATE_PERF_BASELINE = True
     phases_arg = [a for a in args if a.startswith("--phase=")]
     wanted = {a.split("=", 1)[1] for a in phases_arg} or None
     if wanted is None and "--smoke" in args:
@@ -17525,6 +18621,7 @@ def main() -> int:
         ("golds", phase_golds),
         ("wave13", phase_wave13),
         ("parity", phase_parity),
+        ("benchqc", phase_benchqc),
         ("coverage", phase_coverage),
         ("os", phase_os),
     ]
