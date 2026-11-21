@@ -14125,8 +14125,9 @@ fn canonical_plan_for(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    #[allow(clippy::cast_sign_loss)] // epoch seconds fit i64 by construction
-    let now = now as i64;
+    // epoch seconds fit i64 by construction; cast_signed keeps the
+    // conversion explicit for the wrap-checking lints
+    let now = now.cast_signed();
     let inputs = blazar_core::execution_plan::ExecutionPlanInputs {
         row,
         installed: &installed,
@@ -14286,11 +14287,10 @@ async fn plan_cmd(model: &str, json: bool) -> Result<()> {
     println!("PLANNER (canonical execution plan)");
     match &canonical {
         Ok(plan) => {
-            let lane = plan
-                .tag
-                .as_deref()
-                .map(|t| format!("{t} ({:?})", plan.engine))
-                .unwrap_or_else(|| format!("{:?}", plan.engine));
+            let lane = plan.tag.as_deref().map_or_else(
+                || format!("{:?}", plan.engine),
+                |t| format!("{t} ({:?})", plan.engine),
+            );
             println!(
                 "  engine    {lane} via {:?} - confidence {:?}",
                 plan.source, plan.confidence
