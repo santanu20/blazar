@@ -4,6 +4,23 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [0.34.1] - 2026-11-21
+
+### Fixed
+
+- **Ollama-compat workload counters used the swapped surfaces.** The ollama embeddings bridge tagged its requests with the rerank surface and the rerank bridge tagged embeddings, so `blazar_workload_requests_total{kind}` mislabeled both lanes (each request incremented the other lane's counter). Both bridges now classify with their own surface; counter cardinality and names are unchanged.
+- **The v0.34.0 tag could not build `--locked`.** The release bump changed the workspace Cargo.toml versions but left Cargo.lock at 0.33.0, so the tag's release workflow failed at the first `cargo build --locked` and no v0.34.0 binaries were ever published. The lockfile now travels inside the release commit itself (this release proves the path: the lock in this very commit is 0.34.1).
+- CI gate fixes ridden by main since v0.34.0: clippy `cast_possible_wrap`/`map_unwrap_or_else` in the CLI planner lane (all three OS lanes were red), machine-specific paths in bench receipts and one kv test fixture (hygiene gate), and two undocumented config rows (`mcp_max_request_secs`, `mcp_access`) flagged by the config-doc drift gate.
+
+### Added
+
+- **Installer engine-lane census.** `install.sh` and `install.ps1` engine menus now name all ten serving lanes - the piper, kokoro and LiteRT-LM rows were missing from both, so a fresh install only advertised six of the nine installable engine kinds. `uninstall.sh` sweeps the piper `voices/` directory with the other regenerable state (voices are re-pullable engine-class assets, not models). The `engine_coverage.py` census gate now enforces every surface names all ten lanes.
+- **kokoro speech bench lane.** `bench_media.py speech --lane-speech kokoro` drives the gateway's lazy kokoro lane, and `--direct` runs the standalone shim server side by side in the same invocation (true A/B on identical machine state - the shim speaks the same `kokoro-server --port` contract the gateway's lazy runtime spawns).
+
+### Docs
+
+- README gains a self-contained banner and a tightened overview; `docs/benchmarks.md` documents the global-flags-before-subcommand invocation shape with a kokoro A/B example; `docs/config-code-paths.md` gains the `mcp_max_request_secs` and `mcp_access` rows; the probes campaign matrix render and portable-path bench receipts landed on main.
+
 ## [0.34.0] - 2026-11-20
 
 ### Changed
