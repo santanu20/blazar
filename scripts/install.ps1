@@ -276,6 +276,21 @@ try {
             else { Write-Host ">>> WARN: model pull failed - run: blazar pull $env:BLAZAR_INSTALL_MODEL" }
         } catch { Write-Host ">>> WARN: model pull failed - run: blazar pull $env:BLAZAR_INSTALL_MODEL" }
     }
+    # The bootstrap lane is llamacpp-only (zero-touch default: any GGUF,
+    # fastest cold start). The other engines are one command away - say
+    # so, every install, so the choice is discoverable without docs
+    # (mirrors install.sh's engines menu).
+    Write-Host '>>> other engines, one command each:'
+    Write-Host '      blazar engine install --kind sglang      SGLang: safetensors lane, best quality + batching (Linux + NVIDIA, ~6 GiB)'
+    Write-Host '      blazar engine install --kind vllm        vLLM: safetensors lane, throughput-first PagedAttention (Linux + NVIDIA, ~6-8 GiB)'
+    Write-Host '      blazar engine install --kind mistralrs   mistral.rs: GGUF + safetensors (~0.8 GiB)'
+    Write-Host '      blazar engine install --kind sdcpp       sd.cpp: diffusion + video checkpoints - Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5/Wan 2.1 T2V (any GPU via Vulkan, ~0.04-0.3 GiB)'
+    Write-Host '      blazar engine install --kind whisper     whisper: audio transcription + translation (CPU, ~10 MiB; ggml models)'
+    Write-Host '      blazar engine install --kind mlx         mlx: mlx-community quant dirs (CUDA linux + Apple Silicon, ~3 GiB)'
+    Write-Host '      blazar engine install --kind piper       piper: offline text-to-speech (CPU, ~5 MiB; rhasspy/piper voices)'
+    Write-Host '      blazar engine install --kind kokoro      kokoro: neural text-to-speech (CPU, ~0.4 GiB; kokoro-onnx v1 voices)'
+    Write-Host '      blazar engine install --kind openaihost  LiteRT-LM: mobile/edge/NPU .litertlm bundles (any platform, ~0.4 GiB venv)'
+    Write-Host '      blazar engine list                       what is installed; blazar engine use <tag> switches the serving engine'
     if ($WithService) { Register-BlazarTask $installedExe }
     elseif ($taskExisted) {
         # F155b: binary was replaced under an existing task — bring the
@@ -284,7 +299,8 @@ try {
         Write-Host ">>> restarted scheduled task '$TaskName' on the upgraded binary"
     }
     Write-Host '>>> system ready - check health: blazar doctor'
-    Write-Host '>>> All inference is upstream llama.cpp, mistral.rs and SGLang - the engine authors did the hard parts.'
+    Write-Host '>>> engines: llamacpp serves by default; the menu above installs the other 9 lanes'
+    Write-Host '>>> All inference is upstream llama.cpp, mistral.rs, SGLang, vLLM, sd.cpp, whisper.cpp, piper, Kokoro, MLX and LiteRT-LM - the engine authors did the hard parts.'
 } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

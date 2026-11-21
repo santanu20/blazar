@@ -902,6 +902,9 @@ EOF
     menu "blazar engine install --kind sdcpp"     "sd.cpp: diffusion + video checkpoints - Qwen-Image/FLUX/Z-Image/Chroma/SDXL/SD1.5/Wan 2.1 T2V (any GPU via Vulkan, ~0.04-0.3 GiB)"
     menu "blazar engine install --kind whisper"   "whisper: audio transcription + translation (CPU, ~10 MiB; ggml models)"
     menu "blazar engine install --kind mlx"       "mlx: mlx-community quant dirs (CUDA linux + Apple Silicon, ~3 GiB)"
+    menu "blazar engine install --kind piper"     "piper: offline text-to-speech (CPU, ~5 MiB; rhasspy/piper voices)"
+    menu "blazar engine install --kind kokoro"    "kokoro: neural text-to-speech (CPU, ~0.4 GiB; kokoro-onnx v1 voices)"
+    menu "blazar engine install --kind openaihost" "LiteRT-LM: mobile/edge/NPU .litertlm bundles (any platform, ~0.4 GiB venv)"
     menu "blazar engine list"                     "what is installed; blazar engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
     # enable block above). Started even when bootstrap failed: a running
@@ -928,8 +931,8 @@ EOF
         menu "blazar pull <model>" "e.g. blazar pull Qwen3-0.6B (find one: blazar search qwen3)"
     fi
     menu "blazar doctor" "health check with per-row hints"
-    say "engines: llamacpp serves by default; the menu above installs SGLang, mistral.rs or mlx"
-    say "All inference is upstream llama.cpp, mistral.rs and SGLang - the engine authors did the hard parts."
+    say "engines: llamacpp serves by default; the menu above installs the other 9 lanes"
+    say "All inference is upstream llama.cpp, mistral.rs, SGLang, vLLM, sd.cpp, whisper.cpp, piper, Kokoro, MLX and LiteRT-LM - the engine authors did the hard parts."
 }
 
 

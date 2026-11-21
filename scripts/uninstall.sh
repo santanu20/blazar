@@ -250,12 +250,14 @@ fi
 status "removing regenerable user state (store + engines + caches)"
 
 # Data dir minus models: remove named subpaths (store, engines, runtime,
-# config snapshots, audit log, KV sessions, spec caches - all regenerable
-# or re-downloadable) so a declined model removal leaves the directory
-# itself intact.
+# config snapshots, audit log, KV sessions, spec caches, piper voices -
+# all regenerable or re-downloadable) so a declined model removal leaves
+# the directory itself intact.
 # blazar.db plus its SQLite WAL sidecars (-wal, -shm) that can outlive
 # the db file after a daemon shutdown - orphaned checkpoints, not data.
-for _sub in blazar.db blazar.db-wal blazar.db-shm engines run snapshots log sessions speccache; do
+# voices/ holds pulled piper TTS voices: engine-class assets (cheap
+# re-pull via `blazar voice pull`), not models - removed even on keep.
+for _sub in blazar.db blazar.db-wal blazar.db-shm engines run snapshots log sessions speccache voices; do
     [ -e "$DATA_DIR/$_sub" ] &&
         run "remove $DATA_DIR/$_sub" rm -rf "$DATA_DIR/$_sub"
 done
