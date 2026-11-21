@@ -42,7 +42,7 @@ permalink: /
     <div class="term-bar"><i></i><i></i><i></i><span class="term-title">sh — blazar quickstart</span></div>
     <pre class="term-body"><span class="c"># install (macOS, Linux, WSL)</span>
 <span class="p">$</span> curl --proto '=https' --tlsv1.2 -fsSL \
-    https://raw.githubusercontent.com/santanu20/blazar/v0.34.3/scripts/install.sh | sh
+    https://raw.githubusercontent.com/santanu20/blazar/v0.34.3/scripts/install.sh | BLAZAR_VERSION=0.34.3 sh
 
 <span class="c"># windows powershell</span>
 <span class="p">$</span> irm https://raw.githubusercontent.com/santanu20/blazar/v0.34.3/scripts/install.ps1 | iex

@@ -59,7 +59,7 @@ The inference engines still execute the model. Blazar coordinates the serving st
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://raw.githubusercontent.com/santanu20/blazar/v0.34.3/scripts/install.sh \
-  | BLAZAR_REPO=santanu20/blazar sh
+  | BLAZAR_REPO=santanu20/blazar BLAZAR_VERSION=0.34.3 sh
 ```
 
 #### Windows PowerShell

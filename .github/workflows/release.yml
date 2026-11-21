@@ -328,7 +328,7 @@ jobs:
 
           Linux / macOS (WSL included):
 
-              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/$GITHUB_REF_NAME/scripts/install.sh | BLAZAR_REPO=${GITHUB_REPOSITORY} sh
+              curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/$GITHUB_REF_NAME/scripts/install.sh | BLAZAR_REPO=${GITHUB_REPOSITORY} BLAZAR_VERSION=${GITHUB_REF_NAME} sh
 
           (or clone and run \`sh scripts/install.sh --build\` to compile from source)
 
