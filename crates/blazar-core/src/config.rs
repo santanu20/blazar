@@ -1195,10 +1195,16 @@ pub struct Config {
     /// Keep reasoning content in responses. None = engine default.
     #[serde(default)]
     pub reasoning_preserve: Option<bool>,
-    /// Server-side reasoning switch: "" (engine default = auto-detect
-    /// from the chat template) | "on" | "off" | "auto". Authoritative
-    /// for templates that ignore the `thinking`/`enable_thinking`
-    /// request variables.
+    /// Server-side reasoning switch: "" (engine default) | "on" | "off"
+    /// | "auto". Doubles as the think-DEFAULT policy for chat requests
+    /// that say nothing about thinking: "off" injects the explicit
+    /// think-off kwargs (ollama parity, fastest answers); "on" keeps
+    /// model-native thinking always; ""/"auto" is hardware-adaptive -
+    /// think-off only on lanes whose offload label says decode runs at
+    /// the host-bandwidth multiple ("cpu"/"partial"), native thinking
+    /// on full-resident lanes (and quality-first when the lane is
+    /// unknown or not yet spawned). Authoritative for templates that
+    /// ignore the `thinking`/`enable_thinking` request variables.
     #[serde(default)]
     pub reasoning: String,
 

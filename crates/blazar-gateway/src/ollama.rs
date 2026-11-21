@@ -789,6 +789,8 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
                 "blazar_in_flight": p.in_flight,
                 "blazar_endpoint": p.endpoint,
                 "blazar_heat": p.heat,
+                "host_rss_mib": p.host_rss_mib,
+                "host_charge_bytes": p.host_charge_bytes,
                 "expires_at": iso(now_secs.saturating_add(i64::try_from(remaining).unwrap_or(i64::MAX))),
             });
             if let Some(flag) = sleeping.get(&p.endpoint) {
@@ -1219,12 +1221,12 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
 
 fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
     use blazar_runtime::BlazarEvent::{
-        AutotuneAdvice, BenchmarkDone, ConfigReloadFailed, ConfigReloaded, EngineRemoved,
-        EngineRolledBack, EngineUpdated, FailoverSwitched, FleetWorkerDeparted, FleetWorkerJoined,
-        InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved, PullFailed, PullProgress,
-        QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound, SlotsDrainCutover,
-        SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped, SpecGovernorOff,
-        SpecGovernorRecovered,
+        AutotuneAdvice, AutotuneRace, BenchmarkDone, ConfigReloadFailed, ConfigReloaded,
+        EngineRemoved, EngineRolledBack, EngineUpdated, FailoverSwitched, FleetWorkerDeparted,
+        FleetWorkerJoined, InstanceStateChanged, ModelPreloaded, ModelPulled, ModelRemoved,
+        PullFailed, PullProgress, QueueDepth, SlotsAutoAdopted, SlotsCtxAutoFit, SlotsDecodeBound,
+        SlotsDrainCutover, SlotsPinnedPressure, SlotsPrewarmCutover, SlotsReshaped,
+        SpecGovernorOff, SpecGovernorRecovered,
     };
     match e {
         EngineUpdated { .. } => "engine_updated",
@@ -1253,6 +1255,7 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
         FleetWorkerDeparted { .. } => "fleet_worker_departed",
         ConfigReloaded { .. } => "config_reloaded",
         ConfigReloadFailed { .. } => "config_reload_failed",
+        AutotuneRace { .. } => "autotune_race",
     }
 }
 
@@ -1581,10 +1584,13 @@ pub async fn chat(
     if let Some(resp) = refuse_unsupported_think(&row, &req) {
         return resp;
     }
-    // Ollama parity for the absent toggle: thinking-capable templates
-    // default OFF when the caller did not say `think` (local lane only -
-    // remote forwards carry the caller's own bytes to the remote's policy).
-    default_think_off(&row, &mut req);
+    // Ollama parity for the absent toggle (local lane only - remote
+    // forwards carry the caller's own bytes to the remote's policy),
+    // gated by the lane-aware `reasoning` knob: full-resident lanes
+    // keep model-native thinking (quality), slow lanes default OFF.
+    if think_default_off_for_lane(&state, &row.name) {
+        default_think_off(&row, &mut req);
+    }
     let (mut openai_req, num_ctx) = match tr::chat_to_openai(&req) {
         Ok(r) => r,
         Err(e) => return api_error(400, &e),
@@ -2134,6 +2140,39 @@ fn default_think_off(row: &blazar_core::ModelRow, req: &mut Value) {
     if template_supports_thinking_cached(row) {
         req["think"] = Value::Bool(false);
     }
+}
+
+/// Lane-aware think-default policy (the `reasoning` config knob, wired).
+/// Decides whether the think-off default injection applies when the
+/// caller said nothing about thinking:
+/// - `"off"`  - always inject (ollama-parity default, fastest answers).
+/// - `"on"`   - never inject: model-native thinking, the quality-first
+///   pin for templates that think by default (qwen3 dialects).
+/// - `""`/`"auto"` - HARDWARE-ADAPTIVE: inject only when the serving
+///   lane's offload label says decode runs at the host-bandwidth
+///   multiple ("cpu" | "partial"). A full-resident lane serves a think
+///   trace at native decode speed (live receipt 2026-11-21, 8 GiB
+///   AWQ: 47 tok/s full vs 2.6 tok/s offloaded - a 330-token trace
+///   costs ~7s vs ~2min), so native thinking stays ON and answers
+///   gain correctness (same box: "100 days from Tuesday" answered
+///   Thursday think-off, Friday think-on). Not-resident or unknown
+///   lane: no injection - the planner now derives full residency
+///   whenever the card can hold it, and quality wins ties.
+pub(crate) fn lane_aware_think_off(effective_reasoning: &str, lane_gpu: Option<&str>) -> bool {
+    match effective_reasoning {
+        "off" => true,
+        "on" => false,
+        _ => matches!(lane_gpu, Some("cpu") | Some("partial")),
+    }
+}
+
+/// State-resolved wrapper: config knob (per-model overlay beats global)
+/// + the resident instance's offload label.
+pub(crate) fn think_default_off_for_lane(state: &AppState, model: &str) -> bool {
+    lane_aware_think_off(
+        state.cfg().effective_reasoning(model),
+        state.sup.resident_gpu_label(model).as_deref(),
+    )
 }
 
 /// Per-path cache for `template_supports_thinking`, validated by file
@@ -3975,8 +4014,11 @@ pub async fn generate(
     if let Some(resp) = refuse_unsupported_think(&row, &req) {
         return resp;
     }
-    // Ollama parity for the absent toggle (local lane), same as /api/chat.
-    default_think_off(&row, &mut req);
+    // Ollama parity for the absent toggle (local lane), same gate as
+    // /api/chat: the lane-aware `reasoning` knob decides.
+    if think_default_off_for_lane(&state, &row.name) {
+        default_think_off(&row, &mut req);
+    }
     let mut openai_req = match tr::generate_to_openai(&req) {
         Ok(Some(v)) => v,
         Ok(None) => {
@@ -5397,6 +5439,27 @@ mod tests {
         let mut req = think_req(None);
         default_think_off(&row_with_path("/nonexistent/m1.gguf"), &mut req);
         assert!(req.get("think").is_none());
+    }
+
+    #[test]
+    fn unit__lane_aware_think_off__config_and_lane_matrix() {
+        // Explicit pins always win, both directions.
+        assert!(lane_aware_think_off("off", None));
+        assert!(lane_aware_think_off("off", Some("full")));
+        assert!(!lane_aware_think_off("on", Some("cpu")));
+        assert!(!lane_aware_think_off("on", None));
+        // ""/auto = hardware-adaptive: inject only on lanes decoded at
+        // the host-bandwidth multiple; full-resident and unknown lanes
+        // keep model-native thinking (quality-first tie-break).
+        assert!(lane_aware_think_off("", Some("cpu")));
+        assert!(lane_aware_think_off("", Some("partial")));
+        assert!(lane_aware_think_off("auto", Some("partial")));
+        assert!(!lane_aware_think_off("", Some("full")));
+        assert!(!lane_aware_think_off("auto", Some("full")));
+        assert!(!lane_aware_think_off("", None));
+        assert!(!lane_aware_think_off("auto", None));
+        // Legacy/unknown offload labels read as unknown -> quality-first.
+        assert!(!lane_aware_think_off("", Some("auto")));
     }
 
     #[test]

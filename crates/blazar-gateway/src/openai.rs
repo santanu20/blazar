@@ -605,11 +605,18 @@ fn inject_reasoning_effort_kwarg(body: &mut serde_json::Value) -> bool {
 /// children both honor it. Explicit caller kwargs always win; an
 /// explicit `reasoning_effort` means the caller is steering reasoning
 /// deliberately and the default stays out of the way. Fail-open when
-/// the row or template cannot be read.
+/// the row or template cannot be read. Gated by the lane-aware
+/// `reasoning` knob (`lane_aware_think_off`): full-resident lanes keep
+/// model-native thinking - the hardware serves a think trace at native
+/// decode speed there, and the think-off default measurably costs
+/// correctness on reasoning probes.
 fn inject_default_think_off(state: &AppState, body: &mut serde_json::Value) -> bool {
     let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
         return false;
     };
+    if !crate::ollama::think_default_off_for_lane(state, model) {
+        return false;
+    }
     let row = state
         .with_store(|s| crate::proxy::resolve_model(s, model).ok())
         .flatten();

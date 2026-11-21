@@ -3004,6 +3004,117 @@ pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
         .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES)
 }
 
+/// Host-memory lane for the unified host-RAM ledger: how a resident
+/// engine child's pages read against `MemAvailable`. The kernel already
+/// excludes anonymous RSS from `MemAvailable`, so only lanes whose
+/// weights stream as FILE-BACKED pages (mmap'd GGUF/safetensors -
+/// reclaimable page cache the kernel still counts as available)
+/// over-report free RAM; their residents are charged against the
+/// ledger. Python-runtime lanes (sglang/vllm torch offload tensors are
+/// anonymous, kernel-accounted) charge zero - a blanket RSS/PSS
+/// subtraction would double-count them and over-refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMemLane {
+    /// Weights fault in from the model file (llama.cpp/sd.cpp/whisper.cpp
+    /// GGUF mmap, mistral.rs/mlx safetensors mmap). Charged share:
+    /// `min(measured process-group RSS, model bytes)` once settled, the
+    /// half-weights streaming estimate before that.
+    MmapStreaming,
+    /// A Python runtime owns the weights (sglang/vllm venv lanes, the
+    /// `LiteRT` host, python TTS shims). Resident pages are anonymous -
+    /// `MemAvailable` already excludes them, so the charge is zero and
+    /// only the spawn-window reservation covers the load transient.
+    PythonRuntime,
+}
+
+/// Classify one engine kind into its host-memory lane. The lazy
+/// audio/TTS lanes take their natural side (whisper.cpp mmaps its GGUF;
+/// piper/kokoro load through runtime allocators).
+#[must_use]
+pub fn host_mem_lane(kind: crate::engine_kind::EngineKind) -> HostMemLane {
+    use crate::engine_kind::EngineKind;
+    match kind {
+        EngineKind::Sglang
+        | EngineKind::Vllm
+        | EngineKind::Kokoro
+        | EngineKind::Piper
+        | EngineKind::OpenAiHost => HostMemLane::PythonRuntime,
+        EngineKind::LlamaCpp
+        | EngineKind::MistralRs
+        | EngineKind::SdCpp
+        | EngineKind::Whisper
+        | EngineKind::Mlx => HostMemLane::MmapStreaming,
+    }
+}
+
+/// Standing host-RAM slice of the spawn floor: mmap streaming needs
+/// roughly this much headroom beyond the weights for page tables,
+/// allocator arenas and load buffers even in the best case. Named so
+/// the guard, the planner cards and the tests quote one number.
+pub const HOST_SPAWN_FLOOR_OVERHEAD_MIB: u64 = 512;
+
+/// The spawn-time host floor in whole MiB - the exact arithmetic the
+/// supervisor's memory guard refuses on (pinned 2026-11-21 by the
+/// Qwen3-8B receipt: 5816/2 + 512 + 1907 = 5327 vs 4100 available).
+/// `model_mib` is the model file size, `offload_mib` the lane's
+/// effective host offload (sglang CPU-offloaded weights live resident
+/// in RAM). Integer-MiB domain on purpose: the guard has always
+/// computed here, and a byte-domain refactor would shift the refusal
+/// boundary.
+#[must_use]
+pub fn host_floor_mib(model_mib: u64, offload_mib: u64) -> u64 {
+    model_mib / 2 + HOST_SPAWN_FLOOR_OVERHEAD_MIB + offload_mib
+}
+
+/// Predicted PEAK host demand of a spawn, in bytes (explain/plan
+/// cards; the guard refuses on [`host_floor_mib`], not this). Mmap
+/// lanes peak with the full file resident (worst case every page
+/// faulted in). Python-runtime lanes additionally stage the
+/// safetensors through the page cache while quantizing/loading - 2x
+/// the weights is the documented conservative bound until settle
+/// receipts calibrate it.
+#[must_use]
+pub fn host_peak_bytes(
+    lane: HostMemLane,
+    model_bytes: u64,
+    mmproj_bytes: u64,
+    offload_bytes: u64,
+) -> u64 {
+    match lane {
+        HostMemLane::MmapStreaming => model_bytes.saturating_add(mmproj_bytes),
+        HostMemLane::PythonRuntime => model_bytes
+            .saturating_mul(2)
+            .saturating_add(mmproj_bytes)
+            .saturating_add(offload_bytes),
+    }
+}
+
+/// Predicted STEADY-state host residency, in bytes (explain/plan
+/// cards): mmap lanes fault the whole file in as inference touches it
+/// (the charge's `min(rss, weights)` cap agrees); python lanes hold
+/// their offload resident (anonymous, kernel-accounted) - the
+/// interpreter working set is deliberately not predicted, the settle
+/// reconciliation logs carry the measured truth.
+#[must_use]
+pub fn host_steady_bytes(lane: HostMemLane, model_bytes: u64, offload_bytes: u64) -> u64 {
+    match lane {
+        HostMemLane::MmapStreaming => model_bytes.saturating_add(offload_bytes),
+        HostMemLane::PythonRuntime => offload_bytes,
+    }
+}
+
+/// Relief levers the host cards teach, shared by `/api/explain` and
+/// `blazar plan` so the two surfaces can never drift apart.
+#[must_use]
+pub fn host_levers() -> [&'static str; 4] {
+    [
+        "stop co-resident engines (blazar ps / ollama stop) or free host RAM",
+        "pick a smaller quant (blazar fit)",
+        "kv quantization (cache_type = \"q8_0\") on lanes that keep KV host-side",
+        "spawn_mem_guard = false disables the floor (last resort - swap thrash returns)",
+    ]
+}
+
 /// Effective host offload an sglang spawn will run with, in bytes. A
 /// manual `cpu_offload_gb` pin wins, ceil-quantized exactly like the
 /// flag emission in `sglang_gpu_fit` (the engine takes whole GB); with
@@ -3017,6 +3128,16 @@ pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
 /// Unpinned invariant: `floor - ceil(floor - budget) <= budget`, so an
 /// unpinned spawn can never refuse-fast on a single card - only a pin
 /// can demand more GPU than the ladder would leave behind.
+///
+/// Pins are advisories, not overrides: when the standing GPU demand
+/// already fits the largest budget (full residency), a manual offload
+/// only streams weights over PCIe that the card could have held whole.
+/// Live receipt 2026-11-21 (RTX 4070 Laptop, Qwen3-8B AWQ 5816 MiB):
+/// pinned offload 2-3 GB decoded at 2.6 tok/s while the identical
+/// quality class (fp8 KV) at offload 0 decoded at 47 tok/s single /
+/// 182.7 tok/s at 4 slots - an 18-70x hole a stale pin dug. The pin
+/// is honored only on a real deficit (floor > budget), where it
+/// expresses "offload more than the minimum" intent.
 #[must_use]
 pub fn sglang_effective_offload_bytes(
     standing_floor_bytes: u64,
@@ -3024,7 +3145,9 @@ pub fn sglang_effective_offload_bytes(
     manual_offload_gb: Option<f32>,
 ) -> u64 {
     match manual_offload_gb {
-        Some(pin) if pin > 0.0 => gb_to_bytes(pin.ceil()),
+        Some(pin) if pin > 0.0 && standing_floor_bytes > largest_budget_bytes => {
+            gb_to_bytes(pin.ceil())
+        }
         _ => gb_to_bytes(ceil_gb(
             standing_floor_bytes.saturating_sub(largest_budget_bytes),
         )),
@@ -3934,13 +4057,6 @@ fn compile_mistralrs(
     })
 }
 
-/// sglang runtime overhead the server needs beyond weights+KV: CUDA
-/// graphs, activation workspace, NCCL/comm buffers, allocator
-/// fragmentation. Deliberately coarse - the ladder only needs it to stop
-/// mem-fraction from promising the last gibibyte to tensors (live OOM
-/// class upstream warns about in their own memory guide).
-const SGLANG_RUNTIME_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
-
 /// Compile the sd-server launch line (sdcpp dialect).
 ///
 /// Verified dialect facts (live probe, sd.cpp master-890-74988b2 + the
@@ -4540,10 +4656,6 @@ fn sdcpp_extra_args(
     Ok(merged)
 }
 
-/// Share of measured free VRAM the ladder is allowed to promise to
-/// weights+KV (torch reserves the rest for activations/workspace).
-const SGLANG_VRAM_USABLE_PCT: u64 = 92;
-
 /// Hard clamp band for emitted `--mem-fraction-static` - below 0.20 the
 /// server starves weights; above 0.90 it OOMs at graph capture (upstream
 /// default 0.88 lives at the top of the band for a reason).
@@ -4576,19 +4688,38 @@ const SGLANG_MEM_FRACTION_MAX: f32 = 0.90;
 /// and prewarm receipts (2026-10-16 DFLASH class) calibrated against it.
 const SGLANG_DENSE_DYNAMIC_RESERVE_MIB: u64 = 1_750;
 const SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB: u64 = 2_000;
+/// Dense-side dynamic floor: never below this no matter how narrow the
+/// capture. Receipt basis: the 0.90-fraction crash on an 8 GiB card left
+/// only ~819 MiB dynamic and died in graph capture - dense spawns stay
+/// at least 1000 MiB clear of that class.
+const SGLANG_DENSE_DYNAMIC_FLOOR_MIB: u64 = 1_000;
+/// Dense reserve slope per serving slot: CUDA-graph capture breadth and
+/// per-stream activations grow with the slot count. First-order
+/// interpolation between live receipts (2026-11-21, RTX 4070 Laptop
+/// 8 GiB, qwen3-8b-awq): fraction 0.82 with graphs bs [1,2,4] and 4
+/// slots booted with 1.21 GiB post-capture spare -> dynamic need <=
+/// 1474 MiB at 4 slots (~900 base + ~145/slot); the crash receipt
+/// anchors the low end. Capped by [`SGLANG_DENSE_DYNAMIC_RESERVE_MIB`]
+/// so uncalibrated capture breadths keep the original posture.
+const SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB: u64 = 150;
 /// `SGLang` tag the `DSpine` plugin lane is pinned to (the plugin subclasses
 /// engine internals, so its pyproject pin is the source of truth). Update
 /// this const - not the hint text - when the plugin rebases.
 const SGLANG_DSPINE_PLUGIN_TAG: &str = "0.5.22";
 
 /// Dynamic-side reserve for a spawn: the spec baseline keeps its
-/// receipt-calibrated posture; a dense spawn pays the smaller
-/// direct-engine-calibrated floor.
-fn sglang_dynamic_reserve_mib(spec_engaged: bool) -> u64 {
+/// receipt-calibrated posture (its graph and prewarm receipts were
+/// measured against the full 2000 MiB); a dense spawn scales with the
+/// capture breadth - slots decide how many graph sizes and concurrent
+/// activation streams the dynamic side must hold, bounded between the
+/// crash-receipt floor and the original conservative cap.
+fn sglang_dynamic_reserve_mib(spec_engaged: bool, slots: u32) -> u64 {
     if spec_engaged {
         SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB
     } else {
-        SGLANG_DENSE_DYNAMIC_RESERVE_MIB
+        SGLANG_DENSE_DYNAMIC_FLOOR_MIB
+            .saturating_add(SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB * u64::from(slots.max(1)))
+            .min(SGLANG_DENSE_DYNAMIC_RESERVE_MIB)
     }
 }
 
@@ -7092,7 +7223,8 @@ fn sglang_run_fit_ladder(
     let gpu_label: &'static str;
     let kv_est_bytes: Option<u64>;
     if input.hardware.has_gpu() {
-        let (shard, vram, budget) = sglang_shard_budget(input, tun);
+        let (shard, vram) = sglang_shard_budget(input, tun);
+        let engine_total = sglang_engine_units_total(input, shard);
         let ceil_div = |n: u64, d: u32| n.saturating_add(u64::from(d) - 1) / u64::from(d);
         let kv16 = kv_bytes_at(2).map(|b| ceil_div(b, shard));
         let kv8 = kv_bytes_at(1).map(|b| ceil_div(b, shard));
@@ -7140,36 +7272,42 @@ fn sglang_run_fit_ladder(
                 } else {
                     0
                 };
-                // One static-side authority: the tiers may not gate on
-                // more VRAM than the mem-fraction ceiling ever lets the
-                // static pool claim. Tiers used to gate on the 92%
-                // usable budget while the ceiling (VRAM minus dynamic
-                // reserves) held the pool lower - the gap is where a
-                // "full fit" spawned a KV-zero pool and crashed at load
-                // (2026-11-21: 8 GiB AWQ, budget ~7.5 GiB, ceiling pool
-                // ~6.3 GiB = weights alone). Capping the budget here
-                // routes that overflow to Tier C offload instead.
+                // One static-side authority, in the units the engine
+                // allocates: --mem-fraction-static fractions the card
+                // TOTAL, so the ceiling pool (frac x engine_total), the
+                // tier budget, and the mem-fraction demand all measure
+                // what the engine will actually hand the static side.
+                // The legacy 92%-minus-1-GiB usable tax sat below this
+                // pool in free-VRAM units and routed full-fit-eligible
+                // plans into Tier C offload (2026-11-21 live receipt:
+                // tax 6029 vs pool 6959 vs demand 6584 MiB - a stale
+                // offload pin survived the 455 MiB gap at 2.6 tok/s
+                // where derived full residency runs 47). The
+                // slots-scaled dynamic reserve inside the ceiling is
+                // the one headroom charge, receipt-calibrated.
                 let spec_dynamic_reserve_mib = if spec.engaged {
                     SGLANG_SPEC_DYNAMIC_RESERVE_MIB
                 } else {
                     0
                 };
-                let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib);
+                let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib, slots);
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
                     clippy::cast_precision_loss
                 )]
-                let ceiling_pool = (f64::from(ceiling) * vram as f64).round() as u64;
-                let budget = budget.min(ceiling_pool);
+                let ceiling_pool = (f64::from(ceiling) * engine_total as f64).round() as u64;
+                let budget = ceiling_pool;
                 let geom = SglangFitGeometry {
                     shard,
                     vram,
+                    engine_total,
                     budget,
                     weights,
                     draft_weights,
                     kv16_v,
                     kv8_v,
+                    ceiling_pool,
                     slots,
                     ctx,
                     spec_engaged: spec.engaged,
@@ -7215,6 +7353,17 @@ fn sglang_run_fit_ladder(
 struct SglangFitGeometry {
     shard: u32,
     vram: u64,
+    /// Total device memory the engine applies `--mem-fraction-static`
+    /// against - sglang fractions the card TOTAL, not the free slice the
+    /// `vram` anchor measures. Every fraction-to-bytes conversion in the
+    /// ladder (ceiling pool, mem-fraction demand) must multiply THIS or
+    /// the plan undershoots the engine's real static capacity by
+    /// total/free (2026-11-21 receipt: free 7666 of 8188 MiB - a
+    /// free-basis pool of 6516 refused a 6584 MiB static demand the
+    /// engine held fine at frac 0.850 = 6960 MiB, keeping a stale
+    /// offload pin alive at 2.6 tok/s where derived full residency
+    /// runs 47).
+    engine_total: u64,
     budget: u64,
     weights: u64,
     /// Draft-model weights the spec lane loads before pool sizing -
@@ -7222,6 +7371,16 @@ struct SglangFitGeometry {
     draft_weights: u64,
     kv16_v: u64,
     kv8_v: u64,
+    /// Ceiling-capped static pool (`ceiling * engine_total`): the single
+    /// authority for the tier gates, full-residency eligibility AND the
+    /// mem-fraction derive - all three now run the same predicate
+    /// (demand <= ceiling pool), so a plan one arm accepts can never be
+    /// refused by another. The legacy 92%-minus-1-GiB usable tax that
+    /// used to bind below this pool is retired; the slots-scaled dynamic
+    /// reserve inside the ceiling is the one headroom charge
+    /// (receipt-calibrated: a 0.85 spawn left 1228 MiB = reserve x
+    /// total/free, exactly the desktop + dynamic slice the card needed).
+    ceiling_pool: u64,
     /// Spawn-wide facts the tier helpers need (graph sizing, teaching
     /// text, tight-fit gating) - carried here so the fit fns stay at
     /// argument-count lint limits.
@@ -7240,20 +7399,20 @@ struct SglangFitOutcome {
 }
 
 /// Fit-ladder capacity anchor: the TP shard size (the manual `tp_size`
-/// pin wins over the supervisor's auto plan) and the (vram, usable
-/// budget) pair the tiers must fit inside. Under a shard pin > 1 the
+/// pin wins over the supervisor's auto plan) and the free-VRAM anchor
+/// the ceiling fractions measure against. Under a shard pin > 1 the
 /// anchor is the SMALLEST discrete card (the bottleneck rank), never
 /// the summed pool - planning 2x8 GiB as 16 GiB is how NCCL dies at
 /// spawn. Zero discrete cards under a shard pin falls back to
 /// single-rank math (the census warning already flags the impossible
 /// pin).
-fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u64, u64) {
+fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u64) {
     let shard: u32 = tun
         .tp_size
         .filter(|n| *n > 1)
         .or(input.auto_tp_size.filter(|n| *n > 1))
         .unwrap_or(1);
-    let (vram, budget) = if shard > 1 {
+    let vram = if shard > 1 {
         let per_card: Vec<u64> = input
             .hardware
             .gpus
@@ -7269,33 +7428,41 @@ fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u6
             .collect();
         let min_card = per_card.iter().copied().min().unwrap_or(0);
         if min_card == 0 {
-            let summed = capacity_bytes(input.hardware);
-            (
-                summed,
-                summed
-                    .saturating_mul(SGLANG_VRAM_USABLE_PCT)
-                    .saturating_div(100)
-                    .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
-            )
+            capacity_bytes(input.hardware)
         } else {
-            (
-                min_card,
-                min_card
-                    .saturating_mul(SGLANG_VRAM_USABLE_PCT)
-                    .saturating_div(100)
-                    .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
-            )
+            min_card
         }
     } else {
-        let vram = capacity_bytes(input.hardware);
-        (
-            vram,
-            vram.saturating_mul(SGLANG_VRAM_USABLE_PCT)
-                .saturating_div(100)
-                .saturating_sub(SGLANG_RUNTIME_FLOOR_BYTES),
-        )
+        capacity_bytes(input.hardware)
     };
-    (shard, vram, budget)
+    (shard, vram)
+}
+
+/// Engine-units VRAM basis paired with the free-VRAM anchor above:
+/// sglang applies `--mem-fraction-static` against the card TOTAL, so
+/// every fraction-to-bytes conversion (ceiling pool, mem-fraction
+/// demand) must use total memory, not the free slice. Mixing the two
+/// undersells the engine's static capacity by total/free and keeps
+/// stale offload pins alive on margins the engine boots fine
+/// (2026-11-21 receipt: free 7666 of 8188 MiB on an RTX 4070 Laptop -
+/// the free-basis pool refused a 6584 MiB demand the engine held at
+/// frac 0.850 = 6960 MiB). Mirrors the shard-budget card filter so
+/// tensor-parallel ranks keep the bottleneck-card math.
+fn sglang_engine_units_total(input: &ProfileInput<'_>, shard: u32) -> u64 {
+    if shard > 1 {
+        let min_card = input
+            .hardware
+            .gpus
+            .iter()
+            .filter(|g| !g.is_integrated())
+            .map(|g| Hardware::bytes(g.total_mib))
+            .min()
+            .unwrap_or(0);
+        if min_card > 0 {
+            return min_card;
+        }
+    }
+    Hardware::bytes(input.hardware.total_vram_mib())
 }
 
 /// The GPU fit tiers, tried cheapest-first: A full-GPU f16 KV, B fp8
@@ -7308,15 +7475,34 @@ fn sglang_shard_budget(input: &ProfileInput<'_>, tun: &SglangTuning) -> (u32, u6
 /// Emit the pinned `--cpu-offload-gb` flag (whole-GB, live-RAM clamped)
 /// and return the offload total every downstream consumer must agree on.
 /// Unpinned spawns emit nothing here (Tier C derives its own offload).
+///
+/// `full_residency_fits` says the fit ladder found a Tier A/B plan
+/// (weights + KV inside the live VRAM budget). In that case a pin is
+/// advisory only and is NOT emitted: offloading weights the card holds
+/// whole trades decode speed for nothing (2026-11-21 live receipt:
+/// 2.6 vs 47 tok/s single-stream at the same fp8-KV quality class).
+/// The pin keeps full authority on deficit lanes (Tier C), where it
+/// sizes how far past the minimum offload to go.
 fn sglang_push_pinned_offload(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
+    full_residency_fits: bool,
 ) -> f32 {
     let Some(pin) = tun.cpu_offload_gb else {
         return 0.0;
     };
+    if full_residency_fits && pin > 0.0 {
+        warnings.push(format!(
+            "sglang.cpu_offload_gb {pin} ignored: weights + KV fit the live \
+             VRAM budget (fit ladder Tier A/B - full residency), so host \
+             offload would only slow decode (live receipt: 2.6 vs 47 tok/s \
+             single-stream at the same fp8-KV quality class); the pin is \
+             honored only when the ladder reports a real deficit"
+        ));
+        return 0.0;
+    }
     // The engine flag is integer-GB (0.5.21 argparse rejects "5.5":
     // invalid int value) - a fractional pin rounds UP, never down:
     // under-offloading would OOM the spawn the pin exists to save.
@@ -7374,8 +7560,32 @@ fn sglang_gpu_fit(
     warnings: &mut Vec<String>,
     geom: &SglangFitGeometry,
 ) -> Result<SglangFitOutcome, String> {
-    let offload_total_gb = sglang_push_pinned_offload(input, tun, argv, warnings);
     let (weights, budget, kv16_v, kv8_v) = (geom.weights, geom.budget, geom.kv16_v, geom.kv8_v);
+    // Full-residency eligibility decided BEFORE the pin emission so a
+    // stale pin can never offload weights the card holds whole (the
+    // 2026-11-21 receipt class: pin 5 -> 2.6 tok/s vs derived 47 tok/s).
+    // Mirrors the mem-fraction refusal arithmetic exactly - static
+    // demand (weights + floored KV + draft) against the ceiling-capped
+    // budget - so an ignored pin can never produce a plan the mem-fraction
+    // derive then refuses (the tiers alone under-charge: draft weights
+    // sit on the static side only in the mem-fraction math).
+    let kv_floor = |kv: u64| kv.max(SGLANG_MIN_KV_POOL_BYTES);
+    let static_demand = |kv: u64| {
+        weights
+            .saturating_add(kv_floor(kv))
+            .saturating_add(geom.draft_weights)
+    };
+    // Eligibility authority = the ceiling pool, NOT the tier budget: the
+    // mem-fraction derive - the final arbiter that boots or refuses the
+    // child - accepts `demand_frac <= ceiling`, so the pin-ignore
+    // decision must predict exactly that. The tier budget can sit below
+    // the pool (legacy 92%-1GiB usable tax); gating eligibility on it
+    // keeps a stale offload pin alive for margins the derive itself
+    // would boot full-resident (74 MiB gap receipt, 2026-11-21).
+    let full_residency_fits =
+        static_demand(kv16_v) <= geom.ceiling_pool || static_demand(kv8_v) <= geom.ceiling_pool;
+    let offload_total_gb =
+        sglang_push_pinned_offload(input, tun, argv, warnings, full_residency_fits);
     let (slots, spec_engaged) = (geom.slots, geom.spec_engaged);
     if weights.saturating_add(kv16_v) <= budget {
         // Tier A: full GPU, f16 KV.
@@ -7578,10 +7788,13 @@ fn sglang_tier_c_host_offload(
 /// ladder can never "fit" a static side the ceiling then starves - the
 /// 2026-11-21 live 502: tiers gated on the 92% budget while the ceiling
 /// held the pool to 77% of VRAM.
-fn sglang_static_ceiling_frac(vram: u64, spec_dynamic_reserve_mib: u64) -> f32 {
+fn sglang_static_ceiling_frac(vram: u64, spec_dynamic_reserve_mib: u64, slots: u32) -> f32 {
     if vram > 0 {
-        let reserves = Hardware::bytes(sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0))
-            .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
+        let reserves = Hardware::bytes(sglang_dynamic_reserve_mib(
+            spec_dynamic_reserve_mib > 0,
+            slots,
+        ))
+        .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
         if vram > reserves {
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let frac = ((vram - reserves) as f64 / vram as f64) as f32;
@@ -7640,15 +7853,24 @@ fn sglang_push_mem_fraction(
     let static_demand = gpu_static
         .saturating_add(kv_charge)
         .saturating_add(geom.draft_weights);
-    let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib);
-    // Fraction the static demand actually needs. Half a thousandth of
-    // VRAM is below the emitted precision (3 decimals) - the raise
+    let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib, geom.slots);
+    // Fraction the static demand actually needs, in the units the engine
+    // grants it: --mem-fraction-static is applied against the card TOTAL,
+    // so the demand fraction is demand/total. Dividing by the free-basis
+    // `vram` anchor instead understates the pool the engine really sizes
+    // (2026-11-21 receipt: free 7666 of 8188 MiB total - the free-basis
+    // fraction refused demands the engine booted fine). Half a thousandth
+    // of VRAM is below the emitted precision (3 decimals) - the raise
     // check ignores it so a warn-raise never fires on rounding dust.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    let demand_frac = (static_demand as f64 / vram.max(1) as f64) as f32;
+    let demand_frac = (static_demand as f64 / geom.engine_total.max(1) as f64) as f32;
     let frac = if let Some(pin) = tun.mem_fraction_static {
         let governed = pin.clamp(SGLANG_MEM_FRACTION_MIN, ceiling);
-        if (governed - pin).abs() > f32::EPSILON {
+        // Only warn when the clamp moves the EMITTED value: a delta below
+        // the 3-decimal print precision (pin 0.850 vs governed 0.84996)
+        // emits the same fraction the pin asked for - warning there read
+        // as "clamped to itself" noise on live spawns.
+        if (governed - pin).abs() > 5e-4 {
             warnings.push(format!(
                 "sglang.mem_fraction_static {pin:.3} clamped to \
                  {governed:.3}: the pin must leave \
@@ -7657,7 +7879,7 @@ fn sglang_push_mem_fraction(
                  0.90 on an 8 GiB card crashed in graph capture; \
                  sglang then SIGKILLs itself and the gateway \
                  surfaces a 502)",
-                sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0),
+                sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0, geom.slots),
                 if spec_dynamic_reserve_mib > 0 {
                     format!(
                         " plus {spec_dynamic_reserve_mib} MiB for the \
@@ -7704,7 +7926,7 @@ fn sglang_push_mem_fraction(
         }
     } else {
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-        let raw = (static_demand as f64 / vram.max(1) as f64) as f32;
+        let raw = (static_demand as f64 / geom.engine_total.max(1) as f64) as f32;
         raw.clamp(SGLANG_MEM_FRACTION_MIN, ceiling)
     };
     if vram > 0 {
@@ -15585,6 +15807,90 @@ mod tests {
     }
 
     #[test]
+    fn unit__host_floor_mib__pins_the_guard_arithmetic() {
+        // The 2026-11-21 Qwen3-8B refusal receipt: 5816 MiB weights,
+        // 1907 MiB sglang host offload, 4100 MiB MemAvailable -> the
+        // guard refused at exactly 5327. The extraction into core must
+        // reproduce that number bit-for-bit or the boundary drifted.
+        assert_eq!(host_floor_mib(5_816, 1_907), 5_327);
+        assert_eq!(host_floor_mib(500, 0), 500 / 2 + 512);
+        // Integer-MiB domain: an odd MiB truncates the half, exactly
+        // like the inline guard always did.
+        assert_eq!(host_floor_mib(1, 0), 512);
+        assert_eq!(host_floor_mib(3, 1), 1 + 512 + 1);
+        // Zero offload on a big model keeps the half-weights shape.
+        assert_eq!(host_floor_mib(16_384, 0), 8_192 + 512);
+    }
+
+    #[test]
+    fn unit__host_mem_lane__file_backed_lanes_charge_python_lanes_do_not() {
+        use crate::engine_kind::EngineKind as K;
+        assert_eq!(host_mem_lane(K::LlamaCpp), HostMemLane::MmapStreaming);
+        assert_eq!(host_mem_lane(K::MistralRs), HostMemLane::MmapStreaming);
+        assert_eq!(host_mem_lane(K::SdCpp), HostMemLane::MmapStreaming);
+        assert_eq!(host_mem_lane(K::Whisper), HostMemLane::MmapStreaming);
+        assert_eq!(host_mem_lane(K::Mlx), HostMemLane::MmapStreaming);
+        assert_eq!(host_mem_lane(K::Sglang), HostMemLane::PythonRuntime);
+        assert_eq!(host_mem_lane(K::Vllm), HostMemLane::PythonRuntime);
+        assert_eq!(host_mem_lane(K::OpenAiHost), HostMemLane::PythonRuntime);
+        assert_eq!(host_mem_lane(K::Kokoro), HostMemLane::PythonRuntime);
+        assert_eq!(host_mem_lane(K::Piper), HostMemLane::PythonRuntime);
+    }
+
+    #[test]
+    fn unit__host_peak_and_steady_bytes__lane_shaped_and_saturating() {
+        let mib = |m: u64| m * 1024 * 1024;
+        // Mmap peak = file + projector; python peak doubles the weights
+        // for the staging pass and adds the offload on top.
+        assert_eq!(
+            host_peak_bytes(HostMemLane::MmapStreaming, mib(100), mib(8), 0),
+            mib(108)
+        );
+        assert_eq!(
+            host_peak_bytes(HostMemLane::PythonRuntime, mib(100), mib(8), mib(16)),
+            mib(224)
+        );
+        // Steady: mmap approaches the full file; python keeps only the
+        // offload (anon pages the kernel already accounts).
+        assert_eq!(
+            host_steady_bytes(HostMemLane::MmapStreaming, mib(100), mib(16)),
+            mib(116)
+        );
+        assert_eq!(
+            host_steady_bytes(HostMemLane::PythonRuntime, mib(100), mib(16)),
+            mib(16)
+        );
+        // u64 weights must saturate, never wrap.
+        assert_eq!(
+            host_peak_bytes(HostMemLane::PythonRuntime, u64::MAX, 0, 0),
+            u64::MAX
+        );
+        assert_eq!(
+            host_steady_bytes(HostMemLane::MmapStreaming, u64::MAX, 0),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn unit__sglang_effective_offload_bytes__pin_ignored_on_full_fit() {
+        // Advisory pins: weights+KV inside the budget means the pin
+        // would only stream resident-able weights over PCIe. 2026-11-21
+        // live receipt: pinned offload decoded 2.6 tok/s vs derived 47
+        // tok/s single-stream at the same fp8-KV quality class.
+        let mib = |m: u64| m * 1024 * 1024;
+        assert_eq!(
+            sglang_effective_offload_bytes(mib(7900), mib(8188), Some(4.0)),
+            0,
+            "full fit must ignore the pin"
+        );
+        assert_eq!(
+            sglang_effective_offload_bytes(mib(6000), mib(8188), Some(5.0)),
+            0,
+            "comfortable fit ignores even a large pin"
+        );
+    }
+
+    #[test]
     fn unit__sglang_effective_offload_bytes__pin_wins_quantized_up() {
         // 4.5 pin -> ceil 5 GB, 1e9-based like the emitted flag: the
         // admission subtraction must equal the argv the spawn runs with.
@@ -18743,9 +19049,13 @@ mod tests {
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        // model bytes net of the 512 MiB device-overhead charge keep the
-        // weights total (and thus the 168 MiB headroom receipt) unchanged
-        let mut inp = sglang_input(&hf, &hw, &cfg, 8_888 * MIB);
+        // Tier B band under the engine-units ceiling (2026-11-22): the
+        // static pool is total VRAM minus the slots-scaled dynamic
+        // reserve (12000 - 1300 = 10700 MiB), so fp8 KV is required from
+        // ~9.3 GiB of weights up. 9600 MiB model + 512 MiB overhead =
+        // 10112 MiB weights: f16 KV overflows the pool, fp8 fits with
+        // 140 MiB of headroom.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 9_600 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "full");
@@ -18756,21 +19066,19 @@ mod tests {
                 .any(|w| w[0] == "--kv-cache-dtype" && w[1] == "fp8_e5m2")
         );
         assert!(p.warnings.iter().any(|w| w.contains("Tier B")));
-        // tight-fit knobs engage. Graph ceiling from the bench-calibrated
-        // slope: headroom = 10,502,537,216 - 9,856,614,400 - 469,762,048 =
-        // 168 MiB; per-size = 9.1797 GiB * 0.335 = 3.0752 MiB; ceiling =
-        // 84 / 3.0752 = 27 (auto slots take the ceiling, floor 4 no longer
-        // applies at this headroom).
+        // tight-fit knobs engage. Headroom = 10700 - 10112 - 448 = 140
+        // MiB; the bench-calibrated capture slope on 9.875 GiB of
+        // weights yields a ceiling of 36.
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "27")
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "36")
         );
         // the derivation warning the doctor check surfaces verbatim
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("cuda-graph capture list <= 27"))
+                .any(|w| w.contains("cuda-graph capture list <= 36"))
         );
         assert!(
             p.argv
@@ -18780,7 +19088,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.821")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.880")
         );
     }
 
@@ -18897,11 +19205,12 @@ mod tests {
         inp.overlay = &overlay;
         inp.supported_flags = &flags;
         inp.auto_tp_size = Some(2);
-        // 9 GiB + 512 MiB overhead per rank vs the 8.8 GiB per-card
-        // budget: sharding alone cannot hold it - per-rank overflow
-        // (1.4 GB with fp8 KV, ceil -> 2 GB) lands in Tier C against
-        // the PER-RANK host share (16000*4/10/2 = 3200 MiB), so the
-        // spawn is honest "partial", never a blind NCCL death.
+        // 9 GiB + 512 MiB overhead per rank vs the engine-units per-card
+        // pool (10240 - 1300 = 8940 MiB): sharding alone cannot hold it -
+        // per-rank overflow (~800 MiB with fp8 KV, ceil -> 1 GB; the
+        // retired 92%-1GiB tax forced 2) lands in Tier C against the
+        // PER-RANK host share (16000*4/10/2 = 3200 MiB), so the spawn is
+        // honest "partial", never a blind NCCL death.
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "partial");
         assert!(
@@ -18912,7 +19221,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "1")
         );
         assert!(p.warnings.iter().any(|w| w.contains("Tier C")));
     }
@@ -18928,10 +19237,14 @@ mod tests {
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert_eq!(p.gpu, "partial");
         assert_eq!(p.kv_est_bytes, Some(469_762_048));
+        // Offload derived against the engine-units pool (10700 MiB, not
+        // the retired 92%-1GiB tax of 10016): the deficit shrinks from
+        // ~1.4 GiB to ~760 MiB, so 1 GB now suffices - less host traffic
+        // for the same safe fit.
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "1")
         );
         assert!(
             p.argv
@@ -18943,7 +19256,7 @@ mod tests {
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.796")
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.876")
         );
     }
 
@@ -18953,34 +19266,40 @@ mod tests {
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        // model net of the 512 MiB overhead charge keeps the 68 MiB
-        // headroom receipt: per-size = 9.2773 * 0.335 = 3.1079;
-        // ceiling = 34 / 3.1079 = 10
-        let mut inp = sglang_input(&hf, &hw, &cfg, 8_988 * MIB);
+        // Tier B band under the engine-units ceiling: 9500 MiB model +
+        // 512 MiB overhead = 10012 MiB weights; headroom = 10700 -
+        // 10012 - 448 = 240 MiB -> a graph ceiling of 51 (the larger
+        // headroom, the larger the capture ceiling).
+        let mut inp = sglang_input(&hf, &hw, &cfg, 9_500 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "10")
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "51")
         );
     }
 
     #[test]
     fn unit__sglang__tier_b_graph_floor_when_headroom_starved() {
         let cfg = Config::default();
-        let hw = gpu_hw(12_000, 32_000, 8);
+        let hw = gpu_hw(10_500, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        // model net of the 512 MiB overhead charge keeps the 8 MiB
-        // headroom receipt: raw ceiling 1.28 clamps up to the floor of 4
-        let mut inp = sglang_input(&hf, &hw, &cfg, 9_048 * MIB);
+        // 8372 MiB model + 512 MiB overhead = 8884 MiB weights on a
+        // 10.5 GiB card (pool = 10500 - 1300 reserve @ overlay slots 2
+        // = 9200): fp8 KV still fits but only a few hundred MiB of
+        // headroom remain - the raw capture ceiling collapses below
+        // the floor and clamps up to 4.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_372 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "4")
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "4"),
+            "actual: {:?}",
+            p.argv
         );
     }
 
@@ -18993,27 +19312,27 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 11_000 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
-        // the 512 MiB device-overhead charge pushes the per-rank overflow
-        // past 2 GB, so Tier C now emits a 3 GB offload
+        // Offload derives on the engine-units pool (10700 MiB): deficit
+        // ~1.26 GiB -> a 2 GB emission (the retired tax pushed it to 3).
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "3")
+                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
         );
         // slope follows TOTAL weights (11.24 GiB -> 3.77 MiB/size) while
-        // headroom counts only the on-GPU share (weights - 3e9 + kv8
-        // -> 917 MiB): 917 / 3.77 / 2 = 121. A naive implementation that
-        // slopes the on-GPU share would print higher.
+        // headroom counts only the on-GPU share against the bigger pool
+        // (weights - 2 GiB + kv8 -> ~935 MiB): ceiling 99. A naive
+        // implementation that slopes the on-GPU share would print higher.
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "121")
+                .any(|w| w[0] == "--cuda-graph-max-bs" && w[1] == "99")
         );
         // the derivation warning the doctor check surfaces verbatim
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("cuda-graph capture list <= 121"))
+                .any(|w| w.contains("cuda-graph capture list <= 99"))
         );
     }
 
@@ -19066,16 +19385,17 @@ mod tests {
         let hf = hf_meta();
         let flags = SGLANG_FLAGS_0521.clone();
         let overlay = sglang_ctx_overlay();
-        // model net of the 512 MiB overhead charge keeps the legacy
-        // Tier B headroom receipt: ceiling 10
-        let mut inp = sglang_input(&hf, &hw, &cfg, 8_988 * MIB);
+        // Tier B band under the engine-units ceiling (pool 10700 MiB):
+        // 9600 MiB model + 512 MiB overhead -> fp8 KV fits with 140 MiB
+        // headroom, capture ceiling 36.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 9_600 * MIB);
         inp.overlay = &overlay;
         inp.supported_flags = &flags;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--cuda-graph-max-bs-decode" && w[1] == "10")
+                .any(|w| w[0] == "--cuda-graph-max-bs-decode" && w[1] == "36")
         );
         assert!(p.argv.windows(4).any(|w| {
             w[0] == "--cuda-graph-bs-prefill" && w[1] == "256" && w[2] == "1024" && w[3] == "2048"
@@ -19694,19 +20014,24 @@ mod tests {
     fn unit__sglang__dense_ceiling_lands_in_engine_viable_window() {
         // Direct-engine receipts (2026-11-09, RTX 4070 Laptop 8 GiB,
         // qwen3-8b-awq on sglang 0.5.22): mem-fraction 0.80 served green
-        // at 47 tok/s, 0.85 OOM'd in workspace allocation, and the
-        // engine's own load check refused below 0.772 ("minimum viable
-        // 0.7711"). The dense ceiling on an 8188 MiB card must land at
-        // (8188-1750)/8188 = 0.786 - INSIDE the proven viable window
-        // [0.772, 0.83] - so a dense pin no longer forces CPU offload
-        // just to boot.
+        // at 47 tok/s, 0.90 OOM'd in CUDA-graph capture, and the engine's
+        // own load check refused below 0.772 ("minimum viable 0.7711").
+        // Follow-up (2026-11-21, sglang 0.5.23): 0.82 booted green at
+        // 4 slots with 1.21 GiB to spare, proving the activation reserve
+        // the ceiling must hold back SCALES WITH SLOT COUNT, not the old
+        // flat 1750 MiB. The dense ceiling is now slots-scaled
+        // (1000 + 150/slot MiB, clamped to 1750): at 1 slot on an 8188 MiB
+        // card that is (8188-1150)/8188 = 0.860 - a legal pin up to 0.85
+        // (the live user pin) passes through, a 0.90 pin (the capture-
+        // crash receipt) clamps to it. The engine's min-viable 0.772
+        // remains the hard floor.
         let cfg = Config::default();
         let hw = gpu_hw(8_188, 15_900, 8);
         let hf = hf_meta();
         let overlay = ModelOverride {
             ctx: Some(2_048),
             sglang: Some(SglangTuning {
-                mem_fraction_static: Some(0.85),
+                mem_fraction_static: Some(0.90),
                 ..SglangTuning::default()
             }),
             ..DEFAULT_OVERLAY.clone()
@@ -19721,8 +20046,8 @@ mod tests {
             .map(|w| w[1].parse::<f64>().unwrap())
             .expect("dense pin must emit --mem-fraction-static");
         assert!(
-            (frac - 0.786).abs() < 0.001,
-            "dense ceiling must clamp to 0.786, got {frac}"
+            (frac - 0.860).abs() < 0.001,
+            "dense ceiling must clamp to the 1-slot 0.860, got {frac}"
         );
         assert!(
             frac >= 0.772,
@@ -19945,11 +20270,11 @@ mod tests {
         // 7684 MiB), qwen3-8b-awq (5816 MiB) with the user's original
         // pins - cpu_offload_gb 5, mem_fraction_static 0.85, a dspine
         // pin the stock lane's probed vocabulary does not carry. The
-        // old planner refused (507 at the guard, then a doomed 0.85
-        // spawn that crashed with KV=0); the prepared plan must boot:
-        // offload clamped to what live RAM can stage (4 GB), the spec
-        // miss fallen back to dense, the fraction governed to the
-        // dense ceiling (0.786 on this card) - every relief warned.
+        // 2026-11-22 planner prepares the FULL-RESIDENCY boot: the
+        // offload pin is ignored (weights + KV fit the ceiling pool),
+        // the spec miss falls back to dense, and the 0.85 fraction pin
+        // passes governance inside the slots-scaled ceiling - every
+        // decision warned.
         static PROBED_STOCK: LazyLock<Vec<String>> = LazyLock::new(|| {
             vec![
                 "NGRAM".to_string(),
@@ -19977,20 +20302,24 @@ mod tests {
         inp.spec_types = &PROBED_STOCK;
         let p = compile(&inp, &TuningOverrides::default())
             .expect("the live 8 GiB pins must prepare a bootable plan");
-        // Offload relief: 5 GB pin -> 4 GB (MemAvailable 7684 - model/2
-        // 2908 - 512 = 4264 MiB -> 4 whole GB), warned.
+        // Full residency: static demand (6327 weights + 256 floored KV)
+        // = 6583 MiB fits the ceiling pool (8188 - 1000 - 150 = 7038 MiB
+        // at 1 slot), so the offload pin is advisory and NOT emitted -
+        // the 2026-11-21 direct-engine receipt measured the pinned
+        // offload plan at 2.6 tok/s vs 47 tok/s full-resident (18x
+        // single-stream, 70x aggregate at 4 slots) at the same fp8-KV
+        // quality class. Ignoring the stale pin is the fast path, and
+        // the teaching warning says exactly why.
         assert!(
-            p.argv
-                .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "4"),
-            "offload must be clamped to the 4 GB live RAM can stage: {:?}",
+            !p.argv.iter().any(|a| a == "--cpu-offload-gb"),
+            "full residency must not offload: {:?}",
             p.argv
         );
         assert!(
             p.warnings
                 .iter()
-                .any(|w| w.contains("cpu_offload_gb 5 reduced to 4")),
-            "the offload clamp must be surfaced: {:?}",
+                .any(|w| w.contains("cpu_offload_gb 5 ignored")),
+            "the ignored offload pin must be surfaced: {:?}",
             p.warnings
         );
         // Spec relief: vocabulary miss -> dense boot, warned.
@@ -20006,22 +20335,23 @@ mod tests {
             "the dense fallback must be surfaced: {:?}",
             p.warnings
         );
-        // Fraction relief: 0.85 pin governed down to the dense ceiling
-        // (1750 MiB reserve on 8188 MiB -> 0.786), warned; Tier A keeps
-        // f16 KV (no fp8 push) because weights+kv16 fit the capped
-        // budget once 4 GB of weights moved to host.
+        // Fraction: 0.85 pin now passes governance untouched - the
+        // slots-scaled dense ceiling ((8188-1150)/8188 = 0.860) sits
+        // above the pin, and the live 0.82-at-4-slots boot receipt
+        // (1.21 GiB to spare) backs the tighter reserve. Tier A keeps
+        // f16 KV: weights + kv16 fit the tier budget whole.
         assert!(
             p.argv
                 .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.786"),
-            "fraction must be governed to the dense ceiling: {:?}",
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.850"),
+            "the legal 0.85 pin must pass through: {:?}",
             p.argv
         );
         assert!(
-            p.warnings
+            !p.warnings
                 .iter()
-                .any(|w| w.contains("mem_fraction_static 0.850 clamped to 0.786")),
-            "the fraction clamp must be surfaced: {:?}",
+                .any(|w| w.contains("mem_fraction_static 0.850 clamped")),
+            "no clamp warning for a pin inside the ceiling: {:?}",
             p.warnings
         );
         assert!(
@@ -20647,8 +20977,10 @@ mod tests {
         // A cpu_offload_gb pin that also lands the ladder in Tier C
         // used to emit --cpu-offload-gb twice (pin site + Tier C site).
         // The pin site owns the flag: exactly one occurrence in argv.
+        // Deficit fixture (6 GiB card vs 8 GiB weights): pins keep
+        // full authority only on real overflow lanes.
         let cfg = Config::default();
-        let hw = gpu_hw(12_000, 32_000, 8);
+        let hw = gpu_hw(6_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = ModelOverride {
             ctx: Some(32_768),
@@ -21693,7 +22025,12 @@ mod tests {
     }
 
     #[test]
-    fn unit__sglang__offload_pin_honored_even_when_it_fits() {
+    fn unit__sglang__offload_pin_ignored_when_full_residency_fits() {
+        // Pins are advisories on full-residency lanes: this fixture
+        // (8 GiB weights, 32k ctx, 12 GiB card) fits Tier B (fp8 KV),
+        // so a pin 2 must NOT offload weights the card holds whole.
+        // 2026-11-21 live receipt: honored pin decoded 2.6 tok/s vs
+        // 47 tok/s single / 182.7 tok/s at 4 slots when ignored.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
@@ -21709,16 +22046,26 @@ mod tests {
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
+            !p.argv.iter().any(|a| a == "--cpu-offload-gb"),
+            "full-residency lane must not offload: {:?}",
             p.argv
-                .windows(2)
-                .any(|w| w[0] == "--cpu-offload-gb" && w[1] == "2")
         );
-        // mem-fraction nets out the pinned offload: (weights - 2GB + kv16)/vram
         assert!(
-            p.argv
-                .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.625")
+            p.warnings
+                .iter()
+                .any(|w| w.contains("cpu_offload_gb 2 ignored")),
+            "the ignored pin must teach: {:?}",
+            p.warnings
         );
+        // mem-fraction now budgets the full weights on device (no 2 GB
+        // net-out) - strictly larger than the old offload-carving 0.625.
+        let frac = p
+            .argv
+            .windows(2)
+            .find(|w| w[0] == "--mem-fraction-static")
+            .and_then(|w| w[1].parse::<f64>().ok())
+            .expect("mem-fraction emitted");
+        assert!(frac > 0.625, "full residency raises mem-fraction: {frac}");
     }
 
     #[test]
@@ -21726,9 +22073,11 @@ mod tests {
         // The engine flag is integer-GB (0.5.21 argparse: "invalid int
         // value: '5.5'", live 2026-10-16) - a fractional pin must emit
         // whole GB rounded UP (under-offloading OOMs the spawn) and
-        // teach, never silently pass the fraction through.
+        // teach, never silently pass the fraction through. Deficit
+        // fixture (6 GiB card vs 8 GiB weights): the pin has authority
+        // only where the ladder reports a real overflow.
         let cfg = Config::default();
-        let hw = gpu_hw(12_000, 32_000, 8);
+        let hw = gpu_hw(6_000, 32_000, 8);
         let hf = hf_meta();
         let overlay = ModelOverride {
             ctx: Some(32_768),
@@ -21876,10 +22225,15 @@ mod tests {
         let mut inp = sglang_input(&hf, &hw, &cfg, 3_300 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        let frac = p
+            .argv
+            .windows(2)
+            .find(|w| w[0] == "--mem-fraction-static")
+            .map(|w| w[1].parse::<f64>().unwrap())
+            .expect("pin must emit --mem-fraction-static");
         assert!(
-            p.argv
-                .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.781")
+            (frac - 0.856).abs() < 0.001,
+            "0.90 pin must clamp to the slots-scaled dense ceiling, got {frac}"
         );
         assert!(
             p.warnings
@@ -23004,6 +23358,60 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--chunked-prefill-size" && w[1] == "2048")
+        );
+    }
+
+    /// Live receipt regression (2026-11-22, RTX 4070 Laptop): the census
+    /// reported free 7666 of 8188 MiB total while an AWQ model needed a
+    /// 6584 MiB static side. The free-basis ceiling pool (6516) refused
+    /// that demand and kept a stale cpu_offload pin alive at 2.6 tok/s,
+    /// while the engine - which fractions the card TOTAL - held it fine
+    /// at frac 0.850 (6960 MiB, receipt-proven boot). The engine-units
+    /// pool must accept what the engine accepts.
+    #[test]
+    fn unit__sglang__partial_free_card_still_full_resident() {
+        let cfg = Config::default();
+        let mut hw = gpu_hw(8_188, 13_000, 8);
+        hw.gpus[0].free_mib = 7_666;
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(2_048),
+            sglang: Some(crate::config::SglangTuning {
+                cpu_offload_gb: Some(5.0),
+                mem_fraction_static: Some(0.85),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        // qwen3-8b-awq receipt shape: 5816 MiB file + 512 MiB device
+        // overhead = 6328 MiB weights; ctx 2048 keeps the KV estimate
+        // under the 256 MiB pool floor.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 5_816 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(
+            p.gpu, "full",
+            "engine-units pool must accept the demand the engine boots: {:?}",
+            p.warnings
+        );
+        assert!(
+            !p.argv.iter().any(|a| a == "--cpu-offload-gb"),
+            "stale pin must not offload a full-residency fit: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("cpu_offload_gb 5 ignored")),
+            "the ignored pin must be taught: {:?}",
+            p.warnings
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.850"),
+            "the legal 0.85 pin must pass through: {:?}",
+            p.argv
         );
     }
 }

@@ -3471,6 +3471,22 @@ impl Supervisor {
             .collect()
     }
 
+    /// Resolved offload label ("full" | "cpu" | "partial" | "auto") of
+    /// the resident instance serving `model`, by display name - the
+    /// lane-class truth the gateway's reasoning-default policy reads to
+    /// decide whether native thinking is affordable on this hardware
+    /// (full-resident decode serves a think trace at native speed;
+    /// offloaded lanes pay the host-bandwidth multiple). `None` when the
+    /// model is not resident. Replica/variant keys normalize the same
+    /// way `ps` renders them.
+    #[must_use]
+    pub fn resident_gpu_label(&self, model: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|e| display_name_of_key(e.value().name.as_str()) == model)
+            .map(|e| e.value().gpu.clone())
+    }
+
     /// Ensure a model is loaded and ready; returns its endpoint. Waits on
     /// a concurrent load instead of double-spawning.
     pub async fn ensure(&self, name: &str) -> Result<EngineRef, SupervisionError> {

@@ -1175,7 +1175,6 @@
       "--batch-notify-size",
       "--chunked-prefill-size",
       "--context-length",
-      "--cpu-offload-gb",
       "--cuda-graph-backend-prefill",
       "--cuda-graph-bs-decode",
       "--cuda-graph-bs-prefill",
