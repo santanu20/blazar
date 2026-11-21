@@ -23,7 +23,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 272 fields, 0 dead
+## Config (top-level keys) - 273 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -55,6 +55,7 @@ token quality are surfaced as drift.
 | lazy_mode | "auto".to_string() | engine-argv | `blazar-core/src/profile.rs:1206` in `the`; `blazar-core/src/profile.rs:1207` in `the` |
 | server_tools | None | engine-argv | `blazar-core/src/profile.rs:1231` in `the`; `crates/blazar-core/src/profile.rs:14131` in `unit__server_tools__emits_quartet_when_set` |
 | server_tools_runtime | None | engine-argv | `blazar-core/src/profile.rs:1232` in `the`; `crates/blazar-core/src/profile.rs:14131` in `unit__server_tools__emits_quartet_when_set` |
+| mcp_max_request_secs | default_mcp_max_request_secs() | gateway-http | `crates/blazar-gateway/src/state.rs` in `new` (deadline wired into `mcp::Registry::from_config`); `crates/blazar-gateway/src/mcp.rs` in the mediated tool loop (aggregate wall-clock ceiling - 504 teaching on breach) |
 | mcp_servers_config | None | engine-argv | `blazar-core/src/profile.rs:1233` in `the`; `blazar-core/src/profile.rs:1239` in `the` |
 | mcp_servers_json | None | engine-argv | `blazar-core/src/profile.rs:1234` in `the`; `crates/blazar-core/src/profile.rs:14131` in `unit__server_tools__emits_quartet_when_set` |
 | cache_reuse | 0 | engine-argv + runtime/gateway + cli | `blazar-core/src/profile.rs:547` in `the`; `blazar-core/src/profile.rs:550` in `the`; `crates/blazar-runtime/src/bench.rs:1298` in `args_hash`; `blazar-cli/src/main.rs:242` in `?`; `crates/blazar-cli/src/main.rs:2312` in `run` |
@@ -518,7 +519,7 @@ token quality are surfaced as drift.
 | key | - | other + gateway-http + runtime/gateway + engine-argv + cli | `crates/blazar-core/examples/slots_probe.rs:63` in `main`; `crates/blazar-core/src/gguf.rs:604` in `parse_metadata`; `crates/blazar-gateway/src/otlp.rs:128` in `encode`; `crates/blazar-gateway/src/otlp.rs:128` in `encode`; `crates/blazar-runtime/src/quantize.rs:111` in `find_perplexity_bin`; `crates/blazar-runtime/src/supervisor.rs:496` in `model_of_key`; `crates/blazar-core/src/profile.rs:3608` in `push_generation_defaults`; `crates/blazar-core/src/profile.rs:3608` in `push_generation_defaults`; `crates/blazar-cli/tests/config_set.rs:35` in `e2e__config_set_string_value_quoted_and_placed_above_tables`; `crates/blazar-cli/tests/config_set.rs:35` in `e2e__config_set_string_value_quoted_and_placed_above_tables` |
 
 | allow_insecure_http | false | runtime/gateway | `blazar-core/src/config.rs` in `validate` (insecure-cleartext guard at the non-private-address check) |
-## ApiKey ([[api_keys]]) - 10 fields, 0 dead
+## ApiKey ([[api_keys]]) - 11 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -526,6 +527,7 @@ token quality are surfaced as drift.
 | key | - | other + gateway-http + engine-argv + runtime/gateway + cli | `crates/blazar-core/examples/slots_probe.rs:63` in `main`; `crates/blazar-core/src/hfmeta.rs:130` in `u64_of`; `crates/blazar-gateway/src/otlp.rs:128` in `encode`; `crates/blazar-gateway/src/otlp.rs:128` in `encode`; `crates/blazar-core/src/profile.rs:3608` in `push_generation_defaults`; `crates/blazar-core/src/profile.rs:3608` in `push_generation_defaults`; `crates/blazar-runtime/src/quantize.rs:111` in `find_perplexity_bin`; `crates/blazar-runtime/tests/replicas.rs:183` in `integration__no_overlay__legacy_single_key`; `crates/blazar-cli/tests/config_set.rs:35` in `e2e__config_set_string_value_quoted_and_placed_above_tables`; `crates/blazar-cli/tests/config_set.rs:35` in `e2e__config_set_string_value_quoted_and_placed_above_tables` |
 | models | - | other + engine-argv + gateway-http + runtime/gateway + cli | `crates/blazar-core/src/dirs.rs:66` in `models_dir`; `crates/blazar-core/src/catalog.rs:84` in `resolve`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-core/src/profile.rs:4446` in `compile_sglang`; `crates/blazar-gateway/src/whisper.rs:1519` in `audio_capabilities`; `crates/blazar-gateway/src/whisper.rs:1519` in `audio_capabilities`; `crates/blazar-runtime/src/whisper.rs:46` in `models_dir`; `crates/blazar-runtime/src/whisper.rs:1321` in `unit__server_args__loopback_bind_is_pinned`; `blazar-cli/src/main.rs:152` in `?`; `crates/blazar-cli/src/main.rs:2312` in `run` |
 | rpm | - | gateway-http + cli | `crates/blazar-gateway/src/lib.rs:933` in `keys_list`; `crates/blazar-gateway/src/lib.rs:978` in `keys_add`; `crates/blazar-cli/src/main.rs:7068` in `doctor_keys`; `crates/blazar-cli/src/main.rs:14429` in `create_cmd` |
+| mcp_access | None | gateway-http | `crates/blazar-gateway/src/keys.rs` in the posture match (`tools`/`catalog`/`off`; unset = tools); `crates/blazar-gateway/src/lib.rs` in `keys_add` (parses `mcp_access` from the request body); `crates/blazar-core/src/config.rs` in `Config::validate` (posture vocabulary check) |
 | mcp_servers | Vec::new() | gateway-http | `crates/blazar-gateway/src/keys.rs` in `mcp_server_permits` (per-key MCP server allowlist; empty = all servers); `crates/blazar-gateway/src/lib.rs` in `keys_add` (parses `mcp_servers` from the request body) |
 | mcp_tools | Vec::new() | gateway-http | `crates/blazar-gateway/src/keys.rs` in `mcp_tool_permits` (per-key MCP tool allowlist, `<server>:<tool>` selectors; empty = all tools of permitted servers); `crates/blazar-gateway/src/lib.rs` in `keys_add` (parses `mcp_tools` from the request body) |
 | tpm | - | gateway-http + cli | `crates/blazar-gateway/src/proxy.rs:924` in `proxy_request`; `crates/blazar-gateway/src/lib.rs:933` in `keys_list`; `crates/blazar-cli/src/main.rs:7068` in `doctor_keys`; `crates/blazar-cli/src/main.rs:14429` in `create_cmd` |
