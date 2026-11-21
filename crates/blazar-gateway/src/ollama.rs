@@ -3454,7 +3454,7 @@ pub async fn embeddings(
     }
     let class = crate::workload::classify(
         &state,
-        crate::workload::WorkloadSurface::Rerank,
+        crate::workload::WorkloadSurface::Embeddings,
         false,
         false,
     );
@@ -3804,7 +3804,7 @@ pub async fn rerank(
     }
     let class = crate::workload::classify(
         &state,
-        crate::workload::WorkloadSurface::Embeddings,
+        crate::workload::WorkloadSurface::Rerank,
         false,
         false,
     );
