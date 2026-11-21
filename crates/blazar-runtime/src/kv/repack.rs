@@ -868,18 +868,20 @@ mod tests {
         // 0.34.0's FileMapper actually wrote for the qwen2.5-coder-0.5b
         // spawn during the 2026-11-21 live codec certification (config
         // json captured beside the tier, receipt in
-        // bench-artifacts/2026-11-21-kv-codec-live-certs/). Any field
+        // bench-artifacts/2026-11-21-kv-codec-live-certs/; the model path is
+        // rewritten to a portable fixture location - it feeds the digest
+        // verbatim, so the pin below is the digest of THIS fixture json). Any field
         // drift here reads the wrong rank dir and the import fails cold.
         let spec = super::VllmFsSpec::direct(
-            "/home/santanu/.local/share/blazar/models/qwen2.5-coder-0.5b-instruct.d".into(),
+            "/t/models/qwen2.5-coder-0.5b-instruct.d".into(),
             64,
             24,
             "bfloat16",
         );
-        assert_eq!(spec.digest12(), "22d6ff76ec48");
+        assert_eq!(spec.digest12(), "46553cd6d60b");
         assert_eq!(
             spec.fields_json(),
-            "{\"blocks_per_file\":1,\"dcp_size\":1,\"dtype\":\"bfloat16\",\"inference_engine\":\"vllm\",\"kv_cache_groups\":[{\"layer_names\":[\"model.layers.0.self_attn.attn\",\"model.layers.1.self_attn.attn\",\"model.layers.2.self_attn.attn\",\"model.layers.3.self_attn.attn\",\"model.layers.4.self_attn.attn\",\"model.layers.5.self_attn.attn\",\"model.layers.6.self_attn.attn\",\"model.layers.7.self_attn.attn\",\"model.layers.8.self_attn.attn\",\"model.layers.9.self_attn.attn\",\"model.layers.10.self_attn.attn\",\"model.layers.11.self_attn.attn\",\"model.layers.12.self_attn.attn\",\"model.layers.13.self_attn.attn\",\"model.layers.14.self_attn.attn\",\"model.layers.15.self_attn.attn\",\"model.layers.16.self_attn.attn\",\"model.layers.17.self_attn.attn\",\"model.layers.18.self_attn.attn\",\"model.layers.19.self_attn.attn\",\"model.layers.20.self_attn.attn\",\"model.layers.21.self_attn.attn\",\"model.layers.22.self_attn.attn\",\"model.layers.23.self_attn.attn\"],\"tokens_per_block\":64}],\"model_name\":\"/home/santanu/.local/share/blazar/models/qwen2.5-coder-0.5b-instruct.d\",\"parallel_agnostic\":false,\"pcp_size\":1,\"pp_size\":1,\"tokens_per_hash\":64,\"tp_size\":1}"
+            "{\"blocks_per_file\":1,\"dcp_size\":1,\"dtype\":\"bfloat16\",\"inference_engine\":\"vllm\",\"kv_cache_groups\":[{\"layer_names\":[\"model.layers.0.self_attn.attn\",\"model.layers.1.self_attn.attn\",\"model.layers.2.self_attn.attn\",\"model.layers.3.self_attn.attn\",\"model.layers.4.self_attn.attn\",\"model.layers.5.self_attn.attn\",\"model.layers.6.self_attn.attn\",\"model.layers.7.self_attn.attn\",\"model.layers.8.self_attn.attn\",\"model.layers.9.self_attn.attn\",\"model.layers.10.self_attn.attn\",\"model.layers.11.self_attn.attn\",\"model.layers.12.self_attn.attn\",\"model.layers.13.self_attn.attn\",\"model.layers.14.self_attn.attn\",\"model.layers.15.self_attn.attn\",\"model.layers.16.self_attn.attn\",\"model.layers.17.self_attn.attn\",\"model.layers.18.self_attn.attn\",\"model.layers.19.self_attn.attn\",\"model.layers.20.self_attn.attn\",\"model.layers.21.self_attn.attn\",\"model.layers.22.self_attn.attn\",\"model.layers.23.self_attn.attn\"],\"tokens_per_block\":64}],\"model_name\":\"/t/models/qwen2.5-coder-0.5b-instruct.d\",\"parallel_agnostic\":false,\"pcp_size\":1,\"pp_size\":1,\"tokens_per_hash\":64,\"tp_size\":1}"
         );
     }
 
