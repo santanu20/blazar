@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::dirs::BlazarDirs;
 use crate::engine_kind::EngineKind;
@@ -64,7 +64,7 @@ pub struct Store {
 /// time; session-bank identity binds the adapter set by (path, sha),
 /// so a swapped adapter file under an unchanged path can never silently
 /// ride a bank restored for the bytes that actually produced it).
-const SCHEMA_VERSION: i32 = 23;
+const SCHEMA_VERSION: i32 = 24;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -179,6 +179,13 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     ttft_count    INTEGER NOT NULL DEFAULT 0, -- TTFT samples
     ttft_ms_total REAL NOT NULL DEFAULT 0,    -- sum, for mean
     PRIMARY KEY (day, model)
+);
+CREATE TABLE IF NOT EXISTS usage_workload (
+    day           INTEGER NOT NULL,  -- yyyymmdd local day
+    model         TEXT NOT NULL,
+    kind          TEXT NOT NULL,     -- WorkloadKind label at admission
+    requests      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, model, kind)
 );
 CREATE TABLE IF NOT EXISTS optimization_experiments (
     id             INTEGER PRIMARY KEY,
@@ -729,6 +736,18 @@ pub struct UsageDayRow {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// One row of the `usage_workload` mix table - requests a model served
+/// of one workload kind on one day. The routing derivation folds these
+/// into a [`crate::routing_policy::WorkloadMix`].
+pub struct UsageWorkloadRow {
+    pub day: i64,
+    pub model: String,
+    /// `WorkloadKind::as_str` label recorded at admission.
+    pub kind: String,
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoraRow {
     pub id: i64,
     pub model_name: String,
@@ -1037,6 +1056,11 @@ impl Store {
         // v17->v18: `usage_daily` (usage rollups) same replay story.
         // v18->v19: see `migrate_v19_spec_provenance` - replay covers
         // the new ledger tables; the receipt ALTERs live there.
+        // v23->v24: `usage_workload` (per-model x workload-kind daily
+        // request counts) is CREATE-TABLE-IF-NOT-EXISTS in SCHEMA_SQL -
+        // replay covers it. No backfill: days before v24 carry usage
+        // totals but no kind mix; the routing derivation treats that
+        // as thin evidence, never guesses a mix.
         Ok(())
     }
 
@@ -2724,6 +2748,50 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
     }
 
+    /// Batch upsert of per-model workload-kind counts into the daily
+    /// mix table. Same accumulate-on-conflict contract as
+    /// [`Self::add_usage_delta`]: the gateway flushes in-memory
+    /// buckets here, so a retried flush must add, never overwrite.
+    pub fn add_usage_workload_deltas(
+        &self,
+        batch: &[(i64, String, String, i64)],
+    ) -> CoreResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO usage_workload (day, model, kind, requests)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(day, model, kind) DO UPDATE SET
+                     requests = requests + excluded.requests",
+            )?;
+            for (day, model, kind, requests) in batch {
+                stmt.execute(params![day, model, kind, requests])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Per-model workload-kind mix for the last `days` days, oldest
+    /// first. The routing derivation's evidence base (thin evidence =
+    /// no derivation, never a guessed mix).
+    pub fn list_usage_workload(&self, days: i64) -> CoreResult<Vec<UsageWorkloadRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT day, model, kind, requests
+             FROM usage_workload WHERE day >= strftime('%Y%m%d', 'now', ?1)
+             ORDER BY day, model, kind",
+        )?;
+        let rows = stmt.query_map(params![format!("-{days} days")], |r| {
+            Ok(UsageWorkloadRow {
+                day: r.get(0)?,
+                model: r.get(1)?,
+                kind: r.get(2)?,
+                requests: r.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+
     #[allow(clippy::too_many_arguments)] // flat row mirror, not logic
     pub fn add_lora(
         &self,
@@ -3244,11 +3312,10 @@ mod tests {
 
         // Unknown id: Ok(None) - the API layer turns this into the
         // teaching 404, not a store error.
-        assert!(
-            s.update_completion_card("chatcmpl-nope", "{}", 1)
-                .unwrap()
-                .is_none()
-        );
+        assert!(s
+            .update_completion_card("chatcmpl-nope", "{}", 1)
+            .unwrap()
+            .is_none());
         assert!(s.get_completion_card("chatcmpl-nope").unwrap().is_none());
     }
 
@@ -3349,10 +3416,9 @@ mod tests {
         assert!(s.set_job_state("job_1", "running", None, None).unwrap());
         s.append_job_event("job_1", "progress", Some(r#"{"pct":50}"#))
             .unwrap();
-        assert!(
-            s.set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
-                .unwrap()
-        );
+        assert!(s
+            .set_job_state("job_1", "completed", Some(r#"{"text":"hi"}"#), None)
+            .unwrap());
         // Unknown id: the contract returns false, not an error.
         assert!(!s.set_job_state("job_9", "completed", None, None).unwrap());
 
@@ -3920,11 +3986,10 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(v, i64::from(SCHEMA_VERSION));
-            assert!(
-                s.table_columns("model_modalities")
-                    .unwrap()
-                    .contains(&"model".to_string())
-            );
+            assert!(s
+                .table_columns("model_modalities")
+                .unwrap()
+                .contains(&"model".to_string()));
             if pass == 0 {
                 s.set_model_modalities("m", &["decisions".into(), "text".into()])
                     .unwrap();
@@ -4174,12 +4239,10 @@ mod tests {
                     rows[0].hw_fingerprint.as_deref(),
                     Some("gpu:ada|vram:8192|arch:x86_64")
                 );
-                assert!(
-                    rows[0]
-                        .spec_params
-                        .as_deref()
-                        .is_some_and(|p| p.contains("draft_len"))
-                );
+                assert!(rows[0]
+                    .spec_params
+                    .as_deref()
+                    .is_some_and(|p| p.contains("draft_len")));
                 assert!(rows[0].tuned);
                 assert_eq!(rows[0].reps, 2);
             }
@@ -4549,16 +4612,14 @@ mod tests {
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(v, SCHEMA_VERSION);
-            assert!(
-                s.table_columns("jobs")
-                    .unwrap()
-                    .contains(&"owner".to_string())
-            );
-            assert!(
-                s.table_columns("responses")
-                    .unwrap()
-                    .contains(&"owner".to_string())
-            );
+            assert!(s
+                .table_columns("jobs")
+                .unwrap()
+                .contains(&"owner".to_string()));
+            assert!(s
+                .table_columns("responses")
+                .unwrap()
+                .contains(&"owner".to_string()));
             if pass == 0 {
                 s.insert_job(&JobRow {
                     id: "doc_up_1".into(),
@@ -4687,10 +4748,9 @@ mod tests {
         // SQLite reports partial-index violations in column form (probe:
         // "UNIQUE constraint failed: t.a" for an index on t.a WHERE a=1).
         let err = dup.expect_err("second active row must be rejected");
-        assert!(
-            err.to_string()
-                .contains("UNIQUE constraint failed: engines.active")
-        );
+        assert!(err
+            .to_string()
+            .contains("UNIQUE constraint failed: engines.active"));
     }
 
     #[test]
@@ -5481,14 +5541,15 @@ mod tests {
             .unwrap();
         }
         // Opening runs the migration ladder: guarded ALTER adds the
-        // column, the version stamps 23, the legacy row survives with
-        // its honest NULL.
+        // column, the ladder stamps the CURRENT schema version (v23
+        // added the column; v24 added usage_workload), and the legacy
+        // row survives with its honest NULL.
         let s = Store::open(&dirs).unwrap();
         let version: i32 = s
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, SCHEMA_VERSION);
         let rows = s.list_loras(Some("m")).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "/loras/legacy.gguf");
@@ -5522,28 +5583,24 @@ mod tests {
             last_used_at: 0,
         };
         // The live incident rows: awq/gptq/fp8 dirs quantize true.
-        assert!(
-            row(
-                "qwen2.5-0.5b-instruct-awq",
-                "qwen/qwen2.5-0.5b-instruct-awq",
-                "/models/qwen2.5-0.5b-instruct-awq.d"
-            )
-            .is_quantized_safetensors()
-        );
+        assert!(row(
+            "qwen2.5-0.5b-instruct-awq",
+            "qwen/qwen2.5-0.5b-instruct-awq",
+            "/models/qwen2.5-0.5b-instruct-awq.d"
+        )
+        .is_quantized_safetensors());
         assert!(row("m-gptq", "r", "/models/m-gptq.d").is_quantized_safetensors());
         assert!(row("m-fp8-dynamic", "r", "/models/m-fp8-dynamic.d").is_quantized_safetensors());
         // Word boundary: 'hawk' embeds awq as a substring but splits
         // into its own token - stays a normal lane.
         assert!(!row("hawk", "r", "/models/hawk.d").is_quantized_safetensors());
         // Plain BF16 dir: the lane mistral.rs serves perfectly.
-        assert!(
-            !row(
-                "qwen2.5-0.5b-instruct",
-                "qwen/qwen2.5-0.5b-instruct",
-                "/models/qwen2.5-0.5b-instruct.d"
-            )
-            .is_quantized_safetensors()
-        );
+        assert!(!row(
+            "qwen2.5-0.5b-instruct",
+            "qwen/qwen2.5-0.5b-instruct",
+            "/models/qwen2.5-0.5b-instruct.d"
+        )
+        .is_quantized_safetensors());
         // GGUF never counts, even when the filename carries a token.
         assert!(!row("m-awq", "r", "/models/m-awq-q4_k_m.gguf").is_quantized_safetensors());
         // Repo token alone (a dir renamed clean) still signals.

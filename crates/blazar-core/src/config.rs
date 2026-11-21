@@ -3973,6 +3973,18 @@ pub struct EngineRouting {
     /// shipped with.
     #[serde(default)]
     pub policy: RoutingPolicy,
+    /// Workload-aware policy derivation (default on): when a model's
+    /// recorded traffic mix (per-model workload kinds, 30d window) is
+    /// strong enough - at least 20 classified requests and one class
+    /// holding >= 60% of signalled traffic - the spawn path derives
+    /// `latency` for interactive/tool-dominant models and `throughput`
+    /// for long-prefill/batch-dominant ones instead of the static
+    /// `policy` above. Thin or mixed evidence keeps `policy` (the
+    /// derivation never guesses). `false` restores pure static policy
+    /// for every model at once. Per-model `engine` pins still win over
+    /// any policy, derived or configured.
+    #[serde(default = "default_workload_aware")]
+    pub workload_aware: bool,
 }
 
 impl Default for EngineRouting {
@@ -3980,8 +3992,15 @@ impl Default for EngineRouting {
         Self {
             mode: RoutingMode::Auto,
             policy: RoutingPolicy::Quality,
+            workload_aware: default_workload_aware(),
         }
     }
+}
+
+/// `engine_routing.workload_aware` default: ON - the adaptive runtime
+/// mandate. Opt-out is the explicit `false` in config.toml.
+const fn default_workload_aware() -> bool {
+    true
 }
 
 /// `[engine_routing]` `mode`.

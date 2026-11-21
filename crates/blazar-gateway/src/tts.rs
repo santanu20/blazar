@@ -857,8 +857,9 @@ async fn llamacpp_tts_lane(
         state,
         &row.name,
         crate::queue::Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             state,
+            &row.name,
             crate::workload::WorkloadSurface::SpeechSynthesis,
             false,
             false,
@@ -1078,8 +1079,9 @@ async fn kokoro_speech(
     // Workload accounting: the kokoro child admits lazily (no engine
     // spawn up front), so the descriptor bump lives at entry like every
     // other single-admission handler.
-    crate::workload::note(
+    crate::workload::note_for(
         state,
+        voice,
         crate::workload::WorkloadSurface::SpeechSynthesis,
         false,
         false,

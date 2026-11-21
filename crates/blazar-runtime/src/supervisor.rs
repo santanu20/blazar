@@ -5850,9 +5850,31 @@ impl Supervisor {
                 model.is_litert_bundle(),
             ),
         };
+        // Workload-aware policy derivation (same core fn the gateway's
+        // /api/plan prediction consults, so the two can never disagree):
+        // the model's measured usage mix over the evidence window
+        // overrides the configured policy when one signal class
+        // dominates. Thin or unreadable evidence keeps the configured
+        // policy - derivation never guesses.
+        let configured_policy = self.cfg().engine_routing.policy;
+        let policy_decision = blazar_core::routing_policy::derive_policy_from_store(
+            store,
+            configured_policy,
+            self.cfg().engine_routing.workload_aware,
+            &model.name,
+        );
+        if policy_decision.derived {
+            tracing::info!(
+                model = %model.name,
+                from = ?configured_policy,
+                to = ?policy_decision.policy,
+                reason = %policy_decision.reason,
+                "workload-aware routing derived a policy from measured usage"
+            );
+        }
         let Some((tag, _kind)) = blazar_core::engine_kind::serving_lane(
             self.cfg().engine_routing.mode,
-            self.cfg().engine_routing.policy,
+            policy_decision.policy,
             overlay.engine.as_deref(),
             shape,
             self.engine.kind(),

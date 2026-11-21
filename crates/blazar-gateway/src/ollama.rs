@@ -1843,8 +1843,9 @@ pub async fn chat(
     // even under ollama_compat, so they keep their interactive class
     // (and are exactly the mixed traffic that makes reserved capacity
     // reachable on a compat model).
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model_field,
         crate::workload::WorkloadSurface::Chat,
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.cfg().effective_prompt_recipe(&model_field) == crate::prompt_recipe::OLLAMA_COMPAT
@@ -3452,8 +3453,9 @@ pub async fn embeddings(
     {
         return rej.to_response();
     }
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model,
         crate::workload::WorkloadSurface::Embeddings,
         false,
         false,
@@ -3611,8 +3613,9 @@ pub async fn embed(
     {
         return rej.to_response();
     }
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model,
         crate::workload::WorkloadSurface::Embeddings,
         false,
         false,
@@ -3802,8 +3805,9 @@ pub async fn rerank(
     {
         return rej.to_response();
     }
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model,
         crate::workload::WorkloadSurface::Rerank,
         false,
         false,
@@ -4060,8 +4064,9 @@ pub async fn generate(
             "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model,
         crate::workload::WorkloadSurface::Chat,
         req.get("tools").is_some_and(serde_json::Value::is_array),
         state.cfg().effective_prompt_recipe(&model) == crate::prompt_recipe::OLLAMA_COMPAT,

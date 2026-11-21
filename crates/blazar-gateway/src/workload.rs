@@ -43,6 +43,35 @@ pub fn note(
     descriptor
 }
 
+/// Derive, record, and ALSO persist the per-model kind mix (the
+/// workload-aware routing derivation's evidence). Handlers that know
+/// the model at admission call this instead of [`note`] - one call,
+/// both the global counter and the per-model mix, still exactly-once
+/// per request.
+pub fn note_for(
+    state: &AppState,
+    model: &str,
+    surface: WorkloadSurface,
+    has_tools: bool,
+    raw_lane: bool,
+) -> WorkloadDescriptor {
+    let descriptor = note(state, surface, has_tools, raw_lane);
+    state.usage.record_workload(model, descriptor.kind.as_str());
+    descriptor
+}
+
+/// Derive, record (global + per-model mix), and map in one call - the
+/// model-aware drop-in for [`classify`].
+pub fn classify_for(
+    state: &AppState,
+    model: &str,
+    surface: WorkloadSurface,
+    has_tools: bool,
+    raw_lane: bool,
+) -> WorkClass {
+    note_for(state, model, surface, has_tools, raw_lane).work_class()
+}
+
 /// Derive, record, and map in one call - the drop-in replacement for
 /// the direct `classify_work` calls at single-admission handlers.
 pub fn classify(

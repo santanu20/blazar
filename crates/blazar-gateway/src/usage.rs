@@ -45,6 +45,11 @@ fn today_key() -> i64 {
 /// next tick. Same shape as the `AppState`'s cached store connection.
 pub struct UsageMeter {
     buckets: Mutex<HashMap<(i64, String), UsageAcc>>,
+    /// Per-(day, model, workload-kind) request counts - the evidence
+    /// base `engine_routing` workload-aware policy derives from at
+    /// spawn time. Separate map (not a UsageDelta field): the daily
+    /// rollup stays token-shaped, the mix stays count-shaped.
+    workload_buckets: Mutex<HashMap<(i64, String, String), i64>>,
     store: Mutex<Option<Store>>,
     dirs: BlazarDirs,
 }
@@ -54,6 +59,7 @@ impl UsageMeter {
     pub fn new(dirs: &BlazarDirs) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
+            workload_buckets: Mutex::new(HashMap::new()),
             store: Mutex::new(Store::open(dirs).ok()),
             dirs: dirs.clone(),
         }
@@ -81,6 +87,19 @@ impl UsageMeter {
             acc.ttft_count += 1;
             acc.ttft_ms_total += ms;
         }
+    }
+
+    /// One admitted request's workload kind, per model - the routing
+    /// derivation's evidence. O(1) on the admission path; flushed with
+    /// the usage rollups on the same minute tick. `kind` is the
+    /// `WorkloadKind::as_str` label the classifier derived.
+    pub fn record_workload(&self, model: &str, kind: &str) {
+        let mut map = self
+            .workload_buckets
+            .lock()
+            .expect("workload buckets poisoned");
+        *map.entry((today_key(), model.to_string(), kind.to_string()))
+            .or_insert(0) += 1;
     }
 
     /// Drain in-memory buckets into `usage_daily` in ONE store
@@ -111,7 +130,14 @@ impl UsageMeter {
             let mut map = self.buckets.lock().expect("usage buckets poisoned");
             map.drain().collect()
         };
-        if drained.is_empty() {
+        let workload_drained: Vec<(i64, String, String, i64)> = {
+            let mut map = self
+                .workload_buckets
+                .lock()
+                .expect("workload buckets poisoned");
+            map.drain().map(|((d, m, k), n)| (d, m, k, n)).collect()
+        };
+        if drained.is_empty() && workload_drained.is_empty() {
             return Ok(0);
         }
         let n = drained.len();
@@ -124,7 +150,19 @@ impl UsageMeter {
         if let Err(e) = store.add_usage_deltas(&batch) {
             drop(guard);
             requeue_additively(&self.buckets, &batch);
+            requeue_workload_additively(&self.workload_buckets, &workload_drained);
             return Err(e.into());
+        }
+        // The workload mix is a SEPARATE all-or-nothing batch: a
+        // rollup success must not strand the mix, and a mix failure
+        // must not undo (or fail) the landed rollup - the next tick
+        // re-offers exactly the counts that missed.
+        if !workload_drained.is_empty()
+            && let Err(e) = store.add_usage_workload_deltas(&workload_drained)
+        {
+            drop(guard);
+            requeue_workload_additively(&self.workload_buckets, &workload_drained);
+            tracing::warn!("usage workload-mix flush failed, requeued: {e}");
         }
         Ok(n)
     }
@@ -159,6 +197,18 @@ fn requeue_additively(
         acc.gen_secs += d.gen_secs;
         acc.ttft_count += d.ttft_count;
         acc.ttft_ms_total += d.ttft_ms_total;
+    }
+}
+
+/// Same additive-requeue contract for the workload mix batch (see
+/// [`requeue_additively`]).
+fn requeue_workload_additively(
+    buckets: &Mutex<HashMap<(i64, String, String), i64>>,
+    batch: &[(i64, String, String, i64)],
+) {
+    let mut map = buckets.lock().expect("workload buckets poisoned");
+    for (day, model, kind, n) in batch {
+        *map.entry((*day, model.clone(), kind.clone())).or_insert(0) += n;
     }
 }
 
@@ -589,5 +639,116 @@ mod tests {
         let m2 = rows.iter().find(|r| r.model == "m2").unwrap();
         assert_eq!((m2.in_tokens, m2.out_tokens), (7, 3));
         assert_eq!(m.flush().unwrap(), 0, "exactly-once: nothing left");
+    }
+
+    /// The workload mix lands alongside the rollups: same (day, model,
+    /// kind) key accumulates, distinct kinds stay distinct rows, and a
+    /// workload-only window (no rollup records yet) still flushes.
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: integration__unit__scenario
+    fn integration__usage_flush__workload_buckets_land_and_accumulate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let m = UsageMeter::new(&dirs);
+        // Workload-only window: nothing recorded via `record`, so the
+        // flush returns 0 rollup rows but must still land the mix.
+        m.record_workload("m1", "interactive_chat");
+        m.record_workload("m1", "interactive_chat");
+        m.record_workload("m1", "tool_execution");
+        m.record_workload("m2", "long_prefill");
+        assert_eq!(
+            m.flush().unwrap(),
+            0,
+            "no rollup buckets - return counts rollups only"
+        );
+        let guard = m.store.lock().expect("usage store poisoned");
+        let store = guard.as_ref().expect("store ensured by flush");
+        let rows = store.list_usage_workload(30).unwrap();
+        drop(guard);
+        let find = |model: &str, kind: &str| {
+            rows.iter()
+                .find(|r| r.model == model && r.kind == kind)
+                .unwrap_or_else(|| panic!("missing ({model},{kind})"))
+                .requests
+        };
+        assert_eq!(find("m1", "interactive_chat"), 2, "same key accumulates");
+        assert_eq!(find("m1", "tool_execution"), 1, "distinct kind row");
+        assert_eq!(find("m2", "long_prefill"), 1, "per-model isolation");
+        assert_eq!(rows.len(), 3, "exactly one row per (day, model, kind)");
+        // Exactly-once: the drained mix is not re-offered.
+        assert_eq!(m.flush().unwrap(), 0);
+        let guard = m.store.lock().expect("usage store poisoned");
+        assert_eq!(
+            guard
+                .as_ref()
+                .unwrap()
+                .list_usage_workload(30)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// Pin for the mix-vs-rollup independence contract: a workload-batch
+    /// failure must NOT fail the flush (the rollup already landed) and
+    /// must requeue the drained mix additively so the next tick re-offers
+    /// exactly what missed, plus whatever the failure window recorded.
+    #[test]
+    #[allow(non_snake_case)] // repo test-name convention: integration__unit__scenario
+    fn integration__usage_flush__workload_failure_requeues_without_failing_rollup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        let m = UsageMeter::new(&dirs);
+        m.record("m1", 100, 40, 80, 2.5, Some(120.0));
+        m.record_workload("m1", "interactive_chat");
+        // Sabotage ONLY the mix table from a second connection.
+        {
+            let s2 = Store::open(&dirs).unwrap();
+            s2.conn()
+                .execute_batch("DROP TABLE usage_workload;")
+                .unwrap();
+        }
+        assert_eq!(
+            m.flush().unwrap(),
+            1,
+            "rollup landed - mix failure must not fail the flush"
+        );
+        // A workload record landing during the failure window must
+        // merge into the requeued batch additively.
+        m.record_workload("m1", "interactive_chat");
+        // Repair the table (schema replay is intentionally not implied
+        // by reopening at a current user_version).
+        {
+            let s3 = Store::open(&dirs).unwrap();
+            s3.conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS usage_workload (
+                         day      INTEGER NOT NULL,
+                         model    TEXT NOT NULL,
+                         kind     TEXT NOT NULL,
+                         requests INTEGER NOT NULL DEFAULT 0,
+                         PRIMARY KEY (day, model, kind)
+                     );",
+                )
+                .unwrap();
+        }
+        assert_eq!(m.flush().unwrap(), 0, "rollup batch is empty now");
+        let guard = m.store.lock().expect("usage store poisoned");
+        let rows = guard.as_ref().unwrap().list_usage_workload(30).unwrap();
+        drop(guard);
+        let row = rows
+            .iter()
+            .find(|r| r.model == "m1" && r.kind == "interactive_chat")
+            .expect("requeued mix must land after repair");
+        assert_eq!(
+            row.requests, 2,
+            "original + failure-window record, merged additively"
+        );
     }
 }

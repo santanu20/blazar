@@ -14084,13 +14084,23 @@ fn canonical_plan_for(
             row.is_litert_bundle(),
         ),
     };
+    // Workload-aware policy derivation - the SAME core fn the
+    // supervisor consults at spawn, so `blazar plan` predicts exactly
+    // what the daemon will do (the two can never disagree). Thin or
+    // unreadable evidence keeps the configured policy.
+    let policy_decision = blazar_core::routing_policy::derive_policy_from_store(
+        store,
+        cfg.engine_routing.policy,
+        cfg.engine_routing.workload_aware,
+        &row.name,
+    );
     // Receipt axis: a bench row for THIS model on the lane the router
     // will pick (adapter tag when routed, else the active global tag).
     // The lookup must not perturb selection - the planner re-runs the
     // router internally on identical inputs.
     let routing_tag = serving_lane_typed(
         cfg.engine_routing.mode,
-        cfg.engine_routing.policy,
+        policy_decision.policy,
         pin,
         shape,
         global,
@@ -14134,7 +14144,7 @@ fn canonical_plan_for(
         global_kind: global,
         global_tag: global_row.as_ref().map(|g| g.tag.as_str()),
         mode: cfg.engine_routing.mode,
-        policy: cfg.engine_routing.policy,
+        policy: policy_decision.policy,
         pin,
         shape,
         hardware,

@@ -266,8 +266,9 @@ pub async fn embeddings(
         &state,
         &model,
         crate::queue::Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             &state,
+            &model,
             crate::workload::WorkloadSurface::Embeddings,
             false,
             false,
@@ -1075,8 +1076,13 @@ pub async fn openai_proxy(
     } else {
         crate::workload::WorkloadSurface::Chat
     };
-    let workload_class =
-        crate::workload::classify(&state, workload_surface, body_has_tools(&body), false);
+    let workload_class = crate::workload::classify_for(
+        &state,
+        &model,
+        workload_surface,
+        body_has_tools(&body),
+        false,
+    );
     let prefix = if chat_family {
         affinity_hash_bytes(&body)
     } else {
@@ -2018,8 +2024,9 @@ pub async fn scoped_proxy(
             .get("x-blazar-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model,
         crate::workload::WorkloadSurface::Chat,
         body_has_tools(&body),
         false,
@@ -2270,8 +2277,9 @@ pub async fn responses_api(
             .get("x-blazar-priority")
             .and_then(|v| v.to_str().ok()),
     );
-    let class = crate::workload::classify(
+    let class = crate::workload::classify_for(
         &state,
+        &model,
         crate::workload::WorkloadSurface::Chat,
         body_has_tools(&body),
         false,

@@ -227,6 +227,52 @@ async fn integration__ensure_unknown_model__named_error() {
     assert!(err.to_string().contains("no such model"), "{err}");
 }
 
+/// Workload-derived routing policy: 20 interactive requests (floor met,
+/// latency-dominant) must flip the effective policy from the configured
+/// default to Latency - and a GGUF model must STILL land on llamacpp,
+/// because the policy only forks safetensors lanes. The spawn path and
+/// the plan prediction share `derive_policy_from_store`, so pinning the
+/// spawn side here covers both consumers' lane choice.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__routed_engine__workload_derived_policy_keeps_gguf_lane_stable() {
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    // Seed an unambiguous interactive mix for m1. Day key from SQLite's
+    // own clock so the seed always sits inside the 30d read window.
+    let store = Store::open(&dirs).unwrap();
+    let day: i64 = store
+        .conn()
+        .query_row(
+            "SELECT CAST(strftime('%Y%m%d','now') AS INTEGER)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store
+        .add_usage_workload_deltas(&[(day, "m1".into(), "interactive_chat".into(), 20)])
+        .unwrap();
+    let decision = blazar_core::routing_policy::derive_policy_from_store(
+        &store,
+        blazar_core::config::RoutingPolicy::Quality,
+        true,
+        "m1",
+    );
+    assert!(decision.derived, "reason: {}", decision.reason);
+    assert_eq!(decision.policy, blazar_core::config::RoutingPolicy::Latency);
+
+    // The supervisor consumes the same derivation at spawn: the derived
+    // Latency policy must not destabilize the GGUF lane. In this harness
+    // the llamacpp lane is served by the stub binary (LlamaCppEngine on
+    // a probed stub manifest), so the lane tag is "stub".
+    let sup = supervisor(&dirs, base_config(), true);
+    sup.ensure("m1").await.expect("ensure under derived policy");
+    let ps = sup.ps();
+    assert_eq!(ps.len(), 1);
+    assert_eq!(ps[0].engine, "stub");
+    assert_eq!(ps[0].state, "ready");
+    sup.shutdown_all().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn regression__dropped_loader_future_does_not_wedge_next_ensure() {

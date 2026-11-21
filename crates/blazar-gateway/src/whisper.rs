@@ -1704,8 +1704,9 @@ async fn engine_asr_lane(
         state,
         &row.name,
         crate::queue::Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             state,
+            &row.name,
             crate::workload::WorkloadSurface::Transcription,
             false,
             false,

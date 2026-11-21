@@ -21,6 +21,7 @@ pub mod kv_quality;
 pub mod optimize;
 pub mod predict;
 pub mod profile;
+pub mod routing_policy;
 pub mod session_identity;
 pub mod store;
 pub mod telemetry;

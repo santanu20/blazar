@@ -1171,8 +1171,9 @@ pub async fn generations(
         &state,
         &model,
         Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             &state,
+            &model,
             crate::workload::WorkloadSurface::ImageGeneration,
             false,
             false,
@@ -1455,8 +1456,9 @@ pub async fn video_generations(
         &state,
         &model,
         Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             &state,
+            &model,
             crate::workload::WorkloadSurface::VideoGeneration,
             false,
             false,
@@ -1542,8 +1544,9 @@ pub async fn edits(
         &state,
         &model,
         Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             &state,
+            &model,
             crate::workload::WorkloadSurface::ImageGeneration,
             false,
             false,
@@ -1727,8 +1730,9 @@ pub async fn variations(
         &state,
         &model,
         Priority::Normal,
-        crate::workload::classify(
+        crate::workload::classify_for(
             &state,
+            &model,
             crate::workload::WorkloadSurface::ImageGeneration,
             false,
             false,
@@ -2898,8 +2902,9 @@ pub async fn upscale(
             &state,
             model,
             Priority::Normal,
-            crate::workload::classify(
+            crate::workload::classify_for(
                 &state,
+                &model,
                 crate::workload::WorkloadSurface::ImageGeneration,
                 false,
                 false,
