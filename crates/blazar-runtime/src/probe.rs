@@ -508,10 +508,67 @@ pub fn nvidia_used_vram_mib() -> Option<u64> {
     sum_free_mib_csv(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// ggml `--list-devices` (and manifest snapshots built from it) report a
+/// CUDA-carved total - `cudaDeviceProp` minus the driver/display reserve
+/// (~381 MiB low on an RTX 4070 Laptop: 7807 vs 8188 raw) - while serving
+/// engines multiply `--mem-fraction-static` by the RAW card total (receipt
+/// 2026-11-21: mf 0.78 offload-0 booted a 68 MiB KV pool = 0.78x8188 -
+/// 5868 weights - buffers, arithmetic that goes negative on the 7807
+/// basis). A census total below the fraction basis under-sells every
+/// static-side ceiling by total/free and keeps stale offload pins alive on
+/// margins the engine boots fine. Correct the TOTAL to the raw card
+/// identity `nvidia-smi memory.total` reports when it speaks, keep the
+/// lister's FREE (the CUDA-malloc-able view - the conservative number),
+/// and only ever RAISE a total. Non-NVIDIA boxes (no nvidia-smi rows) and
+/// the nvidia-smi fallback lane itself (raw == raw) are no-ops.
+fn enrich_totals_with_raw_nvidia(gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
+    if gpus.is_empty() {
+        return gpus;
+    }
+    enrich_totals_with_raw_rows(gpus, &nvidia_smi_gpus())
+}
+
+/// Pure core of [`enrich_totals_with_raw_nvidia`] - hermetic under test.
+fn enrich_totals_with_raw_rows(gpus: Vec<GpuInfo>, raw: &[GpuInfo]) -> Vec<GpuInfo> {
+    if gpus.is_empty() || raw.is_empty() {
+        return gpus;
+    }
+    let mut gpus = gpus;
+    let normalized = |s: &str| -> String {
+        s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let single_pair = raw.len() == 1 && gpus.len() == 1;
+    for g in &mut gpus {
+        let desc = normalized(&g.description);
+        let matched = raw
+            .iter()
+            .find(|r| normalized(&r.description) == desc)
+            .or_else(|| {
+                // Description drift between census lanes (a shorter lister
+                // string) falls back to the single-card pairing - the
+                // overwhelmingly common shape, and only for rows that
+                // identify as NVIDIA (a non-NVIDIA row must never absorb
+                // an NVIDIA card's total). Multi-card boxes with divergent
+                // names stay unmatched rather than guessed.
+                (single_pair && desc.contains("nvidia")).then_some(&raw[0])
+            });
+        if let Some(r) = matched {
+            if r.total_mib > g.total_mib {
+                g.total_mib = r.total_mib;
+            }
+        }
+    }
+    gpus
+}
+
 /// sysinfo half + caller-supplied GPU list: the composition point for a
 /// LIVE `--list-devices` census (see `engine::manifest::run_list_devices`).
 #[must_use]
 pub fn hardware_with(gpus: Vec<GpuInfo>) -> Hardware {
+    // Totals first: every census leg (live lister, manifest snapshot,
+    // nvidia fallback) flows through here, so the raw-identity correction
+    // lands once for all of them.
+    let gpus = enrich_totals_with_raw_nvidia(gpus);
     // Census must degrade, not die: a refused snapshot still answers with
     // the conservative defaults here (sysinfo 0.40 made construction
     // fallible, so there is no empty System to fall back to).
@@ -634,6 +691,97 @@ mod tests {
     }
 
     #[test]
+    fn unit__enrich_totals__raw_identity_replaces_carved_lister_total() {
+        // The 2026-11-21 receipt shape: ggml lister carved total 7807 on
+        // an 8188-raw card; the fraction basis must see 8188 while the
+        // lister's conservative free (893) survives untouched.
+        let gpus = vec![GpuInfo {
+            name: "CUDA0".into(),
+            description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+            total_mib: 7_807,
+            free_mib: 893,
+        }];
+        let raw = vec![GpuInfo {
+            name: "GeForce RTX 4070 Laptop GPU".into(),
+            description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+            total_mib: 8_188,
+            free_mib: 1_027,
+        }];
+        let out = enrich_totals_with_raw_rows(gpus, &raw);
+        assert_eq!((out[0].total_mib, out[0].free_mib), (8_188, 893));
+    }
+
+    #[test]
+    fn unit__enrich_totals__single_card_drift_pairs_by_nvidia_marker() {
+        let gpus = vec![GpuInfo {
+            name: "CUDA0".into(),
+            description: "NVIDIA RTX 4070 Laptop GPU".into(),
+            total_mib: 7_807,
+            free_mib: 7_657,
+        }];
+        let raw = vec![GpuInfo {
+            name: "GeForce RTX 4070 Laptop GPU".into(),
+            description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+            total_mib: 8_188,
+            free_mib: 7_794,
+        }];
+        let out = enrich_totals_with_raw_rows(gpus, &raw);
+        assert_eq!(out[0].total_mib, 8_188);
+    }
+
+    #[test]
+    fn unit__enrich_totals__non_nvidia_and_lower_raw_untouched() {
+        // A non-NVIDIA row never absorbs an NVIDIA total (single-card
+        // pairing must not fire for it), and the raise-only guard keeps a
+        // smaller raw figure from shrinking an existing total.
+        let amd = GpuInfo {
+            name: "AMD0".into(),
+            description: "AMD Radeon Graphics".into(),
+            total_mib: 4_096,
+            free_mib: 4_000,
+        };
+        let out = enrich_totals_with_raw_rows(
+            vec![amd],
+            &[GpuInfo {
+                name: "x".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 8_188,
+                free_mib: 8_188,
+            }],
+        );
+        assert_eq!(out[0].total_mib, 4_096);
+
+        let already_raw = GpuInfo {
+            name: "CUDA0".into(),
+            description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+            total_mib: 8_188,
+            free_mib: 7_000,
+        };
+        let out = enrich_totals_with_raw_rows(
+            vec![already_raw],
+            &[GpuInfo {
+                name: "x".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 7_807,
+                free_mib: 7_000,
+            }],
+        );
+        assert_eq!(out[0].total_mib, 8_188);
+    }
+
+    #[test]
+    fn unit__enrich_totals__no_raw_rows_is_noop() {
+        let gpus = vec![GpuInfo {
+            name: "CUDA0".into(),
+            description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+            total_mib: 7_807,
+            free_mib: 7_657,
+        }];
+        let out = enrich_totals_with_raw_rows(gpus.clone(), &[]);
+        assert_eq!(out, gpus);
+    }
+
+    #[test]
     fn unit__probe_hardware__merges_sysinfo_and_devices() {
         let m = Manifest {
             tag: "t".into(),
@@ -641,7 +789,11 @@ mod tests {
             version_raw: "version: 1".into(),
             devices: vec![crate::engine::manifest::DeviceDesc {
                 name: "RTX".into(),
-                description: "NVIDIA CUDA".into(),
+                // Deliberately not an NVIDIA description: this test pins
+                // the sysinfo+devices MERGE, and the raw-total enrichment
+                // (live nvidia-smi) must not make the assertion depend on
+                // the host's actual card size.
+                description: "Acme Compute Unit".into(),
                 total_mib: 8_188,
                 free_mib: 7_000,
             }],
