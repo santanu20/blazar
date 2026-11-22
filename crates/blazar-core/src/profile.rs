@@ -4760,19 +4760,31 @@ const SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB: u64 = 100;
 /// this const - not the hint text - when the plugin rebases.
 const SGLANG_DSPINE_PLUGIN_TAG: &str = "0.5.22";
 
-/// Dynamic-side reserve for a spawn: the spec baseline keeps its
-/// receipt-calibrated posture (its graph and prewarm receipts were
-/// measured against the full 2000 MiB); a dense spawn scales with the
-/// capture breadth - slots decide how many graph sizes and concurrent
-/// activation streams the dynamic side must hold, bounded between the
-/// crash-receipt floor and the original conservative cap.
-fn sglang_dynamic_reserve_mib(spec_engaged: bool, slots: u32) -> u64 {
-    if spec_engaged {
+/// Dynamic-side reserve for a spawn, spec-kind aware. A TRAINED-drafter
+/// lane (EAGLE3 / DSpine / DFlash - draft weights live device-side)
+/// keeps the 2000 MiB receipt-calibrated posture its graph and prewarm
+/// receipts were measured against. A SELF-DRAFTING lane (NGRAM -
+/// drafts from the target's own context, no draft weights) pays only
+/// the dense slots-scaled capture reserve: the verify batches are
+/// already priced into graph headroom via the x8 multiplier, so the
+/// trained-drafter base double-charges it. Live receipt (2026-11-22,
+/// qwen3-8b-awq, 8 GiB RTX 4070 Laptop): the trained-drafter 2000
+/// pushed an ngram spawn's ceiling to 0.711 - BELOW the engine's own
+/// 0.772 min-viable for these weights - routing it to a 4 GiB host
+/// offload the RAM could not stage (504 + host evictions), while the
+/// same engine boots ngram green at dense-class reserve (direct
+/// receipt: fraction 0.80, fp8 KV, HEALTH-OK). Dense spawns scale with
+/// the capture breadth as before - slots decide how many graph sizes
+/// and concurrent activation streams the dynamic side must hold,
+/// bounded between the crash-receipt floor and the original cap.
+fn sglang_dynamic_reserve_mib(spec_engaged: bool, trained_drafter: bool, slots: u32) -> u64 {
+    let dense = SGLANG_DENSE_DYNAMIC_FLOOR_MIB
+        .saturating_add(SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB * u64::from(slots.max(1)))
+        .min(SGLANG_DENSE_DYNAMIC_RESERVE_MIB);
+    if spec_engaged && trained_drafter {
         SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB
     } else {
-        SGLANG_DENSE_DYNAMIC_FLOOR_MIB
-            .saturating_add(SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB * u64::from(slots.max(1)))
-            .min(SGLANG_DENSE_DYNAMIC_RESERVE_MIB)
+        dense
     }
 }
 
@@ -6996,14 +7008,30 @@ fn warn_dspine_lm_head_requirement(
 }
 
 /// Knob lane: an explicit `sglang.spec_algorithm` pin owns the spawn and
-/// overrides any resolved draft pair.
+/// overrides any resolved draft pair. The supervisor-tier `spec` pin
+/// (per-request options.spec > model overlay > governor > config) also
+/// lands here for the self-drafting n-gram family - without the bridge
+/// a `spec = "ngram"` pin silently spawned dense on the sglang lane
+/// (live receipt 2026-11-22: the pin flipped, the child argv carried no
+/// spec flags and no warning taught why). Draft-needing algorithms
+/// (eagle3/dspine/dflash/dspark) stay on the pair lane: their mode is
+/// consumed where the resolved draft dir decides the wire name.
 fn push_sglang_spec_knob_lane<'a>(
     input: &ProfileInput<'a>,
     tun: &'a SglangTuning,
     argv: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> Option<SpecEngagement<'a>> {
-    let algorithm = tun.spec_algorithm.as_deref()?;
+    let algorithm = match tun.spec_algorithm.as_deref() {
+        Some(a) => a,
+        None => {
+            if is_ngram_spec(input.spec_mode) {
+                "ngram"
+            } else {
+                return None;
+            }
+        }
+    };
     // blazar spelling -> upstream wire name. Config validation
     // rejects unknown spellings at load; this arm is the defensive
     // net for programmatically built tunings (tests, future
@@ -7343,7 +7371,17 @@ fn sglang_run_fit_ladder(
                 } else {
                     0
                 };
-                let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib, slots);
+                // Self-drafting spec lanes (NGRAM) price verify through
+                // graph headroom and pay the dense capture reserve, not
+                // the trained-drafter base - see the receipt on
+                // `sglang_dynamic_reserve_mib`.
+                let spec_trained_drafter = spec.engaged && spec.draft_dir.is_some();
+                let ceiling = sglang_static_ceiling_frac(
+                    vram,
+                    spec_dynamic_reserve_mib,
+                    spec_trained_drafter,
+                    slots,
+                );
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
@@ -7364,6 +7402,7 @@ fn sglang_run_fit_ladder(
                     slots,
                     ctx,
                     spec_engaged: spec.engaged,
+                    spec_trained_drafter,
                 };
                 let fit = sglang_gpu_fit(input, tun, argv, warnings, &geom)?;
                 gpu_label = fit.gpu_label;
@@ -7440,6 +7479,16 @@ struct SglangFitGeometry {
     slots: u32,
     ctx: u32,
     spec_engaged: bool,
+    /// True only when the spec lane loads TRAINED draft weights
+    /// device-side (EAGLE3 / DSpine / DFlash). Self-drafting lanes
+    /// (NGRAM) carry no draft weights and price their verify batches
+    /// through graph headroom, so they pay the dense slots-scaled
+    /// reserve, not the trained-drafter base (2026-11-22 receipt:
+    /// ngram on an 8 GiB card ceilinged to 0.711 - below the engine's
+    /// own 0.772 min-viable - and dead-ended on a host offload the RAM
+    /// could not stage; the same engine boots ngram green at
+    /// dense-class reserve, direct fraction 0.80).
+    spec_trained_drafter: bool,
 }
 
 /// What the chosen fit tier decided: the serving-tier label, the KV
@@ -7871,10 +7920,16 @@ fn sglang_tier_c_host_offload(
 /// ladder can never "fit" a static side the ceiling then starves - the
 /// 2026-11-21 live 502: tiers gated on the 92% budget while the ceiling
 /// held the pool to 77% of VRAM.
-fn sglang_static_ceiling_frac(vram: u64, spec_dynamic_reserve_mib: u64, slots: u32) -> f32 {
+fn sglang_static_ceiling_frac(
+    vram: u64,
+    spec_dynamic_reserve_mib: u64,
+    trained_drafter: bool,
+    slots: u32,
+) -> f32 {
     if vram > 0 {
         let reserves = Hardware::bytes(sglang_dynamic_reserve_mib(
             spec_dynamic_reserve_mib > 0,
+            trained_drafter,
             slots,
         ))
         .saturating_add(Hardware::bytes(spec_dynamic_reserve_mib));
@@ -7936,7 +7991,12 @@ fn sglang_push_mem_fraction(
     let static_demand = gpu_static
         .saturating_add(kv_charge)
         .saturating_add(geom.draft_weights);
-    let ceiling = sglang_static_ceiling_frac(vram, spec_dynamic_reserve_mib, geom.slots);
+    let ceiling = sglang_static_ceiling_frac(
+        vram,
+        spec_dynamic_reserve_mib,
+        geom.spec_trained_drafter,
+        geom.slots,
+    );
     // Fraction the static demand actually needs, in the units the engine
     // grants it: --mem-fraction-static is applied against the card TOTAL,
     // so the demand fraction is demand/total. Dividing by the free-basis
@@ -7962,7 +8022,11 @@ fn sglang_push_mem_fraction(
                  0.90 on an 8 GiB card crashed in graph capture; \
                  sglang then SIGKILLs itself and the gateway \
                  surfaces a 502)",
-                sglang_dynamic_reserve_mib(spec_dynamic_reserve_mib > 0, geom.slots),
+                sglang_dynamic_reserve_mib(
+                    spec_dynamic_reserve_mib > 0,
+                    geom.spec_trained_drafter,
+                    geom.slots,
+                ),
                 if spec_dynamic_reserve_mib > 0 {
                     format!(
                         " plus {spec_dynamic_reserve_mib} MiB for the \
@@ -20422,6 +20486,44 @@ mod tests {
     }
 
     #[test]
+    fn unit__sglang_spec__supervisor_ngram_pin_engages_knob_lane() {
+        // The supervisor-tier spec pin (`spec = "ngram"` at the model
+        // overlay, or per-request options.spec) must reach the sglang
+        // lane. Before the bridge the knob lane only read the
+        // [.sglang] spec_algorithm knob, so the resolved pin silently
+        // spawned dense - no spec flags, no warning (live receipt
+        // 2026-11-22: the pin flipped in config.toml, the child argv
+        // carried nothing, /api/ps showed no spec line).
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.spec_mode = "ngram";
+        let p = compile(&inp, &TuningOverrides::default())
+            .expect("spec=ngram must engage the sglang knob lane");
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "NGRAM"),
+            "ngram pin must emit --speculative-algorithm NGRAM: {:?}",
+            p.argv
+        );
+        // The default resolver path (spec=auto with no pair) must NOT
+        // silently change: it still flows through the pair lane.
+        let mut auto_inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        auto_inp.spec_mode = "auto";
+        let p = compile(&auto_inp, &TuningOverrides::default())
+            .expect("spec=auto with no pair must still compile");
+        assert!(
+            !p.argv
+                .iter()
+                .any(|a| a == "--speculative-algorithm"),
+            "auto without a resolved pair must stay dense: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
     fn unit__sglang_fit__live_8gib_awq_pins_prepare_boot() {
         // The 2026-11-21 live receipt, as a fixture: RTX 4070 Laptop
         // (8188 MiB), 13.7 GiB RAM with a busy desktop (MemAvailable
@@ -21057,6 +21159,16 @@ mod tests {
         // fraction, by at least the reserve. (2026-10-16 receipt: the
         // old numerator-charge form raised frac, shrank the dynamic pool,
         // and the spawn OOM'd 446 MiB short at prewarm_sampling.)
+        // Spec-kind aware since 2026-11-22: NGRAM is SELF-DRAFTING (no
+        // draft weights; verify batches price through graph headroom),
+        // so its engaged delta over dense is exactly the 256 MiB
+        // verify-chain additive - not the trained-drafter 2000 base
+        // (ngram receipt: the 2000 base ceilinged an 8 GiB spawn to
+        // 0.711, below the engine's own 0.772 min-viable, and
+        // dead-ended it on a host offload; dense-class reserve boots
+        // the same engine green at 0.80 direct). Slots pinned to 4 so
+        // both ceilings sit under the 0.90 band clamp and the full
+        // additive shows in the delta.
         let cfg = Config::default();
         let hw = gpu_hw(12_000, 32_000, 8);
         let hf = hf_meta();
@@ -21064,15 +21176,16 @@ mod tests {
         // the ladder's own budget never goes: an explicit pin (the live
         // 2026-10-16 receipts were pin postures). Pin both runs at the
         // same over-budget fraction; the dense run must clamp to
-        // (12000-2000)/12000 = 0.833 and the engaged run to
-        // (12000-2256)/12000 = 0.812 - a delta of exactly the reserve
-        // share. (Unpinned derives never reach either ceiling inside
-        // Tiers A/B: the tier budget already sits under the ceiling, so
-        // only a pin exercises this governance.)
+        // (12000-1400)/12000 = 0.883 and the engaged run to
+        // (12000-1656)/12000 = 0.862 - a delta of exactly the
+        // verify-chain share. (Unpinned derives never reach either
+        // ceiling inside Tiers A/B: the tier budget already sits under
+        // the ceiling, so only a pin exercises this governance.)
         let weights_bytes = 6_000 * MIB;
         let frac_of = |tuning: crate::config::SglangTuning| {
             let overlay = ModelOverride {
                 ctx: Some(32_768),
+                slots: Some(4),
                 sglang: Some(tuning),
                 ..DEFAULT_OVERLAY.clone()
             };
