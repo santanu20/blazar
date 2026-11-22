@@ -9438,13 +9438,20 @@ drop them from rpc_servers in config.toml",
     /// construction, so every speculation arm must reproduce the dense
     /// reference's greedy text on these prompts. Wording is frozen on
     /// purpose - identical probes keep receipts comparable across
-    /// passes - and the three shapes (code / exact instruction /
-    /// factual recap) give a degraded arm three independent ways to
-    /// trip.
-    const AUTOTUNE_PARITY_PROMPTS: [&str; 3] = [
+    /// passes - and the six shapes (code / exact instruction / factual
+    /// recap / arithmetic / ordered formatting / token reordering) give
+    /// a degraded arm six independent ways to trip. Receipts record
+    /// `parity_pass`/`parity_total` counts rather than per-prompt
+    /// outputs, so receipts raced under an older probe count remain
+    /// valid evidence under their own n (the freshness gate re-races
+    /// them onto the current set regardless).
+    const AUTOTUNE_PARITY_PROMPTS: [&str; 6] = [
         "Write a Python function fib(n) that returns the n-th Fibonacci number using iteration, nothing else.",
         "List exactly three European capital cities, comma-separated, nothing else.",
         "Answer in one sentence: why does the sun rise in the east?",
+        "Compute 17 * 23. Reply with only the final number, nothing else.",
+        "Name the first four planets from the sun in order, comma-separated with no spaces, nothing else.",
+        "Reply with the words apple banana cherry in reverse order, space-separated, nothing else.",
     ];
 
     /// `autotune = "scheduled"` posture: periodically race spec modes
