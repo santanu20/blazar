@@ -6514,6 +6514,33 @@ def phase_sentinel() -> None:
         any("egress" in r for r in net_rows) and any("portal" in r for r in net_rows),
         (net_rows[0][:140] if net_rows else "no network rows"),
     )
+    # Structured output truncated mid-JSON: json_object with a token
+    # budget too small to close the object must surface a
+    # schema_violation detection on the trace (the post-hoc validator
+    # shipped with the sentinel). A silent 200 carrying broken JSON is
+    # exactly the failure class this pins - verified live 2026-11-22
+    # (truncated '{"city":' -> finish=length -> detection fired).
+    st, v, hdr = chat(
+        'Return the JSON {"city": "Oslo", "weather": "rain"} and nothing else.',
+        extra={
+            "response_format": {"type": "json_object"},
+            "max_tokens": 8,
+            "temperature": 0,
+        },
+    )
+    rec = wait_record(trace=hdr.get("x-blazar-trace-id", ""))
+    codes = [d0.get("code") for d0 in (rec or {}).get("detections", [])]
+    finish = ""
+    try:
+        finish = v["choices"][0].get("finish_reason") or ""
+    except Exception:
+        pass
+    check(
+        "sentinel",
+        "json_object truncation -> schema_violation detection",
+        "schema_violation" in codes,
+        f"status={st} finish={finish} codes={codes}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -18223,7 +18250,14 @@ def phase_benchqc() -> None:
         return
     d = DAEMON
     try:
-        d.start({"port": PORT})
+        # Supervisor debug for this phase only: the post-spawn
+        # effective-config reconciliation (planned argv vs the child's
+        # live capability probe) logs at debug on this target - the
+        # line is the observable surface the check below pins.
+        d.start(
+            {"port": PORT},
+            env_extra={"RUST_LOG": "info,blazar_runtime::supervisor=debug"},
+        )
     except RuntimeError as exc:
         for name in sublanes:
             boundary(ph, name, f"mem floor blocked the daemon: {str(exc)[-120:]}")
@@ -18236,6 +18270,31 @@ def phase_benchqc() -> None:
             pass
         prow = wait_loaded(model=MODEL, budget=300)
         engine_tag = str((prow or {}).get("blazar_engine") or "unknown")
+
+        # Lane-generalized effective-config reconciliation: after the
+        # dedicated spawn the supervisor probes the child's live
+        # capability surface (llamacpp /props; sglang /server_info;
+        # vllm /v1/models) and logs the comparison against the planned
+        # argv. Pin the line so the reconciliation provably RAN for
+        # this spawn - the parsers' correctness is unit-tested in Rust,
+        # this proves the wiring fired end-to-end.
+        eff_line = next(
+            (
+                ln.strip()[:120]
+                for ln in open(DAEMON.log_path, errors="replace")
+                if "effective config" in ln
+            ),
+            "",
+        )
+        check(
+            ph,
+            "effective-config reconciliation ran (post-spawn probe+compare)",
+            daemon_log_contains("effective config"),
+            eff_line
+            or "supervisor debug line 'effective config ...' absent from "
+            "the daemon log - post-spawn reconciliation never fired "
+            "or never logged",
+        )
 
         # -- tool-call QC: the project battery, driven as a subprocess
         # against THIS daemon (BLAZAR_BASE pinned - never the script's
@@ -18277,7 +18336,12 @@ def phase_benchqc() -> None:
                 fails = [
                     str(r.get("test"))
                     for r in (row.get("results") or [])
-                    if not r.get("ok")
+                    if not r.get("ok") and not r.get("xfail")
+                ]
+                xfails = [
+                    f"{r.get('test')} ({str(r.get('xfail'))[:80]})"
+                    for r in (row.get("results") or [])
+                    if r.get("xfail")
                 ]
                 results_path = cand
             except (ValueError, OSError):
@@ -18287,7 +18351,8 @@ def phase_benchqc() -> None:
             "tool-call QC battery green (selection/args/schema/stream)",
             rc == 0,
             f"rc={rc} passed={passed}/{total} "
-            f"failing={fails[:4] or 'none'} results={results_path} "
+            f"failing={fails[:4] or 'none'} "
+            f"xfail={xfails[:3] or 'none'} results={results_path} "
             f"tail={tail[-200:]!r}",
         )
 
