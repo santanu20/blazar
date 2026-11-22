@@ -11058,6 +11058,17 @@ drop them from rpc_servers in config.toml",
         });
         argv_cap
             .or_else(|| {
+                // The manual overlay pin shaped the spawn itself
+                // (profile resolves `overlay.slots` into the engine's
+                // parallel flag); admitting past it parks requests in
+                // an engine-side queue the gateway cannot observe.
+                // `ps` labels this authority "pinned" - the number and
+                // the label must agree (live-caught 2026-11-21:
+                // slots_configured 4 while the child ran
+                // --max-running-requests 1).
+                self.cfg().overlay_for(model).slots.map(i64::from)
+            })
+            .or_else(|| {
                 let s = self.cfg().slots;
                 if s > 0 { Some(i64::from(s)) } else { None }
             })
@@ -15899,7 +15910,26 @@ mod routing_tests {
         assert_eq!(sup.slot_cap("m"), 6);
         // Replica keys of the same model resolve identically.
         assert_eq!(sup.slot_cap("m#1"), 6);
+        sup.adopted_slots.remove("m");
         kill_all(&[ph]);
+        // A manual overlay pin caps admission even before any child
+        // exists (slot-less engines emit no parallel flag): the pin
+        // shaped the spawn, so admitting past it would queue requests
+        // engine-side where the gateway cannot see them.
+        let pinned_sup = {
+            let mut s = routing_sup(1);
+            let mut config = blazar_core::config::Config::default();
+            config.model_overrides.insert(
+                "pinned".to_string(),
+                ModelOverride {
+                    slots: Some(2),
+                    ..Default::default()
+                },
+            );
+            s.config = ConfigHandle::new(config);
+            s
+        };
+        assert_eq!(pinned_sup.slot_cap("pinned"), 2);
     }
 
     /// Decay rule: an adopted shape (np6 over a natural np4) survives
