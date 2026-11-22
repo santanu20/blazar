@@ -2461,6 +2461,24 @@ pub struct PsRow {
     pub host_charge_bytes: u64,
 }
 
+/// `/api/ps` join payload for `blazar_effective_config`: what the last
+/// post-spawn effective-config verification actually saw for a model.
+/// The gateway joins it onto ps rows; absence means this daemon never
+/// verified a spawn of that model - unknown, never guessed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EffectiveCfgSnapshot {
+    /// Introspection surface the verification read ("/props",
+    /// "/server_info", "/v1/models", or "engine introspection" for
+    /// lanes without a certified surface).
+    pub surface: String,
+    /// Warn-only findings from planned-vs-observed reconciliation;
+    /// empty = verified clean.
+    pub findings: Vec<String>,
+    /// Wall time of the verification (unix secs) so observers can
+    /// judge staleness against respawn cycles.
+    pub verified_at: i64,
+}
+
 /// Throttle/dedup state for the measured-pressure feedback loop.
 #[derive(Default)]
 struct MeasuredTick {
@@ -2529,6 +2547,13 @@ pub struct Supervisor {
     /// recover-side depending on the override above).
     spec_gov: DashMap<String, SpecGovState>,
     ubatch_gov: DashMap<String, UbatchGovState>,
+    /// Post-spawn effective-config verification snapshot per model
+    /// (surface + findings + time): written at the effective::probe
+    /// call site on every successful spawn, read by the /api/ps
+    /// handler join. Daemon-lifetime memory like `spec_override` -
+    /// one entry per distinct model ever served, refreshed on
+    /// respawn.
+    effective_cfg: DashMap<String, EffectiveCfgSnapshot>,
     /// J2 self-healing: distinct models whose spawn ULTIMATELY failed
     /// since the last successful spawn. Cleared on every success; drives
     /// the crash-loop engine rollback (probe-gated, see
@@ -2954,6 +2979,7 @@ impl Supervisor {
             ubatch_override: DashMap::new(),
             spec_gov: DashMap::new(),
             ubatch_gov: DashMap::new(),
+            effective_cfg: DashMap::new(),
             engine_failures: std::sync::Mutex::new(std::collections::HashSet::new()),
             capability_pins: std::sync::Mutex::new(std::collections::HashMap::new()),
             auto_installing_arches: Arc::new(DashMap::new()),
@@ -7586,17 +7612,20 @@ impl Supervisor {
                         &argv,
                     )
                     .await;
+                    // Name the lane's actual introspection surface -
+                    // the message is part of the observable contract
+                    // validate.py pins ("effective config ..."). The
+                    // same surface string feeds the /api/ps snapshot
+                    // below, so the log line and the ps field can
+                    // never disagree.
+                    use blazar_core::engine_kind::EngineKind;
+                    let surface = match engine.kind() {
+                        EngineKind::LlamaCpp => "/props",
+                        EngineKind::Sglang => "/server_info",
+                        EngineKind::Vllm => "/v1/models",
+                        _ => "engine introspection",
+                    };
                     if effective_warnings.is_empty() {
-                        // Name the lane's actual introspection surface -
-                        // the message is part of the observable contract
-                        // validate.py pins ("effective config ...").
-                        use blazar_core::engine_kind::EngineKind;
-                        let surface = match engine.kind() {
-                            EngineKind::LlamaCpp => "/props",
-                            EngineKind::Sglang => "/server_info",
-                            EngineKind::Vllm => "/v1/models",
-                            _ => "engine introspection",
-                        };
                         tracing::debug!(
                             model = name,
                             "effective config verified against {surface}"
@@ -7606,6 +7635,24 @@ impl Supervisor {
                             tracing::warn!(target: "blazar::effective", model = name, "{w}");
                         }
                     }
+                    // Publish the verification result for /api/ps:
+                    // drift visibility without log scraping. Replaced
+                    // wholesale on every respawn of the model.
+                    let verified_at = i64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    )
+                    .unwrap_or(i64::MAX);
+                    self.effective_cfg.insert(
+                        name.to_string(),
+                        EffectiveCfgSnapshot {
+                            surface: surface.to_string(),
+                            findings: effective_warnings.clone(),
+                            verified_at,
+                        },
+                    );
 
                     // Bank restore, choke point #2 - SYNCHRONOUS and
                     // BEFORE any generation touches the child (the
@@ -11361,6 +11408,14 @@ drop them from rpc_servers in config.toml",
         {
             i.in_flight.fetch_add(p, Ordering::SeqCst);
         }
+    }
+
+    /// Last effective-config verification snapshot for a model, if
+    /// this daemon ever verified one of its spawns. `/api/ps` joins
+    /// this as `blazar_effective_config`.
+    #[must_use]
+    pub fn effective_config_for(&self, model: &str) -> Option<EffectiveCfgSnapshot> {
+        self.effective_cfg.get(model).map(|s| s.clone())
     }
 
     /// ps rows for CLI/API.

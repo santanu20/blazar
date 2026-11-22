@@ -803,6 +803,18 @@ pub async fn ps(State(state): State<Arc<AppState>>) -> Response {
             if let Some(cap) = p.capacity {
                 row["blazar_capacity"] = json!(cap);
             }
+            // Last post-spawn effective-config verification for this
+            // model (planned-vs-observed reconciliation snapshot).
+            // ABSENT when this daemon never verified a spawn of it -
+            // absence means unknown, never guessed (same contract as
+            // blazar_sleeping).
+            if let Some(snap) = state.sup.effective_config_for(&p.name) {
+                row["blazar_effective_config"] = json!({
+                    "surface": snap.surface,
+                    "findings": snap.findings,
+                    "verified_at": snap.verified_at,
+                });
+            }
             row
         })
         .collect();
