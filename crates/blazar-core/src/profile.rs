@@ -7586,6 +7586,36 @@ fn sglang_gpu_fit(
         static_demand(kv16_v) <= geom.ceiling_pool || static_demand(kv8_v) <= geom.ceiling_pool;
     let offload_total_gb =
         sglang_push_pinned_offload(input, tun, argv, warnings, full_residency_fits);
+    // A slots = 1 shape on a lane the card holds whole caps AGGREGATE
+    // throughput: the KV room beyond one stream's pool could serve
+    // parallel streams at the same quality class (2026-11-21 receipt:
+    // 4-way 182.7 vs 47 tok/s aggregate on this hardware). Teach, never
+    // override - the shape is user intent (deeper per-slot context is a
+    // legitimate single-stream preference, and a deterministic pin
+    // explains its own slots = 1), but the trade must not be silent.
+    let deterministic = input
+        .overlay
+        .deterministic
+        .unwrap_or(input.config.deterministic);
+    if full_residency_fits && geom.slots == 1 && !deterministic {
+        let kv_room = geom
+            .ceiling_pool
+            .saturating_sub(weights)
+            .saturating_sub(geom.draft_weights);
+        let per_slot_kv = kv_floor(kv16_v.max(kv8_v));
+        let parallel_streams = (kv_room / per_slot_kv.max(1)).min(u32::MAX as u64) as u32;
+        if parallel_streams >= 2 {
+            warnings.push(format!(
+                "slots = 1 caps aggregate throughput: the full-residency pool could host \
+                 ~{parallel_streams} parallel streams at ctx {} (live receipt class: 182.7 \
+                 vs 47 tok/s 4-way on this hardware); raise or unset the slots pin when \
+                 concurrent load matters - per-slot context deepens as slots shrink, so \
+                 the pin stays right for single-stream depth ({} MiB KV room)",
+                geom.ctx,
+                kv_room / (1024 * 1024),
+            ));
+        }
+    }
     let (slots, spec_engaged) = (geom.slots, geom.spec_engaged);
     if weights.saturating_add(kv16_v) <= budget {
         // Tier A: full GPU, f16 KV.
@@ -23412,6 +23442,60 @@ mod tests {
                 .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.850"),
             "the legal 0.85 pin must pass through: {:?}",
             p.argv
+        );
+    }
+
+    /// The single-stream shape pin must teach its aggregate-throughput
+    /// cost when the card holds the lane whole - silently capping a
+    /// full-residency lane to one stream hides the 4x-class aggregate
+    /// the KV room could carry (2026-11-21 receipt: 182.7 vs 47 tok/s).
+    #[test]
+    fn unit__sglang__single_slot_shape_teaches_parallel_room() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            slots: Some(1),
+            ctx: Some(2_048),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        // Small model: full residency trivially fits, leaving KV room
+        // for several parallel streams at the pinned ctx.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        inp.overlay = &overlay;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--max-running-requests" && w[1] == "1"),
+            "the pin shapes the child: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("slots = 1 caps aggregate throughput")),
+            "the throughput cost of the single-stream shape must be taught: {:?}",
+            p.warnings
+        );
+        // The deterministic pin keeps its own explanation - no duplicate
+        // teaching from the parallel-room check.
+        let det_overlay = ModelOverride {
+            slots: Some(1),
+            ctx: Some(2_048),
+            deterministic: Some(true),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut det_inp = sglang_input(&hf, &hw, &cfg, 2_000 * MIB);
+        det_inp.overlay = &det_overlay;
+        let det = compile(&det_inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !det
+                .warnings
+                .iter()
+                .any(|w| w.contains("caps aggregate throughput")),
+            "deterministic runs explain slots = 1 themselves: {:?}",
+            det.warnings
         );
     }
 }
