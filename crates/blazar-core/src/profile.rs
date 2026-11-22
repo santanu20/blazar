@@ -4694,14 +4694,18 @@ const SGLANG_SPEC_DYNAMIC_BASE_RESERVE_MIB: u64 = 2_000;
 /// at least 1000 MiB clear of that class.
 const SGLANG_DENSE_DYNAMIC_FLOOR_MIB: u64 = 1_000;
 /// Dense reserve slope per serving slot: CUDA-graph capture breadth and
-/// per-stream activations grow with the slot count. First-order
-/// interpolation between live receipts (2026-11-21, RTX 4070 Laptop
-/// 8 GiB, qwen3-8b-awq): fraction 0.82 with graphs bs [1,2,4] and 4
-/// slots booted with 1.21 GiB post-capture spare -> dynamic need <=
-/// 1474 MiB at 4 slots (~900 base + ~145/slot); the crash receipt
-/// anchors the low end. Capped by [`SGLANG_DENSE_DYNAMIC_RESERVE_MIB`]
-/// so uncalibrated capture breadths keep the original posture.
-const SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB: u64 = 150;
+/// per-stream activations grow with the slot count. Receipt chain
+/// (2026-11-21/22, RTX 4070 Laptop 8 GiB, qwen3-8b-awq, raw-total
+/// census basis): fraction 0.8498 at 1 slot booted against a
+/// free-relative dynamic budget of 834 MiB with the engine's measured
+/// bs1 dynamic need at 706 (slack ~128, so the floor + first 150 keeps
+/// ~444 slack); fraction 0.82 with graphs bs [1,2,4] at 4 slots booted
+/// against a 1080 MiB free-relative budget - dynamic(bs4) <= 1080, and
+/// holding the same ~440 MiB slack as the 1-slot receipt lands the
+/// 4-slot reserve at ~1400. That is 100 MiB per added slot past the
+/// floor. Capped by [`SGLANG_DENSE_DYNAMIC_RESERVE_MIB`] so
+/// uncalibrated capture breadths keep the original posture.
+const SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB: u64 = 100;
 /// `SGLang` tag the `DSpine` plugin lane is pinned to (the plugin subclasses
 /// engine internals, so its pyproject pin is the source of truth). Update
 /// this const - not the hint text - when the plugin rebases.
@@ -19311,17 +19315,32 @@ mod tests {
     }
 
     #[test]
+    fn zzprobe__floor_matrix() {
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let overlay = sglang_ctx_overlay();
+        for model in [8_415u64, 8_425, 8_435, 8_445] {
+            let hw = gpu_hw(10_500, 32_000, 8);
+            let mut inp = sglang_input(&hf, &hw, &cfg, model * MIB);
+            inp.overlay = &overlay;
+            let p = compile(&inp, &TuningOverrides::default()).unwrap();
+            let bs = p.argv.windows(2).find(|w| w[0] == "--cuda-graph-max-bs").map(|w| w[1].clone());
+            let mf = p.argv.windows(2).find(|w| w[0] == "--mem-fraction-static").map(|w| w[1].clone());
+            eprintln!("PROBE model={model} bs={bs:?} mf={mf:?}");
+        }
+    }
+    #[test]
     fn unit__sglang__tier_b_graph_floor_when_headroom_starved() {
         let cfg = Config::default();
         let hw = gpu_hw(10_500, 32_000, 8);
         let hf = hf_meta();
         let overlay = sglang_ctx_overlay();
-        // 8372 MiB model + 512 MiB overhead = 8884 MiB weights on a
-        // 10.5 GiB card (pool = 10500 - 1300 reserve @ overlay slots 2
-        // = 9200): fp8 KV still fits but only a few hundred MiB of
-        // headroom remain - the raw capture ceiling collapses below
-        // the floor and clamps up to 4.
-        let mut inp = sglang_input(&hf, &hw, &cfg, 8_372 * MIB);
+        // 8415 MiB model + 512 MiB overhead = 8927 MiB weights on a
+        // 10.5 GiB card (pool = 10500 - 1200 reserve @ overlay slots 2,
+        // 100/slot slope recalibrated 2026-11-22 = 9300): fp8 KV still
+        // fits but only ~150 MiB of headroom remain - the raw capture
+        // ceiling collapses below the floor and clamps up to 4.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_415 * MIB);
         inp.overlay = &overlay;
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
         assert!(
@@ -20050,8 +20069,12 @@ mod tests {
         // 4 slots with 1.21 GiB to spare, proving the activation reserve
         // the ceiling must hold back SCALES WITH SLOT COUNT, not the old
         // flat 1750 MiB. The dense ceiling is now slots-scaled
-        // (1000 + 150/slot MiB, clamped to 1750): at 1 slot on an 8188 MiB
-        // card that is (8188-1150)/8188 = 0.860 - a legal pin up to 0.85
+        // (1000 + 100/slot MiB, clamped to 1750; recalibrated 2026-11-22
+        // on the raw-total census basis - the 1-slot boot at 0.8498
+        // measured a 706 MiB engine dynamic need against an 834 MiB
+        // free-relative budget, so floor + slope keeps the ~440 MiB slack
+        // at every slot count): at 1 slot on an 8188 MiB card that is
+        // (8188-1100)/8188 = 0.866 - a legal pin up to 0.85
         // (the live user pin) passes through, a 0.90 pin (the capture-
         // crash receipt) clamps to it. The engine's min-viable 0.772
         // remains the hard floor.
@@ -20076,8 +20099,8 @@ mod tests {
             .map(|w| w[1].parse::<f64>().unwrap())
             .expect("dense pin must emit --mem-fraction-static");
         assert!(
-            (frac - 0.860).abs() < 0.001,
-            "dense ceiling must clamp to the 1-slot 0.860, got {frac}"
+            (frac - 0.866).abs() < 0.001,
+            "dense ceiling must clamp to the 1-slot 0.866, got {frac}"
         );
         assert!(
             frac >= 0.772,
@@ -22240,8 +22263,8 @@ mod tests {
         let cfg = Config::default();
         let hf = hf_meta();
 
-        // 8 GiB card: dense ceiling = (8000 - 1750) / 8000 = 0.781
-        // (dense reserve is direct-engine calibrated since 2026-11-09;
+        // 8 GiB card, 1 slot: dense ceiling = (8000 - 1100) / 8000 =
+        // 0.863 (floor 1000 + 100/slot, receipt-calibrated 2026-11-22;
         // the spec posture keeps the original 2000 MiB).
         let hw = gpu_hw(8_000, 15_900, 8);
         let overlay = ModelOverride {
@@ -22262,7 +22285,7 @@ mod tests {
             .map(|w| w[1].parse::<f64>().unwrap())
             .expect("pin must emit --mem-fraction-static");
         assert!(
-            (frac - 0.856).abs() < 0.001,
+            (frac - 0.863).abs() < 0.001,
             "0.90 pin must clamp to the slots-scaled dense ceiling, got {frac}"
         );
         assert!(
