@@ -7516,6 +7516,17 @@ def main() -> int:
         help="seed for the quality suites' task generation (receipt-stamped)",
     )
     ap.add_argument(
+        "--quality-only",
+        action="store_true",
+        help=(
+            "run only the checker-verified quality suites lane (blazar vs "
+            "direct parity legs on the selected engine lane): keeps just "
+            "those two providers and sets every other text-lane skip "
+            "flag - the shorthand for lane-quality matrix sessions; "
+            "mutually exclusive with --skip-quality"
+        ),
+    )
+    ap.add_argument(
         "--quality-config-axes",
         action="store_true",
         help="also run quality A/B per gateway config axis (same axes as the "
@@ -7658,11 +7669,33 @@ def main() -> int:
         args.skip_ctxcurve = True
         args.skip_variants = True
 
+    # --quality-only: the lane-quality matrix counterpart of --media-only.
+    # Keeps the direct+blazar parity pair (the quality lane's own legs)
+    # and skips every measurement lane that would repeat per engine tag.
+    # Applied post-parse so --skip-quality stays orthogonal and the
+    # empty-campaign combination is caught loudly.
+    if args.quality_only:
+        if args.skip_quality:
+            log("--quality-only and --skip-quality together: nothing would run")
+            return 2
+        args.providers = ["direct", "blazar"]
+        args.skip_ppl = True
+        args.skip_greedy = True
+        args.skip_tools = True
+        args.skip_features = True
+        args.skip_conc = True
+        args.skip_idle = True
+        args.skip_ctxcurve = True
+        args.skip_variants = True
+        args.skip_media = True
+        args.skip_reshape = True
+
     # ollama and the blazar gateway are the always-on reference lanes:
     # every text campaign carries them so plots and tables always show
     # blazar vs ollama vs engine lanes, no matter which --providers the
-    # operator picked (media-only campaigns are excluded above).
-    if not args.media_only and not args.render_only:
+    # operator picked (media-only and quality-only campaigns pick their
+    # own lanes and are excluded).
+    if not args.media_only and not args.quality_only and not args.render_only:
         always = {"blazar", "ollama"} - set(args.providers)
         if always:
             args.providers = list(args.providers) + sorted(always)
@@ -7875,6 +7908,26 @@ def main() -> int:
             if e.kind in ("llamacpp", "mistralrs", "sglang", "vllm")
             and (e.kind in ("sglang", "vllm")) == model_is_dir
         ]
+    if engines and not text_engines:
+        # Loud, not silent: a format-aware lane collapse (an MLX-layout dir
+        # row swept with --engines vllm, say) otherwise ends the campaign as
+        # a lone inventory row plus a not-measured stamp with no reason on
+        # the log - indistinguishable from a harness bug at a distance.
+        if model_is_litertlm:
+            why = "litertlm bundles select the openaihost lane alone"
+        elif model_is_mlx:
+            why = "MLX-layout dirs select the mlx lane alone (one-kind domain rule)"
+        elif model_is_dir:
+            why = (
+                "safetensors-dir sweeps keep only sglang/vllm "
+                "(GGUF-native binaries cannot load a dir)"
+            )
+        else:
+            why = (
+                "GGUF-file sweeps keep only GGUF-native kinds "
+                "(sglang/vllm need HF checkpoints)"
+            )
+        log("no text lane for the selected engines - all engine cells skip: " + why)
     if not engines:
         log("no benchable engines discovered")
         return 2
@@ -8029,7 +8082,7 @@ def main() -> int:
             )
 
     # ---- direct provider sweep (ctx x np + variant axes)
-    if "direct" in args.providers:
+    if "direct" in args.providers and not args.quality_only:
         for eng in text_engines:
             if eng.server is None:
                 # gateway-routed lane (sglang / openaihost venv): the
@@ -8088,7 +8141,7 @@ def main() -> int:
 
     # ---- blazar provider (default-config cell per engine + mistral.rs
     # paged-attn-off variant + soak)
-    if "blazar" in args.providers:
+    if "blazar" in args.providers and not args.quality_only:
         for eng in text_engines:
             # Each variant below owns its done-check: an early `continue`
             # here used to orphan the paged-attn-off and single-stream

@@ -31,10 +31,15 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("BLAZAR_BASE", "http://127.0.0.1:11435")
-OUT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "bench-artifacts",
-    _dt.datetime.now().strftime("%Y%m%d") + "-toolcall",
+# Default output is date-stamped; BLAZAR_TOOLCALL_OUT redirects it so a
+# lane A/B never overwrites another session's report in the same-day dir.
+OUT_DIR = os.environ.get(
+    "BLAZAR_TOOLCALL_OUT",
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bench-artifacts",
+        _dt.datetime.now().strftime("%Y%m%d") + "-toolcall",
+    ),
 )
 
 WEATHER = {

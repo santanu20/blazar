@@ -3,18 +3,21 @@
 | Campaign | Date | Lanes | Cells | blazar |
 |---|---|---|---:|---|
 | 2026-10-07-overhead | 2026 | blazar,cold,conc,direct,greedy,greedy_gw,greedy_ollama,ollama | 34 | mixed |
-| 2026-11-20-probes | 2026 | blazar,cold,ollama,probe,reshape,tools | 18 | blazar 0.33.0 |
-| 2026-11-20-kokoro-vllm-cert | 2026 | kokoro,vllm,live-spawn,capability-cert | 0 | tree (0.34.x) |
-| 2026-11-20-stage-timing | 2026 | stage-timing,observability,live-spawn | 0 | tree (0.34.x) |
 | 2026-11-20-effective-verify | 2026 | effective-verify,kv-unified,live-spawn,runtime-truth | 0 | tree (0.34.x) |
+| 2026-11-20-kokoro-vllm-cert | 2026 | kokoro,vllm,live-spawn,capability-cert | 0 | tree (0.34.x) |
+| 2026-11-20-probes | 2026 | blazar,cold,ollama,probe,reshape,tools | 18 | blazar 0.33.0 |
+| 2026-11-20-stage-timing | 2026 | stage-timing,observability,live-spawn | 0 | tree (0.34.x) |
+| 2026-11-20-v0.33-wave-final | 2026 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,greedy_ollama,idle,media,ollama,ppl,quality,reshape,tools | 88 | 0.33.0 |
 | 2026-11-20-workload-descriptors | 2026 | workload-descriptors,observability,live-spawn | 0 | tree (0.34.x) |
 | 2026-11-21-gateway-saturation | 2026 | saturation,stage-timing,matched-direct,llamacpp | 5 | tree (0.34.x) |
-| 2026-11-21-vllm-tools-fix | 2026 | vllm,tools,tool-call-parser,live-spawn | 0 | tree (0.34.x) |
-| 2026-11-21-vllm-sglang-lanes | 2026 | vllm,sglang,bench-lane-completion,gateway-venv | 48 | tree (0.34.x) |
-| 2026-11-21-media-lanes | 2026 | media,kokoro,tts,piper,whisper,sdcpp | 10 | tree (0.34.x) |
 | 2026-11-21-kv-codec-live-certs | 2026 | kv-interop,vllm-to-llamacpp,live-spawn,root-cause-fix | 0 | tree (0.34.x) |
 | 2026-11-21-kv-interop-cert | 2026 | kv-interop,certification-matrix | 0 | tree (0.34.x) |
-| 2026-11-20-v0.33-wave-final | 2026 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,greedy_ollama,idle,media,ollama,ppl,quality,reshape,tools | 88 | 0.33.0 |
+| 2026-11-21-media-lanes | 2026 | media,kokoro,tts,piper,whisper,sdcpp | 10 | tree (0.34.x) |
+| 2026-11-21-vllm-sglang-lanes | 2026 | vllm,sglang,bench-lane-completion,gateway-venv | 48 | tree (0.34.x) |
+| 2026-11-21-vllm-tools-fix | 2026 | vllm,tools,tool-call-parser,live-spawn | 0 | tree (0.34.x) |
+| 2026-11-22-b7-llamacpp | 2026 | quality | 2 | 0.34.3 |
+| 2026-11-22-b7-mlx | 2026 | quality | 1 | 0.34.3 |
+| 2026-11-22-b7-vllm | 2026 | quality | 1 | 0.34.3 |
 | 20260923-media | 20260923 | media | 4 | blazar 0.10.0 |
 | 20260923-media-v2 | 20260923 | media | 5 | blazar 0.10.0 |
 | 20260924-all-engines | 20260924 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 105 | blazar 0.11.0 |

@@ -46,6 +46,20 @@ least MIN_CI_ROUNDS paired rounds. Fewer rounds yield
 "insufficient-evidence", never PASS - a 2-round run cannot certify a
 2% overhead bound, and pretending otherwise is how acceptance gates
 get ignored.
+
+Shape integrity: the daemon's adaptive_slots (default on) reshapes
+its engine child under concurrent bursts (e.g. np 2 -> 8 -> 16,
+decayed after quiet) while the matched direct child never moves. The
+harness snapshots the gateway child's np after every rung
+(receipt.gateway_np_by_rung) and matched-arm verdicts auto-invalidate
+per rung when the shape moved - an adaptive win is orchestration
+evidence, never matched-argv evidence. For a fully shape-frozen
+matched ladder, pin the model in the daemon config
+([model_overrides."<model>"] slots = N) and restart the daemon before
+the campaign; run --orchestration campaigns unpinned so the adaptive
+machinery is free to show what it adds. A receipt predating the
+timeline can carry a shape_contamination note (verdicts + evidence)
+with the same effect.
 """
 
 from __future__ import annotations
@@ -180,6 +194,25 @@ def unique_prompt(rung: int, round_idx: int, stream: int, tg: int) -> str:
     )
 
 
+def sse_chunk_tokens(chunk: dict) -> tuple[int, int]:
+    """Token signal from one SSE data chunk.
+
+    Returns (content_deltas, usage_completion_tokens). llama.cpp streams
+    one token per non-empty content delta, so the delta count is a sound
+    fallback; when the server honors stream_options.include_usage the
+    final chunk carries authoritative usage.completion_tokens which the
+    caller prefers over the running delta count.
+    """
+    content = 0
+    if chunk.get("choices"):
+        delta = chunk["choices"][0].get("delta", {}) or {}
+        if delta.get("content"):
+            content = 1
+    usage = chunk.get("usage") or {}
+    completion = usage.get("completion_tokens") or 0
+    return content, int(completion)
+
+
 def drive_stream(
     base: str,
     model: str,
@@ -188,21 +221,33 @@ def drive_stream(
     api_key: str | None,
     errors: list[str],
     ttft_ms: list[float],
+    tokens: list[int],
     lock: threading.Lock,
     timeout: float,
+    eos_bias: dict[str, int] | None = None,
 ) -> None:
-    """One streaming chat completion; records TTFT and raises nothing -
-    failures land in `errors` so a rung survives individual failures
-    and the reliability verdict sees every one."""
-    body = json.dumps(
-        {
-            "model": model,
-            "stream": True,
-            "max_tokens": tg,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-    ).encode("utf-8")
+    """One streaming chat completion; records TTFT and actual generated
+    tokens, raises nothing - failures land in `errors` so a rung survives
+    individual failures and the reliability verdict sees every one.
+
+    Token accounting counts what the model actually emitted (early-stopped
+    greedy completions are common for small instruct models); dividing the
+    requested max_tokens by the wall instead would fabricate throughput
+    whenever the model stops early. `eos_bias` (from --force-length)
+    suppresses EOS via logit_bias so every stream decodes exactly `tg`
+    tokens - fixed-length walls isolate serving capacity.
+    """
+    payload_body: dict = {
+        "model": model,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": tg,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if eos_bias:
+        payload_body["logit_bias"] = eos_bias
+    body = json.dumps(payload_body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -211,6 +256,8 @@ def drive_stream(
     )
     started = time.monotonic()
     first = None
+    content_deltas = 0
+    usage_completion = 0
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             for raw in resp:
@@ -224,16 +271,18 @@ def drive_stream(
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
-                if chunk.get("choices") and first is None:
-                    delta = chunk["choices"][0].get("delta", {})
-                    if delta.get("content"):
-                        first = time.monotonic()
+                c, u = sse_chunk_tokens(chunk)
+                content_deltas += c
+                usage_completion = max(usage_completion, u)
+                if c and first is None:
+                    first = time.monotonic()
         if first is None:
             with lock:
                 errors.append("stream produced no content tokens")
             return
         with lock:
             ttft_ms.append((first - started) * 1000.0)
+            tokens.append(usage_completion if usage_completion > 0 else content_deltas)
     except Exception as e:
         with lock:
             errors.append(f"{type(e).__name__}: {e}")
@@ -247,10 +296,12 @@ def drive_rung(
     round_idx: int,
     api_key: str | None,
     timeout: float = 300.0,
+    eos_bias: dict[str, int] | None = None,
 ) -> dict:
     """C concurrent unique-prompt streams; one round of one rung."""
     errors: list[str] = []
     ttft_ms: list[float] = []
+    tokens: list[int] = []
     lock = threading.Lock()
     threads = [
         threading.Thread(
@@ -263,8 +314,10 @@ def drive_rung(
                 api_key,
                 errors,
                 ttft_ms,
+                tokens,
                 lock,
                 timeout,
+                eos_bias,
             ),
         )
         for s in range(c)
@@ -275,14 +328,18 @@ def drive_rung(
     for t in threads:
         t.join()
     wall = time.monotonic() - started
+    gen_tokens = sum(tokens)
     return {
         "wall_s": wall,
         "ok": c - len([e for e in errors if "no content" not in e]),
         "errs": len(errors),
         "err_samples": errors[:5],
-        # System throughput: generated tokens / wall. All streams finish
-        # inside the wall (join), so this is the honest aggregate rate.
-        "sys_tps": round((c * tg) / wall, 2) if wall > 0 else 0.0,
+        # Actual emitted tokens / wall. Early-stopped greedy completions
+        # are common for small instruct models; the requested max_tokens
+        # would fabricate throughput whenever the model stops short.
+        "gen_tokens": gen_tokens,
+        "early_stop_streams": sum(1 for t in tokens if t < tg),
+        "sys_tps": round(gen_tokens / wall, 2) if wall > 0 else 0.0,
         "ttft_ms": [round(x, 3) for x in ttft_ms],
     }
 
@@ -345,6 +402,70 @@ def child_argv_from_proc(daemon_pid: int) -> list[str] | None:
     return None
 
 
+def warm_gateway_model(gateway_base: str, model: str, tg: int) -> None:
+    """Send a tiny generation so the gateway materializes the engine child.
+
+    An evicted or idle-reaped lane has no child process; argv capture
+    needs one live. Failures surface later at capture time - warming is
+    strictly best-effort.
+    """
+    url = f"{gateway_base}/v1/chat/completions"
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "warm"}],
+        "max_tokens": max(1, min(8, tg)),
+        "temperature": 0,
+        "stream": False,
+    }
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError) as exc:
+        print(
+            f"warm request failed ({exc}); continuing to argv capture", file=sys.stderr
+        )
+
+
+def capture_child_argv(daemon_pid: int, timeout_secs: float = 90.0) -> list[str] | None:
+    """Poll /proc until the gateway's llama-server child appears.
+
+    Model loads can take tens of seconds on cold page cache; poll with a
+    bounded deadline instead of a single best-effort read."""
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        argv = child_argv_from_proc(daemon_pid)
+        if argv:
+            return argv
+        time.sleep(1.0)
+    return None
+
+
+def argv_np(argv: list[str] | None) -> int | None:
+    """Slot count (-np / --parallel) stated in a llama-server argv.
+
+    None when absent or malformed - callers treat unknown as
+    not-comparable rather than guessing a shape."""
+    if not argv:
+        return None
+    for i, a in enumerate(argv):
+        if a in ("-np", "--parallel") and i + 1 < len(argv):
+            try:
+                return int(argv[i + 1])
+            except ValueError:
+                return None
+        if a.startswith("--parallel="):
+            try:
+                return int(a.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
 # ------------------------------------------------------------ statistics
 
 
@@ -394,10 +515,71 @@ def _insufficient(metric: str, rounds: int, why: str) -> dict:
     }
 
 
+def _cold_start(receipt: dict, metric: str) -> dict | None:
+    """Steady-state throughput/latency verdicts are undefined in an
+    evict-per-round campaign: gateway rounds measure model reload
+    inside the wall while the direct child stays resident. Cold-start
+    runs stay valid COLD evidence (reliability, reload cost) and are
+    reported - the steady-state gates simply demand a resident run
+    instead of judging a mode they were never defined over."""
+    if receipt.get("lane_mode", "resident") != "evict-per-round":
+        return None
+    return {
+        "metric": metric,
+        "verdict": "insufficient-evidence",
+        "reason": "cold-start mode (lane_mode=evict-per-round): "
+        "steady-state metrics require resident lanes",
+    }
+
+
+def _shape_drift(receipt: dict, metric: str, level: int | None = None) -> dict | None:
+    """Matched-arm verdicts are defined over a FROZEN gateway shape.
+
+    The direct child is spawned from the captured argv and never moves,
+    but the daemon's adaptive_slots machinery may reshape its child
+    mid-campaign (2 -> 8 -> 16 under concurrent bursts, decayed after
+    quiet) - that is the product working as designed; the measurement
+    must simply not claim matched-argv semantics through a reshape.
+    Two evidence paths:
+    * live: the gateway_np_by_rung timeline (captured after each rung);
+    * backfill: receipt["shape_contamination"] carrying daemon-log
+      evidence for campaigns that predate the timeline.
+    Orchestration-arm verdicts never call this - adaptive shape is
+    their subject, not their confounder."""
+    note = receipt.get("shape_contamination") or {}
+    if metric in note.get("verdicts", []):
+        return {
+            "metric": metric,
+            "verdict": "insufficient-evidence",
+            "reason": f"shape contamination: {note.get('evidence', 'unspecified')}",
+        }
+    if level is None:
+        return None
+    direct_np = argv_np(receipt.get("direct_argv"))
+    gw_np = (receipt.get("gateway_np_by_rung", {}).get("gateway") or {}).get(level)
+    if gw_np is not None and direct_np is not None and gw_np != direct_np:
+        return {
+            "metric": metric,
+            "verdict": "insufficient-evidence",
+            "reason": f"gateway child reshaped at C={level} "
+            f"(np {direct_np}->{gw_np}; adaptive slots): matched-argv "
+            "semantics broken - pin model slots for a shape-frozen run",
+        }
+    return None
+
+
 def verdict_single_request_overhead(receipt: dict) -> dict:
     """C=1 matched-arm overhead: PASS requires the CI95 UPPER bound of
     overhead to sit at/below target. `faster` is a pass variant - a
     gateway that beats direct at C=1 (page-cache-controlled) passes."""
+    cold = _cold_start(receipt, "single_request_overhead")
+    if cold is not None:
+        return cold
+    drift = _shape_drift(receipt, "single_request_overhead") or _shape_drift(
+        receipt, "single_request_overhead", 1
+    )
+    if drift is not None:
+        return drift
     target = ACCEPTANCE_TARGETS["single_request_overhead_pct"] / 100.0
     gw, dr = _leg_rounds_tps(receipt, "gateway"), _leg_rounds_tps(receipt, "direct")
     n = min(len(gw), len(dr))
@@ -423,11 +605,22 @@ def verdict_matched_band(receipt: dict) -> dict:
     at/above (1 - band). Rungs with too few rounds are reported but
     cannot alone fail the gate (the band is a saturation bound, judged
     where evidence exists)."""
+    cold = _cold_start(receipt, "matched_overhead_band")
+    if cold is not None:
+        return cold
+    backfill = _shape_drift(receipt, "matched_overhead_band")
+    if backfill is not None:
+        return backfill
     band = ACCEPTANCE_TARGETS["matched_overhead_band_pct"] / 100.0
     floor = 1.0 - band
     worst = None
+    contaminated: list[int] = []
     for rung in receipt.get("rungs", []):
         level = rung["level"]
+        drift = _shape_drift(receipt, "matched_overhead_band", level)
+        if drift is not None:
+            contaminated.append(level)
+            continue
         gw = _rung_round_tps(receipt, "gateway", level)
         dr = _rung_round_tps(receipt, "direct", level)
         n = min(len(gw), len(dr))
@@ -439,9 +632,18 @@ def verdict_matched_band(receipt: dict) -> dict:
         if worst is None or lo < worst[1]:
             worst = (level, lo, n)
     if worst is None:
+        if contaminated:
+            return {
+                "metric": "matched_overhead_band",
+                "verdict": "insufficient-evidence",
+                "reason": "every evidenced rung ran through an adaptive "
+                f"reshape (contaminated: {contaminated}) - pin model "
+                "slots for a shape-frozen run",
+                "shape_contaminated_rungs": contaminated,
+            }
         return _insufficient("matched_overhead_band", 0, "no rung with enough rounds")
     level, lo, n = worst
-    return {
+    out = {
         "metric": "matched_overhead_band",
         "verdict": "pass" if lo >= floor else "fail",
         "target": f"CI95 lower ratio >= {floor:.2f} at every evidenced rung",
@@ -449,11 +651,21 @@ def verdict_matched_band(receipt: dict) -> dict:
         "ci95_lower_ratio": round(lo, 4),
         "rounds": n,
     }
+    if contaminated:
+        out["shape_contaminated_rungs"] = contaminated
+        out["note"] = (
+            "excluded rungs ran through adaptive reshapes; pin slots "
+            "for full-ladder matched evidence"
+        )
+    return out
 
 
 def verdict_orchestration_gain(receipt: dict) -> dict:
     """Orchestration-arm aggregate gain vs matched direct at the highest
     rung: CI95 LOWER bound of (orch/direct - 1) must reach target."""
+    cold = _cold_start(receipt, "orchestration_aggregate_gain")
+    if cold is not None:
+        return cold
     target = ACCEPTANCE_TARGETS["orchestration_aggregate_gain_pct"] / 100.0
     levels = [r["level"] for r in receipt.get("rungs", [])]
     if not levels or "orchestration" not in receipt.get("legs", {}):
@@ -487,6 +699,9 @@ def verdict_p95_interactive(receipt: dict) -> dict:
     representative rung vs matched direct: CI95 lower of the
     improvement must reach target. Improvement ratio is
     direct_p95/orch_p95 (>1 = gateway faster)."""
+    cold = _cold_start(receipt, "p95_interactive_gain")
+    if cold is not None:
+        return cold
     target = ACCEPTANCE_TARGETS["p95_interactive_gain_pct"] / 100.0
     if "orchestration" not in receipt.get("legs", {}):
         return {
@@ -604,9 +819,12 @@ ALL_VERDICTS = (
 def normalize_receipt(receipt: dict) -> dict:
     """Adapt the 2026-11-21 legacy receipt shape (per-leg rung-major
     arrays) into the legs-map shape the verdict engine reads, so old
-    campaigns remain judgeable without a re-run."""
+    campaigns remain judgeable without a re-run. Also coerces leg
+    level keys back to ints: a JSON round-trip turns them into
+    strings and the verdict lookups (get(level)) would silently see
+    zero rounds."""
     if "legs" in receipt:
-        return receipt
+        return _coerce_level_keys(receipt)
     legs: dict[str, dict[int, list]] = {}
     for leg in ("direct", "gateway"):
         if leg not in receipt:
@@ -620,7 +838,28 @@ def normalize_receipt(receipt: dict) -> dict:
     rungs = (
         [{"level": lv} for lv in sorted(legs["gateway"])] if "gateway" in legs else []
     )
-    return {**receipt, "legs": legs, "rungs": rungs or receipt.get("rungs", [])}
+    receipt = {**receipt, "legs": legs, "rungs": rungs or receipt.get("rungs", [])}
+    return _coerce_level_keys(receipt)
+
+
+def _coerce_level_keys(receipt: dict) -> dict:
+    """JSON serializes int dict keys to strings; verdicts look runs up
+    by int level, so re-key every leg's rounds map (and the np
+    timeline) back to ints."""
+    legs = receipt.get("legs", {})
+    coerced = {
+        leg: {int(k): v for k, v in rounds_map.items()}
+        for leg, rounds_map in legs.items()
+    }
+    out = {**receipt, "legs": coerced}
+    np_map = receipt.get("gateway_np_by_rung")
+    if isinstance(np_map, dict):
+        out["gateway_np_by_rung"] = {
+            leg: {int(k): v for k, v in levels.items()}
+            for leg, levels in np_map.items()
+            if isinstance(levels, dict)
+        }
+    return out
 
 
 def run_verdicts(receipt: dict) -> dict:
@@ -685,12 +924,21 @@ def run_campaign(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     gateway_base = args.gateway.rstrip("/")
     direct_base = f"http://127.0.0.1:{args.direct_port}"
+    eos_bias = (
+        {str(t): -100 for t in args.eos_token_ids_list}
+        if getattr(args, "force_length", False)
+        else None
+    )
 
     # Gateway child argv: operator file wins, /proc best-effort next.
+    # The /proc path first WARMS the model so the engine child exists -
+    # a freshly evicted or idle-reaped lane has no child to read and the
+    # campaign would otherwise depend on operator pre-warming.
     if args.child_argv_file:
         gateway_argv = json.loads(Path(args.child_argv_file).read_text())
     elif args.daemon_pid:
-        gateway_argv = child_argv_from_proc(args.daemon_pid)
+        warm_gateway_model(gateway_base, args.model, args.tg)
+        gateway_argv = capture_child_argv(args.daemon_pid, timeout_secs=90.0)
         if not gateway_argv:
             print("could not capture gateway child argv from /proc", file=sys.stderr)
             return 2
@@ -701,18 +949,34 @@ def run_campaign(args: argparse.Namespace) -> int:
     direct_argv = matched_direct_argv(gateway_argv, args.direct_port)
 
     # Spawn the matched direct child; readiness-gated; torn down in finally.
+    # Startup stderr is kept in the artifacts - a direct child that dies
+    # before /health (VRAM exhaustion, bad flag combination) must leave
+    # evidence, not a bare "connection refused".
+    direct_stderr_path = out_dir / "direct_stderr.log"
+    direct_stderr = direct_stderr_path.open("w")
     direct_proc = subprocess.Popen(
-        direct_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        direct_argv, stdout=subprocess.DEVNULL, stderr=direct_stderr
     )
     receipt: dict = {
         "model": args.model,
         "tg": args.tg,
         "rounds": args.rounds,
+        "lane_mode": "evict-per-round" if args.evict_between_rounds else "resident",
         "rungs": [{"level": lv} for lv in args.rungs],
         "legs": {},
+        # Slot-shape timeline of the daemon's engine child, snapshotted
+        # after each gateway-side rung. adaptive_slots (default on)
+        # reshapes the child under concurrent bursts; matched-arm
+        # verdicts consult this to never claim matched-argv semantics
+        # through a reshape.
+        "gateway_np_by_rung": {"gateway": {}, "orchestration": {}},
         "gateway_child_argv": gateway_argv,
         "direct_argv": direct_argv,
         "leg_order": "alternating per round (direct-first on even, gateway-first on odd)",
+        "token_accounting": "actual (usage.completion_tokens, content-delta fallback); gen_tokens per round",
+        "length_policy": "forced (EOS suppressed via logit_bias)"
+        if eos_bias
+        else "natural",
         "methodology": "matched-argv saturation; see scripts/bench_saturation.py docstring",
     }
     try:
@@ -751,7 +1015,13 @@ def run_campaign(args: argparse.Namespace) -> int:
                         metrics_snapshot(gateway_base) if leg != "direct" else None
                     )
                     r = drive_rung(
-                        base, args.model, level, args.tg, round_idx, args.api_key
+                        base,
+                        args.model,
+                        level,
+                        args.tg,
+                        round_idx,
+                        args.api_key,
+                        eos_bias=eos_bias,
                     )
                     if metrics_before is not None:
                         r["stage_metrics_delta"] = metric_delta(
@@ -763,6 +1033,10 @@ def run_campaign(args: argparse.Namespace) -> int:
                         f"{r['sys_tps']} t/s, {r['errs']} errs",
                         flush=True,
                     )
+                if leg != "direct" and args.daemon_pid:
+                    receipt["gateway_np_by_rung"][leg][level] = argv_np(
+                        child_argv_from_proc(args.daemon_pid)
+                    )
         if args.vram_poll and args.daemon_pid:
             receipt["vram_gib"] = poll_vram(args.daemon_pid, args.direct_port)
     finally:
@@ -771,6 +1045,7 @@ def run_campaign(args: argparse.Namespace) -> int:
             direct_proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             direct_proc.kill()
+        direct_stderr.close()
 
     acceptance = run_verdicts(receipt)
     (out_dir / "sat_receipt.json").write_text(json.dumps(receipt, indent=2))
@@ -902,6 +1177,35 @@ def selftest() -> int:
     p95 = next(r for r in v["results"] if r["metric"] == "p95_interactive_gain")
     check("p95 improvement passes", p95["verdict"] == "pass", str(p95))
 
+    # Evict-per-round mode: steady-state gates step aside, cold-start
+    # facts (reliability) stay judged.
+    cold = _synth_receipt(8, gw_bias=1.0)
+    cold["lane_mode"] = "evict-per-round"
+    v = run_verdicts(cold)
+    for metric in (
+        "single_request_overhead",
+        "matched_overhead_band",
+        "orchestration_aggregate_gain",
+        "p95_interactive_gain",
+    ):
+        row = next(r for r in v["results"] if r["metric"] == metric)
+        check(
+            f"evict mode {metric} -> insufficient (needs resident)",
+            row["verdict"] == "insufficient-evidence"
+            and "evict-per-round" in row.get("reason", ""),
+            str(row),
+        )
+    rel = next(r for r in v["results"] if r["metric"] == "reliability")
+    check("evict mode reliability still judged", rel["verdict"] == "pass", str(rel))
+    check("evict mode overall incomplete", v["overall"] == "incomplete")
+
+    # JSON round-trip keeps verdicts working (int keys become strings
+    # on disk; from-receipt mode re-judges campaigns off disk).
+    roundtrip = json.loads(json.dumps(_synth_receipt(8, gw_bias=1.0)))
+    v = run_verdicts(roundtrip)
+    ov = next(r for r in v["results"] if r["metric"] == "single_request_overhead")
+    check("json round-trip receipt still judged", ov["verdict"] == "pass", str(ov))
+
     # Bootstrap CI determinism + sanity on a fixed fixture.
     ci1 = bootstrap_ratio_ci([100.0, 102.0, 98.0, 101.0], [100.0, 100.0, 100.0, 100.0])
     ci2 = bootstrap_ratio_ci([100.0, 102.0, 98.0, 101.0], [100.0, 100.0, 100.0, 100.0])
@@ -941,6 +1245,91 @@ def selftest() -> int:
     )
     check("--parallel preserved", argv[argv.index("--parallel") + 1] == "2", str(argv))
 
+    # argv_np: the shape probe behind drift detection.
+    check("argv_np -np form", argv_np(["llama-server", "-np", "4"]) == 4)
+    check("argv_np --parallel form", argv_np(["s", "--parallel", "16"]) == 16)
+    check("argv_np --parallel= form", argv_np(["s", "--parallel=8"]) == 8)
+    check("argv_np absent is None", argv_np(["s", "--ctx-size", "32768"]) is None)
+    check("argv_np empty is None", argv_np(None) is None)
+
+    # Shape drift: a rung whose gateway child moved shape is excluded
+    # from matched judgment, never silently averaged in.
+    drift = _synth_receipt(8, gw_bias=1.0)
+    drift["direct_argv"] = ["llama-server", "-np", "2"]
+    drift["gateway_np_by_rung"] = {"gateway": {1: 2, 2: 2, 4: 8, 8: 8, 16: 16}}
+    v = run_verdicts(drift)
+    band = next(r for r in v["results"] if r["metric"] == "matched_overhead_band")
+    check(
+        "band excludes reshaped rungs",
+        band["verdict"] == "pass"
+        and band.get("shape_contaminated_rungs") == [4, 8, 16],
+        str(band),
+    )
+    ov = next(r for r in v["results"] if r["metric"] == "single_request_overhead")
+    check("C=1 clean shape still judged", ov["verdict"] == "pass", str(ov))
+
+    all_drift = _synth_receipt(8, gw_bias=1.0)
+    all_drift["direct_argv"] = ["llama-server", "-np", "2"]
+    all_drift["gateway_np_by_rung"] = {"gateway": {1: 8, 2: 8, 4: 8, 8: 8, 16: 16}}
+    v = run_verdicts(all_drift)
+    band = next(r for r in v["results"] if r["metric"] == "matched_overhead_band")
+    check(
+        "all-rung drift yields insufficient band",
+        band["verdict"] == "insufficient-evidence"
+        and "adaptive" in band.get("reason", ""),
+        str(band),
+    )
+    ov = next(r for r in v["results"] if r["metric"] == "single_request_overhead")
+    check(
+        "all-rung drift yields insufficient overhead",
+        ov["verdict"] == "insufficient-evidence" and "reshape" in ov.get("reason", ""),
+        str(ov),
+    )
+
+    # Backfill path: receipts predating the timeline carry a
+    # shape_contamination note with daemon-log evidence.
+    note = _synth_receipt(8, gw_bias=1.0)
+    note["shape_contamination"] = {
+        "verdicts": ["single_request_overhead", "matched_overhead_band"],
+        "evidence": "daemon log 08:07:23 adaptive slots adopted from=2 to=8",
+    }
+    v = run_verdicts(note)
+    band = next(r for r in v["results"] if r["metric"] == "matched_overhead_band")
+    ov = next(r for r in v["results"] if r["metric"] == "single_request_overhead")
+    check(
+        "contamination note blocks matched verdicts",
+        band["verdict"] == "insufficient-evidence"
+        and ov["verdict"] == "insufficient-evidence"
+        and "daemon log" in band.get("reason", ""),
+        f"{band} {ov}",
+    )
+    og = next(r for r in v["results"] if r["metric"] == "orchestration_aggregate_gain")
+    check(
+        "orchestration verdicts exempt from contamination",
+        og["verdict"] in ("pass", "fail")
+        or "orchestration leg" in og.get("reason", ""),
+        str(og),
+    )
+
+    # JSON round-trip of the np timeline: str level keys must coerce.
+    drift_rt = json.loads(json.dumps(drift))
+    band = verdict_matched_band(normalize_receipt(drift_rt))
+    check(
+        "np timeline survives json round-trip",
+        band.get("shape_contaminated_rungs") == [4, 8, 16],
+        str(band),
+    )
+
+    # Actual-token accounting: SSE chunks carry either per-token content
+    # deltas or an authoritative usage block; early-stop honesty depends
+    # on preferring the latter and never dividing requested tg by wall.
+    c1, u1 = sse_chunk_tokens({"choices": [{"delta": {"content": "tok"}}]})
+    c2, u2 = sse_chunk_tokens({"choices": [{"delta": {"content": ""}}]})
+    c3, u3 = sse_chunk_tokens({"choices": [], "usage": {"completion_tokens": 13}})
+    check("sse content delta counts one token", c1 == 1 and u1 == 0)
+    check("sse empty delta counts nothing", c2 == 0 and u2 == 0)
+    check("sse usage chunk carries completion tokens", c3 == 0 and u3 == 13)
+
     if failures:
         print(f"\nselftest: {len(failures)} FAILURES")
         for f in failures:
@@ -960,9 +1349,33 @@ def main() -> int:
     p.add_argument("--gateway", default="http://127.0.0.1:11435")
     p.add_argument("--api-key", default=None)
     p.add_argument("--model", default=None)
-    p.add_argument("--tg", type=int, default=128)
+    p.add_argument(
+        "--tg",
+        type=int,
+        default=256,
+        help="generated tokens per stream; keep walls >=1s at C=1 or the "
+        "paired-ratio CI widens past the acceptance band from timer "
+        "jitter alone (256 floor, 512 for lane verdicts)",
+    )
     p.add_argument("--rungs", default="1,2,4,8,16")
     p.add_argument("--rounds", type=int, default=8)
+    p.add_argument(
+        "--force-length",
+        action="store_true",
+        help="suppress EOS via logit_bias so every stream decodes exactly "
+        "--tg tokens on both legs: fixed-length decode isolates pure "
+        "serving capacity (the matched-overhead band's intended subject) "
+        "from completion-length divergence between state-diverged "
+        "children. Requires --eos-token-ids. Default off = realistic "
+        "workload where small instruct models early-stop",
+    )
+    p.add_argument(
+        "--eos-token-ids",
+        default=None,
+        help="comma-separated EOS token ids for --force-length (model-"
+        "specific, e.g. qwen2.5: 151645,151643); discover from the "
+        "model's tokenizer",
+    )
     p.add_argument(
         "--orchestration",
         action="store_true",
@@ -989,6 +1402,20 @@ def main() -> int:
     )
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
+
+    if args.force_length and not args.eos_token_ids:
+        p.error("--force-length requires --eos-token-ids (model-specific EOS ids)")
+    if args.eos_token_ids and not args.force_length:
+        p.error("--eos-token-ids only applies with --force-length")
+    if args.eos_token_ids:
+        try:
+            args.eos_token_ids_list = [
+                int(x) for x in args.eos_token_ids.split(",") if x.strip()
+            ]
+        except ValueError:
+            p.error("--eos-token-ids must be comma-separated integers")
+        if not args.eos_token_ids_list:
+            p.error("--eos-token-ids parsed to an empty list")
 
     if args.selftest:
         return selftest()
