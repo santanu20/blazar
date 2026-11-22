@@ -277,31 +277,75 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // the connection quintet (model-path/host/port/api-key/served-name);
     // this profile owns the numbers (ctx ladder, VRAM tiers, concurrency).
     if input.engine_kind == crate::engine_kind::EngineKind::Sglang {
+        let spec_intent = input.draft_path.is_some()
+            || input
+                .overlay
+                .sglang
+                .as_ref()
+                .is_some_and(|s| s.spec_algorithm.is_some());
+        // A spec lane was requested (resolved draft pair or an explicit
+        // sglang.spec_algorithm pin), but speculation is a speed knob,
+        // not a capability gate - it must never COST the fast lane.
+        // Two escape shapes, both degrade to the dense plan with a loud
+        // teaching (live receipts 2026-11-22, qwen3-8b-awq + DSPINE
+        // draft pair on an 8 GiB card, static demand ~9 GiB):
+        //   1. The spec-charged plan REFUSES outright (mem-fraction
+        //      demand over the trained-drafter ceiling) - hard 400 on
+        //      every request until the pair was uninstalled.
+        //   2. The spec-charged plan lands a LEGAL offload tier: weights
+        //      spill to host RAM to fund the 2000 MiB drafter reserve,
+        //      decode drops to the ~2.6 tok/s offload class while the
+        //      dense plan full-fits at 47 - spec bought a 15x loss.
+        // In both shapes, a dense plan that avoids host offload wins;
+        // when dense also needs offload the spec plan stands (spec at
+        // least recovers some offloaded-decode latency). The
+        // unregistered-algorithm path already degrades this way inside
+        // push_sglang_speculative; this closes the registered-but-unfit
+        // gap in both its escape shapes.
+        let spec_offloaded = |p: &Profile| {
+            p.argv.iter().any(|a| a == "--cpu-offload-gb")
+                && p.argv
+                    .windows(2)
+                    .any(|w| w[0] == "--speculative-algorithm")
+        };
         return match compile_sglang(input, tuning) {
-            Ok(profile) => Ok(profile),
+            Ok(profile) => {
+                if spec_intent && spec_offloaded(&profile) {
+                    let mut dense_overlay = input.overlay.clone();
+                    if let Some(sg) = dense_overlay.sglang.as_mut() {
+                        sg.spec_algorithm = None;
+                        sg.spec_draft_path = None;
+                    }
+                    let dense = ProfileInput {
+                        spec_mode: "off",
+                        draft_path: None,
+                        draft_gguf: None,
+                        overlay: &dense_overlay,
+                        ..input.clone()
+                    };
+                    if let Ok(dense_profile) = compile_sglang(&dense, tuning) {
+                        if !dense_profile.argv.iter().any(|a| a == "--cpu-offload-gb") {
+                            let mut p = dense_profile;
+                            p.warnings.insert(
+                                0,
+                                "spec lane needs host offload on this card - \
+                                 spawning dense full-residency instead (speculation \
+                                 is a speed knob, not a capability gate; offloaded \
+                                 spec runs the ~2.6 tok/s lane where dense full \
+                                 residency runs 47 - the pair stays banked for a \
+                                 bigger card)"
+                                    .to_string(),
+                            );
+                            return Ok(p);
+                        }
+                    }
+                }
+                Ok(profile)
+            }
             Err(reason) => {
-                if input.draft_path.is_none()
-                    && input
-                        .overlay
-                        .sglang
-                        .as_ref()
-                        .is_none_or(|s| s.spec_algorithm.is_none())
-                {
+                if !spec_intent {
                     return Err(reason);
                 }
-                // A spec lane was requested (resolved draft pair or an
-                // explicit sglang.spec_algorithm pin) but the
-                // spec-charged plan cannot fit this card (target +
-                // draft + verify chain vs the dynamic ceiling).
-                // Speculation is a speed knob, not a capability gate:
-                // degrade to the dense plan with a loud teaching
-                // instead of blocking the model entirely. The
-                // unregistered-algorithm path already degrades this
-                // way inside push_sglang_speculative; this closes the
-                // registered-but-unfit gap (live receipt 2026-11-22:
-                // qwen3-8b-awq + DSPINE draft pair on an 8 GiB card -
-                // static demand ~9 GiB vs the card, hard 400 on every
-                // request until the pair was uninstalled).
                 let mut dense_overlay = input.overlay.clone();
                 if let Some(sg) = dense_overlay.sglang.as_mut() {
                     sg.spec_algorithm = None;
@@ -20482,6 +20526,82 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--mem-fraction-static"),
             "the dense plan must still derive its fraction"
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__offloaded_spec_loses_to_dense_full_residency() {
+        // The second escape shape of the same 2026-11-22 DSPINE
+        // receipt: when host RAM allows the offload, the spec-charged
+        // plan lands a LEGAL Tier C (weights spilled to host RAM to
+        // fund the 2000 MiB drafter reserve) - no refusal, just a
+        // ~2.6 tok/s spawn where the dense plan full-fits at 47.
+        // Speculation is a speed knob: full-residency dense must win
+        // over offloaded spec. Fixture mirrors the refusal-shape test
+        // (AWQ weights 6328 MiB on 8188 MiB, DSPINE registered, draft
+        // pair resolved) but with the offload pin left free to derive:
+        // the spec plan offloads, the dense plan full-fits, dense wins.
+        // When dense ALSO needs offload (model heavier than any
+        // full-fit), the spec plan stands - covered by the model-size
+        // bump arm below.
+        static PROBED_WITH_DSPINE: LazyLock<Vec<String>> =
+            LazyLock::new(|| vec!["NGRAM".to_string(), "DSPINE".to_string()]);
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(4_096),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        fn mk<'a>(
+            hw: &'a Hardware,
+            hf: &'a HfMeta,
+            cfg: &'a Config,
+            overlay: &'a ModelOverride,
+            probed: &'a [String],
+        ) -> ProfileInput<'a> {
+            let mut inp = sglang_input(hf, hw, cfg, 5_816 * MIB);
+            inp.overlay = overlay;
+            inp.spec_types = probed;
+            inp
+        }
+        // 8 GiB card: spec plan spills weights to host, dense full-fits
+        // - dense must win with the offload teaching.
+        let hw = gpu_hw(8_188, 15_900, 8);
+        let p = compile(&mk(&hw, &hf, &cfg, &overlay, &PROBED_WITH_DSPINE), &TuningOverrides::default())
+            .expect("offloaded spec must degrade to dense full residency");
+        assert!(
+            !p.argv.iter().any(|a| a == "--cpu-offload-gb"),
+            "dense full residency must not offload: {:?}",
+            p.argv
+        );
+        assert!(
+            !p.argv.iter().any(|a| a == "--speculative-algorithm"),
+            "dense preference must not emit a spec flag: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("spec lane needs host offload")),
+            "preference must teach the offload trade: {:?}",
+            p.warnings
+        );
+        // A card where BOTH plans need offload keeps the spec plan
+        // (spec recovers some offloaded-decode latency).
+        let hw = gpu_hw(6_144, 15_900, 8);
+        let p = compile(&mk(&hw, &hf, &cfg, &overlay, &PROBED_WITH_DSPINE), &TuningOverrides::default())
+            .expect("tiny card must still compile");
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPINE"),
+            "when dense also offloads, the spec plan stands: {:?}",
+            p.argv
         );
     }
 
