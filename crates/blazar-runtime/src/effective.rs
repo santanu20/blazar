@@ -27,9 +27,24 @@
 //!   tracing), never fatal - a healthy child serving a slightly different
 //!   shape beats a rejected spawn.
 //!
-//! Other lanes (mistral.rs, sglang, vllm, mlx, ...) have no equivalent
-//! queryable effective-config surface wired here yet; they skip the probe
-//! silently and gain a lane when a surface is certified live.
+//! Other lanes:
+//! - sglang exposes its resolved startup configuration through
+//!   `GET /server_info` (0.5.22+; the legacy alias `/get_server_info`
+//!   still answers with a deprecation warning). The body carries the
+//!   RESOLVED server args - capacity pins (`max_running_requests`,
+//!   `context_length`, `mem_fraction_static`) land top-level or inside
+//!   a nested arg record depending on build; both shapes are searched,
+//!   never deeper (per-DP `internal_states` is runtime state, not
+//!   config). One derivation is known-legitimate: some attention
+//!   configs scale `mem_fraction_static` by 0.85 at startup, so a
+//!   differing fraction is reported with that possibility named rather
+//!   than as silent drift.
+//! - The vllm lane exposes no certified capacity introspection endpoint
+//!   endpoint; the lane probes `/v1/models` for liveness and reports an
+//!   honest `unverified` line instead of guessing capacity.
+//! - Remaining lanes (mistral.rs, mlx, ...) have no equivalent queryable
+//!   effective-config surface wired here yet; they skip the probe
+//!   silently and gain a lane when a surface is certified live.
 
 use blazar_core::Endpoint;
 
@@ -231,6 +246,207 @@ pub async fn probe_llamacpp(
     compare(&planned, &observed)
 }
 
+/// What the sglang spawn argv explicitly pinned for the child.
+#[derive(Debug, Default, PartialEq)]
+pub struct PlannedSglang {
+    /// `--max-running-requests`: concurrent request capacity, when pinned.
+    pub max_running_requests: Option<u32>,
+    /// `--context-length`: model context window override, when pinned.
+    pub context_length: Option<u32>,
+    /// `--mem-fraction-static`: static memory fraction, when pinned.
+    pub mem_fraction_static: Option<f64>,
+}
+
+/// Effective values parsed from sglang's `/server_info` body.
+#[derive(Debug, Default, PartialEq)]
+pub struct EffectiveSglang {
+    pub max_running_requests: Option<u32>,
+    pub context_length: Option<u32>,
+    pub mem_fraction_static: Option<f64>,
+}
+
+/// Parse the sglang spawn argv for pinned capacity values (long flags,
+/// space-separated pairs - the profile compiler's emission form).
+#[must_use]
+pub fn planned_from_argv_sglang(argv: &[String]) -> PlannedSglang {
+    let flag_value = |long: &str| -> Option<String> {
+        argv.windows(2).find(|w| w[0] == long).map(|w| w[1].clone())
+    };
+    PlannedSglang {
+        max_running_requests: flag_value("--max-running-requests").and_then(|v| v.parse().ok()),
+        context_length: flag_value("--context-length").and_then(|v| v.parse().ok()),
+        mem_fraction_static: flag_value("--mem-fraction-static").and_then(|v| v.parse().ok()),
+    }
+}
+
+/// Look a numeric key up in a resolved-server-args body: top level
+/// first, then inside object-valued children one nesting level deep
+/// (newer builds group args into nested records). Bounded to depth one
+/// on purpose - `internal_states` entries are per-DP runtime state,
+/// not configuration, and must never answer a config lookup.
+fn resolved_u64(body: &serde_json::Value, key: &str) -> Option<u64> {
+    let at = |v: &serde_json::Value| v.get(key).and_then(serde_json::Value::as_u64);
+    at(body).or_else(|| {
+        body.as_object()?
+            .values()
+            .filter(|v| v.is_object())
+            .find_map(at)
+    })
+}
+
+/// Float sibling of [`resolved_u64`] (same depth bound).
+fn resolved_f64(body: &serde_json::Value, key: &str) -> Option<f64> {
+    let at = |v: &serde_json::Value| v.get(key).and_then(serde_json::Value::as_f64);
+    at(body).or_else(|| {
+        body.as_object()?
+            .values()
+            .filter(|v| v.is_object())
+            .find_map(at)
+    })
+}
+
+/// Parse the `/server_info` body into the comparable shape. Absent or
+/// non-numeric fields stay `None` - never treated as zero or mismatch.
+#[must_use]
+pub fn parse_server_info(body: &serde_json::Value) -> EffectiveSglang {
+    EffectiveSglang {
+        max_running_requests: resolved_u64(body, "max_running_requests")
+            .and_then(|v| u32::try_from(v).ok()),
+        context_length: resolved_u64(body, "context_length").and_then(|v| u32::try_from(v).ok()),
+        mem_fraction_static: resolved_f64(body, "mem_fraction_static"),
+    }
+}
+
+/// Compare planned sglang argv pins against the resolved server args;
+/// one human-readable line per finding (empty = verified clean).
+#[must_use]
+pub fn compare_sglang(planned: &PlannedSglang, observed: &EffectiveSglang) -> Vec<String> {
+    let mut findings = Vec::new();
+    if let (Some(want), Some(got)) = (planned.max_running_requests, observed.max_running_requests)
+        && want != got
+    {
+        findings.push(format!(
+            "effective config mismatch: argv pinned --max-running-requests {want} but the server resolves {got}"
+        ));
+    }
+    if let (Some(want), Some(got)) = (planned.context_length, observed.context_length)
+        && want != got
+    {
+        findings.push(format!(
+            "effective config mismatch: argv pinned --context-length {want} but the server resolves {got}"
+        ));
+    }
+    if let (Some(want), Some(got)) = (planned.mem_fraction_static, observed.mem_fraction_static)
+        && (want - got).abs() > 1e-6
+    {
+        // Known-legitimate derivation: some attention configs scale the
+        // fraction by 0.85 at startup - the line names it instead of
+        // crying drift, and stays warn-only either way.
+        findings.push(format!(
+            "effective config mismatch: argv pinned --mem-fraction-static {want} but the server resolves {got:.4} (sglang may derive a scaled fraction in some attention configs - see its startup logs)"
+        ));
+    }
+    findings
+}
+
+/// Probe a fresh sglang child's resolved startup configuration and
+/// compare against its argv. `GET /server_info` is the canonical route
+/// (0.5.22+); the legacy `/get_server_info` alias is the fallback for
+/// older installs. Bounded by a short timeout: this runs inline on the
+/// spawn path (loopback). Transport or parse failures return a single
+/// `unverified` line so the gap is visible, never silent.
+pub async fn probe_sglang(endpoint: &Endpoint, auth: Option<&str>, argv: &[String]) -> Vec<String> {
+    let (client, base) = crate::supervisor::child_dial(endpoint);
+    let mut body: Option<serde_json::Value> = None;
+    for path in ["/server_info", "/get_server_info"] {
+        let mut get = client
+            .get(format!("{base}{path}"))
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(secret) = auth {
+            get = get.bearer_auth(secret);
+        }
+        match get.send().await {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => {
+                    body = Some(v);
+                    break;
+                }
+                Err(e) => {
+                    return vec![format!(
+                        "effective config unverified: {path} body unreadable: {e}"
+                    )];
+                }
+            },
+            // Canonical route absent on an older build: fall through to
+            // the legacy alias on the next loop iteration.
+            Ok(_) if path == "/server_info" => {}
+            Ok(r) => {
+                return vec![format!(
+                    "effective config unverified: GET /get_server_info answered {} on the fresh child",
+                    r.status()
+                )];
+            }
+            Err(e) => {
+                return vec![format!(
+                    "effective config unverified: server-info probe failed on the fresh child: {e}"
+                )];
+            }
+        }
+    }
+    let Some(body) = body else {
+        return vec![
+            "effective config unverified: no server-info route answered on the fresh child"
+                .to_string(),
+        ];
+    };
+    compare_sglang(&planned_from_argv_sglang(argv), &parse_server_info(&body))
+}
+
+/// Probe a fresh vLLM child. vLLM's OpenAI-compatible surface exposes
+/// no certified capacity introspection endpoint, so no argv pin can be
+/// verified; the liveness probe distinguishes "surface absent" (line
+/// below) from "probe never ran", and capacity stays honestly
+/// unverified rather than guessed from argv.
+pub async fn probe_vllm(endpoint: &Endpoint, auth: Option<&str>) -> Vec<String> {
+    let (client, base) = crate::supervisor::child_dial(endpoint);
+    let mut get = client
+        .get(format!("{base}/v1/models"))
+        .timeout(std::time::Duration::from_secs(5));
+    if let Some(secret) = auth {
+        get = get.bearer_auth(secret);
+    }
+    match get.send().await {
+        Ok(r) if r.status().is_success() => vec![
+            "effective config unverified: vllm exposes no capacity introspection surface (liveness confirmed via /v1/models)".to_string(),
+        ],
+        Ok(r) => vec![format!(
+            "effective config unverified: GET /v1/models answered {} on the fresh child - capacity and liveness both unconfirmed",
+            r.status()
+        )],
+        Err(e) => vec![format!(
+            "effective config unverified: /v1/models probe failed on the fresh child: {e}"
+        )],
+    }
+}
+
+/// Lane dispatch for post-spawn effective-config verification. Lanes
+/// without a certified introspection surface return no lines today;
+/// each gained surface wires in here.
+pub async fn probe(
+    kind: blazar_core::engine_kind::EngineKind,
+    endpoint: &Endpoint,
+    auth: Option<&str>,
+    argv: &[String],
+) -> Vec<String> {
+    use blazar_core::engine_kind::EngineKind;
+    match kind {
+        EngineKind::LlamaCpp => probe_llamacpp(endpoint, auth, argv).await,
+        EngineKind::Sglang => probe_sglang(endpoint, auth, argv).await,
+        EngineKind::Vllm => probe_vllm(endpoint, auth).await,
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
@@ -415,5 +631,159 @@ mod tests {
             planned_from_argv(&argv(&["--kv-unified-per-slot", "4096"])).kv_geometry,
             KvGeometry::UnifiedPerSlot
         );
+    }
+
+    /// sglang `/server_info` shape: resolved server args land top-level
+    /// (the `result.update(scheduler_info)` merge) or inside a nested
+    /// arg record depending on build - field names verified against the
+    /// installed 0.5.22 package source AND against a live capture
+    /// (2026-11-22, sglang 0.5.22 child serving qwen3-1.7b: top-level
+    /// `context_length` 16384 + `mem_fraction_static` 0.755 matching the
+    /// pinned argv, `max_running_requests` null when unpinned; receipt
+    /// bench-artifacts/20261122-w7-live/).
+    fn server_info_shape() -> serde_json::Value {
+        serde_json::json!({
+            "max_running_requests": 4,
+            "context_length": 8192,
+            "mem_fraction_static": 0.82,
+            "version": "0.5.22",
+            "launch_command": "python -m sglang.launch_server ...",
+            "max_total_num_tokens": 22026,
+            "internal_states": [{"dp_rank": 0, "load_generation": 1}],
+        })
+    }
+
+    /// Live-captured unpinned shape (sglang 0.5.22, 2026-11-22): absent
+    /// pins are null at top level, never zero - the parser must read
+    /// them as "engine default" and never mismatch.
+    #[test]
+    fn unit__parse_server_info__live_unpinned_shape_all_nulls() {
+        let observed = parse_server_info(&serde_json::json!({
+            "context_length": 16384,
+            "mem_fraction_static": 0.755,
+            "max_running_requests": serde_json::Value::Null,
+            "version": "0.5.22",
+            "max_total_num_tokens": 22026,
+            "launch_command": "--model-path ... --context-length 16384 --mem-fraction-static 0.755",
+        }));
+        assert_eq!(observed.max_running_requests, None);
+        assert_eq!(observed.context_length, Some(16384));
+        assert_eq!(observed.mem_fraction_static, Some(0.755));
+        // The live argv pinned context-length + mem-fraction only.
+        let planned = planned_from_argv_sglang(&argv(&[
+            "--model-path",
+            "/x",
+            "--context-length",
+            "16384",
+            "--mem-fraction-static",
+            "0.755",
+        ]));
+        assert!(
+            compare_sglang(&planned, &observed).is_empty(),
+            "live shape must verify clean"
+        );
+    }
+
+    #[test]
+    fn unit__planned_from_argv_sglang__parses_capacity_pins() {
+        let planned = planned_from_argv_sglang(&argv(&[
+            "--model-path",
+            "/x",
+            "--max-running-requests",
+            "8",
+            "--context-length",
+            "16384",
+            "--mem-fraction-static",
+            "0.87",
+        ]));
+        assert_eq!(planned.max_running_requests, Some(8));
+        assert_eq!(planned.context_length, Some(16384));
+        assert_eq!(planned.mem_fraction_static, Some(0.87));
+
+        let planned = planned_from_argv_sglang(&argv(&["--model-path", "/x"]));
+        assert_eq!(planned, PlannedSglang::default());
+    }
+
+    #[test]
+    fn unit__parse_server_info__reads_top_level_shape() {
+        let observed = parse_server_info(&server_info_shape());
+        assert_eq!(observed.max_running_requests, Some(4));
+        assert_eq!(observed.context_length, Some(8192));
+        assert!((observed.mem_fraction_static.unwrap() - 0.82).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unit__parse_server_info__nested_arg_record_searched_one_level() {
+        // Newer builds group resolved args into nested records; the
+        // lookup must find them there without diving into
+        // internal_states (per-DP runtime state, not config).
+        let body = serde_json::json!({
+            "schedule": {"max_running_requests": 2, "context_length": 4096},
+            "memory": {"mem_fraction_static": 0.9},
+            "internal_states": [{"max_running_requests": 999}],
+        });
+        let observed = parse_server_info(&body);
+        assert_eq!(observed.max_running_requests, Some(2));
+        assert_eq!(observed.context_length, Some(4096));
+        assert!((observed.mem_fraction_static.unwrap() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unit__parse_server_info__absent_fields_stay_none() {
+        let observed = parse_server_info(&serde_json::json!({"version": "0.4.1"}));
+        assert_eq!(observed, EffectiveSglang::default());
+    }
+
+    #[test]
+    fn unit__compare_sglang__clean_match_is_empty() {
+        let planned = planned_from_argv_sglang(&argv(&[
+            "--max-running-requests",
+            "4",
+            "--context-length",
+            "8192",
+            "--mem-fraction-static",
+            "0.82",
+        ]));
+        assert!(compare_sglang(&planned, &parse_server_info(&server_info_shape())).is_empty());
+    }
+
+    #[test]
+    fn unit__compare_sglang__unpinned_capacity_never_a_mismatch() {
+        // Nothing pinned, engine derived its own capacity: engine
+        // business, not drift (same policy as the llamacpp defaults).
+        let planned = planned_from_argv_sglang(&argv(&["--model-path", "/x"]));
+        assert!(compare_sglang(&planned, &parse_server_info(&server_info_shape())).is_empty());
+    }
+
+    #[test]
+    fn unit__compare_sglang__slot_and_ctx_drift_reported() {
+        let planned = planned_from_argv_sglang(&argv(&[
+            "--max-running-requests",
+            "8",
+            "--context-length",
+            "16384",
+        ]));
+        let findings = compare_sglang(&planned, &parse_server_info(&server_info_shape()));
+        assert_eq!(findings.len(), 2);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("max-running-requests 8"))
+        );
+        assert!(findings.iter().any(|f| f.contains("context-length 16384")));
+    }
+
+    #[test]
+    fn unit__compare_sglang__derived_mem_fraction_names_the_derivation() {
+        // Attention configs may scale the pinned fraction by 0.85 - the
+        // line must name that possibility, not report bare drift.
+        let planned = planned_from_argv_sglang(&argv(&["--mem-fraction-static", "0.87"]));
+        let observed = EffectiveSglang {
+            mem_fraction_static: Some(0.87 * 0.85),
+            ..EffectiveSglang::default()
+        };
+        let findings = compare_sglang(&planned, &observed);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].contains("may derive a scaled fraction"));
     }
 }

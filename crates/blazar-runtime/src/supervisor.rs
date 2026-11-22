@@ -7535,26 +7535,36 @@ impl Supervisor {
                         let _ = child.reap().await;
                         continue;
                     }
-                    // Effective-config verification (llama.cpp lane):
-                    // the child's /props is the runtime truth of what it
-                    // booted with; the argv is only what we asked for.
-                    // Inline + bounded (one loopback GET) so a mismatch
-                    // is named BEFORE any traffic, bank restore or warmup
-                    // touches the child. Warn-only: a healthy child with
-                    // drifted shape is reported, never rejected.
-                    let effective_warnings =
-                        if engine.kind() == blazar_core::engine_kind::EngineKind::LlamaCpp {
-                            crate::effective::probe_llamacpp(
-                                &endpoint,
-                                auth.as_ref().map(|a| a.secret.as_str()),
-                                &argv,
-                            )
-                            .await
-                        } else {
-                            Vec::new()
-                        };
+                    // Effective-config verification (llama.cpp, sglang,
+                    // vllm lanes): the child's own introspection surface
+                    // is the runtime truth of what it booted with; the
+                    // argv is only what we asked for. Inline + bounded
+                    // (loopback GETs) so a mismatch is named BEFORE any
+                    // traffic, bank restore or warmup touches the child.
+                    // Warn-only: a healthy child with drifted shape is
+                    // reported, never rejected.
+                    let effective_warnings = crate::effective::probe(
+                        engine.kind(),
+                        &endpoint,
+                        auth.as_ref().map(|a| a.secret.as_str()),
+                        &argv,
+                    )
+                    .await;
                     if effective_warnings.is_empty() {
-                        tracing::debug!(model = name, "effective config verified against /props");
+                        // Name the lane's actual introspection surface -
+                        // the message is part of the observable contract
+                        // validate.py pins ("effective config ...").
+                        use blazar_core::engine_kind::EngineKind;
+                        let surface = match engine.kind() {
+                            EngineKind::LlamaCpp => "/props",
+                            EngineKind::Sglang => "/server_info",
+                            EngineKind::Vllm => "/v1/models",
+                            _ => "engine introspection",
+                        };
+                        tracing::debug!(
+                            model = name,
+                            "effective config verified against {surface}"
+                        );
                     } else {
                         for w in &effective_warnings {
                             tracing::warn!(target: "blazar::effective", model = name, "{w}");
