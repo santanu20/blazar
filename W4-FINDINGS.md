@@ -59,13 +59,28 @@ CI95, B=2000, seed 1337).
 
 ### Product findings routed for follow-up
 
-- **C=4 admission pacing**: gateway TTFT occasionally elevated (1.1 s vs
-  direct 0.5 s) with queue_wait on 2 slots — dispatch release granularity is
-  the optimization candidate (`stage_metrics_delta` in the receipts).
-- **Daemon log-freeze** (2 independent repros): `run/daemon.log` and
-  `sentinel.jsonl` writers froze mid-campaign while the daemon kept serving
-  and writing the store. Silent-logging-death bug; needs root-cause in a
-  dedicated wave.
+- **C=4 admission pacing — CLOSED 2026-11-22, not a defect.** The
+  original signal (resident campaign: gateway C=4 TTFT p95 1.6 s vs
+  direct 0.5 s, queue_wait_sum 2.68 s) does not survive clean
+  measurement: in the pinned force-length run
+  (`bench-artifacts/2026-11-22-a4-pinned3/`) gateway C=4 TTFT is
+  p50 900 ms vs direct 849 ms, p95 1795 vs 1768 — the same 1–6 % hop
+  band as throughput. The resident-run elevation was the early-stop
+  mixture confound (streams that stop at 13 tokens free slots early on
+  one leg only), and the observed queue_wait equals the physics of
+  np=2 slots at C=4 (streams 3–4 wait out one full 512-token decode
+  of the first pair), not a dispatch-release granularity problem. No
+  code change without a defect; reopening trigger = TTFT p95 gateway
+  − direct > 10 % in a pinned force-length campaign.
+- **Daemon log-freeze — hardened, root cause still open.** 3 forensic
+  repros of `run/daemon.log` + `sentinel.jsonl` writers freezing while
+  the daemon kept serving; controlled instrumented repro (strace +
+  growth watchdog) was negative. Shipped in 6383a67: reaper heartbeat
+  (60 s INFO breadcrumb with resident/inflight — a silent window is
+  now a provable timestamp gap, live-validated at exactly 60.002 s
+  cadence) and `TeeWrite` poison recovery (a poisoned file mutex no
+  longer permanently darkens the durable log arm). Full forensics:
+  `docs/issues/012-silent-log-freeze.md`.
 
 ## B7 — lane × suite quality matrix (same weights family, three formats)
 
