@@ -6541,6 +6541,27 @@ def phase_sentinel() -> None:
         "schema_violation" in codes,
         f"status={st} finish={finish} codes={codes}",
     )
+    # The same detection must be visible at /metrics as monotonic
+    # counters: blazar_sentinel_records_total (every committed
+    # observation), blazar_sentinel_detections_total{code=...} (the
+    # schema_violation above lands here), and the verdict-cache
+    # hit/miss pair. The scraped exposition text itself is what's
+    # pinned - not just any 200.
+    mst, _, mraw = http("GET", "/metrics")
+    mtext = mraw.decode(errors="replace") if isinstance(mraw, bytes) else str(mraw)
+    mlines = [ln for ln in mtext.splitlines() if ln.startswith("blazar_sentinel_")]
+    check(
+        "sentinel",
+        "blazar_sentinel_* metrics families present",
+        mst == 200
+        and any(ln.startswith("blazar_sentinel_records_total ") for ln in mlines)
+        and any(
+            ln.startswith('blazar_sentinel_detections_total{code="schema_violation"}')
+            for ln in mlines
+        )
+        and any(ln.startswith("blazar_sentinel_verdict_cache_hits") for ln in mlines),
+        f"status={mst} lines={mlines[:6]}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -18320,6 +18341,7 @@ def phase_benchqc() -> None:
             rc, tail = -1, "toolcall_eval.py timed out after 1800s"
         passed = total = None
         fails: list[str] = []
+        t10_row = None
         results_path = None
         cand = os.path.join(
             repo,
@@ -18343,6 +18365,14 @@ def phase_benchqc() -> None:
                     for r in (row.get("results") or [])
                     if r.get("xfail")
                 ]
+                t10_row = next(
+                    (
+                        r
+                        for r in (row.get("results") or [])
+                        if str(r.get("test")) == "T10 malformed-args history tolerance"
+                    ),
+                    None,
+                )
                 results_path = cand
             except (ValueError, OSError):
                 pass
@@ -18354,6 +18384,40 @@ def phase_benchqc() -> None:
             f"failing={fails[:4] or 'none'} "
             f"xfail={xfails[:3] or 'none'} results={results_path} "
             f"tail={tail[-200:]!r}",
+        )
+
+        # -- repair lane: T10 must clear WITH the repair note. Upstream
+        # llama-server 500s spec-legal malformed tool-args history; the
+        # proxy balance-repairs the arguments, retries once, and stamps
+        # x-blazar-repair - the battery captured that header into the
+        # T10 evidence. A green T10 without the note means the child
+        # never tripped: unproven, not passed.
+        t10_ok = bool(t10_row and t10_row.get("ok"))
+        t10_ev = str((t10_row or {}).get("evidence") or "")
+        check(
+            ph,
+            "repair lane: malformed-args history answered (x-blazar-repair)",
+            t10_ok and "repair=" in t10_ev,
+            f"ok={t10_ok} evidence={t10_ev[:160]!r}"
+            + (
+                " (no repair note: child never tripped or lane absent)"
+                if t10_ok and "repair=" not in t10_ev
+                else ""
+            ),
+        )
+
+        # -- /api/ps carries the spawn-time effective-config snapshot:
+        # introspection surface + findings per loaded model, joined by
+        # the handler from the supervisor's spawn-verify map (absent
+        # only before the model's first dedicated spawn).
+        ecfg = (prow or {}).get("blazar_effective_config") or {}
+        check(
+            ph,
+            "ps row exposes blazar_effective_config snapshot",
+            bool(ecfg.get("surface")),
+            f"surface={ecfg.get('surface')!r} "
+            f"findings={len(ecfg.get('findings') or [])} "
+            f"verified_at={ecfg.get('verified_at')}",
         )
 
         # -- greedy determinism: two identical temperature-0 requests.

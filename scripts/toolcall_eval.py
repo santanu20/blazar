@@ -111,6 +111,16 @@ BOOK = {
 }
 
 
+# Response headers of the most recent post() - the battery is
+# single-threaded, so T10 can read x-blazar-repair straight after its
+# call without threading a fourth return value through every caller.
+LAST_RESPONSE_HEADERS: dict = {}
+
+# True when --direct BASE_URL re-runs the battery against a bare
+# engine (T10's xfail pin is direct-arm-only: no gateway, no repair).
+DIRECT_ARM = False
+
+
 def post(path: str, body: dict, timeout: int = 180):
     req = urllib.request.Request(
         BASE + path,
@@ -122,8 +132,12 @@ def post(path: str, body: dict, timeout: int = 180):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
+            LAST_RESPONSE_HEADERS.clear()
+            LAST_RESPONSE_HEADERS.update(dict(r.headers))
             return r.status, json.loads(raw), time.monotonic() - t0
     except urllib.error.HTTPError as e:
+        LAST_RESPONSE_HEADERS.clear()
+        LAST_RESPONSE_HEADERS.update(dict(e.headers))
         return e.code, json.loads(e.read() or b"{}"), time.monotonic() - t0
 
 
@@ -556,26 +570,32 @@ class Battery:
             # llama-server's JSON parse exception) vs blazar's own
             # "blazar_error" shape - attribution rides in the evidence.
             err = f" error={json.dumps(v.get('error', v))[:140]}"
+        # The gateway repair lane (llama.cpp 500 + json parse_error
+        # signature -> one repaired retry) stamps its note here when it
+        # saved the request; absence on a PASS means the child never
+        # tripped (repair not needed), absence on a FAIL means no
+        # repair was attempted.
+        repair = LAST_RESPONSE_HEADERS.get(
+            "x-blazar-repair", LAST_RESPONSE_HEADERS.get("X-Blazar-Repair")
+        )
+        repaired = f" repair={repair!r}" if repair else ""
         self.record(
             "T10 malformed-args history tolerance",
             ok,
-            f"status={st} calls={len(tcs)} answer={content[:100]!r}{err}",
+            f"status={st} calls={len(tcs)} answer={content[:100]!r}{repaired}{err}",
             xfail=(
-                # Root-caused 2026-11-22 live: llama-server itself 500s
+                # Direct-arm pin only: upstream llama-server 500s
                 # (nlohmann parse_error.101) on spec-legal malformed
-                # tool-arguments carried in request history; the
-                # gateway's zero-rewrite /v1 proxy forwards the child
-                # error faithfully. OpenAI treats arguments as an
-                # opaque string, so the input is legitimate client
-                # usage. Gateway repair lane (signature-matched
-                # repair-on-500, single retry, observable header+log)
-                # pending approval - remove this pin when it ships.
+                # tool-arguments carried in request history, and a bare
+                # engine has no gateway repair lane to save it. The
+                # gateway arm ships the repair-on-500 lane, so it must
+                # PASS this check un-pinned.
                 "upstream llama-server rejects spec-legal malformed "
                 "tool-args history (json parse_error.101 -> 500); "
-                "gateway repair lane pending approval"
-            )
-            if not ok
-            else None,
+                "direct engine has no repair lane"
+                if (not ok and DIRECT_ARM)
+                else None
+            ),
         )
 
         # T11 tool-error recovery: an errored tool result must yield a
@@ -724,9 +744,10 @@ def main() -> int:
             i += 1
     models = models or ["qwen2.5-0.5b-instruct"]
 
-    global BASE
+    global BASE, DIRECT_ARM
     if direct_base:
         BASE = direct_base
+        DIRECT_ARM = True
     out_dir = OUT_DIR + ("-direct" if direct_base else "")
     os.makedirs(out_dir, exist_ok=True)
 
