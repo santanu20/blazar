@@ -9218,13 +9218,158 @@ def _eng_spec_draft(rows: list[dict], kinds_by_tag: dict, disk_kinds: set) -> No
         # mem-fraction-static and caps cuda-graph decode bs on its own.
         _spec_live("dflash", draft, target, 4.0, "4")
 
+    def _spec_degrade_live(draft: dict, qtarget: dict) -> None:
+        """Degrade-contract cell: a spec pair that CANNOT fit the card
+        must degrade to a dense full-residency boot with a loud
+        teaching - never a refusal (4b9b5c5) and never a legal-but-
+        offloaded spec spawn (e93e852, the 2.6 tok/s class). Exact
+        2026-11-22 live receipt shape: qwen3-8b-awq + dspine pin on an
+        8 GiB card via the SUPERVISOR spec tier (also E2E-covers the
+        ModelOverride.spec -> spec_mode bridge)."""
+        cfg = {
+            "port": PORT,
+            "model_overrides": {
+                qtarget["name"]: {
+                    "engine": "sglang",
+                    "ctx": 2048,
+                    "spec": "dspine",
+                }
+            },
+        }
+        try:
+            d.start(cfg, floor_model=qtarget["name"])
+        except RuntimeError as exc:
+            if "MemAvailable" in str(exc):
+                boundary(
+                    ph,
+                    "dspine degrade lane",
+                    f"mem floor blocked the start: {str(exc)[-120:]}",
+                )
+            else:
+                check(ph, "dspine degrade lane ran", False, str(exc))
+            return
+        try:
+            model = qtarget["name"]
+            try:
+                chat("Say ok", model=model, timeout=600)
+            except Exception:
+                pass
+            prow = wait_loaded(model=model, budget=600)
+            if prow is None:
+                check(
+                    ph,
+                    "dspine degrade: model still loads",
+                    False,
+                    f"no ps row for {model} - daemon log: {d.log_path}",
+                )
+                return
+            warns = ps_field(prow, "blazar_warnings", "warnings") or []
+            check(
+                ph,
+                "dspine degrade: teaching names the spec lane",
+                any("spec lane" in str(w) for w in warns),
+                f"warnings: {[str(w)[:90] for w in warns][:4]}",
+            )
+            check(
+                ph,
+                "dspine degrade: dense full-residency boot (no offload flag)",
+                prow.get("blazar_gpu") == "full",
+                f"gpu={prow.get('blazar_gpu')} (partial/cpu = the "
+                "offloaded-spec escape shape e93e852 retires)",
+            )
+            pid = child_pid(model)
+            argv = child_argv(pid) if pid else []
+            check(
+                ph,
+                "dspine degrade: argv carries no spec flags",
+                "--speculative-algorithm" not in argv,
+                f"argv spec slice: {[a for a in argv if 'speculative' in a][:3]}",
+            )
+            check(
+                ph,
+                "dspine degrade: argv carries no host offload",
+                "--cpu-offload-gb" not in argv,
+                f"argv offload slice: {[a for a in argv if 'offload' in a][:3]}",
+            )
+            try:
+                cst, cv, _ = chat("Reply with exactly: ok", model=model, timeout=240)
+                choices = (cv or {}).get("choices") if cst == 200 else None
+                content = (
+                    str(
+                        (choices or [{}])[0].get("message", {}).get("content", "")
+                    ).strip()
+                    if choices
+                    else ""
+                )
+            except Exception as exc:
+                content = ""
+                check(
+                    ph,
+                    "dspine degrade: chat round-trip",
+                    False,
+                    f"chat raised {type(exc).__name__}: {str(exc)[-120:]}",
+                )
+            if content:
+                check(
+                    ph,
+                    "dspine degrade: chat round-trip",
+                    True,
+                    f"model={model} content={content[:40]!r}",
+                )
+        finally:
+            d.stop()
+
     draft, target = _draft_target("dspine")
-    if draft is None or target is None:
+    if draft is None:
         boundary(
             ph,
             "dspine live lane",
             "no dspine draft dir + bf16 target pair in the store",
         )
+    elif target is None:
+        # Draft present but no unquantized bf16 target: a quantized
+        # sibling (e.g. qwen3-8b-awq beside the qwen3-8b-dspine draft)
+        # on a sub-12 GiB card is the degrade-contract shape - pin it
+        # for real instead of skipping.
+        base = draft["name"].rsplit("-b16", 1)[0]
+        base = base.rsplit("-dspine", 1)[0]
+        qtarget = next(
+            (
+                r
+                for r in rows
+                if r["name"] != draft["name"]
+                and r["name"].startswith(base)
+                and Path(r["path"]).is_dir()
+                and not _eng_has_components(r)
+                and "mlx" not in f"{r['name']} {r['path']}".lower()
+            ),
+            None,
+        )
+        total = _gpu_total_mib()
+        if qtarget is not None and total is not None and total < 12288:
+            if FAST:
+                boundary(
+                    ph,
+                    "dspine degrade lane",
+                    "FAST mode: full run spawns the quantized target for real",
+                )
+            else:
+                _spec_degrade_live(draft, qtarget)
+        elif qtarget is not None and total is not None and total >= 12288:
+            boundary(
+                ph,
+                "dspine live lane",
+                f"dspine needs an unquantized bf16 target on this {total} MiB "
+                f"card (quantized sibling {qtarget['name']} degrades dense by "
+                f"contract - covered on sub-12 GiB boxes)",
+            )
+        else:
+            boundary(
+                ph,
+                "dspine live lane",
+                "no bf16 target for the dspine draft in the store "
+                "(pull the unquantized target to engage the draft for real)",
+            )
     else:
         total = _gpu_total_mib()
         if total is None:
@@ -18595,6 +18740,73 @@ def phase_benchqc() -> None:
                 f"{key}: now {cur:.2f} vs base {base:.2f} tok/s "
                 f"({delta:+.1%}, engine={engine_tag}, baseline commit "
                 f"{baselines[-1].get('commit', '?')})",
+            )
+
+        # -- aggregate concurrency guard: 4 parallel streams must ALL
+        # deliver tokens and must not collapse below the single-stream
+        # median (2026-11-22 live class: a max_total_tokens pin starved
+        # streams 2-4 to empty content on the shared KV pool; the
+        # pre-audit offload-lane class collapsed decode itself).
+        agg_rows: list[int] = []
+        agg_lock = threading.Lock()
+
+        def _agg_stream(i: int) -> None:
+            st, _, v = http_json(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": MODEL,
+                    "stream": False,
+                    "max_tokens": 96,
+                    "temperature": 0,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Write {40 + i * 10} words about the "
+                                f"number {i * i + 7}."
+                            ),
+                        }
+                    ],
+                },
+                timeout=300,
+            )
+            ct = (
+                (v.get("usage") or {}).get("completion_tokens")
+                if isinstance(v, dict)
+                else None
+            )
+            with agg_lock:
+                agg_rows.append(ct if isinstance(ct, int) else 0)
+
+        agg_threads = [
+            threading.Thread(target=_agg_stream, args=(i,)) for i in range(4)
+        ]
+        agg_t0 = time.monotonic()
+        for t in agg_threads:
+            t.start()
+        for t in agg_threads:
+            t.join()
+        agg_wall = time.monotonic() - agg_t0
+        starved = [i for i, ct in enumerate(agg_rows) if ct <= 0]
+        check(
+            ph,
+            "4-way aggregate: every stream delivers tokens",
+            not starved,
+            f"streams {agg_rows} completion_tokens in {agg_wall:.1f}s "
+            f"(starved: {starved}) - the shared-pool starvation class "
+            "(max_total_tokens pin / KV pool undersized for the slot count)",
+        )
+        agg_total = sum(agg_rows)
+        if not starved and agg_total > 0 and agg_wall > 0:
+            agg_tps = agg_total / agg_wall
+            check(
+                ph,
+                "4-way aggregate t/s holds the single-stream median",
+                agg_tps >= 0.9 * cur,
+                f"aggregate {agg_tps:.2f} tok/s vs single {cur:.2f} "
+                f"tok/s (ratio {agg_tps / cur:.2f}x) - a collapse here "
+                "is the offload-lane / scheduling-regression class",
             )
     finally:
         d.stop()
