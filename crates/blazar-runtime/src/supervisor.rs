@@ -9216,6 +9216,15 @@ drop them from rpc_servers in config.toml",
         self.lmcache.reap_idle(budget, consumers).await;
     }
 
+    /// Liveness breadcrumb emitted from the reaper loop: one INFO line
+    /// per interval so a future silent-logging window shows up as a
+    /// provable timestamp gap in the durable log instead of being
+    /// indistinguishable from quiet. Born from the 2026-11-22 incident
+    /// (docs/issues/012-silent-log-freeze.md): all log sinks went dark
+    /// for ~10 minutes under load while the daemon kept serving, and
+    /// post-mortems had no way to bound when emission stopped.
+    const DAEMON_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// Reaper: implements the ladder (Ready->Sleeping at `idle_sleep_secs`,
     /// ->Evicted at `idle_timeout_secs`). Runs until the manager is dropped.
     #[must_use]
@@ -9224,12 +9233,28 @@ drop them from rpc_servers in config.toml",
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(mgr.reaper_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut heartbeat_at = Instant::now();
             loop {
                 ticker.tick().await;
                 mgr.reap_dead_children().await;
                 mgr.reap_once().await;
                 mgr.reap_lmcache_daemon().await;
                 mgr.autotune_schedule_tick().await;
+                if heartbeat_at.elapsed() >= Self::DAEMON_HEARTBEAT_INTERVAL {
+                    heartbeat_at = Instant::now();
+                    let resident = mgr.instances.len();
+                    let inflight = mgr
+                        .instances
+                        .iter()
+                        .map(|entry| entry.value().in_flight.load(Ordering::SeqCst))
+                        .sum::<i64>();
+                    tracing::info!(
+                        target: "blazar::heartbeat",
+                        resident,
+                        inflight,
+                        "daemon heartbeat"
+                    );
+                }
             }
         })
     }

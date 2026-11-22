@@ -23,6 +23,7 @@ Wave map (dependency order):
 | 009-gateway-saturation-overhead.md | Profile and reduce gateway saturation overhead | P1 | 3 | B05 | 004 |
 | 010-workload-descriptors.md | Normalized workload descriptors across API dialects | P1 | 4 | B06 | - |
 | 011-kv-interop-certification-matrix.md | Cross-engine KV interoperability certification matrix | P1 | 5 | B07 | - |
+| 012-silent-log-freeze.md | Daemon log sinks go silently dark under load (heartbeat + poison-recovery hardening) | P1 | hotfix | - | - |
 
 Deferred on purpose (do not file): new inference engine work, a distributed
 KV service, RL-based scheduling, wholesale promotion of upstream engine flags

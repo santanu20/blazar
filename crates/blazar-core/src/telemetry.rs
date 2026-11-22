@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriter;
@@ -11,6 +13,7 @@ use tracing_subscriber::fmt::writer::MakeWriter;
 /// simply dropped and the next rotation/daemon start recovers.
 struct TeeWriter {
     file: Option<Arc<Mutex<std::fs::File>>>,
+    poison_warned: Arc<AtomicBool>,
 }
 
 impl MakeWriter<'_> for TeeWriter {
@@ -19,20 +22,43 @@ impl MakeWriter<'_> for TeeWriter {
     fn make_writer(&self) -> Self::Writer {
         TeeWrite {
             file: self.file.clone(),
+            poison_warned: Arc::clone(&self.poison_warned),
         }
     }
 }
 
 struct TeeWrite {
     file: Option<Arc<Mutex<std::fs::File>>>,
+    poison_warned: Arc<AtomicBool>,
+}
+
+impl TeeWrite {
+    /// Lock the file arm, recovering from poison exactly once with a
+    /// stderr marker. `None` when the arm is unarmed.
+    fn lock_file(&self) -> Option<std::sync::MutexGuard<'_, std::fs::File>> {
+        let file = self.file.as_ref()?;
+        match file.lock() {
+            Ok(guard) => Some(guard),
+            Err(poisoned) => {
+                // The poison flag never clears once set, so a single
+                // panic mid-write would otherwise silence the file arm
+                // forever while stderr carries on - recover the guard
+                // and name the moment exactly once.
+                if !self.poison_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "blazar: log file arm hit a poisoned lock (a writer panicked mid-write); recovering - subsequent lines are NOT lost"
+                    );
+                }
+                Some(poisoned.into_inner())
+            }
+        }
+    }
 }
 
 impl std::io::Write for TeeWrite {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write_all(buf);
-        if let Some(file) = &self.file
-            && let Ok(mut guard) = file.lock()
-        {
+        if let Some(mut guard) = self.lock_file() {
             let _ = guard.write_all(buf);
         }
         Ok(buf.len())
@@ -40,9 +66,7 @@ impl std::io::Write for TeeWrite {
 
     fn flush(&mut self) -> std::io::Result<()> {
         let _ = std::io::stderr().flush();
-        if let Some(file) = &self.file
-            && let Ok(mut guard) = file.lock()
-        {
+        if let Some(mut guard) = self.lock_file() {
             let _ = guard.flush();
         }
         Ok(())
@@ -98,7 +122,10 @@ pub fn init_tracing(verbosity: u8, log_level: Option<&str>, log_file: Option<&Pa
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(TeeWriter { file });
+        .with_writer(TeeWriter {
+            file,
+            poison_warned: Arc::new(AtomicBool::new(false)),
+        });
     // journald already stamps every line (with the machine's local time);
     // a second RFC3339 UTC stamp from tracing only adds noise and a
     // timezone mismatch. Foreground terminals and the daemon-owned log
@@ -122,6 +149,13 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    fn tee_for(file: std::fs::File) -> TeeWrite {
+        TeeWrite {
+            file: Some(Arc::new(Mutex::new(file))),
+            poison_warned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     #[test]
     fn unit__tee_write__mirrors_bytes_into_the_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -131,9 +165,7 @@ mod tests {
             .append(true)
             .open(&log)
             .unwrap();
-        let mut tee = TeeWrite {
-            file: Some(Arc::new(Mutex::new(file))),
-        };
+        let mut tee = tee_for(file);
         tee.write_all(b"line one\n").unwrap();
         tee.write_all(b"line two\n").unwrap();
         tee.flush().unwrap();
@@ -145,10 +177,45 @@ mod tests {
 
     #[test]
     fn unit__tee_write__unarmed_tee_still_writes() {
-        let mut tee = TeeWrite { file: None };
+        let mut tee = TeeWrite {
+            file: None,
+            poison_warned: Arc::new(AtomicBool::new(false)),
+        };
         // No file, and stderr is not observable here - the contract under
         // test is that the unarmed path returns success, not panics.
         assert_eq!(tee.write(b"x").unwrap(), 1);
         assert!(tee.flush().is_ok());
+    }
+
+    #[test]
+    fn unit__tee_write__poisoned_lock_recovers_instead_of_going_dark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("tee.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .unwrap();
+        let shared = Arc::new(Mutex::new(file));
+        // Poison the mutex the way it happens in production: a panic
+        // while the guard is held.
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.lock().unwrap();
+            panic!("writer died mid-write");
+        }));
+        assert!(boom.is_err());
+        assert!(shared.is_poisoned());
+        let mut tee = TeeWrite {
+            file: Some(Arc::clone(&shared)),
+            poison_warned: Arc::new(AtomicBool::new(false)),
+        };
+        // Pre-fix behavior: lock() errs, write silently skipped, file
+        // stays empty forever. Post-fix: the guard is recovered and the
+        // bytes land.
+        tee.write_all(b"after poison\n").unwrap();
+        tee.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "after poison\n");
+        // The one-time marker fired.
+        assert!(tee.poison_warned.load(Ordering::Relaxed));
     }
 }
