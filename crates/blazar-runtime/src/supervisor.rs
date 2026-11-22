@@ -266,17 +266,22 @@ struct RacePassSummary {
 /// Evidence consult for `spec = "auto"`: the best MEASURED spec mode
 /// from `blazar tune <model> --spec-race` receipts, gated on what this
 /// engine advertises and whether the catalog's draft pair is actually
-/// available. Returns the override spelling - a winning `draft` receipt
-/// maps to `"auto"` (the profile planner owns pair engagement) - plus
-/// the measured ratio over dense. `None` keeps the heuristic auto
-/// chain (planner decides per spawn). Receipts never override explicit
-/// pins: callers consult only when the tier chain resolved to "auto".
-/// Pure so the gating is pinnable without a live supervisor/store.
+/// available (`draft_available` for the draft-simple arm,
+/// `dflash_available` for the typed draft-dflash arm - spawn-side
+/// compile refuses a dflash without its catalog pair, so a receipt
+/// for an unpairable model must never win here either). Returns the
+/// override spelling - a winning `draft` receipt maps to `"auto"`
+/// (the profile planner owns pair engagement) - plus the measured
+/// ratio over dense. `None` keeps the heuristic auto chain (planner
+/// decides per spawn). Receipts never override explicit pins: callers
+/// consult only when the tier chain resolved to "auto". Pure so the
+/// gating is pinnable without a live supervisor/store.
 #[must_use]
 pub fn best_measured_spec_mode(
     receipts: &[blazar_core::store::SpecReceiptRow],
     advertised: &[String],
     draft_available: bool,
+    dflash_available: bool,
 ) -> Option<(&'static str, f64)> {
     let mut best: Option<(&'static str, f64, i64)> = None;
     for r in receipts {
@@ -315,7 +320,12 @@ pub fn best_measured_spec_mode(
         }
         let eligible = match r.mode.as_str() {
             "ngram" => advertised.iter().any(|s| s == "ngram-simple"),
-            "dflash" => advertised.iter().any(|s| s == "draft-dflash"),
+            // Typed-pair modes are only adoption-grade when the spawn
+            // path can actually serve them: compile hard-errors a
+            // dflash without its catalog pair (and the draft arm
+            // without a pulled draft), so eligibility mirrors that
+            // truth instead of trusting the race to have gated it.
+            "dflash" => dflash_available && advertised.iter().any(|s| s == "draft-dflash"),
             "draft" => draft_available && advertised.iter().any(|s| s == "draft-simple"),
             _ => false,
         };
@@ -5282,9 +5292,22 @@ impl Supervisor {
                     ),
                     DraftPick::Paired(_)
                 );
-                if let Some((mode, ratio)) =
-                    best_measured_spec_mode(&receipts, &manifest.spec_types, draft_available)
-                {
+                let dflash_available = matches!(
+                    pick_draft(
+                        &store,
+                        &m.name,
+                        "dflash",
+                        lane_for(self.engine.kind()),
+                        Some(&m.path),
+                    ),
+                    DraftPick::Paired(_)
+                );
+                if let Some((mode, ratio)) = best_measured_spec_mode(
+                    &receipts,
+                    &manifest.spec_types,
+                    draft_available,
+                    dflash_available,
+                ) {
                     tracing::info!(
                         model = %m.name,
                         mode,
@@ -6483,9 +6506,22 @@ impl Supervisor {
                     ),
                     DraftPick::Paired(_)
                 );
-                if let Some((mode, ratio)) =
-                    best_measured_spec_mode(&receipts, &caps.spec_types, draft_available)
-                {
+                let dflash_available = matches!(
+                    pick_draft(
+                        &store,
+                        name,
+                        "dflash",
+                        lane_for(engine.kind()),
+                        main_path.as_deref(),
+                    ),
+                    DraftPick::Paired(_)
+                );
+                if let Some((mode, ratio)) = best_measured_spec_mode(
+                    &receipts,
+                    &caps.spec_types,
+                    draft_available,
+                    dflash_available,
+                ) {
                     tracing::info!(
                         model = name,
                         mode,
@@ -9433,6 +9469,13 @@ drop them from rpc_servers in config.toml",
     /// or a week of drift gets caught.
     const AUTOTUNE_SPEC_RECEIPT_MAX_AGE: i64 = 7 * 24 * 3600;
 
+    /// Workload-evidence window for race candidacy: a model is only
+    /// raced when the gateway measured chat-shaped traffic for it in
+    /// this window. Mirrors [`WORKLOAD_MIN_REQUESTS`]'s window so the
+    /// scheduler's notion of "a model in use" never disagrees with the
+    /// optimize ladder's.
+    const AUTOTUNE_EVIDENCE_WINDOW_DAYS: i64 = 30;
+
     /// Fixed greedy probes for the parity gate: verified speculation
     /// (target-side acceptance) is output-equivalent to dense by
     /// construction, so every speculation arm must reproduce the dense
@@ -9586,7 +9629,41 @@ drop them from rpc_servers in config.toml",
                 return;
             }
         };
+        // Evidence floor: race only what the gateway has actually
+        // served chat-shaped traffic for. Embedders, rerankers, TTS
+        // voices and translation/OCR models are GGUF rows too, but
+        // spec-decoding receipts are meaningless for them - and racing
+        // a multi-GiB model nobody chats with is pure churn on the
+        // lane. A fresh install earns its first race after its first
+        // use, the same evidence-driven posture as the optimize
+        // ladder's WORKLOAD_MIN_REQUESTS floor.
+        let chat_evidenced: Vec<String> = store
+            .list_usage_workload(Self::AUTOTUNE_EVIDENCE_WINDOW_DAYS)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| {
+                matches!(
+                    w.kind.as_str(),
+                    "interactive_chat" | "tool_execution" | "long_prefill"
+                )
+            })
+            .map(|w| w.model)
+            .collect();
         for row in models {
+            // Chat-evidence gate (see above). `name:quant` request
+            // traffic addresses this row through the gateway's alias
+            // convention, so a suffixed workload row counts for its
+            // base model.
+            let evidenced = chat_evidenced
+                .iter()
+                .any(|m| m == &row.name || m.starts_with(&format!("{}:", row.name)));
+            if !evidenced {
+                tracing::debug!(
+                    model = %row.name,
+                    "autotune race: no chat workload evidence, skipping model"
+                );
+                continue;
+            }
             // GGUF-only lane: the race compiles llama.cpp argv against
             // GGUF metadata (read failure = not a GGUF row / unreadable
             // file - skip either way, the manual lane owns the loud
@@ -9610,6 +9687,26 @@ drop them from rpc_servers in config.toml",
             };
             if !stale {
                 continue;
+            }
+            // Lane agreement: race only models that would actually
+            // spawn on the llamacpp lane. Same resolver the spawn path
+            // uses, so the scheduler can never race a model it would
+            // never serve here; a routing refusal (uninstallable pin,
+            // format with no lane) means the spawn would fail too -
+            // not raceable either way.
+            let overlay = self.cfg().overlay_for(&row.name);
+            match self.resolve_routed_engine(&store, &overlay, &row) {
+                Ok(Some((engine, _)))
+                    if engine.kind() != blazar_core::engine_kind::EngineKind::LlamaCpp =>
+                {
+                    tracing::debug!(
+                        model = %row.name,
+                        "autotune race: routed off the llamacpp lane, skipping model"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => continue,
             }
             if !self.model_lane_idle(&row.name) {
                 tracing::info!(
@@ -9635,6 +9732,16 @@ drop them from rpc_servers in config.toml",
                 crate::lane_for(blazar_core::engine_kind::EngineKind::LlamaCpp),
                 Some(&row.path),
             );
+            // Typed draft-dflash pair, resolved with the same spawn
+            // truth: only a Paired pick may race the dflash arm
+            // (spawn-side compile refuses the mode without its pair).
+            let dflash_pick = crate::pick_draft(
+                &store,
+                &row.name,
+                "dflash",
+                crate::lane_for(blazar_core::engine_kind::EngineKind::LlamaCpp),
+                Some(&row.path),
+            );
             let loras: Vec<(String, f64)> = store
                 .list_loras(Some(&row.name))
                 .unwrap_or_default()
@@ -9649,6 +9756,7 @@ drop them from rpc_servers in config.toml",
                     &manifest,
                     &bench_bin,
                     draft_pick,
+                    dflash_pick,
                     &loras,
                 )
                 .await
@@ -9707,16 +9815,26 @@ drop them from rpc_servers in config.toml",
         manifest: &crate::Manifest,
         bench_bin: &std::path::PathBuf,
         draft_pick: DraftPick,
+        dflash_pick: DraftPick,
         loras: &[(String, f64)],
     ) -> Result<RacePassSummary> {
         let cfg = self.cfg();
         // Candidate arms exactly as the manual race builds them:
-        // manifest-advertised modes only.
+        // manifest-advertised modes only. The dflash arm additionally
+        // needs the typed pair actually resolvable - advertised alone
+        // would race a draft-free shape spawn-side compile refuses,
+        // landing a receipt adoption could never serve.
         let mut modes = vec!["dense".to_string()];
         if manifest.spec_types.iter().any(|s| s == "ngram-simple") {
             modes.push("ngram".to_string());
         }
-        if manifest.spec_types.iter().any(|s| s == "draft-dflash") {
+        let dflash_draft: Option<String> = match &dflash_pick {
+            DraftPick::Paired(p) if manifest.spec_types.iter().any(|s| s == "draft-dflash") => {
+                Some(p.clone())
+            }
+            _ => None,
+        };
+        if dflash_draft.is_some() {
             modes.push("dflash".to_string());
         }
         // Draft arm: resolve the catalog pair and verify the planner
@@ -9819,6 +9937,7 @@ drop them from rpc_servers in config.toml",
             let race_argv = base_race.argv.clone();
             let mode_for_task = mode.clone();
             let draft = draft_pair.as_ref().map(|(p, n)| (p.clone(), *n));
+            let dflash_path = dflash_draft.clone();
             let dirs = self.dirs.clone();
             let bin = bench_bin.clone();
             let outcome = tokio::task::spawn_blocking(move || {
@@ -9830,6 +9949,7 @@ drop them from rpc_servers in config.toml",
                     &race_argv,
                     &mode_for_task,
                     draft.as_ref().map(|(p, n)| (p.as_str(), *n)),
+                    dflash_path.as_deref(),
                     Some(ngram_knobs),
                     None,
                     &Self::AUTOTUNE_PARITY_PROMPTS,
@@ -15169,26 +15289,34 @@ mod routing_tests {
         // gated out, ngram (1.10) takes over - hardware truth, not hope.
         let rows = vec![receipt("ngram", 1.10), receipt("draft", 1.30)];
         assert_eq!(
-            best(&rows, &advertised, false),
+            best(&rows, &advertised, false, false),
             Some(("ngram", 1.10)),
             "draft receipt without an available pair must not win"
         );
         // With the pair available the draft receipt wins and maps to
         // the "auto" override spelling (planner owns engagement).
-        assert_eq!(best(&rows, &advertised, true), Some(("auto", 1.30)));
+        assert_eq!(best(&rows, &advertised, true, false), Some(("auto", 1.30)));
         // Engine that advertises neither spec type: nothing is usable.
-        assert_eq!(best(&rows, &[], true), None);
-        // dflash needs draft-dflash advertised.
+        assert_eq!(best(&rows, &[], true, false), None);
+        // dflash needs draft-dflash advertised AND the typed pair
+        // resolvable: spawn-side compile hard-errors an unpaired
+        // dflash, so a receipt for one must never adopt either.
         let dflash_rows = vec![receipt("dflash", 1.50)];
-        assert_eq!(best(&dflash_rows, &advertised, true), None);
+        assert_eq!(best(&dflash_rows, &advertised, true, false), None);
         assert_eq!(
-            best(&dflash_rows, &["draft-dflash".to_string()], false),
+            best(&dflash_rows, &["draft-dflash".to_string()], false, true),
             Some(("dflash", 1.50)),
-            "dflash is draft-free: pair availability is irrelevant"
+            "paired + advertised dflash is servable and selects"
+        );
+        assert_eq!(
+            best(&dflash_rows, &["draft-dflash".to_string()], false, false),
+            None,
+            "unpaired dflash receipt (live bug: adoption picked a mode spawn refuses) \
+             must never select"
         );
         // Dense is the baseline, sub-threshold receipts are noise.
         let noise = vec![receipt("dense", 1.0), receipt("ngram", 1.02)];
-        assert_eq!(best(&noise, &advertised, true), None);
+        assert_eq!(best(&noise, &advertised, true, false), None);
         // Equal ratios: the LATER measurement breaks the tie.
         let tie = vec![
             blazar_core::store::SpecReceiptRow {
@@ -15200,10 +15328,10 @@ mod routing_tests {
                 ..receipt("ngram", 1.20)
             },
         ];
-        assert_eq!(best(&tie, &advertised, true), Some(("ngram", 1.20)));
+        assert_eq!(best(&tie, &advertised, true, false), Some(("ngram", 1.20)));
         // Unknown receipt spellings never select.
         let unknown = vec![receipt("eagle3", 2.0)];
-        assert_eq!(best(&unknown, &advertised, true), None);
+        assert_eq!(best(&unknown, &advertised, true, false), None);
     }
 
     #[test]
@@ -15229,7 +15357,7 @@ mod routing_tests {
         // tuned arm wins on its honest (smaller) ratio.
         let rows = vec![receipt("ngram", 1.50, false), receipt("ngram", 1.12, true)];
         assert_eq!(
-            best(&rows, &advertised, false),
+            best(&rows, &advertised, false, false),
             Some(("ngram", 1.12)),
             "untuned ngram must lose to the tuned arm despite the higher ratio"
         );
@@ -15238,7 +15366,7 @@ mod routing_tests {
         // receipt population's shape: default-shape races).
         let untuned_only = vec![receipt("ngram", 1.50, false)];
         assert_eq!(
-            best(&untuned_only, &advertised, false),
+            best(&untuned_only, &advertised, false, false),
             None,
             "an untuned-only ngram history must not pin the mode"
         );
@@ -15252,7 +15380,7 @@ mod routing_tests {
             ..receipt("dflash", 1.40, false)
         }];
         assert_eq!(
-            best(&dflash, &["draft-dflash".to_string()], false),
+            best(&dflash, &["draft-dflash".to_string()], false, true),
             Some(("dflash", 1.40))
         );
     }
@@ -15282,7 +15410,7 @@ mod routing_tests {
             receipt(1.12, r#"{"parity_pass":3,"parity_total":3,"n":256}"#),
         ];
         assert_eq!(
-            best(&failed, &advertised, false),
+            best(&failed, &advertised, false, false),
             Some(("ngram", 1.12)),
             "parity-failed receipt must lose to the clean arm despite the higher ratio"
         );
@@ -15290,7 +15418,7 @@ mod routing_tests {
         // chain keeps deciding.
         let failed_only = vec![receipt(1.50, r#"{"parity_pass":0,"parity_total":3}"#)];
         assert_eq!(
-            best(&failed_only, &advertised, false),
+            best(&failed_only, &advertised, false, false),
             None,
             "a parity-failed-only history must not pin the mode"
         );
@@ -15300,7 +15428,7 @@ mod routing_tests {
         for params in ["{}", r#"{"n":256}"#, r#"{"parity_pass":"2"}"#, "not json"] {
             let legacy = vec![receipt(1.30, params)];
             assert_eq!(
-                best(&legacy, &advertised, false),
+                best(&legacy, &advertised, false, false),
                 Some(("ngram", 1.30)),
                 "params {params} must stay eligible"
             );

@@ -21758,9 +21758,10 @@ aborts on this family. Profile pins for it would measure nothing",
         if manifest.spec_types.iter().any(|s| s == "ngram-simple") {
             race_modes.push("ngram".to_string());
         }
-        if manifest.spec_types.iter().any(|s| s == "draft-dflash") {
-            race_modes.push("dflash".to_string());
-        }
+        // The dflash arm joins below, once the typed draft-dflash pair
+        // is resolved: advertised alone would race a draft-free shape
+        // spawn-side compile refuses, landing a receipt adoption could
+        // never serve.
         let overlay_race = cfg.overlay_for(model);
         let input_race = blazar_runtime::bench::build_input(
             model,
@@ -21882,6 +21883,43 @@ aborts on this family. Profile pins for it would measure nothing",
                 }
             }
         }
+        // dflash arm: the typed draft-dflash pair must be resolvable
+        // through the same store/catalog truth a spawn uses - an
+        // advertised-but-unpaired model degrades loudly here instead
+        // of racing an unservable arm.
+        let mut dflash_draft: Option<String> = None;
+        if manifest.spec_types.iter().any(|s| s == "draft-dflash") {
+            match blazar_runtime::pick_draft(
+                &store,
+                model,
+                "dflash",
+                blazar_runtime::lane_for(blazar_core::engine_kind::EngineKind::LlamaCpp),
+                Some(&row.path),
+            ) {
+                blazar_runtime::DraftPick::Paired(p) => {
+                    dflash_draft = Some(p.clone());
+                    race_modes.push("dflash".to_string());
+                }
+                blazar_runtime::DraftPick::Unavailable => {
+                    println!(
+                        "dflash arm skipped - no draft-dflash pair for {model} in the \
+                         catalog (spawn would refuse the mode; nothing to race)"
+                    );
+                }
+                blazar_runtime::DraftPick::IncompatibleLane(p) => {
+                    println!(
+                        "dflash arm skipped - catalog draft {p} is not a GGUF file; \
+                         llama.cpp drafts load as GGUF files"
+                    );
+                }
+                blazar_runtime::DraftPick::SelfPaired(_) => {
+                    println!(
+                        "dflash arm skipped - catalog draft for {model} resolved to the \
+                         main model file itself; a model cannot draft itself"
+                    );
+                }
+            }
+        }
         let base_race =
             blazar_core::profile::compile(&input_race, &blazar_core::TuningOverrides::default())
                 .map_err(|e| anyhow!("profile: {e}"))?;
@@ -21901,6 +21939,7 @@ aborts on this family. Profile pins for it would measure nothing",
             &race_modes,
             1,
             draft_pair.as_ref().map(|(p, n)| (p.as_str(), *n)),
+            dflash_draft.as_deref(),
             Some(ngram_knobs),
             slo_ms,
         )?;

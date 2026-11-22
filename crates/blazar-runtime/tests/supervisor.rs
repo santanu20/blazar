@@ -287,6 +287,21 @@ async fn integration__autotune_schedule__lands_parity_receipts_and_event() {
     autotune_engine_assets(&dirs);
     let store = Store::open(&dirs).unwrap();
 
+    // Evidence floor: the scheduled pass only races models with
+    // chat-shaped workload rows in the window (day key packed int,
+    // matching the store's YYYYMMDD convention).
+    let day: i64 = store
+        .conn()
+        .query_row(
+            "SELECT CAST(strftime('%Y%m%d','now') AS INTEGER)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store
+        .add_usage_workload_deltas(&[(day, "m1".into(), "interactive_chat".into(), 5)])
+        .unwrap();
+
     let mut cfg = base_config();
     cfg.autotune = Some("scheduled".into());
     let mut engine = LlamaCppEngine::new(stub_manifest());
@@ -407,6 +422,20 @@ fn autotune_engine_assets(dirs: &BlazarDirs) {
 async fn integration__autotune_schedule__busy_lane_skips_model() {
     let (_t, dirs) = setup(&[("m1", 500)]);
     autotune_engine_assets(&dirs);
+    // Evidence seeded so the busy-lane gate (not the evidence floor)
+    // is what skips this model.
+    let store = Store::open(&dirs).unwrap();
+    let day: i64 = store
+        .conn()
+        .query_row(
+            "SELECT CAST(strftime('%Y%m%d','now') AS INTEGER)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    store
+        .add_usage_workload_deltas(&[(day, "m1".into(), "interactive_chat".into(), 5)])
+        .unwrap();
     let mut cfg = base_config();
     cfg.autotune = Some("scheduled".into());
     let sup = supervisor(&dirs, cfg, true);
@@ -423,6 +452,33 @@ async fn integration__autotune_schedule__busy_lane_skips_model() {
     assert_eq!(sup.ps().len(), 1, "serving instance must survive");
     assert_eq!(sup.ps()[0].state, "ready");
     sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__autotune_schedule__no_chat_evidence_skips_model() {
+    // The evidence floor: a GGUF model the gateway has never served
+    // chat traffic for (embedder, TTS voice, fresh install) must never
+    // be raced - no evictions, no children, no receipts.
+    let (_t, dirs) = setup(&[("m1", 500)]);
+    autotune_engine_assets(&dirs);
+    let mut cfg = base_config();
+    cfg.autotune = Some("scheduled".into());
+    let sup = supervisor(&dirs, cfg, true);
+    sup.autotune_schedule_tick().await;
+    // Detached pass: give it a window to (wrongly) start racing, then
+    // assert nothing landed and nothing was evicted or spawned.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let store = Store::open(&dirs).unwrap();
+    assert!(
+        store.list_spec_receipts("m1", "stub").unwrap().is_empty(),
+        "unevidenced model must not race"
+    );
+    assert!(sup.ps().is_empty(), "no instance may be spawned for a race");
+    assert!(
+        !sup.autotune_race_busy_for_test(),
+        "pass must release the single-flight flag"
+    );
 }
 
 #[tokio::test]

@@ -430,28 +430,41 @@ impl Tuner<'_> {
     /// Spec-mode race (`tune --spec-race`): spawn the real llama-server
     /// once per candidate mode - dense (no speculation), ngram
     /// (`--spec-type ngram-simple` at engine defaults), dflash
-    /// (`--spec-type draft-dflash`, draft-free block speculation),
-    /// draft (`--spec-type draft-simple` with the catalog's draft
-    /// model and the profile's n-max) - and measure single-stream
+    /// (`--spec-type draft-dflash` with the catalog's typed draft
+    /// model), draft (`--spec-type draft-simple` with the catalog's
+    /// draft model and the profile's n-max) - and measure single-stream
     /// wall tokens/s. Phase one of the two-phase spec search: the
     /// winning mode (if ngram) goes to [`Self::ngram_search`] for
     /// (`size_m`, `min_hits`) refinement; dflash and dense carry no
     /// refinable knobs on this axis. Only modes the engine's manifest
     /// advertises may race - the caller filters before invoking.
     /// `draft` additionally requires the caller to pass the draft
-    /// pair (`path`, `n_max`) resolved from the catalog.
+    /// pair (`path`, `n_max`) and the catalog's typed draft-dflash
+    /// model resolved from the store; an advertised-but-unpaired
+    /// dflash must not race (spawn-side compile would refuse to serve
+    /// the resulting receipt).
+    #[allow(clippy::too_many_arguments)]
     pub fn spec_mode_race(
         &self,
         base_argv: &[String],
         modes: &[String],
         idle_secs: u64,
         draft: Option<(&str, u32)>,
+        dflash_draft: Option<&str>,
         ngram_knobs: Option<(u32, u32, u32)>,
         slo_ms: Option<f64>,
     ) -> Result<Vec<(String, f64)>> {
         let mut out = Vec::new();
         for mode in modes {
-            let arm = self.race_one_mode(base_argv, mode, draft, ngram_knobs, slo_ms, &[])?;
+            let arm = self.race_one_mode(
+                base_argv,
+                mode,
+                draft,
+                dflash_draft,
+                ngram_knobs,
+                slo_ms,
+                &[],
+            )?;
             out.push((mode.to_string(), arm.tok_per_s));
             std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
         }
@@ -476,6 +489,7 @@ impl Tuner<'_> {
         base_argv: &[String],
         mode: &str,
         draft: Option<(&str, u32)>,
+        dflash_draft: Option<&str>,
         ngram_knobs: Option<(u32, u32, u32)>,
         slo_ms: Option<f64>,
         parity_prompts: &[&str],
@@ -514,7 +528,19 @@ impl Tuner<'_> {
                 }
             }
             "dflash" => {
-                argv.extend(["--spec-type".to_string(), "draft-dflash".to_string()]);
+                // The typed draft-dflash arm must run the catalog's
+                // draft model exactly as a spawn would: without it the
+                // engine boots a draft-free shape spawn-side compile
+                // refuses, and the receipt could never be served.
+                let path = dflash_draft.ok_or_else(|| {
+                    anyhow!("spec race: dflash mode requested but no draft-dflash pair resolved")
+                })?;
+                argv.extend([
+                    "--spec-type".to_string(),
+                    "draft-dflash".to_string(),
+                    "--spec-draft-model".to_string(),
+                    path.to_string(),
+                ]);
             }
             "draft" => {
                 let (path, n_max) = draft.ok_or_else(|| {
