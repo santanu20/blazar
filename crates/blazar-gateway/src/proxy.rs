@@ -1006,6 +1006,247 @@ pub(crate) async fn child_send(
     }
 }
 
+/// Deterministic JSON truncation repair: append the missing closing
+/// quote for an unterminated string, then close every still-open
+/// bracket in reverse order. Escape-aware (a quoted `"` never toggles
+/// string state); a mismatched closer means the input is corrupt
+/// beyond truncation and returns `None`.
+fn balance_close_json(raw: &str) -> Option<String> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut stack: Vec<char> = Vec::new();
+    for ch in raw.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => stack.push(ch),
+            '}' => {
+                if stack.pop() != Some('{') {
+                    return None;
+                }
+            }
+            ']' => {
+                if stack.pop() != Some('[') {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::with_capacity(raw.len() + stack.len() + 1);
+    out.push_str(raw);
+    if in_string {
+        out.push('"');
+    }
+    while let Some(open) = stack.pop() {
+        out.push(if open == '{' { '}' } else { ']' });
+    }
+    (out != raw).then_some(out)
+}
+
+/// Whether a child error body is llama-server's JSON-arguments parse
+/// rejection (nlohmann embeds both `json.exception` and `parse_error`
+/// in the message): the only 500 shape the repair lane may touch.
+/// Cheap substring gates before any parse.
+fn is_llamacpp_parse_error_500(buf: &[u8]) -> bool {
+    crate::keys::find_sub(buf, b"json.exception").is_some()
+        && crate::keys::find_sub(buf, b"parse_error").is_some()
+}
+
+/// Repair an OpenAI chat history whose `tool_calls` carry arguments
+/// strings that are not valid JSON - spec-legal for the client (the
+/// contract treats arguments as an opaque string), fatal for
+/// llama.cpp's parser. Truncation-class strings are closed losslessly
+/// ([`balance_close_json`]); anything still unparseable has its
+/// tool_call entry and the matching tool-result message dropped, so
+/// the child never sees an orphaned tool answer. Returns a
+/// "repaired=N dropped=M" receipt when the body changed, `None` when
+/// nothing needed (or could be) fixed.
+fn repair_tool_args_history(v: &mut serde_json::Value) -> Option<String> {
+    let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return None;
+    };
+    let mut repaired = 0usize;
+    let mut dropped_ids: Vec<String> = Vec::new();
+    for msg in messages.iter_mut() {
+        let Some(calls) = msg.get_mut("tool_calls").and_then(|t| t.as_array_mut()) else {
+            continue;
+        };
+        for call in calls.iter_mut() {
+            let args = call
+                .pointer_mut("/function/arguments")
+                .and_then(|a| a.as_str())
+                .map(str::to_string);
+            let Some(args) = args else { continue };
+            if serde_json::from_str::<serde_json::Value>(&args).is_ok() {
+                continue;
+            }
+            let fixed = balance_close_json(&args)
+                .filter(|candidate| serde_json::from_str::<serde_json::Value>(candidate).is_ok());
+            match fixed {
+                Some(fixed) => {
+                    if let Some(a) = call.pointer_mut("/function/arguments") {
+                        *a = serde_json::Value::String(fixed);
+                    }
+                    repaired += 1;
+                }
+                None => {
+                    if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                        dropped_ids.push(id.to_string());
+                    }
+                    if let Some(obj) = call.as_object_mut() {
+                        // Marker is retained away with the entry - it
+                        // never reaches serialization.
+                        obj.insert("__blazar_drop".to_string(), serde_json::Value::Bool(true));
+                    }
+                }
+            }
+        }
+        if let Some(arr) = msg.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+            arr.retain(|c| c.get("__blazar_drop").is_none());
+        }
+    }
+    // Orphaned tool results would still poison the child - remove
+    // them by tool_call_id.
+    if !dropped_ids.is_empty() {
+        messages.retain(|msg| {
+            !(msg.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                && msg
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| dropped_ids.iter().any(|d| d == id)))
+        });
+    }
+    // Assistant messages the drop emptied (no tool calls left, no
+    // content of any shape) carry no signal - remove them whole.
+    messages.retain(|msg| {
+        !(msg.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            && msg
+                .get("tool_calls")
+                .is_some_and(|t| t.as_array().is_some_and(|a| a.is_empty()))
+            && msg.get("content").map_or(true, serde_json::Value::is_null))
+    });
+    (repaired > 0 || !dropped_ids.is_empty())
+        .then(|| format!("repaired={repaired} dropped={}", dropped_ids.len()))
+}
+
+/// Rebuild a child response from its own saved parts so a buffered
+/// probe leaves the relay contract intact - identical status,
+/// headers, and body bytes flow downstream whether or not the repair
+/// lane decided to act.
+fn rebuild_child_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: axum::body::Bytes,
+) -> reqwest::Response {
+    let mut builder = axum::http::Response::builder().status(status);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(body.clone())
+        .map(reqwest::Response::from)
+        .unwrap_or_else(|_| reqwest::Response::from(axum::http::Response::new(body)))
+}
+
+/// Reactive repair lane for the llama.cpp tool-args 500: buffers the
+/// error body (the caller already gated on engine, chat lane, status
+/// and a bounded declared length), checks the nlohmann signature,
+/// repairs the request's tool-args history, re-applies the same child
+/// mutations the first send received, and retries exactly once. Every
+/// miss - wrong signature, unrepairable body, failed retry - returns
+/// the ORIGINAL response rebuilt from its own parts, so non-matching
+/// failures relay byte-identically. The retry rides the same engine
+/// ref; after a crash-window respawn this ref may be dead, in which
+/// case the retry fails transport and the original 500 stands.
+#[allow(clippy::too_many_arguments)]
+async fn repair_tool_args_500_retry(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    method: &axum::http::Method,
+    url: &str,
+    path_query: &str,
+    headers: &HeaderMap,
+    request_body: &axum::body::Bytes,
+    resp: reqwest::Response,
+    model: &str,
+) -> (reqwest::Response, Option<String>) {
+    let status = resp.status();
+    let hdrs = resp.headers().clone();
+    let Ok(buf) = resp.bytes().await else {
+        return (
+            rebuild_child_response(status, &hdrs, axum::body::Bytes::new()),
+            None,
+        );
+    };
+    let unchanged = || rebuild_child_response(status.clone(), &hdrs, buf.clone());
+    if !is_llamacpp_parse_error_500(&buf) {
+        return (unchanged(), None);
+    }
+    let mut repaired_req = match serde_json::from_slice::<serde_json::Value>(request_body) {
+        Ok(v) => v,
+        Err(_) => return (unchanged(), None),
+    };
+    let Some(note) = repair_tool_args_history(&mut repaired_req) else {
+        return (unchanged(), None);
+    };
+    // The retried body gets the same mutation treatment as the first
+    // send (model stamps, dialect fixes, LoRA pairs) or the child
+    // rejects a shape it otherwise accepts.
+    let model_field = repaired_req
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(model);
+    let stamp = sglang_variant_stamp(state, engine, Some(model_field));
+    let lora = match llamacpp_variant_lora(state, engine, Some(model_field)).await {
+        Some(Ok(pairs)) => Some(pairs),
+        // A teach on the retry means the LoRA pin cannot be rebuilt:
+        // the original 500 stands rather than a degraded retry.
+        Some(Err(_)) | None => None,
+    };
+    let Ok(repaired_bytes) = serde_json::to_vec(&repaired_req) else {
+        return (unchanged(), None);
+    };
+    let retry_body = apply_child_request_mutations_stamped(
+        engine,
+        path_query,
+        axum::body::Bytes::from(repaired_bytes),
+        Some(&repaired_req),
+        stamp.as_deref(),
+        lora.as_deref(),
+    );
+    match forward_once(state, engine, method, url, headers, retry_body).await {
+        Ok(r2) => {
+            tracing::info!(
+                target: "blazar::proxy",
+                model,
+                repair = %note,
+                "repaired spec-legal malformed tool-args history after child 500; single retry"
+            );
+            (r2, Some(note))
+        }
+        Err(e2) => {
+            tracing::warn!(
+                target: "blazar::proxy",
+                model,
+                "repair retry failed ({e2}); relaying original child 500"
+            );
+            (unchanged(), None)
+        }
+    }
+}
+
 /// One child-engine transport attempt: child auth, hop-by-hop header
 /// filtering, send. The hot path and the crash-window retry both ride
 /// it, so a retry carries identical auth and header hygiene.
@@ -1306,7 +1547,7 @@ pub async fn proxy_request(
         crate::keys::LocalServiceStamp::new(std::sync::Arc::clone(&state.service_ewma_local), model)
     });
     let upstream = forward_once(state, engine, method, &url, headers, body).await;
-    let resp = match upstream {
+    let mut resp = match upstream {
         Ok(r) => r,
         Err(e) => {
             if let Some(s) = service_stamp.take() {
@@ -1429,6 +1670,33 @@ pub async fn proxy_request(
         }
     };
 
+    // llama.cpp tool-args 500 repair (spec-legal malformed history):
+    // gated on engine + status + chat lane + a bounded declared body
+    // length, so the common path never buffers a byte. The helper
+    // rebuilds the original response from its own parts on every
+    // non-matching arm - relay behavior is preserved exactly.
+    let mut repair_note: Option<String> = None;
+    if engine.kind == EngineKind::LlamaCpp
+        && resp.status() == StatusCode::INTERNAL_SERVER_ERROR
+        && is_chat_path(path_query)
+        && resp.content_length().is_some_and(|cl| cl <= 64 * 1024)
+    {
+        let (r, note) = repair_tool_args_500_retry(
+            state,
+            engine,
+            method,
+            &url,
+            path_query,
+            headers,
+            &body_snapshot,
+            resp,
+            model,
+        )
+        .await;
+        resp = r;
+        repair_note = note;
+    }
+
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     for (name, value) in resp.headers() {
@@ -1440,6 +1708,11 @@ pub async fn proxy_request(
     // cold load say so.
     if load_ms > 100 {
         builder = builder.header("x-blazar-status", "loading");
+    }
+    // Repair-lane receipt (see [`repair_tool_args_500_retry`]): the
+    // client sees exactly what the gateway changed on its behalf.
+    if let Some(note) = repair_note {
+        builder = builder.header("x-blazar-repair", note);
     }
     // Structured-output receipt (E2-δ): successful responses that rode
     // a constraint say WHICH one - clients auditing schema conformance
@@ -4608,6 +4881,123 @@ mod cache_obs_tests {
         assert_eq!(obs.prompt_tokens.load(Ordering::Relaxed), 120, "usage wins");
         assert_eq!(obs.cached_tokens.load(Ordering::Relaxed), 96, "usage wins");
         assert_eq!(obs.unclassified.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod repair_lane_tests {
+    use super::*;
+
+    #[test]
+    fn unit__balance_close_json__unterminated_string_then_brackets() {
+        // Truncated string value: close the quote only.
+        assert_eq!(balance_close_json("\"Tok").as_deref(), Some("\"Tok\""));
+        // Truncated object with the string still open: quote, then the
+        // bracket, in that order.
+        assert_eq!(
+            balance_close_json("{\"city\": \"Tok").as_deref(),
+            Some("{\"city\": \"Tok\"}")
+        );
+        // Nested truncation closes inside-out.
+        assert_eq!(
+            balance_close_json("{\"a\": [{\"b\": 1").as_deref(),
+            Some("{\"a\": [{\"b\": 1}]}")
+        );
+        // An escaped quote never ends the string - the closer lands
+        // after the real content.
+        assert_eq!(
+            balance_close_json("{\"a\": \"x\\\"").as_deref(),
+            Some("{\"a\": \"x\\\"\"}")
+        );
+    }
+
+    #[test]
+    fn unit__balance_close_json__corrupt_beyond_truncation_is_none() {
+        // Mismatched closer: not a truncation, unfixable.
+        assert_eq!(balance_close_json("}"), None);
+        assert_eq!(balance_close_json("{\"a\": 1]"), None);
+        // Already balanced: nothing to append -> no repair.
+        assert_eq!(balance_close_json("{\"a\": 1}"), None);
+        assert_eq!(balance_close_json(""), None);
+    }
+
+    #[test]
+    fn unit__repair_tool_args_history__lossless_truncation_repair() {
+        let mut v = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Tokyo?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Tok"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool error: truncated"}
+            ]
+        });
+        let note = repair_tool_args_history(&mut v);
+        assert_eq!(note.as_deref(), Some("repaired=1 dropped=0"));
+        let args = v["messages"][1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("args");
+        assert!(serde_json::from_str::<serde_json::Value>(args).is_ok());
+        // The tool result is NOT orphaned - it stays for the model.
+        assert_eq!(v["messages"][2]["role"], "tool");
+    }
+
+    #[test]
+    fn unit__repair_tool_args_history__uncorruptible_entry_dropped_with_orphan() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_bad", "type": "function",
+                     "function": {"name": "f", "arguments": "not json at all"}},
+                    {"id": "call_ok", "type": "function",
+                     "function": {"name": "g", "arguments": "{\"x\": 1}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_bad", "content": "err"},
+                {"role": "tool", "tool_call_id": "call_ok", "content": "ok"}
+            ]
+        });
+        let note = repair_tool_args_history(&mut v);
+        assert_eq!(note.as_deref(), Some("repaired=0 dropped=1"));
+        // The corrupt call is gone, its orphaned result went with it,
+        // and the healthy pair survived untouched.
+        let calls = v["messages"][0]["tool_calls"].as_array().expect("calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_ok");
+        assert_eq!(v["messages"].as_array().expect("messages").len(), 2);
+        assert_eq!(v["messages"][1]["tool_call_id"], "call_ok");
+    }
+
+    #[test]
+    fn unit__repair_tool_args_history__clean_history_is_untouched() {
+        let mut v = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "c", "type": "function",
+                     "function": {"name": "f", "arguments": "{\"a\": 2}"}}
+                ]}
+            ]
+        });
+        assert_eq!(repair_tool_args_history(&mut v), None);
+        // Non-array messages shape: nothing to do.
+        let mut bare = serde_json::json!({"messages": "nope"});
+        assert_eq!(repair_tool_args_history(&mut bare), None);
+    }
+
+    #[test]
+    fn unit__is_llamacpp_parse_error_500__signature_gates() {
+        // nlohmann parse_error body (live-captured shape, T10 run).
+        let nlohmann = br#"{"error":{"code":500,"message":"json.exception.parse_error.101 ... \"Tok ...","type":"server_error"}}"#;
+        assert!(is_llamacpp_parse_error_500(nlohmann));
+        // Any other 500 body: both markers required.
+        assert!(!is_llamacpp_parse_error_500(
+            br#"{"error":{"message":"internal"}}"#
+        ));
+        assert!(!is_llamacpp_parse_error_500(
+            b"parse_error without the exception prefix"
+        ));
     }
 }
 
