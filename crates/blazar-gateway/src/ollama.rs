@@ -4909,6 +4909,29 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             .evictions
             .load(std::sync::atomic::Ordering::Relaxed)
     );
+    // Sentinel quality telemetry: committed records, per-code
+    // detections, and the D6 verdict-cache economics - the ring's
+    // content stays on /api/why; this is the scrape-time summary.
+    let (sent_records, sent_detections) = state.sentinel.metrics_counts();
+    let (verdict_hits, verdict_misses) = state.sentinel.verdict_stats();
+    let _ = write!(
+        merged,
+        "# HELP blazar_sentinel_records_total Sentinel records committed (finished observed generations)\n# TYPE blazar_sentinel_records_total counter\nblazar_sentinel_records_total {sent_records}\n"
+    );
+    let _ = write!(
+        merged,
+        "# HELP blazar_sentinel_detections_total Detections per sentinel code\n# TYPE blazar_sentinel_detections_total counter\n"
+    );
+    for (code, count) in &sent_detections {
+        let _ = write!(
+            merged,
+            "blazar_sentinel_detections_total{{code=\"{code}\"}} {count}\n"
+        );
+    }
+    let _ = write!(
+        merged,
+        "# HELP blazar_sentinel_verdict_cache_hits Structured-output verdict LRU hits (D6)\n# TYPE blazar_sentinel_verdict_cache_hits counter\nblazar_sentinel_verdict_cache_hits {verdict_hits}\n# HELP blazar_sentinel_verdict_cache_misses Structured-output verdict LRU misses (D6)\n# TYPE blazar_sentinel_verdict_cache_misses counter\nblazar_sentinel_verdict_cache_misses {verdict_misses}\n"
+    );
     // E4: audit lines dropped (writer saturated / IO failure). Non-zero
     // while `audit_log = true` means the trail has gaps.
     let _ = write!(

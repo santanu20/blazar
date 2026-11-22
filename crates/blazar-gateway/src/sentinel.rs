@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use std::time::Duration;
@@ -70,6 +70,36 @@ pub enum Code {
 }
 
 impl Code {
+    /// Every detection code in declaration order - the single list to
+    /// extend when the vocabulary grows (counter arrays and `/metrics`
+    /// rendering derive from this, never a parallel hand count).
+    pub const ALL: [Self; 11] = [
+        Self::CtxTruncated,
+        Self::CtxNearLimit,
+        Self::ToolArgsInvalidJson,
+        Self::ToolNameUnknown,
+        Self::SchemaViolation,
+        Self::EmptyResponse,
+        Self::ReasoningNoAnswer,
+        Self::StalledStream,
+        Self::TemplateNoTools,
+        Self::CacheBustSystem,
+        Self::EngineSlowAttn,
+    ];
+
+    /// Width of code-indexed arrays; `ALL.len()` frozen at compile time.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Index into `ALL`-sized arrays (metrics counters). Every variant
+    /// is in `ALL` by construction, so the expect is a static truth.
+    #[must_use]
+    pub fn idx(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|&c| c == self)
+            .expect("every Code variant is in ALL")
+    }
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -764,6 +794,11 @@ pub struct Sentinel {
     watch_tx: tokio::sync::broadcast::Sender<SentinelRecord>,
     /// J5: stall-triggered evictions (None until the owner wires it).
     evict_hook: Mutex<Option<EvictHook>>,
+    /// `/metrics` counters: records committed and detections per code
+    /// (index = `Code::idx`). Monotonic scrape-time visibility; the
+    /// ring stays the source of truth for record content.
+    records_total: AtomicU64,
+    detections_total: [AtomicU64; Code::COUNT],
 }
 
 /// Wrapper so the struct stays Clone-cheap and Debug-clean.
@@ -823,6 +858,8 @@ impl Sentinel {
             persist_path,
             watch_tx,
             evict_hook: Mutex::new(None),
+            records_total: AtomicU64::new(0),
+            detections_total: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 
@@ -863,6 +900,24 @@ impl Sentinel {
     pub fn verdict_stats(&self) -> (u64, u64) {
         let v = self.verdicts.lock();
         (v.hits, v.misses)
+    }
+
+    /// `/metrics` counters: committed records plus per-code detection
+    /// counts. Every code is reported, zeros included, so scrape
+    /// output stays stable across restarts of the vocabulary.
+    #[must_use]
+    pub fn metrics_counts(&self) -> (u64, Vec<(&'static str, u64)>) {
+        let records = self.records_total.load(Ordering::Relaxed);
+        let detections = Code::ALL
+            .iter()
+            .map(|&c| {
+                (
+                    c.as_str(),
+                    self.detections_total[c.idx()].load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        (records, detections)
     }
 
     /// Begin observing a request: spawns the analyzer and returns the
@@ -1074,7 +1129,9 @@ impl Sentinel {
 
     /// Warn, ring-insert, and persist one finalized record.
     pub(crate) fn commit(&self, record: &SentinelRecord) {
+        self.records_total.fetch_add(1, Ordering::Relaxed);
         for d in &record.detections {
+            self.detections_total[d.code.idx()].fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 target: "blazar::sentinel",
                 trace = %record.trace,
@@ -1821,6 +1878,41 @@ mod tests {
         let _ = s.judge(&ctx, &body, 200);
         let got = rx.recv().await.expect("record broadcast");
         assert_eq!(got.trace, "plm-watch-1");
+    }
+
+    #[tokio::test]
+    async fn unit__metrics_counts__commit_bumps_records_and_per_code_counters() {
+        let s = Sentinel::new(true, 0, None);
+        let mut rx = s.watch();
+        let ctx = RequestCtx {
+            trace: "plm-metrics-1".into(),
+            route: "openai-chat".into(),
+            model: "m".into(),
+            ..Default::default()
+        };
+        // Empty content + clean finish = the canonical empty_response
+        // detection, so both counter families move in one commit.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+        let _ = s.judge(&ctx, &body, 200);
+        // Broadcast fires inside commit AFTER the counter bumps - the
+        // received record proves the bumps already happened.
+        let _ = rx.recv().await.expect("record broadcast");
+        let (records, detections) = s.metrics_counts();
+        assert_eq!(records, 1, "one committed record");
+        let empty = detections
+            .iter()
+            .find(|(c, _)| *c == "empty_response")
+            .expect("empty_response reported");
+        assert_eq!(empty.1, 1, "detection counter bumped exactly once");
+        let zeros = detections.iter().filter(|(_, n)| *n == 0).count();
+        assert_eq!(
+            zeros,
+            Code::COUNT - 1,
+            "every other code reported (at zero)"
+        );
     }
 
     #[test]
