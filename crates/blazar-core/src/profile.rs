@@ -277,7 +277,56 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
     // the connection quintet (model-path/host/port/api-key/served-name);
     // this profile owns the numbers (ctx ladder, VRAM tiers, concurrency).
     if input.engine_kind == crate::engine_kind::EngineKind::Sglang {
-        return compile_sglang(input, tuning);
+        return match compile_sglang(input, tuning) {
+            Ok(profile) => Ok(profile),
+            Err(reason) => {
+                if input.draft_path.is_none()
+                    && input
+                        .overlay
+                        .sglang
+                        .as_ref()
+                        .is_none_or(|s| s.spec_algorithm.is_none())
+                {
+                    return Err(reason);
+                }
+                // A spec lane was requested (resolved draft pair or an
+                // explicit sglang.spec_algorithm pin) but the
+                // spec-charged plan cannot fit this card (target +
+                // draft + verify chain vs the dynamic ceiling).
+                // Speculation is a speed knob, not a capability gate:
+                // degrade to the dense plan with a loud teaching
+                // instead of blocking the model entirely. The
+                // unregistered-algorithm path already degrades this
+                // way inside push_sglang_speculative; this closes the
+                // registered-but-unfit gap (live receipt 2026-11-22:
+                // qwen3-8b-awq + DSPINE draft pair on an 8 GiB card -
+                // static demand ~9 GiB vs the card, hard 400 on every
+                // request until the pair was uninstalled).
+                let mut dense_overlay = input.overlay.clone();
+                if let Some(sg) = dense_overlay.sglang.as_mut() {
+                    sg.spec_algorithm = None;
+                    sg.spec_draft_path = None;
+                }
+                let dense = ProfileInput {
+                    spec_mode: "off",
+                    draft_path: None,
+                    draft_gguf: None,
+                    overlay: &dense_overlay,
+                    ..input.clone()
+                };
+                let mut profile = compile_sglang(&dense, tuning)?;
+                profile.warnings.insert(
+                    0,
+                    format!(
+                        "spec lane cannot fit this card ({reason}) - spawning \
+                         dense instead (speculation is a speed knob, not a \
+                         capability gate; the pair stays banked for a bigger \
+                         card or a lighter target)"
+                    ),
+                );
+                Ok(profile)
+            }
+        };
     }
     // Dialect fork: vllm speaks `vllm serve` grammar, admits memory via
     // a GPU fraction (not ctx math), and reads safetensors dirs - none
@@ -20313,6 +20362,62 @@ mod tests {
             p.argv
                 .windows(2)
                 .any(|w| w[0] == "--speculative-algorithm" && w[1] == "DSPINE")
+        );
+    }
+
+    #[test]
+    fn unit__sglang_spec__registered_but_unfit_degrades_dense_with_warning() {
+        // Live receipt 2026-11-22: DSPINE registered on sglang-0.5.22
+        // with the qwen3-8b-awq target + 2.4 GiB draft pair on an
+        // 8 GiB card - the spec verify reserve (2000 MiB) pushes the
+        // static demand past the dynamic ceiling and the compile
+        // hard-refused (400 MODEL_UNSUPPORTED_ENGINE on every request)
+        // instead of degrading to the dense plan that fits. The
+        // unregistered-algorithm path already degraded; a REGISTERED
+        // algorithm whose charged plan cannot fit now degrades the
+        // same way - speculation is a speed knob, not a capability
+        // gate. Fixture: AWQ weights 6328 MiB (5816 + 512 overhead),
+        // offload pinned off, spec reserve 2000 -> ceiling pool
+        // 0.756 x 8188 = 6190 < demand 6584 -> the spec plan refuses;
+        // the dense ceiling (reserve 1100 at 1 slot -> pool 7088)
+        // holds it comfortably.
+        static PROBED_WITH_DSPINE: LazyLock<Vec<String>> =
+            LazyLock::new(|| vec!["NGRAM".to_string(), "DSPINE".to_string()]);
+        let cfg = Config::default();
+        let hw = gpu_hw(8_188, 15_900, 8);
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(4_096),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
+                cpu_offload_gb: Some(0.0),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 5_816 * MIB);
+        inp.overlay = &overlay;
+        inp.spec_types = &PROBED_WITH_DSPINE;
+        let p = compile(&inp, &TuningOverrides::default())
+            .expect("registered-but-unfit spec must degrade to a dense boot");
+        assert!(
+            !p.argv.iter().any(|a| a == "--speculative-algorithm"),
+            "dense degradation must not emit a spec flag: {:?}",
+            p.argv
+        );
+        assert!(
+            p.warnings.iter().any(|w| w.contains("spec lane cannot fit")
+                && w.contains("dense")
+                && (w.contains("cannot boot") || w.contains("does not fit"))),
+            "degradation must teach the original refusal and the dense boot: {:?}",
+            p.warnings
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--mem-fraction-static"),
+            "the dense plan must still derive its fraction"
         );
     }
 
