@@ -304,9 +304,7 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
         // gap in both its escape shapes.
         let spec_offloaded = |p: &Profile| {
             p.argv.iter().any(|a| a == "--cpu-offload-gb")
-                && p.argv
-                    .windows(2)
-                    .any(|w| w[0] == "--speculative-algorithm")
+                && p.argv.windows(2).any(|w| w[0] == "--speculative-algorithm")
         };
         return match compile_sglang(input, tuning) {
             Ok(profile) => {
@@ -19481,8 +19479,16 @@ mod tests {
             let mut inp = sglang_input(&hf, &hw, &cfg, model * MIB);
             inp.overlay = &overlay;
             let p = compile(&inp, &TuningOverrides::default()).unwrap();
-            let bs = p.argv.windows(2).find(|w| w[0] == "--cuda-graph-max-bs").map(|w| w[1].clone());
-            let mf = p.argv.windows(2).find(|w| w[0] == "--mem-fraction-static").map(|w| w[1].clone());
+            let bs = p
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "--cuda-graph-max-bs")
+                .map(|w| w[1].clone());
+            let mf = p
+                .argv
+                .windows(2)
+                .find(|w| w[0] == "--mem-fraction-static")
+                .map(|w| w[1].clone());
             eprintln!("PROBE model={model} bs={bs:?} mf={mf:?}");
         }
     }
@@ -20522,9 +20528,7 @@ mod tests {
             p.warnings
         );
         assert!(
-            p.argv
-                .windows(2)
-                .any(|w| w[0] == "--mem-fraction-static"),
+            p.argv.windows(2).any(|w| w[0] == "--mem-fraction-static"),
             "the dense plan must still derive its fraction"
         );
     }
@@ -20572,8 +20576,11 @@ mod tests {
         // 8 GiB card: spec plan spills weights to host, dense full-fits
         // - dense must win with the offload teaching.
         let hw = gpu_hw(8_188, 15_900, 8);
-        let p = compile(&mk(&hw, &hf, &cfg, &overlay, &PROBED_WITH_DSPINE), &TuningOverrides::default())
-            .expect("offloaded spec must degrade to dense full residency");
+        let p = compile(
+            &mk(&hw, &hf, &cfg, &overlay, &PROBED_WITH_DSPINE),
+            &TuningOverrides::default(),
+        )
+        .expect("offloaded spec must degrade to dense full residency");
         assert!(
             !p.argv.iter().any(|a| a == "--cpu-offload-gb"),
             "dense full residency must not offload: {:?}",
@@ -20594,8 +20601,11 @@ mod tests {
         // A card where BOTH plans need offload keeps the spec plan
         // (spec recovers some offloaded-decode latency).
         let hw = gpu_hw(6_144, 15_900, 8);
-        let p = compile(&mk(&hw, &hf, &cfg, &overlay, &PROBED_WITH_DSPINE), &TuningOverrides::default())
-            .expect("tiny card must still compile");
+        let p = compile(
+            &mk(&hw, &hf, &cfg, &overlay, &PROBED_WITH_DSPINE),
+            &TuningOverrides::default(),
+        )
+        .expect("tiny card must still compile");
         assert!(
             p.argv
                 .windows(2)
@@ -20635,9 +20645,7 @@ mod tests {
         let p = compile(&auto_inp, &TuningOverrides::default())
             .expect("spec=auto with no pair must still compile");
         assert!(
-            !p.argv
-                .iter()
-                .any(|a| a == "--speculative-algorithm"),
+            !p.argv.iter().any(|a| a == "--speculative-algorithm"),
             "auto without a resolved pair must stay dense: {:?}",
             p.argv
         );
@@ -23851,8 +23859,7 @@ mod tests {
         det_inp.overlay = &det_overlay;
         let det = compile(&det_inp, &TuningOverrides::default()).unwrap();
         assert!(
-            !det
-                .warnings
+            !det.warnings
                 .iter()
                 .any(|w| w.contains("caps aggregate throughput")),
             "deterministic runs explain slots = 1 themselves: {:?}",

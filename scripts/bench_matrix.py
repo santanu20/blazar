@@ -352,8 +352,14 @@ def portable_path(text: str) -> str:
     # it carries the exact build identity.
     text = re.sub(
         r"--blazar-bin\s+(\S+)",
-        lambda m: "--blazar-bin "
-        + (m.group(1) if m.group(1).startswith(("target/", "./", "~")) else "target/release/blazar"),
+        lambda m: (
+            "--blazar-bin "
+            + (
+                m.group(1)
+                if m.group(1).startswith(("target/", "./", "~"))
+                else "target/release/blazar"
+            )
+        ),
         text,
     )
     return text
@@ -1932,9 +1938,7 @@ def run_media_tts_kokoro_cell(cfg: dict) -> dict:
                     rec["cold_request_s"] = round(cold["total_s"], 3)
                 warm = [r["total_s"] for r in ok_wav if not r["cold_request"]]
                 if warm:
-                    rec["wav_total_s_median"] = round(
-                        statistics.median(warm), 3
-                    )
+                    rec["wav_total_s_median"] = round(statistics.median(warm), 3)
                 elif ok_wav:
                     rec["wav_total_s_median"] = round(
                         statistics.median([r["total_s"] for r in ok_wav]), 3

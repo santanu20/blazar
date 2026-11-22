@@ -535,7 +535,10 @@ fn enrich_totals_with_raw_rows(gpus: Vec<GpuInfo>, raw: &[GpuInfo]) -> Vec<GpuIn
     }
     let mut gpus = gpus;
     let normalized = |s: &str| -> String {
-        s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     };
     let single_pair = raw.len() == 1 && gpus.len() == 1;
     for g in &mut gpus {
