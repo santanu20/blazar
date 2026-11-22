@@ -3,16 +3,23 @@
 
 Measures the dimensions the perf bench matrix cannot: selection
 correctness, argument validity, tool_choice forms, parallel calls,
-multi-turn loop, strict JSON schema, streaming tool deltas, and the
-tools-vs-no-tools latency delta (transport overhead proxy - the child
-is auth-gated by design, so raw-child comparison is not reachable
-externally; the no-tools request of identical prompt size isolates the
-tool-transport cost instead).
+multi-turn loop, strict JSON schema, streaming tool deltas, nested-
+schema arguments, malformed-history tolerance, tool-error recovery,
+full streaming call assembly, and the tools-vs-no-tools latency delta
+(transport overhead proxy - the child is auth-gated by design, so raw-
+child comparison is not reachable externally; the no-tools request of
+identical prompt size isolates the tool-transport cost instead).
 
 Usage:
     python3 scripts/toolcall_eval.py [model ...]     # default: qwen2.5-0.5b-instruct
+    python3 scripts/toolcall_eval.py --direct http://127.0.0.1:8199 [model ...]
 
-Outputs bench-artifacts/<date>-toolcall/<model>.json + report rows.
+The default arm hits the Blazar gateway; --direct re-runs the identical
+battery against a bare engine URL for gateway-vs-direct attribution.
+Direct-arm artifacts land in a sibling -direct dir, never over the
+gateway run's.
+
+Outputs bench-artifacts/<date>-toolcall/results.json + report rows.
 Every check is deterministic: exact tool name, parseable args, required
 fields with correct types. Parallel-call behavior is MEASURED (recorded
 count), never failed - models legitimately choose one call at a time.
@@ -78,6 +85,30 @@ CALC = {
         },
     },
 }
+BOOK = {
+    "type": "function",
+    "function": {
+        "name": "book_flight",
+        "description": "Book a flight; origin is an object with city and country",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "origin": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "country": {"type": "string"},
+                    },
+                    "required": ["city", "country"],
+                    "additionalProperties": False,
+                },
+                "passengers": {"type": "integer", "minimum": 1},
+                "class": {"type": "string", "enum": ["economy", "business"]},
+            },
+            "required": ["origin", "passengers", "class"],
+        },
+    },
+}
 
 
 def post(path: str, body: dict, timeout: int = 180):
@@ -111,19 +142,73 @@ def call_args(tc: dict) -> dict:
         return {"__unparseable__": raw[:80]}
 
 
+def stream_collect(body: dict):
+    """POST a streaming chat request and assemble tool-call deltas.
+
+    Returns (sse_done, calls) where calls maps the delta index to the
+    assembled {"id", "name", "arguments"} of that streamed tool call.
+    Names accumulate as fragments too: some engines stream the function
+    name across chunks instead of emitting it whole in the first delta.
+    """
+    req = urllib.request.Request(
+        BASE + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"content-type": "application/json"},
+    )
+    calls: dict[int, dict] = {}
+    sse_done = False
+    with urllib.request.urlopen(req, timeout=180) as r:
+        for line in r:
+            if not line.startswith(b"data: "):
+                continue
+            payload = line[6:].strip()
+            if payload == b"[DONE]":
+                sse_done = True
+                break
+            try:
+                delta = json.loads(payload)["choices"][0]["delta"]
+            except (ValueError, KeyError, IndexError):
+                continue
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function", {})
+                if fn.get("name"):
+                    slot["name"] += fn["name"]
+                slot["arguments"] += fn.get("arguments") or ""
+    return sse_done, calls
+
+
 class Battery:
     def __init__(self, model: str):
         self.model = model
         self.results: list[dict] = []
 
-    def record(self, name: str, ok: bool, evidence: str, measured=None):
+    def record(self, name: str, ok: bool, evidence: str, measured=None, xfail=None):
+        # xfail: the test still RUNS and records its raw result; a
+        # failure covered by a root-caused xfail reason counts as an
+        # expected failure (gate stays green, report shows XFAIL with
+        # the reason - never a silent skip). If it passes anyway the
+        # marker clears loudly so the pin can be removed.
         row = {"test": name, "ok": bool(ok), "evidence": evidence[:220]}
         if measured is not None:
             row["measured"] = measured
+        if xfail:
+            if ok:
+                row["xfail_cleared"] = xfail
+            else:
+                row["xfail"] = xfail
         self.results.append(row)
-        tag = "PASS" if ok else "FAIL"
+        if ok:
+            tag = "PASS" + (" (xfail cleared!)" if xfail else "")
+        else:
+            tag = "XFAIL" if xfail else "FAIL"
         extra = f" ({measured})" if measured is not None else ""
-        print(f"  [{tag}] {name}{extra} - {evidence[:120]}")
+        reason = f" reason: {xfail[:120]}" if (xfail and not ok) else ""
+        print(f"  [{tag}] {name}{extra} - {evidence[:120]}{reason}")
 
     def chat(self, tools, messages, **kw):
         body = {
@@ -185,8 +270,9 @@ class Battery:
         # Task-bearing prompt + one retry: tiny models occasionally
         # sample prose on the first draw even under the constraint -
         # transport enforcement is what this pins, not draw luck.
-        t3_calls, t3_st, attempt = 0, 0, -1
-        for _attempt in range(2):
+        t3_calls, t3_st, attempts = 0, 0, 0
+        for _ in range(2):
+            attempts += 1
             st, v, _ = self.chat(
                 [WEATHER],
                 [
@@ -210,7 +296,7 @@ class Battery:
         self.record(
             "T3 tool_choice=required",
             t3_st == 200 and t3_calls >= 1,
-            f"status={t3_st} calls={t3_calls} attempts={attempt + 1}",
+            f"status={t3_st} calls={t3_calls} attempts={attempts}",
         )
 
         # T4 dict-form tool_choice pins one specific function.
@@ -296,104 +382,292 @@ class Battery:
         )
 
         # T7 strict structured output alongside tools capability.
-        st, v, _ = post(
-            "/v1/chat/completions",
-            {
-                "model": m,
-                "stream": False,
-                "max_tokens": 120,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Return the weather summary as JSON with "
-                        "fields city (string) and temp_c (integer). City: Oslo.",
-                    }
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "summary",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "city": {"type": "string"},
-                                "temp_c": {"type": "integer"},
+        # Budget realism: reasoning-capable models spend tokens thinking
+        # before the first JSON byte, so a 120-token cap starved them
+        # (finish_reason=length, truncated content). 256 is the honest
+        # baseline; ONE retry at 512 fires only on an explicit length
+        # cap - a schema failure at a healthy budget is a real contract
+        # failure, not starvation.
+        def t7_once(budget: int):
+            st, v, _ = post(
+                "/v1/chat/completions",
+                {
+                    "model": m,
+                    "stream": False,
+                    "max_tokens": budget,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Return the weather summary as JSON with "
+                            "fields city (string) and temp_c (integer). City: Oslo.",
+                        }
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "summary",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "city": {"type": "string"},
+                                    "temp_c": {"type": "integer"},
+                                },
+                                "required": ["city", "temp_c"],
+                                "additionalProperties": False,
                             },
-                            "required": ["city", "temp_c"],
-                            "additionalProperties": False,
                         },
                     },
                 },
-            },
-        )
-        ok = False
-        if st == 200:
+            )
+            finish, content = "", ""
+            if st == 200:
+                ch = v.get("choices", [{}])[0]
+                finish = ch.get("finish_reason") or ""
+                content = ch.get("message", {}).get("content") or ""
             try:
-                j = json.loads(
-                    v.get("choices", [{}])[0].get("message", {}).get("content", "")
-                )
-                ok = isinstance(j.get("city"), str) and isinstance(j.get("temp_c"), int)
-            except (ValueError, AttributeError):
-                ok = False
+                j = json.loads(content)
+            except ValueError:
+                j = None
+            ok = (
+                isinstance(j, dict)
+                and isinstance(j.get("city"), str)
+                and isinstance(j.get("temp_c"), int)
+            )
+            return ok, st, finish, content
+
+        budget = 256
+        ok, st, finish, content = t7_once(budget)
+        if not ok and finish == "length":
+            budget = 512
+            ok, st, finish, content = t7_once(budget)
         self.record(
             "T7 strict json_schema output",
             ok,
-            f"status={st} content={str(v.get('choices', [{}])[0].get('message', {}).get('content'))[:120]!r}",
+            f"status={st} budget={budget} finish_reason={finish} "
+            f"content={content[:120]!r}",
         )
 
-        # T8 streaming: tool-call deltas assemble into a valid call.
-        body = {
-            "model": m,
-            "stream": True,
-            "max_tokens": 200,
-            "tools": [WEATHER],
-            "messages": [{"role": "user", "content": "Weather in Berlin?"}],
-        }
-        req = urllib.request.Request(
-            BASE + "/v1/chat/completions",
-            data=json.dumps(body).encode(),
-            method="POST",
-            headers={"content-type": "application/json"},
-        )
-        assembled: dict[int, str] = {}
-        sse_ok = False
+        # T8 streaming: tool-call argument deltas assemble into valid JSON.
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
-                for line in r:
-                    if not line.startswith(b"data: "):
-                        continue
-                    payload = line[6:].strip()
-                    if payload == b"[DONE]":
-                        sse_ok = True
-                        break
-                    try:
-                        delta = json.loads(payload)["choices"][0]["delta"]
-                    except (ValueError, KeyError, IndexError):
-                        continue
-                    for tc in delta.get("tool_calls") or []:
-                        idx = tc.get("index", 0)
-                        assembled[idx] = assembled.get(idx, "") + (
-                            tc.get("function", {}).get("arguments") or ""
-                        )
+            sse_ok, streamed = stream_collect(
+                {
+                    "model": m,
+                    "stream": True,
+                    "max_tokens": 200,
+                    "tools": [WEATHER],
+                    "messages": [{"role": "user", "content": "Weather in Berlin?"}],
+                }
+            )
         except Exception as e:
             self.record("T8 streaming tool deltas", False, f"transport: {e}")
-            assembled = {}
-        if assembled or sse_ok:
-            args_ok = any("city" in (a or "") for a in assembled.values())
+            streamed = {}
+            sse_ok = False
+        if streamed or sse_ok:
+            args_list = [c["arguments"] for c in streamed.values()]
+            args_ok = any("city" in (a or "") for a in args_list)
             # name fragments arrive as deltas too; accept if any args JSON parses
             try:
                 parsed_any = any(
-                    isinstance(json.loads(a), dict)
-                    for a in assembled.values()
-                    if a.strip()
+                    isinstance(json.loads(a), dict) for a in args_list if a.strip()
                 )
             except ValueError:
                 parsed_any = False
             self.record(
                 "T8 streaming tool deltas",
                 sse_ok and parsed_any and args_ok,
-                f"streams=[{list(assembled.values())[:2]}]",
+                f"streams=[{args_list[:2]}]",
+            )
+
+        # T9 nested-schema arguments: emitted args must satisfy a schema
+        # with a nested object, a bounded integer, and an enum member.
+        st, v, _ = self.chat(
+            [BOOK],
+            [
+                {
+                    "role": "user",
+                    "content": "Book a flight from Tokyo, Japan for "
+                    "3 passengers in economy class.",
+                }
+            ],
+        )
+        tcs = (
+            tool_calls_of(v.get("choices", [{}])[0].get("message", {}))
+            if st == 200
+            else []
+        )
+        ok = False
+        detail = f"status={st} calls={[t['function']['name'] for t in tcs]}"
+        if st == 200 and tcs and tcs[0]["function"]["name"] == "book_flight":
+            a = call_args(tcs[0])
+            raw_origin = a.get("origin")
+            origin = raw_origin if isinstance(raw_origin, dict) else {}
+            ok = (
+                "__unparseable__" not in a
+                and str(origin.get("city", "")).lower().find("tokyo") >= 0
+                and str(origin.get("country", "")).lower().find("japan") >= 0
+                and a.get("passengers") == 3
+                and a.get("class") == "economy"
+            )
+            detail = f"status={st} args={a}"
+        self.record("T9 nested-schema args", ok, detail)
+
+        # T10 malformed-args history tolerance: a prior turn carrying an
+        # unparseable arguments string must not break the transport; the
+        # model gets a clean chance to re-emit a valid call.
+        st, v, _ = self.chat(
+            [WEATHER],
+            [
+                {"role": "user", "content": "Weather in Tokyo?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Tok',  # truncated JSON
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_bad",
+                    "content": '{"error": "arguments were not valid JSON"}',
+                },
+                {"role": "user", "content": "That call failed. Try again properly."},
+            ],
+        )
+        tcs = (
+            tool_calls_of(v.get("choices", [{}])[0].get("message", {}))
+            if st == 200
+            else []
+        )
+        content = ""
+        if st == 200:
+            content = v.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        ok = st == 200 and bool(len(tcs) >= 1 or content.strip())
+        err = ""
+        if st != 200:
+            # Name the failure origin: a child engine error body (e.g.
+            # llama-server's JSON parse exception) vs blazar's own
+            # "blazar_error" shape - attribution rides in the evidence.
+            err = f" error={json.dumps(v.get('error', v))[:140]}"
+        self.record(
+            "T10 malformed-args history tolerance",
+            ok,
+            f"status={st} calls={len(tcs)} answer={content[:100]!r}{err}",
+            xfail=(
+                # Root-caused 2026-11-22 live: llama-server itself 500s
+                # (nlohmann parse_error.101) on spec-legal malformed
+                # tool-arguments carried in request history; the
+                # gateway's zero-rewrite /v1 proxy forwards the child
+                # error faithfully. OpenAI treats arguments as an
+                # opaque string, so the input is legitimate client
+                # usage. Gateway repair lane (signature-matched
+                # repair-on-500, single retry, observable header+log)
+                # pending approval - remove this pin when it ships.
+                "upstream llama-server rejects spec-legal malformed "
+                "tool-args history (json parse_error.101 -> 500); "
+                "gateway repair lane pending approval"
+            )
+            if not ok
+            else None,
+        )
+
+        # T11 tool-error recovery: an errored tool result must yield a
+        # coherent next step - a retry call with parseable args or a
+        # textual acknowledgement - never a transport failure.
+        st, v, _ = self.chat(
+            [WEATHER],
+            [
+                {"role": "user", "content": "What is the weather in Springfield?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_err",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"city": "Springfield"}),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_err",
+                    "content": '{"error": "ambiguous city: provide city and country"}',
+                },
+            ],
+        )
+        tcs = (
+            tool_calls_of(v.get("choices", [{}])[0].get("message", {}))
+            if st == 200
+            else []
+        )
+        content = ""
+        if st == 200:
+            content = v.get("choices", [{}])[0].get("message", {}).get("content") or ""
+        retry_args = [call_args(t) for t in tcs]
+        ok = st == 200 and bool(
+            any("__unparseable__" not in a for a in retry_args) or content.strip()
+        )
+        self.record(
+            "T11 tool-error recovery",
+            ok,
+            f"status={st} retry_args={retry_args} answer={content[:80]!r}",
+        )
+
+        # T12 streaming tool-call assembly completeness: the full call
+        # (id + name + parseable arguments) must survive delta transport.
+        try:
+            sse_ok, streamed = stream_collect(
+                {
+                    "model": m,
+                    "stream": True,
+                    "max_tokens": 200,
+                    "tools": [WEATHER],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "What is the weather in Osaka? Call the tool.",
+                        }
+                    ],
+                }
+            )
+        except Exception as e:
+            self.record("T12 streaming call assembly", False, f"transport: {e}")
+            streamed = {}
+            sse_ok = False
+        if streamed or sse_ok:
+            complete = [
+                c
+                for c in streamed.values()
+                if c["name"] and c["id"] and c["arguments"].strip()
+            ]
+            parseable = 0
+            for c in complete:
+                try:
+                    parseable += (
+                        1 if isinstance(json.loads(c["arguments"]), dict) else 0
+                    )
+                except ValueError:
+                    pass
+            ok = sse_ok and bool(complete) and parseable == len(complete)
+            ev = "; ".join(
+                f"{c['id']}:{c['name']}({c['arguments'][:40]})"
+                for c in streamed.values()
+            )
+            self.record(
+                "T12 streaming call assembly",
+                ok,
+                f"sse_done={sse_ok} calls=[{ev}]",
             )
 
         # L1 latency overhead proxy: identical prompt size, tools vs none.
@@ -427,15 +701,46 @@ class Battery:
         )
 
     def summary(self):
-        fails = [r for r in self.results if not r["ok"]]
+        # Expected failures (root-caused, reason recorded in the row)
+        # count toward the gate; raw failures do not.
+        fails = [r for r in self.results if not r["ok"] and not r.get("xfail")]
         return len(self.results) - len(fails), len(self.results)
 
 
 def main() -> int:
-    models = sys.argv[1:] or ["qwen2.5-0.5b-instruct"]
-    os.makedirs(OUT_DIR, exist_ok=True)
-    ver = json.loads(urllib.request.urlopen(BASE + "/api/version", timeout=5).read())
-    ps = json.loads(urllib.request.urlopen(BASE + "/api/ps", timeout=5).read())
+    args = sys.argv[1:]
+    direct_base = None
+    models = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--direct":
+            if i + 1 >= len(args):
+                print("--direct requires a base URL", file=sys.stderr)
+                return 2
+            direct_base = args[i + 1].rstrip("/")
+            i += 2
+        else:
+            models.append(args[i])
+            i += 1
+    models = models or ["qwen2.5-0.5b-instruct"]
+
+    global BASE
+    if direct_base:
+        BASE = direct_base
+    out_dir = OUT_DIR + ("-direct" if direct_base else "")
+    os.makedirs(out_dir, exist_ok=True)
+
+    def fetch(path: str, default):
+        # Bare engines lack the blazar endpoints; a missing probe is
+        # recorded as its default, never fatal - the battery still runs.
+        try:
+            with urllib.request.urlopen(BASE + path, timeout=5) as r:
+                return json.loads(r.read())
+        except Exception:
+            return default
+
+    ver = fetch("/api/version", {})
+    ps = fetch("/api/ps", {"models": []})
     engine = next(
         (
             r.get("blazar_engine")
@@ -444,6 +749,19 @@ def main() -> int:
         ),
         None,
     )
+    if direct_base:
+        # Identify the bare engine when it exposes sglang's info route.
+        info = fetch("/get_server_info", {})
+        engine = f"direct engine ({info.get('version') or 'unidentified'})"
+        blazar_ver = "none (direct-engine arm)"
+    else:
+        # /api/version .version is the ollama-compat number the gateway
+        # reports for client compatibility; the real build label rides
+        # in blazar_version. Label the fallback so a stale daemon can
+        # never masquerade as a newer build in reports.
+        blazar_ver = ver.get("blazar_version") or (
+            f"{ver.get('version', '?')} (api-compat fallback)"
+        )
     commit = (
         subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -460,33 +778,65 @@ def main() -> int:
         ok, total = b.summary()
         all_rows[m] = {"passed": ok, "total": total, "results": b.results}
 
+    if engine is None and not direct_base:
+        # First request may have been the one to spawn the child; re-probe
+        # so the receipt names the engine that actually served the run.
+        ps = fetch("/api/ps", ps)
+        engine = next(
+            (
+                r.get("blazar_engine")
+                for r in ps.get("models", [])
+                if r.get("name") == models[0]
+            ),
+            None,
+        )
+
     receipt = {
         "object": "blazar.toolcall-eval",
         "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
         "base": BASE,
+        "arm": "direct" if direct_base else "gateway",
         "version": ver,
+        "blazar_version": blazar_ver,
         "commit": commit,
         "engine_first_model": engine,
         "models": all_rows,
-        "reproduce": f"python3 scripts/toolcall_eval.py {' '.join(models)}",
+        "reproduce": f"python3 scripts/toolcall_eval.py {' '.join(args)}",
     }
-    out = os.path.join(OUT_DIR, "results.json")
+    out = os.path.join(out_dir, "results.json")
     with open(out, "w") as f:
         json.dump(receipt, f, indent=1)
         f.write("\n")
-    md = os.path.join(OUT_DIR, "report.md")
+    md = os.path.join(out_dir, "report.md")
     with open(md, "w") as f:
         f.write("# Tool-calling quality battery\n\n")
         f.write(
             f"{_dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')} | "
-            f"blazar {ver.get('version')} | commit {commit} | engine {engine}\n\n"
+            f"arm {'direct' if direct_base else 'gateway'} | "
+            f"blazar {blazar_ver} | commit {commit} | engine {engine}\n\n"
         )
         for m, rows in all_rows.items():
-            f.write(f"## {m} - {rows['passed']}/{rows['total']} passed\n\n")
-            f.writelines(
-                f"- {'PASS' if r['ok'] else 'FAIL'} | {r['test']} - {r['evidence']}\n"
-                for r in rows["results"]
-            )
+            passed, total = rows["passed"], rows["total"]
+            xfl = [r for r in rows["results"] if r.get("xfail")]
+            hdr = f"{passed}/{total} passed"
+            if xfl:
+                hdr += f" ({len(xfl)} expected-failure{'s' if len(xfl) > 1 else ''})"
+            f.write(f"## {m} - {hdr}\n\n")
+            for r in rows["results"]:
+                if r.get("xfail"):
+                    f.write(
+                        f"- XFAIL | {r['test']} - {r['evidence']}\n"
+                        f"  reason: {r['xfail']}\n"
+                    )
+                elif r.get("xfail_cleared"):
+                    f.write(
+                        f"- PASS (xfail cleared) | {r['test']} - {r['evidence']}\n"
+                        f"  cleared pin: {r['xfail_cleared']}\n"
+                    )
+                else:
+                    f.write(
+                        f"- {'PASS' if r['ok'] else 'FAIL'} | {r['test']} - {r['evidence']}\n"
+                    )
             f.write("\n")
     total_ok = sum(r["passed"] for r in all_rows.values())
     total_n = sum(r["total"] for r in all_rows.values())
