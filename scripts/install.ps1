@@ -50,8 +50,14 @@ function Fail([string]$Message) { Write-Host "ERROR: $Message" -ForegroundColor 
 function Get-UserPathRaw {
     # The user PATH is REG_EXPAND_SZ: read it unexpanded so `%USERPROFILE%`
     # entries stay variables (the .NET GetEnvironmentVariable API expands them).
-    [Microsoft.Win32.Registry]::GetValue('HKEY_CURRENT_USER\Environment', 'Path', $null,
-        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    # The 4-argument static GetValue is .NET 5+ only; the key overload also
+    # runs under Windows PowerShell 5.1 (.NET Framework).
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+    try {
+        return $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally {
+        $key.Close()
+    }
 }
 
 function Set-UserPathRaw([string]$Value) {

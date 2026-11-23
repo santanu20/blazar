@@ -31,9 +31,15 @@ function Assert-That {
 # The user PATH is a REG_EXPAND_SZ value: read it unexpanded so a comparison
 # against the install dir is exact.
 function Get-UserPathEntries {
-    return ([Microsoft.Win32.Registry]::GetValue(
-        'HKEY_CURRENT_USER\Environment', 'Path', $null,
-        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)) -split ';'
+    # The 4-argument static GetValue is .NET 5+ only; the key overload also
+    # runs under Windows PowerShell 5.1.
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+    try {
+        $raw = $key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally {
+        $key.Close()
+    }
+    return $raw -split ';'
 }
 
 function Invoke-Installer {
