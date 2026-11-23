@@ -16,6 +16,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $installer = Join-Path $PSScriptRoot '..\scripts\install.ps1'
 $installDir = Join-Path $env:RUNNER_TEMP 'blazar-ci'
+# The smoke covers the installer, not the engine download: the bootstrap
+# lane is the largest download of an install and is exercised elsewhere.
+$env:BLAZAR_INSTALL_ENGINE = '0'
 $exe = Join-Path $installDir 'blazar.exe'
 $taskName = 'blazar'
 

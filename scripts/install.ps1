@@ -138,11 +138,16 @@ if (-not $Build -and -not $Repo -and -not $ApiBase) {
 }
 if (-not $ApiBase) { $ApiBase = "https://api.github.com/repos/$Repo" }
 
-$isArm64Host = $env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64'
+# PROCESSOR_ARCHITEW6432 exists only in a 32-bit process on 64-bit Windows;
+# under StrictMode an unset $env: entry throws, so read both through the API.
+$processArch = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE')
+$nativeArch = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITEW6432')
+$isArm64Host = $processArch -eq 'ARM64' -or $nativeArch -eq 'ARM64'
 $Target = if ($isArm64Host) { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 
 $headers = @{ 'User-Agent' = 'blazar-install' }
-if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $($env:GITHUB_TOKEN)" }
+$token = [Environment]::GetEnvironmentVariable('GITHUB_TOKEN')
+if ($token) { $headers['Authorization'] = "Bearer $token" }
 
 if (-not $Build) {
     $releasePath = if ($Version) { "releases/tags/$Version" } else { 'releases/latest' }
@@ -261,7 +266,12 @@ try {
     # engine bootstrap below picks its asset by driver presence, so a
     # driverless NVIDIA box would silently serve on CPU: detect and say
     # so instead. Opt out: BLAZAR_AUTO_DRIVER=0.
-    if ($env:BLAZAR_INSTALL_ENGINE -ne '0' -and $env:BLAZAR_AUTO_DRIVER -ne '0') {
+    # Optional knobs are read through the API: under StrictMode an unset
+    # $env: entry throws.
+    $engineInstall = [Environment]::GetEnvironmentVariable('BLAZAR_INSTALL_ENGINE')
+    $autoDriver = [Environment]::GetEnvironmentVariable('BLAZAR_AUTO_DRIVER')
+    $firstModel = [Environment]::GetEnvironmentVariable('BLAZAR_INSTALL_MODEL')
+    if ($engineInstall -ne '0' -and $autoDriver -ne '0') {
         try { $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction Stop) } catch { $gpus = @() }
         if ($gpus.Count -gt 0) {
             $nvidia = $gpus | Where-Object { $_.Name -match 'NVIDIA' }
@@ -288,7 +298,7 @@ try {
     # BLAZAR_INSTALL_MODEL (opt-in).
     $engineOk = $false
     try { $engineOk = -not [string]::IsNullOrEmpty((& $installedExe engine list --json 2>$null | Select-String '"active":\s*true')) } catch { }
-    if ($env:BLAZAR_INSTALL_ENGINE -ne '0' -and -not $engineOk) {
+    if ($engineInstall -ne '0' -and -not $engineOk) {
         Write-Host ">>> bootstrapping llama.cpp engine (blazar engine update - largest download of this install)..."
         try {
             & $installedExe engine update --no-gate
@@ -298,13 +308,13 @@ try {
     } else {
         Write-Host '>>> engine already active (or bootstrap disabled) - skipping engine download'
     }
-    if ($env:BLAZAR_INSTALL_MODEL) {
-        Write-Host ">>> pulling first model: $env:BLAZAR_INSTALL_MODEL..."
+    if ($firstModel) {
+        Write-Host ">>> pulling first model: $firstModel..."
         try {
-            & $installedExe pull $env:BLAZAR_INSTALL_MODEL
-            if ($LASTEXITCODE -eq 0) { Write-Host ">>> model ready: $env:BLAZAR_INSTALL_MODEL" }
-            else { Write-Host ">>> WARN: model pull failed - run: blazar pull $env:BLAZAR_INSTALL_MODEL" }
-        } catch { Write-Host ">>> WARN: model pull failed - run: blazar pull $env:BLAZAR_INSTALL_MODEL" }
+            & $installedExe pull $firstModel
+            if ($LASTEXITCODE -eq 0) { Write-Host ">>> model ready: $firstModel" }
+            else { Write-Host ">>> WARN: model pull failed - run: blazar pull $firstModel" }
+        } catch { Write-Host ">>> WARN: model pull failed - run: blazar pull $firstModel" }
     }
     # The bootstrap lane is llamacpp-only (zero-touch default: any GGUF,
     # fastest cold start). The other engines are one command away - say
