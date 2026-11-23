@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="358" viewBox="0 0 880 358" role="img">
+<text x="0" y="16" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#111111">Decode throughput vs context length</text>
+<text x="0" y="34" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#777777">qwen2.5-0.5b-instruct-q4_k_m.gguf | 2026-11-22 | 2026-11-22-postfix-full</text>
+<line x1="58" y1="257.7" x2="657.4" y2="257.7" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="261.7" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">320</text>
+<line x1="58" y1="190.0" x2="657.4" y2="190.0" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="194.0" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">340</text>
+<line x1="58" y1="122.4" x2="657.4" y2="122.4" stroke="#EBEBEB" stroke-width="1"/>
+<text x="50" y="126.4" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="end">360</text>
+<text x="119.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">2000</text>
+<text x="324.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">5000</text>
+<text x="479.8" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">1e4</text>
+<text x="634.9" y="312" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#666666" text-anchor="middle">20000</text>
+<line x1="58" y1="56" x2="58" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<line x1="58" y1="296" x2="657.4" y2="296" stroke="#C9C9C9" stroke-width="1"/>
+<text x="58" y="46" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777">decode t/s</text>
+<text x="357.7" y="330" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#777777" text-anchor="middle">context tokens (log)</text>
+<polyline points="125.1,264.3 435.2,296.0 590.3,288.9" fill="none" stroke="#0072B2" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="125.1" cy="264.3" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="435.2" cy="296.0" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<circle cx="590.3" cy="288.9" r="4" fill="#FFFFFF" stroke="#0072B2" stroke-width="2"/>
+<text x="599.3" y="292.9" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#0072B2" font-weight="600">blazar | llama.cpp b12606-cuda</text>
+<polyline points="125.1,128.7 435.2,245.4 590.3,203.2" fill="none" stroke="#009E73" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="125.1" cy="128.7" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="435.2" cy="245.4" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<circle cx="590.3" cy="203.2" r="4" fill="#FFFFFF" stroke="#009E73" stroke-width="2"/>
+<text x="599.3" y="207.2" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#009E73" font-weight="600">ollama | ollama-host</text>
+<text x="0" y="352" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#999999">Long-context points, log x-axis. Higher is better.</text>
+</svg>
