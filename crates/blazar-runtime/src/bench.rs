@@ -465,7 +465,7 @@ impl Tuner<'_> {
                 slo_ms,
                 &[],
             )?;
-            out.push((mode.to_string(), arm.tok_per_s));
+            out.push((mode.clone(), arm.tok_per_s));
             std::thread::sleep(std::time::Duration::from_secs(idle_secs.max(1)));
         }
         if out.is_empty() {
@@ -484,6 +484,11 @@ impl Tuner<'_> {
     /// regression the adoption decision must refuse. The manual
     /// `tune --spec-race` lane passes no prompts and gets exactly the
     /// historical behavior.
+    // Natural race-config surface: one parameter per speculation axis
+    // (dense/draft pair/dflash/ngram shape) plus the SLO and parity
+    // capture - bundling would invent a config struct only this seam
+    // reads.
+    #[allow(clippy::too_many_arguments)]
     pub fn race_one_mode(
         &self,
         base_argv: &[String],

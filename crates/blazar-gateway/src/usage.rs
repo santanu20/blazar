@@ -47,7 +47,7 @@ pub struct UsageMeter {
     buckets: Mutex<HashMap<(i64, String), UsageAcc>>,
     /// Per-(day, model, workload-kind) request counts - the evidence
     /// base `engine_routing` workload-aware policy derives from at
-    /// spawn time. Separate map (not a UsageDelta field): the daily
+    /// spawn time. Separate map (not a `UsageDelta` field): the daily
     /// rollup stays token-shaped, the mix stays count-shaped.
     workload_buckets: Mutex<HashMap<(i64, String, String), i64>>,
     store: Mutex<Option<Store>>,

@@ -2185,7 +2185,7 @@ pub(crate) fn lane_aware_think_off(effective_reasoning: &str, lane_gpu: Option<&
     match effective_reasoning {
         "off" => true,
         "on" => false,
-        _ => matches!(lane_gpu, Some("cpu") | Some("partial")),
+        _ => matches!(lane_gpu, Some("cpu" | "partial")),
     }
 }
 
@@ -4934,9 +4934,9 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
         "# HELP blazar_sentinel_detections_total Detections per sentinel code\n# TYPE blazar_sentinel_detections_total counter\n"
     );
     for (code, count) in &sent_detections {
-        let _ = write!(
+        let _ = writeln!(
             merged,
-            "blazar_sentinel_detections_total{{code=\"{code}\"}} {count}\n"
+            "blazar_sentinel_detections_total{{code=\"{code}\"}} {count}"
         );
     }
     let _ = write!(

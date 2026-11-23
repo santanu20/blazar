@@ -276,7 +276,7 @@ async fn integration__routed_engine__workload_derived_policy_keeps_gguf_lane_sta
 /// `autotune = "scheduled"` end-to-end against the real stub engine:
 /// the reaper tick detaches a race pass that spawns real children for
 /// the advertised spec arms, lands receipts carrying parity evidence,
-/// publishes the AutotuneRace event, and releases the single-flight
+/// publishes the `AutotuneRace` event, and releases the single-flight
 /// guard. The engine row + engine dir wear the stub binary as both
 /// llama-bench and llama-server - exactly the asset layout
 /// `find_bench_bin` demands.
@@ -337,12 +337,12 @@ async fn integration__autotune_schedule__lands_parity_receipts_and_event() {
     s.load_timeout_secs = Some(4);
     let sup = Arc::new(s);
 
-    sup.autotune_schedule_tick().await;
+    sup.autotune_schedule_tick();
     // The pass is detached; poll the store until the dense baseline
     // and at least one spec arm land (the stub advertises ngram-simple,
     // so the ngram arm must race) or the deadline faults.
     let deadline = Instant::now() + Duration::from_secs(60);
-    let mut receipts = Vec::new();
+    let mut receipts;
     loop {
         receipts = store.list_spec_receipts("m1", "stub").unwrap();
         let dense = receipts.iter().any(|r| r.mode == "dense");
@@ -394,8 +394,9 @@ fn autotune_engine_assets(dirs: &BlazarDirs) {
     for name in ["llama-server", "llama-bench"] {
         let p = engine_dir.join(name);
         std::fs::copy(stub_bin(), &p).unwrap();
-        #[allow(unsafe_code, reason = "chmod on a fresh tempdir copy")]
-        unsafe {
+        // chmod on a fresh tempdir copy: PermissionsExt::from_mode and
+        // set_permissions are safe APIs - no unsafe block needed.
+        {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -442,7 +443,7 @@ async fn integration__autotune_schedule__busy_lane_skips_model() {
     sup.ensure("m1").await.expect("serve m1");
     // One in-flight request pins the lane busy.
     sup.begin_request("m1");
-    sup.autotune_schedule_tick().await;
+    sup.autotune_schedule_tick();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let store = Store::open(&dirs).unwrap();
     assert!(
@@ -465,7 +466,7 @@ async fn integration__autotune_schedule__no_chat_evidence_skips_model() {
     let mut cfg = base_config();
     cfg.autotune = Some("scheduled".into());
     let sup = supervisor(&dirs, cfg, true);
-    sup.autotune_schedule_tick().await;
+    sup.autotune_schedule_tick();
     // Detached pass: give it a window to (wrongly) start racing, then
     // assert nothing landed and nothing was evicted or spawned.
     tokio::time::sleep(Duration::from_millis(750)).await;

@@ -313,10 +313,9 @@ pub fn best_measured_spec_mode(
             r.spec_params
                 .as_deref()
                 .and_then(|s| spec_params_number(s, "parity_total")),
-        ) {
-            if p < t {
-                continue;
-            }
+        ) && p < t
+        {
+            continue;
         }
         let eligible = match r.mode.as_str() {
             "ngram" => advertised.iter().any(|s| s == "ngram-simple"),
@@ -2467,8 +2466,8 @@ pub struct PsRow {
 /// verified a spawn of that model - unknown, never guessed.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EffectiveCfgSnapshot {
-    /// Introspection surface the verification read ("/props",
-    /// "/server_info", "/v1/models", or "engine introspection" for
+    /// Introspection surface the verification read (`/props`,
+    /// `/server_info`, `/v1/models`, or `engine introspection` for
     /// lanes without a certified surface).
     pub surface: String,
     /// Warn-only findings from planned-vs-observed reconciliation;
@@ -2548,7 +2547,7 @@ pub struct Supervisor {
     spec_gov: DashMap<String, SpecGovState>,
     ubatch_gov: DashMap<String, UbatchGovState>,
     /// Post-spawn effective-config verification snapshot per model
-    /// (surface + findings + time): written at the effective::probe
+    /// (surface + findings + time): written at the `effective::probe`
     /// call site on every successful spawn, read by the /api/ps
     /// handler join. Daemon-lifetime memory like `spec_override` -
     /// one entry per distinct model ever served, refreshed on
@@ -7618,11 +7617,10 @@ impl Supervisor {
                     // same surface string feeds the /api/ps snapshot
                     // below, so the log line and the ps field can
                     // never disagree.
-                    use blazar_core::engine_kind::EngineKind;
                     let surface = match engine.kind() {
-                        EngineKind::LlamaCpp => "/props",
-                        EngineKind::Sglang => "/server_info",
-                        EngineKind::Vllm => "/v1/models",
+                        blazar_core::engine_kind::EngineKind::LlamaCpp => "/props",
+                        blazar_core::engine_kind::EngineKind::Sglang => "/server_info",
+                        blazar_core::engine_kind::EngineKind::Vllm => "/v1/models",
                         _ => "engine introspection",
                     };
                     if effective_warnings.is_empty() {
@@ -9239,7 +9237,7 @@ drop them from rpc_servers in config.toml",
                 mgr.reap_dead_children().await;
                 mgr.reap_once().await;
                 mgr.reap_lmcache_daemon().await;
-                mgr.autotune_schedule_tick().await;
+                mgr.autotune_schedule_tick();
                 if heartbeat_at.elapsed() >= Self::DAEMON_HEARTBEAT_INTERVAL {
                     heartbeat_at = Instant::now();
                     let resident = mgr.instances.len();
@@ -9531,7 +9529,7 @@ drop them from rpc_servers in config.toml",
     /// arm) and evicts the raced model's instances, so the cadence is
     /// hours, not minutes; within the window every model also carries
     /// its own freshness gate (see [`AUTOTUNE_SPEC_RECEIPT_MAX_AGE`]).
-    const AUTOTUNE_SCHEDULE_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+    const AUTOTUNE_SCHEDULE_INTERVAL: Duration = Duration::from_hours(6);
 
     /// Receipt freshness for the scheduled pass: a model whose newest
     /// spec receipt on this engine is younger than this stays
@@ -9584,7 +9582,7 @@ drop them from rpc_servers in config.toml",
     /// Detached from the reaper tick so a slow pass never delays the
     /// reaper ladder. Public so integration tests drive the exact
     /// production pass without waiting on the timer.
-    pub async fn autotune_schedule_tick(self: &Arc<Self>) {
+    pub fn autotune_schedule_tick(self: &Arc<Self>) {
         if !self.cfg().autotune_scheduled() {
             return;
         }
@@ -9643,6 +9641,12 @@ drop them from rpc_servers in config.toml",
     /// model back if it was resident. Traffic-aware at every step - a
     /// model that gains traffic is skipped, a model whose traffic
     /// returns mid-race aborts its remaining arms.
+    // One scheduled pass, linearly ordered: lane setup -> evidence
+    // floor -> per-model eligibility cascade -> race -> receipt write.
+    // The ordering IS the invariant (a model is evicted only after it
+    // clears every gate), and the autotune integration tests pin the
+    // sequence - splitting for line count would scatter that contract.
+    #[allow(clippy::too_many_lines)]
     async fn autotune_race_pass(self: &Arc<Self>) {
         let store = match Store::open(&self.dirs) {
             Ok(s) => s,
@@ -9654,7 +9658,7 @@ drop them from rpc_servers in config.toml",
         // Same lane rule as the manual tune lane: the race drives
         // llama-server children, so argv compile needs a llamacpp
         // engine row (active-if-llamacpp, else first installed).
-        let engine_row = match store
+        let Some(engine_row) = store
             .active_engine()
             .ok()
             .flatten()
@@ -9665,12 +9669,10 @@ drop them from rpc_servers in config.toml",
                     .ok()?
                     .into_iter()
                     .find(|e| e.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
-            }) {
-            Some(e) => e,
-            None => {
-                tracing::debug!("autotune race: no llamacpp engine installed; nothing to race");
-                return;
-            }
+            })
+        else {
+            tracing::debug!("autotune race: no llamacpp engine installed; nothing to race");
+            return;
         };
         let mut manifest: crate::Manifest = match serde_json::from_str(&engine_row.manifest) {
             Ok(m) => m,
@@ -9740,9 +9742,8 @@ drop them from rpc_servers in config.toml",
             // GGUF metadata (read failure = not a GGUF row / unreadable
             // file - skip either way, the manual lane owns the loud
             // error path).
-            let gguf = match blazar_core::read_metadata_file(std::path::Path::new(&row.path)) {
-                Ok(g) => g,
-                Err(_) => continue,
+            let Ok(gguf) = blazar_core::read_metadata_file(std::path::Path::new(&row.path)) else {
+                continue;
             };
             let receipts = store
                 .list_spec_receipts(&row.name, &engine_row.tag)
@@ -9790,7 +9791,7 @@ drop them from rpc_servers in config.toml",
             let was_resident = self
                 .instances
                 .iter()
-                .any(|e| model_of_key(e.key()) == &row.name);
+                .any(|e| model_of_key(e.key()) == row.name);
             if let Err(e) = self.evict_model(&row.name).await {
                 tracing::warn!(model = %row.name, "autotune race: evict failed: {e}");
                 continue;
@@ -9850,7 +9851,7 @@ drop them from rpc_servers in config.toml",
                     });
                 }
                 Err(e) => {
-                    tracing::warn!(model = %row.name, "autotune race: pass aborted: {e}")
+                    tracing::warn!(model = %row.name, "autotune race: pass aborted: {e}");
                 }
             }
             // Warm-back: a model the pass evicted from residency
@@ -9879,13 +9880,18 @@ drop them from rpc_servers in config.toml",
     /// (loras, draft pick) are read by the caller - this fn never
     /// holds a store connection across an await (rusqlite handles are
     /// !Send), landing each receipt through a fresh per-use open.
+    // One model's full race: dense reference arm first, then every
+    // advertised spec arm, receipts landed per-arm through fresh store
+    // opens (rusqlite is !Send). The parameter list is the race
+    // context the caller already resolved - one slot per race axis.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn autotune_race_model(
         self: &Arc<Self>,
         row: &ModelRow,
         gguf: &blazar_core::GgufMeta,
         engine_row: &blazar_core::store::EngineRow,
         manifest: &crate::Manifest,
-        bench_bin: &std::path::PathBuf,
+        bench_bin: &std::path::Path,
         draft_pick: DraftPick,
         dflash_pick: DraftPick,
         loras: &[(String, f64)],
@@ -9923,7 +9929,7 @@ drop them from rpc_servers in config.toml",
             &hw,
             &cfg,
             &overlay,
-            &loras,
+            loras,
             None,
             &engine_row.tag,
             &manifest.flags,
@@ -9948,7 +9954,7 @@ drop them from rpc_servers in config.toml",
                 &hw,
                 &cfg,
                 &overlay,
-                &loras,
+                loras,
                 Some(dp),
                 &engine_row.tag,
                 &manifest.flags,
@@ -10011,7 +10017,7 @@ drop them from rpc_servers in config.toml",
             let draft = draft_pair.as_ref().map(|(p, n)| (p.clone(), *n));
             let dflash_path = dflash_draft.clone();
             let dirs = self.dirs.clone();
-            let bin = bench_bin.clone();
+            let bin = bench_bin.to_path_buf();
             let outcome = tokio::task::spawn_blocking(move || {
                 let tuner = crate::bench::Tuner {
                     dirs: &dirs,
@@ -10084,7 +10090,7 @@ drop them from rpc_servers in config.toml",
                 Store::open(&self.dirs)?.put_spec_receipt(
                     &row.name,
                     &engine_row.tag,
-                    &mode,
+                    mode,
                     outcome.tok_per_s,
                     dense_tps,
                     &blazar_core::store::SpecProvenance {
@@ -10095,6 +10101,10 @@ drop them from rpc_servers in config.toml",
                     },
                 )?;
                 summary.arms += 1;
+                // round() first, so the cast lands on an integral-valued
+                // f64; the ratio of two measured tok/s rates cannot reach
+                // i64 range, so truncation is unreachable in practice.
+                #[allow(clippy::cast_possible_truncation)]
                 let gain = if dense_tps > 0.0 {
                     Some(((outcome.tok_per_s / dense_tps - 1.0) * 100.0).round() as i64)
                 } else {

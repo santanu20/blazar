@@ -555,10 +555,10 @@ fn enrich_totals_with_raw_rows(gpus: Vec<GpuInfo>, raw: &[GpuInfo]) -> Vec<GpuIn
                 // names stay unmatched rather than guessed.
                 (single_pair && desc.contains("nvidia")).then_some(&raw[0])
             });
-        if let Some(r) = matched {
-            if r.total_mib > g.total_mib {
-                g.total_mib = r.total_mib;
-            }
+        if let Some(r) = matched
+            && r.total_mib > g.total_mib
+        {
+            g.total_mib = r.total_mib;
         }
     }
     gpus

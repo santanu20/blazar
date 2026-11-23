@@ -1036,11 +1036,7 @@ fn balance_close_json(raw: &str) -> Option<String> {
                     return None;
                 }
             }
-            ']' => {
-                if stack.pop() != Some('[') {
-                    return None;
-                }
-            }
+            ']' if stack.pop() != Some('[') => return None,
             _ => {}
         }
     }
@@ -1064,19 +1060,17 @@ fn is_llamacpp_parse_error_500(buf: &[u8]) -> bool {
         && crate::keys::find_sub(buf, b"parse_error").is_some()
 }
 
-/// Repair an OpenAI chat history whose `tool_calls` carry arguments
+/// Repair an `OpenAI` chat history whose `tool_calls` carry arguments
 /// strings that are not valid JSON - spec-legal for the client (the
 /// contract treats arguments as an opaque string), fatal for
 /// llama.cpp's parser. Truncation-class strings are closed losslessly
 /// ([`balance_close_json`]); anything still unparseable has its
-/// tool_call entry and the matching tool-result message dropped, so
+/// `tool_call` entry and the matching tool-result message dropped, so
 /// the child never sees an orphaned tool answer. Returns a
 /// "repaired=N dropped=M" receipt when the body changed, `None` when
 /// nothing needed (or could be) fixed.
 fn repair_tool_args_history(v: &mut serde_json::Value) -> Option<String> {
-    let Some(messages) = v.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return None;
-    };
+    let messages = v.get_mut("messages").and_then(|m| m.as_array_mut())?;
     let mut repaired = 0usize;
     let mut dropped_ids: Vec<String> = Vec::new();
     for msg in messages.iter_mut() {
@@ -1094,22 +1088,19 @@ fn repair_tool_args_history(v: &mut serde_json::Value) -> Option<String> {
             }
             let fixed = balance_close_json(&args)
                 .filter(|candidate| serde_json::from_str::<serde_json::Value>(candidate).is_ok());
-            match fixed {
-                Some(fixed) => {
-                    if let Some(a) = call.pointer_mut("/function/arguments") {
-                        *a = serde_json::Value::String(fixed);
-                    }
-                    repaired += 1;
+            if let Some(fixed) = fixed {
+                if let Some(a) = call.pointer_mut("/function/arguments") {
+                    *a = serde_json::Value::String(fixed);
                 }
-                None => {
-                    if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
-                        dropped_ids.push(id.to_string());
-                    }
-                    if let Some(obj) = call.as_object_mut() {
-                        // Marker is retained away with the entry - it
-                        // never reaches serialization.
-                        obj.insert("__blazar_drop".to_string(), serde_json::Value::Bool(true));
-                    }
+                repaired += 1;
+            } else {
+                if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                    dropped_ids.push(id.to_string());
+                }
+                if let Some(obj) = call.as_object_mut() {
+                    // Marker is retained away with the entry - it
+                    // never reaches serialization.
+                    obj.insert("__blazar_drop".to_string(), serde_json::Value::Bool(true));
                 }
             }
         }
@@ -1134,8 +1125,8 @@ fn repair_tool_args_history(v: &mut serde_json::Value) -> Option<String> {
         !(msg.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
             && msg
                 .get("tool_calls")
-                .is_some_and(|t| t.as_array().is_some_and(|a| a.is_empty()))
-            && msg.get("content").map_or(true, serde_json::Value::is_null))
+                .is_some_and(|t| t.as_array().is_some_and(std::vec::Vec::is_empty))
+            && msg.get("content").is_none_or(serde_json::Value::is_null))
     });
     (repaired > 0 || !dropped_ids.is_empty())
         .then(|| format!("repaired={repaired} dropped={}", dropped_ids.len()))
@@ -1154,10 +1145,10 @@ fn rebuild_child_response(
     for (name, value) in headers {
         builder = builder.header(name, value);
     }
-    builder
-        .body(body.clone())
-        .map(reqwest::Response::from)
-        .unwrap_or_else(|_| reqwest::Response::from(axum::http::Response::new(body)))
+    builder.body(body.clone()).map_or_else(
+        |_| reqwest::Response::from(axum::http::Response::new(body)),
+        reqwest::Response::from,
+    )
 }
 
 /// Reactive repair lane for the llama.cpp tool-args 500: buffers the
@@ -1190,13 +1181,12 @@ async fn repair_tool_args_500_retry(
             None,
         );
     };
-    let unchanged = || rebuild_child_response(status.clone(), &hdrs, buf.clone());
+    let unchanged = || rebuild_child_response(status, &hdrs, buf.clone());
     if !is_llamacpp_parse_error_500(&buf) {
         return (unchanged(), None);
     }
-    let mut repaired_req = match serde_json::from_slice::<serde_json::Value>(request_body) {
-        Ok(v) => v,
-        Err(_) => return (unchanged(), None),
+    let Ok(mut repaired_req) = serde_json::from_slice::<serde_json::Value>(request_body) else {
+        return (unchanged(), None);
     };
     let Some(note) = repair_tool_args_history(&mut repaired_req) else {
         return (unchanged(), None);
@@ -4889,6 +4879,7 @@ mod repair_lane_tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__balance_close_json__unterminated_string_then_brackets() {
         // Truncated string value: close the quote only.
         assert_eq!(balance_close_json("\"Tok").as_deref(), Some("\"Tok\""));
@@ -4912,6 +4903,7 @@ mod repair_lane_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__balance_close_json__corrupt_beyond_truncation_is_none() {
         // Mismatched closer: not a truncation, unfixable.
         assert_eq!(balance_close_json("}"), None);
@@ -4922,6 +4914,7 @@ mod repair_lane_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__repair_tool_args_history__lossless_truncation_repair() {
         let mut v = serde_json::json!({
             "model": "m",
@@ -4945,6 +4938,7 @@ mod repair_lane_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__repair_tool_args_history__uncorruptible_entry_dropped_with_orphan() {
         let mut v = serde_json::json!({
             "messages": [
@@ -4970,6 +4964,7 @@ mod repair_lane_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__repair_tool_args_history__clean_history_is_untouched() {
         let mut v = serde_json::json!({
             "messages": [
@@ -4987,6 +4982,7 @@ mod repair_lane_tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn unit__is_llamacpp_parse_error_500__signature_gates() {
         // nlohmann parse_error body (live-captured shape, T10 run).
         let nlohmann = br#"{"error":{"code":500,"message":"json.exception.parse_error.101 ... \"Tok ...","type":"server_error"}}"#;

@@ -321,21 +321,21 @@ pub fn compile(input: &ProfileInput<'_>, tuning: &TuningOverrides) -> Result<Pro
                         overlay: &dense_overlay,
                         ..input.clone()
                     };
-                    if let Ok(dense_profile) = compile_sglang(&dense, tuning) {
-                        if !dense_profile.argv.iter().any(|a| a == "--cpu-offload-gb") {
-                            let mut p = dense_profile;
-                            p.warnings.insert(
-                                0,
-                                "spec lane needs host offload on this card - \
-                                 spawning dense full-residency instead (speculation \
-                                 is a speed knob, not a capability gate; offloaded \
-                                 spec runs the ~2.6 tok/s lane where dense full \
-                                 residency runs 47 - the pair stays banked for a \
-                                 bigger card)"
-                                    .to_string(),
-                            );
-                            return Ok(p);
-                        }
+                    if let Ok(dense_profile) = compile_sglang(&dense, tuning)
+                        && !dense_profile.argv.iter().any(|a| a == "--cpu-offload-gb")
+                    {
+                        let mut p = dense_profile;
+                        p.warnings.insert(
+                            0,
+                            "spec lane needs host offload on this card - \
+                             spawning dense full-residency instead (speculation \
+                             is a speed knob, not a capability gate; offloaded \
+                             spec runs the ~2.6 tok/s lane where dense full \
+                             residency runs 47 - the pair stays banked for a \
+                             bigger card)"
+                                .to_string(),
+                        );
+                        return Ok(p);
                     }
                 }
                 Ok(profile)
@@ -3222,7 +3222,7 @@ pub fn host_levers() -> [&'static str; 4] {
 ///
 /// Pins are advisories, not overrides: when the standing GPU demand
 /// already fits the largest budget (full residency), a manual offload
-/// only streams weights over PCIe that the card could have held whole.
+/// only streams weights over `PCIe` that the card could have held whole.
 /// Live receipt 2026-11-21 (RTX 4070 Laptop, Qwen3-8B AWQ 5816 MiB):
 /// pinned offload 2-3 GB decoded at 2.6 tok/s while the identical
 /// quality class (fp8 KV) at offload 0 decoded at 47 tok/s single /
@@ -4803,7 +4803,7 @@ const SGLANG_DENSE_DYNAMIC_RESERVE_PER_SLOT_MIB: u64 = 100;
 const SGLANG_DSPINE_PLUGIN_TAG: &str = "0.5.22";
 
 /// Dynamic-side reserve for a spawn, spec-kind aware. A TRAINED-drafter
-/// lane (EAGLE3 / DSpine / DFlash - draft weights live device-side)
+/// lane (EAGLE3 / `DSpine` / `DFlash` - draft weights live device-side)
 /// keeps the 2000 MiB receipt-calibrated posture its graph and prewarm
 /// receipts were measured against. A SELF-DRAFTING lane (NGRAM -
 /// drafts from the target's own context, no draft weights) pays only
@@ -7323,6 +7323,33 @@ fn push_nonllama_vocab_teaching(config: &Config, lane: &str, warnings: &mut Vec<
 /// and hands the CPU lane its `--device cpu` teaching. Returns the
 /// profile's gpu label and KV estimate.
 #[allow(clippy::too_many_arguments)]
+/// Static-side draft-weights charge for a spec lane: sglang loads the
+/// draft before sizing the KV pool and counts it in `pre_model_load`
+/// ("If using speculative decoding, draft weights are now counted" -
+/// `kv_cache_configurator`). Leaving it out of the derive lands the
+/// fraction under the engine's own minimum-viable floor and the spawn
+/// dies at `alloc_memory_pool` (2026-10-16 receipt: derive 0.605 vs
+/// minimum 0.6076). Unreadable dir fails open like the admission-side
+/// charge, with the same warn.
+fn sglang_draft_static_bytes(spec: &SpecEngagement<'_>, warnings: &mut Vec<String>) -> u64 {
+    if let Some(draft) = spec.draft_dir {
+        crate::hfmeta::root_safetensors_bytes(std::path::Path::new(draft)).unwrap_or_else(|| {
+            warnings.push(format!(
+                "sglang draft dir {draft} unreadable at compile - \
+                 mem-fraction derived draft-free; sizing may run tight"
+            ));
+            0
+        })
+    } else {
+        0
+    }
+}
+
+// Natural spawn-compile seam: profile inputs + tier geometry knobs in,
+// argv/warnings out - bundling further would just reshuffle the ladder's
+// call contract (the geometry the tiers share already moved to
+// SglangFitGeometry).
+#[allow(clippy::too_many_arguments)]
 fn sglang_run_fit_ladder(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -7373,28 +7400,7 @@ fn sglang_run_fit_ladder(
                 // pool went to zero, child crashed at load).
                 let weights = ceil_div(input.model_bytes, shard)
                     .saturating_add(Hardware::bytes(SGLANG_DEVICE_OVERHEAD_MIB));
-                // Draft weights are STATIC-side: sglang loads them
-                // before sizing the KV pool and counts them in
-                // pre_model_load ("If using speculative decoding, draft
-                // weights are now counted" - kv_cache_configurator).
-                // Leaving them out of the derive lands the fraction
-                // under the engine's own minimum-viable floor and the
-                // spawn dies at alloc_memory_pool (2026-10-16 receipt:
-                // derive 0.605 vs minimum 0.6076). Unreadable dir fails
-                // open like the admission-side charge, with the same
-                // warn.
-                let draft_weights = if let Some(draft) = spec.draft_dir {
-                    crate::hfmeta::root_safetensors_bytes(std::path::Path::new(draft))
-                        .unwrap_or_else(|| {
-                            warnings.push(format!(
-                                "sglang draft dir {draft} unreadable at compile - \
-                                 mem-fraction derived draft-free; sizing may run tight"
-                            ));
-                            0
-                        })
-                } else {
-                    0
-                };
+                let draft_weights = sglang_draft_static_bytes(spec, warnings);
                 // One static-side authority, in the units the engine
                 // allocates: --mem-fraction-static fractions the card
                 // TOTAL, so the ceiling pool (frac x engine_total), the
@@ -7522,7 +7528,7 @@ struct SglangFitGeometry {
     ctx: u32,
     spec_engaged: bool,
     /// True only when the spec lane loads TRAINED draft weights
-    /// device-side (EAGLE3 / DSpine / DFlash). Self-drafting lanes
+    /// device-side (EAGLE3 / `DSpine` / `DFlash`). Self-drafting lanes
     /// (NGRAM) carry no draft weights and price their verify batches
     /// through graph headroom, so they pay the dense slots-scaled
     /// reserve, not the trained-drafter base (2026-11-22 receipt:
@@ -7747,7 +7753,7 @@ fn sglang_gpu_fit(
             .saturating_sub(weights)
             .saturating_sub(geom.draft_weights);
         let per_slot_kv = kv_floor(kv16_v.max(kv8_v));
-        let parallel_streams = (kv_room / per_slot_kv.max(1)).min(u32::MAX as u64) as u32;
+        let parallel_streams = u32::try_from(kv_room / per_slot_kv.max(1)).unwrap_or(u32::MAX);
         if parallel_streams >= 2 {
             warnings.push(format!(
                 "slots = 1 caps aggregate throughput: the full-residency pool could host \
@@ -20550,17 +20556,6 @@ mod tests {
         // bump arm below.
         static PROBED_WITH_DSPINE: LazyLock<Vec<String>> =
             LazyLock::new(|| vec!["NGRAM".to_string(), "DSPINE".to_string()]);
-        let cfg = Config::default();
-        let hf = hf_meta();
-        let overlay = ModelOverride {
-            ctx: Some(4_096),
-            sglang: Some(crate::config::SglangTuning {
-                spec_algorithm: Some("dspine".into()),
-                spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
-                ..crate::config::SglangTuning::default()
-            }),
-            ..DEFAULT_OVERLAY.clone()
-        };
         fn mk<'a>(
             hw: &'a Hardware,
             hf: &'a HfMeta,
@@ -20573,6 +20568,17 @@ mod tests {
             inp.spec_types = probed;
             inp
         }
+        let cfg = Config::default();
+        let hf = hf_meta();
+        let overlay = ModelOverride {
+            ctx: Some(4_096),
+            sglang: Some(crate::config::SglangTuning {
+                spec_algorithm: Some("dspine".into()),
+                spec_draft_path: Some("/models/qwen3-8b-dspine-b16".into()),
+                ..crate::config::SglangTuning::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
         // 8 GiB card: spec plan spills weights to host, dense full-fits
         // - dense must win with the offload teaching.
         let hw = gpu_hw(8_188, 15_900, 8);
@@ -23763,7 +23769,7 @@ mod tests {
     /// Live receipt regression (2026-11-22, RTX 4070 Laptop): the census
     /// reported free 7666 of 8188 MiB total while an AWQ model needed a
     /// 6584 MiB static side. The free-basis ceiling pool (6516) refused
-    /// that demand and kept a stale cpu_offload pin alive at 2.6 tok/s,
+    /// that demand and kept a stale `cpu_offload` pin alive at 2.6 tok/s,
     /// while the engine - which fractions the card TOTAL - held it fine
     /// at frac 0.850 (6960 MiB, receipt-proven boot). The engine-units
     /// pool must accept what the engine accepts.

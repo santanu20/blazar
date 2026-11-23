@@ -2904,7 +2904,7 @@ pub async fn upscale(
             Priority::Normal,
             crate::workload::classify_for(
                 &state,
-                &model,
+                model,
                 crate::workload::WorkloadSurface::ImageGeneration,
                 false,
                 false,
