@@ -27,49 +27,63 @@ check() { # name expected_substring actual_text
         fail=$((fail+1)); printf 'FAIL  %s\n      expected to contain: %s\n      got: %.400s\n' "$1" "$2" "$3"
     fi
 }
-post() { curl -s -m 120 -H 'content-type: application/json' -d "$2" "$BASE$1"; }
-get()  { curl -s -m 30 "$BASE$1"; }
+refute() { # name unexpected_substring actual_text
+    if printf '%s' "$3" | grep -qF "$2"; then
+        fail=$((fail+1)); printf 'FAIL  %s\n      unexpected: %s\n      got: %.400s\n' "$1" "$2" "$3"
+    else
+        pass=$((pass+1)); printf 'PASS  %s\n' "$1"
+    fi
+}
+jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+post() { curl -sS -m 120 -H 'content-type: application/json' -d "$2" "$BASE$1"; }
+get()  { curl -sS -m 30 "$BASE$1"; }
+
+# Model names travel as JSON strings, never as concatenated shell text.
+model_json=$(jstr "$MODEL")
 
 echo "== client-compat matrix against $BASE (model: $MODEL) =="
 
-# --- openai-sdk: plain chat -------------------------------------------------
-body=$(post /v1/chat/completions '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Say ok"}],"max_tokens":16}')
+# --- openai-sdk: plain chat ---------------------------------------------------
+body=$(post /v1/chat/completions '{"model":'"$model_json"',"messages":[{"role":"user","content":"Say ok"}],"max_tokens":16}')
 check "openai-sdk chat: choices[0].message.content" '"content"' "$body"
 check "openai-sdk chat: usage object" '"usage"' "$body"
 check "openai-sdk chat: finish_reason" '"finish_reason"' "$body"
+refute "openai-sdk chat: no error object" '"error"' "$body"
 
-# --- continue-cline: tools shape --------------------------------------------
-body=$(post /v1/chat/completions '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"What is the weather in Tokyo? Use the tool."}],"max_tokens":64,"tools":[{"type":"function","function":{"name":"get_weather","description":"weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}')
+# --- continue-cline: tools shape ----------------------------------------------
+body=$(post /v1/chat/completions '{"model":'"$model_json"',"messages":[{"role":"user","content":"What is the weather in Tokyo? Use the tool."}],"max_tokens":64,"tools":[{"type":"function","function":{"name":"get_weather","description":"weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}')
 check "continue-cline tools: 200 with choices or teaching error" '"choices"' "$body"
 
-# --- codex-responses: stored response + previous_response_id chain ---------
-rid=$(post /v1/responses '{"model":"'"$MODEL"'","input":"Remember the number 42. Reply with just the number.","store":true}' \
+# --- codex-responses: stored response + previous_response_id chain ------------
+rid=$(post /v1/responses '{"model":'"$model_json"',"input":"Remember the number 42. Reply with just the number.","store":true}' \
       | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
 if [ -n "$rid" ]; then
     pass=$((pass+1)); printf 'PASS  codex responses: stored id %s\n' "$rid"
-    body=$(post /v1/responses '{"model":"'"$MODEL"'","previous_response_id":"'"$rid"'","input":"What number did I ask you to remember?"}')
+    rid_json=$(jstr "$rid")
+    body=$(post /v1/responses '{"model":'"$model_json"',"previous_response_id":'"$rid_json"',"input":"What number did I ask you to remember?"}')
     check "codex responses: chain resolved (no teaching 404)" '"id"' "$body"
 else
     fail=$((fail+1)); printf 'FAIL  codex responses: no id returned from store:true\n'
 fi
 
-# --- anthropic-sdk: /v1/messages --------------------------------------------
-body=$(post /v1/messages '{"model":"'"$MODEL"'","max_tokens":16,"messages":[{"role":"user","content":"Say ok"}]}')
+# --- anthropic-sdk: /v1/messages ------------------------------------------------
+body=$(post /v1/messages '{"model":'"$model_json"',"max_tokens":16,"messages":[{"role":"user","content":"Say ok"}]}')
 check "anthropic-sdk messages: content array" '"content"' "$body"
 check "anthropic-sdk messages: stop_reason" '"stop_reason"' "$body"
+refute "anthropic-sdk messages: no error object" '"error"' "$body"
 
-# --- ollama-cli: /api/chat ---------------------------------------------------
-body=$(post /api/chat '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Say ok"}],"stream":false}')
+# --- ollama-cli: /api/chat -------------------------------------------------------
+body=$(post /api/chat '{"model":'"$model_json"',"messages":[{"role":"user","content":"Say ok"}],"stream":false}')
 check "ollama-cli chat: message.content" '"message"' "$body"
-echo "$body" | grep -qF "\"model\"" && { pass=$((pass+1)); printf 'PASS  ollama-cli chat: model echo\n'; } \
-    || { fail=$((fail+1)); printf 'FAIL  ollama-cli chat: model echo\n'; }
+check "ollama-cli chat: model echo" "\"model\":\"$MODEL\"" "$body"
+refute "ollama-cli chat: no error object" '"error"' "$body"
 
-# --- lifecycle: request card + cancel ----------------------------------------
+# --- lifecycle: request card + cancel --------------------------------------------
 body=$(get "/v1/requests?state=done&limit=1")
 check "lifecycle: /v1/requests answers" 'blazar.request.list' "$body"
 rid=$(printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin).get("data",[]); print(d[0].get("id","") if d else "")')
 if [ -n "$rid" ]; then
-    code=$(curl -s -m 30 -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/requests/$rid/cancel")
+    code=$(curl -sS -m 30 -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/requests/$rid/cancel")
     [ "$code" = "200" ] && { pass=$((pass+1)); printf 'PASS  lifecycle: cancel on terminal card idempotent (200)\n'; } \
         || { fail=$((fail+1)); printf 'FAIL  lifecycle: cancel returned %s\n' "$code"; }
 else

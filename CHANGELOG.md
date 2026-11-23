@@ -40,6 +40,7 @@ tracked here.
 - **The installer asks before it installs an NVIDIA kernel driver.** `scripts/install.sh` runs the driver install only when `BLAZAR_AUTO_DRIVER=1` or the prompt gets a `y`; without a terminal it says so and prints the rerun command, and it uses `pacman -S` instead of the partial-upgrade `pacman -Sy`. A fresh install no longer starts the unit when no engine is active: the unit stays enabled and the installer prints the two commands that start it, instead of a 3-second crash loop.
 - **The uninstaller keeps the registry signing key.** `scripts/uninstall.sh --purge` removes the config entries but leaves `registry/` under the config directory and says so; it stops only the invoking user's processes, checks that a pidfile PID is still blazar before signalling it, and targets the invoking user's systemd and launchd domains when run with sudo.
 - **`scripts/push-export.sh` defaults to `main` and runs the CI gates.** It aborted by default since the branch rename (it expected `master`); it now runs clippy with `--all-features` and `cargo nextest run --workspace`, and `scripts/bootstrap.sh` uses `pacman -S` and points at the same commands.
+- **`scripts/compat/compat_check.sh` builds request bodies as JSON.** Model names and response ids go through `json.dumps` instead of shell concatenation, curl reports transport errors, and every chat fixture also asserts that no error object came back.
 
 ### Removed
 
