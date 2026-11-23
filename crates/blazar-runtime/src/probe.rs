@@ -1077,6 +1077,7 @@ mod tests {
         assert_eq!(attempts.get(), 1, "permanent errors are never retried");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn unit__pgid_rss_mib__measures_the_own_process_group() {
         // The test runner walks its OWN group: at least this process is
@@ -1100,5 +1101,17 @@ mod tests {
             Some(rss) => assert!(rss > 0, "own group must hold resident pages, got {rss}"),
             None => panic!("own process group must be measurable on this platform"),
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn unit__pgid_rss_mib__reports_none_without_procfs() {
+        // No /proc off Linux, so the ledger keeps its estimate charge and
+        // says so - the probe must answer None rather than guess a number.
+        assert_eq!(
+            pgid_rss_mib(std::process::id()),
+            None,
+            "without procfs the group is not measurable"
+        );
     }
 }

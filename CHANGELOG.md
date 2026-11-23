@@ -45,6 +45,7 @@ tracked here.
 - **Ruff backlog in the scripts** - `subprocess.run` calls without `check`, a `try/except/pass` replaced by `contextlib.suppress`, an ambiguous `l` loop variable, an unclosed file handle in the effective-config reconciliation check and an unused unpack target. No behavior change.
 - **Clippy is clean workspace-wide under `-D warnings`.** The config editor marks its 23 pure parsers `#[must_use]` and its named tests carry the suite's non-snake-case allowance; the gateway config API fixes a doc list item, a duplicated doc sentence and an underscore-named lock guard, and keeps the HTTP response as the `ConfigFileIo` error type behind a reasoned allow; the CLI `config set`/`unset` arms import before their first statement; the events backlog stops cloning a `Copy` closure. No behavior change.
 - **`url` is updated to 2.5.9** (RUSTSEC-2026-0592): `Url::origin()` could overflow the stack on nested `blob:` URLs. The advisory was failing `cargo audit`, which is clean again; `form_urlencoded` moves to 1.2.3 as its requirement.
+- **The process-group RSS test only runs where `/proc` exists.** `pgid_rss_mib` answers `None` off Linux by design, but its test read `/proc/self/stat` unconditionally, so the workspace tests failed on macOS and Windows; the Linux assertion is now gated and a non-Linux test pins the `None` contract.
 
 ## [0.34.3] - 2026-11-21
 
