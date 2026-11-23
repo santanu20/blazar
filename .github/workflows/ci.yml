@@ -50,10 +50,13 @@ jobs:
       # locally. It also runs test binaries in parallel on every OS, so the
       # old Windows serial pin is obsolete. No doc-tests exist in the
       # workspace, so nextest covers the full cargo-test surface.
+      # --no-fail-fast keeps the remaining tests running after a failure:
+      # macOS and Windows runners are not available to every contributor,
+      # so a red run has to list every failure at once, not one per run.
       - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --workspace 2>&1 | tee test.log
+      - run: cargo nextest run --workspace --no-fail-fast 2>&1 | tee test.log
         shell: bash
       - name: upload test log (always, for diagnosis)
         if: always()
