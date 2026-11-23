@@ -42,8 +42,22 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Windows PowerShell 5.1 on older .NET can default to TLS 1.0/1.1; GitHub requires 1.2+.
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 function Fail([string]$Message) { Write-Host "ERROR: $Message" -ForegroundColor Red; exit 1 }
+
+function Get-UserPathRaw {
+    # The user PATH is REG_EXPAND_SZ: read it unexpanded so `%USERPROFILE%`
+    # entries stay variables (the .NET GetEnvironmentVariable API expands them).
+    [Microsoft.Win32.Registry]::GetValue('HKEY_CURRENT_USER\Environment', 'Path', $null,
+        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+}
+
+function Set-UserPathRaw([string]$Value) {
+    [Microsoft.Win32.Registry]::SetValue('HKEY_CURRENT_USER\Environment', 'Path', $Value,
+        [Microsoft.Win32.RegistryKind]::ExpandString)
+}
 
 $TaskName = 'blazar'
 
@@ -56,7 +70,16 @@ function Stop-BlazarGraceful([string]$ExePath) {
             Start-Sleep -Milliseconds 800
         }
     } catch { }
-    Get-Process -Name blazar -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Only the daemon installed at $ExePath: `blazar pull`/`run` in other
+    # terminals and other users' daemons are not ours to stop. The command
+    # line comes from CIM because Process.CommandLine is absent in Windows
+    # PowerShell 5.1 (StrictMode would throw on the property).
+    $daemons = @(Get-CimInstance Win32_Process -Filter "Name='blazar.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        $_.ExecutablePath -eq $ExePath -and $_.CommandLine -match '\bserve\b'
+    })
+    foreach ($daemon in $daemons) {
+        Stop-Process -Id $daemon.ProcessId -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($Uninstall) {
@@ -69,17 +92,24 @@ if ($Uninstall) {
     # F155: graceful drain before the hard kill.
     Stop-BlazarGraceful (Join-Path $InstallDir 'blazar.exe')
     if (Test-Path (Join-Path $InstallDir 'blazar.exe')) {
-        Remove-Item $InstallDir -Recurse -Force
-        Write-Host ">>> removed $InstallDir"
+        # Remove only what this installer owns: a custom -InstallDir may hold
+        # other tools, so the directory itself goes only once it is empty.
+        Remove-Item (Join-Path $InstallDir 'blazar.exe') -Force
+        if (-not (Get-ChildItem $InstallDir -Force -ErrorAction SilentlyContinue)) {
+            Remove-Item $InstallDir -Force
+            Write-Host ">>> removed $InstallDir"
+        } else {
+            Write-Host ">>> removed blazar.exe (kept $InstallDir: it holds other files)"
+        }
     }
     # F155b: exact-entry PATH removal (split on ';', drop the precise
     # install dir, rejoin) — substring matching over-matches sibling
     # directories and the leading-';'-only replace left stale entries.
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userPath = Get-UserPathRaw
     if ($userPath) {
         $entries = @($userPath.Split(';') | Where-Object { $_ -ne '' -and $_ -ne $InstallDir })
         if ($entries.Count -ne @($userPath.Split(';') | Where-Object { $_ -ne '' }).Count) {
-            [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
+            Set-UserPathRaw ($entries -join ';')
             Write-Host '>>> removed PATH entry'
         }
     }
@@ -181,8 +211,8 @@ try {
             else { & git clone --depth 1 $cloneUrl $srcRoot }
             if ($LASTEXITCODE -ne 0) { Fail "git clone failed: $cloneUrl" }
         }
-        Write-Host '>>> compiling (cargo build --release; first build takes a few minutes)...'
-        & cargo build --release --manifest-path (Join-Path $srcRoot 'Cargo.toml')
+        Write-Host '>>> compiling (cargo build --release --locked -p blazar; first build takes a few minutes)...'
+        & cargo build --release --locked -p blazar --manifest-path (Join-Path $srcRoot 'Cargo.toml')
         if ($LASTEXITCODE -ne 0) {
             Fail 'cargo build failed (output above). If it mentions link.exe: winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"'
         }
@@ -214,11 +244,11 @@ try {
 
     # F155b: exact-entry PATH add — `-notlike "*dir*"` over-matched
     # sibling directories (Programs\blazar vs Programs\blazar-old).
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userPath = Get-UserPathRaw
     if (-not $userPath) { $userPath = '' }
     $entries = @($userPath.Split(';') | Where-Object { $_ -ne '' })
     if ($entries -notcontains $InstallDir) {
-        [Environment]::SetEnvironmentVariable('Path', (($entries + $InstallDir) -join ';'), 'User')
+        Set-UserPathRaw (($entries + $InstallDir) -join ';')
         Write-Host ">>> NOTE: added $InstallDir to your user PATH - open a new terminal for it to take effect"
     }
 
