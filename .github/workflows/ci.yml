@@ -152,18 +152,18 @@ jobs:
   audit:
     name: cargo audit (dep CVEs)
     runs-on: ubuntu-latest
-    # audit-check reports findings as a check-run annotation; the job-level
-    # token must be allowed to write checks or the action errors out after a
-    # clean scan ("Resource not accessible by integration").
+    # A plain cargo-audit run: nothing annotates a check run, so the job
+    # needs no write permission. The action used before failed twice in
+    # three runs while updating its own check run after a clean scan.
     permissions:
-      checks: write
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # F161: no dep-vulnerability gate existed (7c dependency audit).
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   hygiene:
     name: hygiene gates (paths + AI artifacts)
@@ -177,3 +177,4 @@ jobs:
       - run: shellcheck -S warning scripts/check_hygiene.sh
       - run: sh scripts/check_hygiene.sh
       - run: python3 scripts/check_glyphs.py
+
