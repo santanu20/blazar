@@ -3884,7 +3884,20 @@ class Daemon:
                     os.kill(self.proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                self.proc.wait(timeout=10)
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    # A daemon that ignores SIGKILL sits in uninterruptible
+                    # state (driver/GPU wedge class, live 2026-11-22): the
+                    # harness must record it and move on - the next start's
+                    # orphan sweep reclaims the pid once the kernel releases
+                    # it. Crashing the phase here would misreport a
+                    # wedged-peer environment as a product failure.
+                    print(
+                        f"validate: daemon pid={self.proc.pid} ignored "
+                        f"SIGKILL (uninterruptible state?) - abandoning "
+                        f"handle; startup sweep will reclaim it"
+                    )
         elif pid and pid > 1 and os.path.exists(f"/proc/{pid}"):
             # A daemon we started earlier in this harness run.
             try:
@@ -4465,17 +4478,48 @@ def cli(
     extra_env: dict | None = None,
 ) -> subprocess.CompletedProcess:
     assert SANDBOX is not None
-    p = subprocess.run(
+    # Own process group per call: a wedged CLI (or grandchildren it
+    # spawned that inherit the pipes) must die by group-kill, never
+    # freeze the harness. subprocess.run()'s Popen.__exit__ wait() has
+    # no timeout, so an SIGKILL-ignoring (uninterruptible) child would
+    # block the harness forever (live 2026-11-22: 8h freeze against a
+    # driver-wedged daemon state).
+    p = subprocess.Popen(
         [PAL, *args],
         env=SANDBOX.env(extra_env),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
-        check=False,
+        start_new_session=True,
     )
-    if check_exit and p.returncode != 0:
-        print(f"    cli stderr: {p.stderr.strip()[:400]}")
-    return p
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        print(
+            f"validate: cli {' '.join(args[:3])} exceeded {timeout}s - "
+            f"SIGKILL process group (wedged child?)"
+        )
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Grandchildren in uninterruptible state keep the pipes
+            # open forever; abandon the handle (pipes close on GC) and
+            # report whatever partial output the first wait collected.
+            part_out = exc.stdout if isinstance(exc.stdout, str) else ""
+            part_err = exc.stderr if isinstance(exc.stderr, str) else ""
+            out = part_out
+            err = (
+                f"{part_err}\n<harness: cli wedged past SIGKILL; killed at {timeout}s>"
+            )
+    rc = p.returncode if p.returncode is not None else -int(signal.SIGKILL)
+    result = subprocess.CompletedProcess([PAL, *args], rc, out, err)
+    if check_exit and result.returncode != 0:
+        print(f"    cli stderr: {result.stderr.strip()[:400]}")
+    return result
 
 
 def cli_retry(
@@ -7490,7 +7534,13 @@ def _eng_json_schema(lane: str, model: str) -> None:
             {
                 "model": model,
                 "stream": False,
-                "max_tokens": 120,
+                # Budget must cover a thinking model's reasoning pass
+                # BEFORE the schema-bound answer: qwen3-1.7b on the
+                # sglang lane burned a 120-token cap entirely in
+                # reasoning (finish=length, content='', sentinel
+                # reasoning_no_answer - live 2026-11-22), so the cap
+                # measured the budget, not the lane's JSON contract.
+                "max_tokens": 768,
                 "temperature": 0.2,
                 "messages": [
                     {
@@ -7828,6 +7878,7 @@ def _eng_sdcpp_images(lane: str, row: dict | None) -> None:
             f"only {free} MiB VRAM free - diffusion lane skipped rather than thrash",
         )
         return
+    log_offset = os.path.getsize(DAEMON.log_path)
     st, _, v = http_json(
         "POST",
         "/v1/images/generations",
@@ -7851,6 +7902,37 @@ def _eng_sdcpp_images(lane: str, row: dict | None) -> None:
                 ph,
                 "image generation returns a PNG",
                 f"engine refused on resources: {str(v)[:160]}",
+            )
+            return
+        # Host-pressure eviction is a resource refusal the engine never sees:
+        # the offloaded DiT faults in gigabytes of file-backed pages during
+        # generation, MemAvailable dips under the supervisor's critical arm
+        # (1 GiB) and the host-pressure evictor reclaims this very child
+        # mid-request (observed live 2026-11-22: mem_available_mib=951, two
+        # evictions of the respawned child, 502 with retry-once teaching).
+        # Excuse the failure ONLY on the evictor's own receipt naming this
+        # model in the request window - a plain crash-loop 502 still fails.
+        window = ""
+        try:
+            with open(DAEMON.log_path, "rb") as f:
+                f.seek(log_offset)
+                window = re.sub(rb"\x1b\[[0-9;]*m", b"", f.read()).decode(
+                    "utf-8", "replace"
+                )
+        except OSError:
+            pass
+        evicted = (
+            "host pressure: evicting the coldest idle resident for RAM relief" in window
+            and f"victim={row['name']}" in window
+        )
+        if evicted:
+            boundary(
+                ph,
+                "image generation returns a PNG",
+                "host at critical memory pressure - the supervisor's RAM-relief "
+                "evictor reclaimed the diffusion child mid-generation (its "
+                "offloaded DiT streams through system RAM); lane unmeasured on "
+                "this host state rather than fail the product's protection",
             )
             return
         check(
@@ -7977,20 +8059,34 @@ def _eng_lane_knobs(kind: str, model_row: dict) -> dict:
     if kind == "vllm":
         # VllmTuning: the profile compiler ALWAYS emits
         # --gpu-memory-utilization (upstream default 0.90 starves GPU
-        # co-tenants). The validate box shares one 12 GiB card with a
-        # co-tenant daemon, so the cell pins the co-tenant-safe 0.3 -
-        # also a live proof that the knob reaches the child argv
-        # verbatim. override ctx maps to --max-model-len (exact pair,
-        # same posture as the other safetensors lanes), and the
-        # served-model-name pin must carry the gateway's ':' -> '--'
-        # sanitization (a bare ':' name would 404 divergent-model
-        # requests downstream).
+        # co-tenants). The fraction is sized from the actual card and
+        # the row's weights (1.5x headroom for activations + KV,
+        # clamped to 0.30..0.90) because a static pin cannot hold
+        # across cards: live 2026-11-22, the old 0.3 pin (sized for a
+        # 12 GiB assumption) budgeted 2456 MiB on this 8188 MiB card
+        # while qwen3-1.7b bf16 weights alone are 3891 MiB, so vllm's
+        # engine core aborted every spawn with "No available memory
+        # for the cache blocks" (KV gets what is left inside the
+        # fraction). The computed value still proves verbatim knob
+        # reach into the child argv. override ctx maps to
+        # --max-model-len (exact pair, same posture as the other
+        # safetensors lanes), and the served-model-name pin must carry
+        # the gateway's ':' -> '--' sanitization (a bare ':' name
+        # would 404 divergent-model requests downstream).
+        gpu_total = _gpu_total_mib()
+        weights_mib = int(model_row.get("bytes") or 0) // (1024 * 1024)
+        if gpu_total and weights_mib:
+            need_mib = weights_mib * 3 // 2
+            frac_h = max(30, min(90, -(-need_mib * 100 // gpu_total)))
+        else:
+            frac_h = 30
+        frac = f"{frac_h / 100:.2f}".rstrip("0").rstrip(".")
         return {
-            "cfg": {"vllm": {"gpu_memory_utilization": 0.3}},
+            "cfg": {"vllm": {"gpu_memory_utilization": float(frac)}},
             "override": {"ctx": 8192},
             "pairs": [
                 ("--max-model-len", "8192"),
-                ("--gpu-memory-utilization", "0.3"),
+                ("--gpu-memory-utilization", frac),
                 (
                     "--served-model-name",
                     str(model_row.get("name") or "").replace(":", "--"),
@@ -9088,6 +9184,29 @@ def _eng_spec_draft(rows: list[dict], kinds_by_tag: dict, disk_kinds: set) -> No
         offload_mib = int((offload or 0) * 1024)
         target_mib = model_bytes_mib(target["name"])
         draft_mib = model_bytes_mib(draft["name"])
+        # Receipt-recipe gate mirroring the product's live-RAM offload
+        # clamp (profile.rs sglang_clamp_offload_to_live_ram: MemAvailable
+        # - weights/2 - 512 MiB floors the whole-GB offload a pin can
+        # carry). The recipe contract needs the pin to survive VERBATIM -
+        # the argv audit below asserts --cpu-offload-gb <pin> exactly
+        # once - and a clamped pin also shrinks the on-card relief so
+        # admission refuses 507 by design while the lane polls for a ps
+        # row that can never appear. Live 2026-11-22: MemAvailable
+        # 6133 MiB clamped the 4 GiB recipe pin to 1 GiB, the guard
+        # refused every spawn for 600 s, and the lane failed as if the
+        # product were broken instead of boundary-ing the host state.
+        if offload is not None:
+            carryable_gb = max(mem_available_mib() - target_mib // 2 - 512, 0) // 1024
+            if carryable_gb < offload:
+                boundary(
+                    ph,
+                    f"{algorithm} live lane",
+                    f"host cannot carry the {offload:g} GiB offload recipe "
+                    f"pin: MemAvailable {mem_available_mib()} MiB clamps it "
+                    f"to {carryable_gb} GiB (product spawn guard) - free "
+                    f"host RAM or rerun the lane on an idle box",
+                )
+                return
         default_need = int(target_mib * 1.25) + 1024
         offload_need = min(
             int((target_mib + draft_mib - offload_mib) * 1.25) + 1024,
@@ -9166,7 +9285,7 @@ def _eng_spec_draft(rows: list[dict], kinds_by_tag: dict, disk_kinds: set) -> No
                 if problems
                 else f"{len(expected)} spec pairs exact-once in argv",
             )
-            st, _, v = chat("Say ok", model=model)
+            st, v, _ = chat("Say ok", model=model)
             msg = {}
             if st == 200 and isinstance(v, dict):
                 msg = (v.get("choices") or [{}])[0].get("message") or {}
@@ -9472,7 +9591,7 @@ def _eng_litert(kinds_by_tag: dict, disk_kinds: set) -> None:
             served_kind == "openaihost",
             f"model={model} engine={tag} -> kind {served_kind!r}",
         )
-        st, _, v = chat("Say ok", model=model)
+        st, v, _ = chat("Say ok", model=model)
         msg = {}
         if st == 200 and isinstance(v, dict):
             msg = (v.get("choices") or [{}])[0].get("message") or {}
@@ -12799,34 +12918,35 @@ def phase_commands() -> None:
     p = cli("coreside")
     reg("coreside", p.returncode == 0, p.stdout.strip()[:80])
 
+    # `drafts` is an online family-keyed surface (drafts_cmd: curated
+    # registry pairings + raw HF search on the model's family token);
+    # it never lists local store rows, so naming store fixtures was a
+    # wrong proxy. Deterministic contract: rc0 and the per-model
+    # candidates header in every path (registry/search failures are
+    # advisory by design). Draft-shaped store rows additionally prove
+    # family extraction ('qwen3-4b-dflash-b16' -> family 'qwen3').
     p = cli("drafts", MODEL)
-    # The drafts surface must actually NAME the store's draft fixtures
-    # (rc0 with an empty table would hide a registry-link rot); rc0
-    # alone remains the floor when no draft family is installed.
+    drafts_ok = p.returncode == 0 and f"draft candidates for {MODEL}" in p.stdout
+    detail = f"rc={p.returncode} header={f'draft candidates for {MODEL}' in p.stdout}"
     try:
         _db = _sandbox_db()
         try:
-            _draft_names = [
-                r[0]
-                for r in _db.execute(
-                    "SELECT name FROM models WHERE name LIKE '%dflash%'"
-                    " OR name LIKE '%dspine%' OR name LIKE '%eagle%'"
-                    " OR name LIKE '%mtp%'"
-                )
-            ]
+            _draft_row = _db.execute(
+                "SELECT name FROM models WHERE name LIKE '%dflash%'"
+                " OR name LIKE '%dspine%' OR name LIKE '%mtp%' LIMIT 1"
+            ).fetchone()
         finally:
             _db.close()
     except sqlite3.Error:
-        _draft_names = []
-    drafts_ok = p.returncode == 0 and (
-        not _draft_names or any(n in p.stdout for n in _draft_names)
-    )
-    reg(
-        "drafts",
-        drafts_ok,
-        f"rc={p.returncode} store_drafts={_draft_names[:3] or 'none'} "
-        f"visible={any(n in p.stdout for n in _draft_names) if _draft_names else 'n/a'}",
-    )
+        _draft_row = None
+    if _draft_row:
+        pd = cli("drafts", _draft_row[0])
+        family_ok = (
+            pd.returncode == 0 and f"draft candidates for {_draft_row[0]}" in pd.stdout
+        )
+        drafts_ok = drafts_ok and family_ok
+        detail += f" family-row={_draft_row[0]} family_ok={family_ok}"
+    reg("drafts", drafts_ok, detail)
 
     def _search():
         p = cli("search", "qwen", timeout=120)
@@ -14057,11 +14177,19 @@ def phase_commands() -> None:
         if p.returncode != 0 and ("cmake" in out.lower() or "toolchain" in out.lower()):
             regb("engine.build", f"no local build toolchain: {out.strip()[:120]}")
             return
-        if p.returncode != 0 and ("rate limited" in out.lower() or "403" in out):
+        if p.returncode != 0 and (
+            "rate limited" in out.lower()
+            or "403" in out
+            or "error sending request" in out
+            or "request failed" in out
+        ):
             # engine.build clones from GitHub; the anonymous API quota
             # (60 req/hr) shared with every other lane's release lookups
-            # exhausts on heavy windows - same environment class the
-            # install/download lanes already boundary-classify.
+            # exhausts on heavy windows, and brief connection drops surface
+            # as reqwest "error sending request" - same environment class
+            # the install/download lanes already boundary-classify (observed
+            # live 2026-11-23: build+install both failed one window, GH back
+            # to 200 minutes later).
             regb("engine.build", f"blocked this window: {out.strip()[:120]}")
             return
         reg(
@@ -14171,7 +14299,12 @@ def phase_commands() -> None:
         worker_rc = worker.wait(timeout=15)
     except subprocess.TimeoutExpired:
         worker.kill()
-        worker_rc = worker.wait()
+        try:
+            worker_rc = worker.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Uninterruptible (driver-wedge class) survivor: report the
+            # kill instead of blocking the harness on it forever.
+            worker_rc = -int(signal.SIGKILL)
     reg(
         "rpc.worker",
         worker_up and worker_rc == 143,
@@ -14884,6 +15017,71 @@ def phase_commands() -> None:
         f"converter-xor={g3.returncode != 0} hf-shape={g4.returncode != 0}",
     )
 
+    # kv status: offline store inventory, one JSONL row per store model
+    # (empty store renders empty, rc0). MODEL is always in the store by
+    # this phase, so require its row with the inventory keys intact.
+    s1 = cli("kv", "status", "--json")
+    try:
+        _kvrows = [json.loads(l) for l in s1.stdout.splitlines() if l.strip()]
+        _kvrows_ok = all(
+            {"model", "banks", "legacy_banks", "bytes", "newest_ctx"} <= set(r)
+            for r in _kvrows
+        ) and any(r.get("model") == MODEL for r in _kvrows)
+    except json.JSONDecodeError:
+        _kvrows_ok = False
+    reg(
+        "kv.status",
+        s1.returncode == 0 and _kvrows_ok,
+        f"rc={s1.returncode} rows={len(s1.stdout.splitlines())} model_row={_kvrows_ok}",
+    )
+
+    # kv inspect: unknown model teaches toward `blazar list`; a known
+    # model renders rc0 even with zero banks (honest zero, not an error).
+    i1 = cli("kv", "inspect", "zzz-nope")
+    i2 = cli("kv", "inspect", MODEL)
+    reg(
+        "kv.inspect",
+        i1.returncode != 0
+        and 'unknown model "zzz-nope"' in i1.stdout + i1.stderr
+        and i2.returncode == 0,
+        f"teach={i1.returncode != 0} known_rc={i2.returncode}",
+    )
+
+    # kv gc: bare run refuses to guess (teaches the dry-run/apply pair);
+    # --dry-run is report-only on either store state (clean or orphans).
+    c0 = cli("kv", "gc")
+    c1 = cli("kv", "gc", "--dry-run")
+    reg(
+        "kv.gc",
+        c0.returncode != 0
+        and "kv gc needs --dry-run" in c0.stdout + c0.stderr
+        and c1.returncode == 0
+        and ("no reclaimable KV debris" in c1.stdout or "reclaimable:" in c1.stdout),
+        f"bare={c0.returncode != 0} dry_run={c1.returncode}",
+    )
+
+    # engine card: kind-resolution works in both store states (installed
+    # row -> full capability card; missing lane -> card + install note);
+    # the tag selector is positional, and an unknown tag teaches toward
+    # `blazar engine list`.
+    e1 = cli("engine", "card", "--kind", "llamacpp", "--json")
+    try:
+        _cardobj = json.loads(e1.stdout)
+        _card = _cardobj.get("card", _cardobj)
+        _card_ok = {"lane", "build"} <= set(_card)
+    except json.JSONDecodeError:
+        _card_ok = False
+    e2 = cli("engine", "card", "zz-nope")
+    reg(
+        "engine.card",
+        e1.returncode == 0
+        and _card_ok
+        and e2.returncode != 0
+        and 'no installed engine tag "zz-nope"' in e2.stdout + e2.stderr,
+        f"card={_card_ok} teach={e2.returncode != 0} phrase="
+        f"{'no installed engine tag' in e2.stdout + e2.stderr}",
+    )
+
     # join: contained donor-refusal legs. An isolated XDG with an
     # unlikely discovery_port makes the udp seek deterministic (no
     # gateway can answer); the explicit --gateway leg points at a closed
@@ -15215,7 +15413,7 @@ def phase_knobs_behavior() -> None:
 
     # -- prompt_preflight: oversized prompt -> teaching 4xx ----------------
     d.start({"port": PORT, "prompt_preflight": True})
-    st, _, v = chat(
+    st, v, _ = chat(
         "x", extra={"messages": [{"role": "user", "content": "x" * 2_000_000}]}
     )
     cov(
@@ -16349,7 +16547,12 @@ def _pty_session(argv, steps, timeout=300, env=None):
             rc = proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
-            rc = proc.wait()
+            try:
+                rc = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                # Uninterruptible (driver-wedge class) survivor: report
+                # the kill instead of blocking the harness forever.
+                rc = -int(signal.SIGKILL)
             err = err or "process did not exit; killed"
     finally:
         os.close(mfd)
@@ -18021,7 +18224,25 @@ def phase_fleet() -> None:
         f"exit={p.returncode} out={p.stdout.strip()[:80]!r}",
     )
     reg("agent.list", p.returncode == 0, f"exit={p.returncode}")
-    p = cli("adopt", "--yes")
+    # adopt + join teaching legs run under an isolated XDG whose udp
+    # ports are freshly allocated free ports. The default well-known
+    # discovery/agent ports get a broadcast + loopback-unicast scan, so
+    # any blazar node on this host or LAN answering at that moment
+    # flips the CLI into its found-a-peer branch and hides the teaching
+    # bail these checks assert on. Free ports make "nobody answers"
+    # deterministic (same hermetic pattern as the wave-phase join legs).
+    fx = os.path.join(SANDBOX.root, "fleet-xdg")
+    os.makedirs(os.path.join(fx, "blazar"), exist_ok=True)
+    fx_env = {
+        "XDG_CONFIG_HOME": fx,
+        "XDG_DATA_HOME": os.path.join(fx, "data"),
+    }
+    with open(os.path.join(fx, "blazar", "config.toml"), "w") as f:
+        f.write(
+            f"agent_port = {_fleet_free_udp_port()}\n"
+            f"discovery_port = {_fleet_free_udp_port()}\n"
+        )
+    p = cli("adopt", "--yes", extra_env=fx_env)
     taught = "no agents answered" in (p.stdout + p.stderr)
     check(
         "fleet",
@@ -18052,7 +18273,10 @@ def phase_fleet() -> None:
         f"exit={p.returncode} cfg={init_cfg.exists()}",
     )
     reg("init", init_ok, f"exit={p.returncode} discovery_enabled written")
-    p = cli("join", "--yes")
+    # join reads the isolated fleet-xdg config (pinned free port), not
+    # the shared sandbox config init just wrote: seeking a port nothing
+    # beacons on makes the no-gateway teaching bail deterministic.
+    p = cli("join", "--yes", extra_env=fx_env)
     join_taught = "no gateway answered" in (p.stdout + p.stderr)
     check(
         "fleet",

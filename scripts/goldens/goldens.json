@@ -1,8 +1,8 @@
 {
- "generated": "2026-11-20T16:57:35+00:00",
+ "generated": "2026-11-22T14:42:02+00:00",
  "generator": "python3 scripts/validate.py --update-goldens",
  "items": {
-  "api.ps.row": "85e854adbe33de01d0f3a1d22fe5704838764b2d1d6d36ae7710aad857d37371",
+  "api.ps.row": "aab38df7c889de1c2689074f01395fcf489587e298cf71ae94a132eb9678d027",
   "api.version": "978afe664fdbc884470cd709fce545916cb5417f6eafbe77d1255cf7c274dfcf",
   "chat.sse-final-keys": "3b4e5535f31a42b2c0a4b499f0c1932737308c8541f39bb3c887f1b5a0ede997",
   "completions.bash": "2f7e95a64e57745f3397049c8609398be6eabaaea5422edda6ed84211b50e03d",
