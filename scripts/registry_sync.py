@@ -159,9 +159,9 @@ def cmd_check(registry_path: str) -> int:
         for gguf_name in row.get("architectures", []):
             # The enum<->wire-name mapping is only reliable in the fork's
             # own arch-name table (underscores live in the enum, not the
-            # wire string: raon1nano == RAON1_NANO, domynedge ==
-            # DOMYN_EDGE), so verdicts key on the exact quoted wire
-            # string, exactly what a GGUF general.architecture carries.
+            # wire string: raon1nano == RAON1_NANO), so verdicts key on
+            # the exact quoted wire string, exactly what a GGUF
+            # general.architecture carries.
             wire = f'"{gguf_name}"'
             if wire in upstream_text:
                 drift.append(

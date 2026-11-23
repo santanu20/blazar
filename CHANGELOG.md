@@ -35,6 +35,10 @@ tracked here.
 - **Engine-coverage proof links point at the published branch.** `scripts/engine_coverage.py` renders every receipt link in `docs/engine-coverage.md` as a GitHub URL, so the 31 proof links resolve on the docs site and on GitHub instead of 404.
 - **CI's test step runs to the end.** nextest stopped after the first failure, hiding 469 (macOS) and 416 (Windows) not-yet-run tests behind a single panic; the step now passes `--no-fail-fast`, so a red run lists every failing test at once.
 
+### Removed
+
+- **The `domyn-edge` lane is retired from `registry/capability-lanes.json`.** Its `domynedge` architecture graduated into llama.cpp mainline (upstream PR 32559, merged 2026-11-20), which is exactly what the weekly registry check flags as drift; the registry is re-signed and `scripts/registry_sync.py --check` now reports 8 lanes and no drift.
+
 ### Fixed
 
 - **Spec-legal malformed tool-args history is repaired after an upstream 500** - a request whose tool-call round the engine failed mid-flight now gets a spec-legal repair instead of surfacing the engine error on every follow-up turn.
