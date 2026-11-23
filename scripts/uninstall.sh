@@ -27,7 +27,8 @@
 #   --dry-run         print every action, remove nothing
 #   --remove-models   non-interactive full nuke (models deleted!)
 #   --keep-models     non-interactive, models explicitly kept
-#   --purge           also remove ~/.config/blazar (config + token)
+#   --purge           also remove ~/.config/blazar (config + token; the
+#                     registry signing key under registry/ is kept)
 #   --yes             skip prompts using SAFE defaults (models KEPT);
 #                     never implies --remove-models - data deletion is
 #                     opt-in only via the explicit flag
@@ -147,14 +148,30 @@ if command -v "$SYSTEMCTL" >/dev/null 2>&1; then
         run "systemctl daemon-reload" $SUDO "$SYSTEMCTL" daemon-reload
     fi
     if [ -e "$USER_UNIT" ]; then
-        run "systemctl --user disable --now blazar" systemctl --user disable --now blazar
-        run "systemctl --user daemon-reload" systemctl --user daemon-reload
+        # The user unit belongs to the INVOKING user's manager: under sudo
+        # a bare `systemctl --user` would ask root's (absent) manager.
+        # shellcheck disable=SC2086
+        _user_ctl="$SYSTEMCTL --user"
+        if [ "$(id -u)" -eq 0 ] && [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != root ]; then
+            # shellcheck disable=SC2086
+            _user_ctl="runuser -u $SUDO_USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") $SYSTEMCTL --user"
+        fi
+        # shellcheck disable=SC2086
+        run "systemctl --user disable --now blazar" $_user_ctl disable --now blazar
+        # shellcheck disable=SC2086
+        run "systemctl --user daemon-reload" $_user_ctl daemon-reload
     fi
 fi
 
 if [ "$(uname -s)" = Darwin ]; then
-    run "launchctl bootout gui/$(id -u)/dev.blazar" \
-        launchctl bootout "gui/$(id -u)/dev.blazar"
+    # The agent is registered in the invoking user's GUI domain, which is
+    # not root's when this runs under sudo.
+    _gui_uid=$(id -u)
+    if [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != root ]; then
+        _gui_uid=$(id -u "$SUDO_USER")
+    fi
+    run "launchctl bootout gui/$_gui_uid/dev.blazar" \
+        launchctl bootout "gui/$_gui_uid/dev.blazar"
     run "launchctl bootout system/dev.blazar" \
         $SUDO launchctl bootout system/dev.blazar
 fi
@@ -168,32 +185,44 @@ if [ -f "$PIDFILE" ]; then
     case "$_pid" in
         '' | *[!0-9]*) ;; # malformed: skip, never guess
         *)
-            if kill -0 "$_pid" 2>/dev/null; then
-                run "TERM daemon pid $_pid (pidfile)" kill -TERM "$_pid"
-                if [ "$DRY" != 1 ]; then
-                    _i=0
-                    while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 10 ]; do
-                        _i=$((_i + 1))
-                        sleep 1
-                    done
-                fi
-            fi
+            # A pidfile outlives its daemon, so the number may now belong to
+            # an unrelated process: the executable name must be blazar
+            # before anything is signalled.
+            case "$(ps -p "$_pid" -o comm= 2>/dev/null)" in
+                blazar | */blazar)
+                    if kill -0 "$_pid" 2>/dev/null; then
+                        run "TERM daemon pid $_pid (pidfile)" kill -TERM "$_pid"
+                        if [ "$DRY" != 1 ]; then
+                            _i=0
+                            while kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 10 ]; do
+                                _i=$((_i + 1))
+                                sleep 1
+                            done
+                        fi
+                    fi
+                    ;;
+            esac
             ;;
     esac
 fi
 
-# Stray sweep (Linux): any process whose EXECUTABLE is the system binary
-# itself - pidfile-less manual `blazar serve &`, a deleted-pidfile
-# daemon. Exact /proc/<pid>/exe match only (no name patterns to
-# self-match); foreign-XDG daemons running OTHER binaries are not ours
-# to kill.
+# Stray sweep (Linux): any process of the INVOKING user whose EXECUTABLE
+# is the system binary itself - pidfile-less manual `blazar serve &`, a
+# deleted-pidfile daemon. Exact /proc/<pid>/exe match only (no name
+# patterns to self-match); daemons owned by other users are theirs to
+# stop, and signalling them would only fail and mark this run incomplete.
 if [ "$(uname -s)" = Linux ] && [ -e "$BIN_DIR/blazar" ]; then
+    _own_uid=$(id -u)
+    if [ "${SUDO_USER:-}" != "" ] && [ "$SUDO_USER" != root ]; then
+        _own_uid=$(id -u "$SUDO_USER")
+    fi
     _strays=
     for _p in /proc/[0-9]*/exe; do
         [ "$(readlink "$_p" 2>/dev/null)" = "$BIN_DIR/blazar" ] || continue
         _spid=${_p#/proc/}
         _spid=${_spid%/exe}
         [ "$_spid" = "$$" ] && continue
+        [ "$(stat -c %u "/proc/$_spid" 2>/dev/null)" = "$_own_uid" ] || continue
         _strays="$_strays $_spid"
     done
     for _spid in $_strays; do
@@ -240,9 +269,20 @@ fi
 
 # --------------------------------------------------------- 3. user state
 # Config is user settings (port pin, keys, overlays) - kept unless --purge.
+# registry/ holds the maintainer's registry signing key, which cannot be
+# regenerated: --purge leaves that one directory in place and says so.
 if [ "$PURGE" -eq 1 ]; then
     if [ -e "$CONFIG_DIR" ]; then
-        run "purge $CONFIG_DIR (config.toml, gh-token.env)" rm -rf "$CONFIG_DIR"
+        for _entry in "$CONFIG_DIR"/* "$CONFIG_DIR"/.[!.]* "$CONFIG_DIR"/..?*; do
+            [ -e "$_entry" ] || [ -L "$_entry" ] || continue
+            [ "$_entry" = "$CONFIG_DIR/registry" ] && continue
+            run "purge $_entry" rm -rf "$_entry"
+        done
+        if [ -e "$CONFIG_DIR/registry" ]; then
+            status "kept $CONFIG_DIR/registry (registry signing key) - remove it by hand once no registry depends on it"
+        elif [ -z "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]; then
+            run "remove $CONFIG_DIR" rmdir "$CONFIG_DIR"
+        fi
     fi
 else
     status "kept $CONFIG_DIR (config.toml, gh-token.env, backups) - re-run with --purge to remove"
