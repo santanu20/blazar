@@ -14,6 +14,20 @@ plugins:
   - jekyll-seo-tag
   - jekyll-sitemap
 
+# Working notes under research/ and issues/ stay in git for provenance but
+# are not published. Jekyll 3 replaces its default exclusion list with this
+# one, so the vendor and node_modules entries must stay.
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - node_modules
+  - vendor/bundle/
+  - vendor/cache/
+  - vendor/gems/
+  - vendor/ruby/
+  - research
+  - issues
+
 kramdown:
   syntax_highlighter_opts:
     # GitHub-dark code blocks to match the terminal art.

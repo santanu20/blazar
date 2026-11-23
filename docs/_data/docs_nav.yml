@@ -49,17 +49,3 @@
     - title: Error Codes
       path: /error-codes.html
       note: Stable gateway error classifications and remediation
-- section: Research notes
-  items:
-    - title: Inference Frontier Scan
-      path: /research/2026-09-26-inference-frontier-scan.html
-    - title: Competitor Pain-Point Audit
-      path: /research/2026-10-02-competitor-pain-points-audit.html
-    - title: MLX Direct vs Gateway
-      path: /research/2026-10-02-mlx-direct-vs-gateway.html
-    - title: Upstream Engine Radar
-      path: /research/2026-10-02-upstream-engine-radar.html
-    - title: Diffusion-LLM Readiness
-      path: /research/2026-10-03-diffusion-llm-readiness.html
-    - title: MLX Lane Spec
-      path: /research/mlx-lane-spec.html

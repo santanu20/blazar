@@ -250,7 +250,7 @@ permalink: /
 <section class="section" id="docs">
   <div class="section-head">
     <h2>Documentation</h2>
-    <p>Ten deep dives — concepts to schema to every HTTP surface — plus the research notes that shaped the engine lanes.</p>
+    <p>Ten deep dives — concepts to schema to every HTTP surface.</p>
   </div>
   <div class="grid-cards">
     {% for item in site.data.docs_nav[1].items limit: 9 %}
@@ -261,7 +261,6 @@ permalink: /
     {% endfor %}
   </div>
   <p class="hero-meta" style="margin-top:18px">
-    research notes: {% for item in site.data.docs_nav[2].items %}<a href="{{ item.path | relative_url }}">{{ item.title }}</a> · {% endfor %}
     <a href="https://github.com/santanu20/blazar/blob/main/CHANGELOG.md">changelog</a>
   </p>
 </section>
