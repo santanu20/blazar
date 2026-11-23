@@ -27,7 +27,7 @@
 <text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
 <text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
 <text x="299.0" y="33.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar run — single-shot generation (llama.cpp lane)</text>
-<text x="30.0" y="65.0" font-size="12.5" fill="#8b949e" font-weight="400">blazar 0.34.3 - powered by upstream llama.cpp, mistral.rs and SGLang</text>
+<text x="30.0" y="65.0" font-size="12.5" fill="#8b949e" font-weight="400">blazar 0.34.3 - powered by upstream llama.cpp, mistral.rs, SGLang, vLLM and MLX</text>
 <text x="30.0" y="84.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
 <text x="30.0" y="103.0" font-size="12.5" fill="#3fb950" font-weight="400">$ blazar run qwen3-0.6b &quot;Explain what a local inference engine does, in</text>
 <text x="30.0" y="122.0" font-size="12.5" fill="#e6edf3" font-weight="400">one sentence.&quot; --max-tokens 60</text>
@@ -50,9 +50,9 @@
 <text x="612.0" y="198.0" font-size="12.5" fill="#d29922" font-weight="400">warn  spec=auto: no usable draft pair for qwen3-0.6b — n-gram lookup</text>
 <text x="612.0" y="217.0" font-size="12.5" fill="#d29922" font-weight="400">      speculation engaged (self-drafting, no extra VRAM; warm across</text>
 <text x="612.0" y="236.0" font-size="12.5" fill="#d29922" font-weight="400">      restarts via spec_cache)</text>
-<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — seven lanes, one binary</text>
-<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — seven lanes, one binary</text>
-<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — seven lanes, one binary</text>
+<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — ten lanes, one binary</text>
+<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — ten lanes, one binary</text>
+<text x="299.0" y="315.3" font-size="12.5" fill="#8b949e" font-weight="600" text-anchor="middle">blazar engine list — ten lanes, one binary</text>
 <text x="30.0" y="347.0" font-size="12.5" fill="#8b949e" font-weight="400">engine up to date: b11370-cuda (channel: latest)</text>
 <text x="30.0" y="366.0" font-size="12.5" fill="#e6edf3" font-weight="400"></text>
 <text x="30.0" y="385.0" font-size="12.5" fill="#8b949e" font-weight="400">TAG                KIND       ASSET                          STATE    SHA256</text>

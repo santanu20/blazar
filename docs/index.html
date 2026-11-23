@@ -52,7 +52,7 @@ permalink: /
 <span class="p">$</span> blazar pull qwen3-0.6b         <span class="c"># registry shortname</span>
 <span class="p">$</span> blazar serve                   <span class="c"># gateway on http://127.0.0.1:11435</span>
 <span class="p">$</span> blazar run qwen3-0.6b          <span class="c"># interactive REPL</span>
-<span class="o">blazar 0.34.3 - powered by upstream llama.cpp, mistral.rs and SGLang</span></pre>
+<span class="o">blazar 0.34.3 - powered by upstream llama.cpp, mistral.rs, SGLang, vLLM and MLX</span></pre>
   </div>
   <p class="hero-meta" style="margin-top:14px">
     also available: <code>cargo install blazar</code> ·
@@ -69,7 +69,7 @@ permalink: /
     <div class="card">
       <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h7"/></svg></div>
       <h3>Multi-engine serving</h3>
-      <p>llama.cpp, mistral.rs, SGLang and MLX serve text and embeddings; sd.cpp, whisper.cpp and Piper cover images, video, speech-to-text and TTS — all behind one endpoint.</p>
+      <p>llama.cpp, mistral.rs, SGLang, vLLM and MLX serve text and embeddings; sd.cpp, whisper.cpp, Piper and Kokoro cover images, video, speech-to-text and TTS — all behind one endpoint.</p>
     </div>
     <div class="card">
       <div class="glyph"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg></div>
@@ -94,24 +94,27 @@ permalink: /
     <div class="card">
       <div class="glyph"><svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="19" cy="19" r="2.5"/></svg></div>
       <h3>Diagnostics built in</h3>
-      <p><code>blazar explain</code> shows the routing decision for any model, <code>blazar doctor</code> audits the install, and per-request telemetry is first-class.</p>
+      <p><code>blazar explain</code> shows the routing decision for any model, <code>blazar doctor</code> audits the install, per-request telemetry is first-class, and the built-in web console manages models, routing, config and keys.</p>
     </div>
   </div>
 </section>
 
 <section class="section" id="engines">
   <div class="section-head">
-    <h2>Seven lanes, one binary</h2>
+    <h2>Ten lanes, one binary</h2>
     <p>Blazar never bundles engines — it manages official upstream builds, picks the right lane per model, and upgrades them independently.</p>
   </div>
   <div class="engine-strip">
     <div class="engine-pill"><b>llama.cpp</b><span>GGUF text + embeddings + speech</span></div>
     <div class="engine-pill"><b>mistral.rs</b><span>GGUF + safetensors serving</span></div>
     <div class="engine-pill"><b>SGLang</b><span>quantized safetensors</span></div>
+    <div class="engine-pill"><b>vLLM</b><span>throughput-first serving</span></div>
     <div class="engine-pill"><b>MLX-LM</b><span>Apple-Silicon + CUDA</span></div>
     <div class="engine-pill"><b>sd.cpp</b><span>images + video</span></div>
     <div class="engine-pill"><b>whisper.cpp</b><span>speech to text</span></div>
     <div class="engine-pill"><b>piper</b><span>text to speech</span></div>
+    <div class="engine-pill"><b>kokoro</b><span>neural TTS</span></div>
+    <div class="engine-pill"><b>LiteRT-LM</b><span>edge .litertlm bundles</span></div>
   </div>
   <p class="hero-meta" style="margin-top:18px">
     how models map to lanes: <a href="{{ '/engines.html' | relative_url }}">Engines &amp; Routing</a>
@@ -124,7 +127,7 @@ permalink: /
     <p>Applications speak OpenAI-, Ollama- or Anthropic-shaped HTTP. Blazar translates, admits, routes, and supervises the engine processes.</p>
   </div>
   <div class="arch-figure">
-    <svg viewBox="0 0 920 730" width="100%" height="auto" role="img" aria-label="Blazar architecture: applications talk to the Blazar control plane, which routes to four text engines and three media engines, with federation to remote peers" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <svg viewBox="0 0 920 730" width="100%" role="img" aria-label="Blazar architecture: applications talk to the Blazar control plane, which routes to five text engines and four media engines, with federation to remote peers" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
       <defs>
         <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0 0L10 5L0 10z" fill="#8b949e"/>
@@ -165,44 +168,52 @@ permalink: /
       <text x="839" y="133" text-anchor="middle" font-size="13" fill="#c9d1d9">Remote peers</text>
       <text x="839" y="151" text-anchor="middle" font-size="10.5" fill="#8b949e">capacity / warm / route</text>
       <g stroke="#8b949e" stroke-width="1.5" fill="none">
-        <polyline points="460,446 460,468 130,468 130,490" marker-end="url(#arr)"/>
-        <polyline points="460,446 460,468 350,468 350,490" marker-end="url(#arr)"/>
-        <polyline points="460,446 460,468 570,468 570,490" marker-end="url(#arr)"/>
-        <polyline points="460,446 460,468 790,468 790,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 116,468 116,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 288,468 288,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 632,468 632,490" marker-end="url(#arr)"/>
+        <polyline points="460,446 460,468 804,468 804,490" marker-end="url(#arr)"/>
       </g>
       <g>
-        <rect x="40" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="130" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">llama.cpp</text>
-        <rect x="260" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="350" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">mistral.rs</text>
-        <rect x="480" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="570" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">SGLang</text>
-        <rect x="700" y="494" width="180" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="790" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">MLX</text>
+        <rect x="40" y="494" width="152" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="116" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">llama.cpp</text>
+        <rect x="212" y="494" width="152" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="288" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">mistral.rs</text>
+        <rect x="384" y="494" width="152" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="460" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">SGLang</text>
+        <rect x="556" y="494" width="152" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="632" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">vLLM</text>
+        <rect x="728" y="494" width="152" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="804" y="528" text-anchor="middle" font-size="14" fill="#a5d6ff">MLX</text>
       </g>
       <g stroke="#8b949e" stroke-width="1.5" fill="none">
-        <line x1="130" y1="550" x2="130" y2="570"/>
-        <line x1="350" y1="550" x2="350" y2="570"/>
-        <line x1="570" y1="550" x2="570" y2="570"/>
-        <line x1="790" y1="550" x2="790" y2="570"/>
+        <line x1="116" y1="550" x2="116" y2="570"/>
+        <line x1="288" y1="550" x2="288" y2="570"/>
+        <line x1="460" y1="550" x2="460" y2="570"/>
+        <line x1="632" y1="550" x2="632" y2="570"/>
+        <line x1="804" y1="550" x2="804" y2="570"/>
       </g>
       <rect x="40" y="572" width="840" height="38" rx="8" fill="#11161f" stroke="#30363d"/>
       <text x="460" y="597" text-anchor="middle" font-size="13" fill="#c9d1d9">Text / Embeddings</text>
       <g stroke="#8b949e" stroke-width="1.5" fill="none">
-        <polyline points="460,610 460,626 210,626 210,640" marker-end="url(#arr)"/>
-        <polyline points="460,610 460,640" marker-end="url(#arr)"/>
-        <polyline points="460,610 460,626 710,626 710,640" marker-end="url(#arr)"/>
+        <polyline points="460,610 460,626 139,626 139,640" marker-end="url(#arr)"/>
+        <polyline points="460,610 460,626 353,626 353,640" marker-end="url(#arr)"/>
+        <polyline points="460,610 460,626 567,626 567,640" marker-end="url(#arr)"/>
+        <polyline points="460,610 460,626 781,626 781,640" marker-end="url(#arr)"/>
       </g>
       <g>
-        <rect x="110" y="644" width="200" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="210" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">sd.cpp</text>
-        <text x="210" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Images / Video</text>
-        <rect x="360" y="644" width="200" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="460" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">whisper.cpp</text>
-        <text x="460" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Speech to text</text>
-        <rect x="610" y="644" width="200" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
-        <text x="710" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">piper</text>
-        <text x="710" y="688" text-anchor="middle" font-size="11" fill="#8b949e">TTS</text>
+        <rect x="42" y="644" width="194" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="139" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">sd.cpp</text>
+        <text x="139" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Images / Video</text>
+        <rect x="256" y="644" width="194" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="353" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">whisper.cpp</text>
+        <text x="353" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Speech to text</text>
+        <rect x="470" y="644" width="194" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="567" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">piper</text>
+        <text x="567" y="688" text-anchor="middle" font-size="11" fill="#8b949e">TTS</text>
+        <rect x="684" y="644" width="194" height="56" rx="8" fill="#11161f" stroke="#30363d"/>
+        <text x="781" y="668" text-anchor="middle" font-size="14" fill="#a5d6ff">kokoro</text>
+        <text x="781" y="688" text-anchor="middle" font-size="11" fill="#8b949e">Neural TTS</text>
       </g>
     </svg>
   </div>

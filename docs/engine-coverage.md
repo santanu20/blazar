@@ -345,9 +345,9 @@ Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
 
 ## sglang-0.5.23 (sglang) - 604 flags probed
 
-**certified: 3 | first-class: 69 | passthrough: 531 | intentionally-unsupported: 1 | not-applicable: 0 | unverified: 0**
+**certified: 3 | first-class: 68 | passthrough: 531 | intentionally-unsupported: 2 | not-applicable: 0 | unverified: 0**
 
-Registry lane `sglang` pins 72 first-class flags (compile + spawn-time emission).
+Registry lane `sglang` pins 71 first-class flags (compile + spawn-time emission).
 
 ### Capability matrix
 
@@ -384,7 +384,7 @@ Registry lane `sglang` pins 72 first-class flags (compile + spawn-time emission)
 - **LoRA advanced** (12): --experts-shared-outer-loras, --lora-drain-wait-threshold, --lora-paths., --lora-strict-loading, --lora-target-modules, --lora-use-virtual-experts (+6 more)
 - **multimodal/ASR** (8): --allowed-media-domains, --asr-max-buffer-seconds, --asr-max-concurrent-sessions, --disable-fast-image-processor, --enable-multimodal, --image-processor-backend (+2 more)
 
-Intentionally-unsupported (gateway-owned, refused in `extra_args`): --api-key
+Intentionally-unsupported (gateway-owned, refused in `extra_args`): --api-key, --cpu-offload-gb
 
 Scope disposition: Blazar integrates the SGLang server launch path, not a separate router / disaggregated-PD tier. Router and disagg flags the installed server advertises are passthrough-reachable through extra_args where the manifest gate allows; a dedicated router tier is a documented scope decision, not a wiring gap.
 

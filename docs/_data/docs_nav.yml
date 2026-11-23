@@ -7,7 +7,7 @@
       note: Measured gateway overhead, concurrency scaling, charts
     - title: Engines & Routing
       path: /engines.html
-      note: The seven serving lanes and how models map to them
+      note: The ten serving lanes and how models map to them
     - title: Integrations
       path: /integrations.html
       note: Client dialects, blazar connect, the Ollama drop-in path
@@ -43,6 +43,12 @@
     - title: Configuration Code Paths
       path: /config-code-paths.html
       note: Where every configuration knob lives in source
+    - title: Engine Coverage
+      path: /engine-coverage.html
+      note: Machine-checked engine capability and flag inventory
+    - title: Error Codes
+      path: /error-codes.html
+      note: Stable gateway error classifications and remediation
 - section: Research notes
   items:
     - title: Inference Frontier Scan

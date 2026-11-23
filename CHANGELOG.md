@@ -4,6 +4,39 @@ All notable changes to Blazar are documented here. Format follows
 Keep a Changelog; versions follow SemVer. Earlier releases were not
 tracked here.
 
+## [Unreleased]
+
+### Added
+
+- **The web console is now a management surface.** `/ui` grew from a read-only dashboard into a full operations console: nine tabs (Dashboard, Models, Fabric, Routing, Config, Benchmarks, Jobs, Sessions, Keys) with live JSON polling on the active tab and a `/api/events` SSE strip. Actions run the same validated write planes the CLI and HTTP API expose - config set/unset/reload, warm/evict, job cancel, key add/rotate/remove, failover pin/unpin and pool member drain/pin - so the console can never bypass a validation gate.
+- **File pins surfaced in the config GUI.** `GET /api/config` carries `pins`: every scalar pin the config file makes, as dotted keys in the same grammar `config set`/`unset` speak. The console's Config tab badges each row pinned-in-file vs built-in default - the same distinction `blazar config get` prints.
+- **Event replay for reconnecting dashboards.** The EventBus keeps a bounded 256-event replay ring (recorded before broadcast, so a late subscriber never misses an event); `/api/events` prepends the backlog, oldest first, before the live tail. A browser refresh no longer reads as "nothing happened while I was away".
+- **Sentinel counter families at `/metrics`** (`blazar_sentinel_*`) plus a reaper heartbeat that makes a silent log-sink outage provable instead of invisible: a 60 s INFO breadcrumb with resident/inflight counts keeps flowing even when request logging stalls.
+- **Spawn-time effective-config snapshot on `/api/ps` rows** - each running child reports the resolved configuration it actually booted with.
+- **Scheduled autotune spec-race loop with parity-gated adoption**: races speculative configurations on a schedule and adopts a winner only on evidence, an eligible lane and a servable spec pair; the parity gate deepened from three to six deterministic prompts.
+- **Engine routing policy derived from the measured workload mix** - the policy order a model's traffic is served by comes from measured mix evidence, not a static pin.
+- **Gateway saturation acceptance harness with CI verdicts** (`scripts/bench_saturation.py`, `ACCEPTANCE.md`): matched-argv concurrency ladders that fail when gateway overhead exceeds the acceptance band.
+- **W1-W9 measurement campaigns**: honest gateway-overhead proof under matched concurrency, lane quality matrix, hardened tool-call battery with a direct-engine arm, force-length saturation verdicts, and the C=4 admission-pacing follow-up closed as not-a-defect. Receipts under `bench-artifacts/`.
+- **2026-11-22 post-fix campaign receipts.** `BENCHMARK.md` is re-rendered from `bench-artifacts/2026-11-22-postfix-full/`, and the tool-call battery receipts are refreshed under `bench-artifacts/20261122-toolcall/` and `20261123-toolcall/`.
+
+### Changed
+
+- **Admission enforces a host-RAM ledger with pressure relief** - spawn admission now accounts host RAM across resident engines and relieves pressure instead of admitting into swap.
+- **SGLang residency is planned in engine units with an adaptive think-default.** Related planner work: dense full residency is preferred over a legal-but-offloaded speculative plan; self-drafting spec lanes are charged the dense capture reserve; a registered-but-unfit spec lane degrades to dense instead of refusing; the dense per-slot reserve is recalibrated to a receipt-calibrated 100 MiB/slot; and the aggregate-throughput tradeoff of a slots=1 full-residency plan is taught explicitly.
+- **`slot_cap` honors the manual overlay pin before the config default.**
+- **Census totals carry the raw card identity**, not the CUDA-carved lister view.
+- **Effective-engine-config verification extended to the SGLang and vLLM lanes**, not just llama.cpp.
+- **Live validation survives wedged children and host-state-dependent lanes.** CLI calls run in their own process group under a hard timeout (a child that ignores SIGKILL is abandoned, never awaited forever); the host-pressure eviction of an offloaded image lane and a live-RAM-clamped offload recipe record as host-state boundaries rather than product failures; the fleet adopt/join teaching legs run on freshly allocated UDP ports under an isolated XDG home; `phase_commands` covers `kv status/inspect/gc` and `engine card`; and the `/api/ps` golden carries the effective-config and host-charge columns.
+
+### Fixed
+
+- **Spec-legal malformed tool-args history is repaired after an upstream 500** - a request whose tool-call round the engine failed mid-flight now gets a spec-legal repair instead of surfacing the engine error on every follow-up turn.
+- **The installer pins the downloaded binary to the installer release version** - an upgrade can no longer leave a mixed-version install.
+- **Silent log-sink outages are provable and recoverable**: the log tee recovers from lock poisoning with a one-time stderr marker, and the incident class is documented in `docs/issues/012-silent-log-freeze.md`.
+- **Benchmark parity and variant deltas anchor on healthy default cells.** An errored gateway row no longer reads as a -100% parity outlier, a failed same-engine baseline surfaces its orphan speed instead of crashing the renderer, and the mistral.rs staged view is no longer dereferenced back into the shared models dir (stray projectors poisoned every v0.9.5 direct cell).
+- **Tool-result grounding is not pinned to draw luck.** The tool-call battery's T6 case re-runs once when a tiny model re-emits the call instead of grounding on the first draw, and reports the attempt count.
+- **Clippy backlog in the planner, autotune and gateway code** - let-else/let-chain collapses, `&Path` signatures, a sync `autotune_schedule_tick` (it held no await point) and a needless `unsafe` block removed from the autotune integration test. No behavior change.
+
 ## [0.34.3] - 2026-11-21
 
 ### Fixed

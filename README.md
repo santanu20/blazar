@@ -45,7 +45,7 @@ The inference engines still execute the model. Blazar coordinates the serving st
 | Agent and tool workflows | Server-mediated MCP tool calling for OpenAI, Ollama and Anthropic clients |
 | Multimodal workloads | Text, embeddings, reranking, image generation/editing/upscaling, video, speech-to-text, text-to-speech and realtime voice |
 | Work that survives restarts | SQLite-backed durable jobs, cancellation, artifacts and restart-safe response chains |
-| Operability | CLI diagnostics, derived engine capability cards, explainable routing, read-only web console, metrics, OTLP and audit logs |
+| Operability | CLI diagnostics, derived engine capability cards, explainable routing, a built-in web console, metrics, OTLP and audit logs |
 | Local security controls | Loopback-by-default serving, optional scoped API keys, TLS, explicit CORS, audit controls and PII scrubbing |
 
 ---
@@ -171,7 +171,7 @@ If one model, one runtime and one process meet the need, a direct engine server 
 
 ## Engines and routing
 
-Blazar's README lists these 10 engine lanes:
+Blazar ships these 10 engine lanes:
 
 | Engine | Role | Typical workloads |
 |---|---|---|
@@ -246,9 +246,9 @@ Server-mediated MCP tool calling for OpenAI, Anthropic and Ollama clients. Blaza
 
 A SQLite ledger persists durable jobs, events, cancellation state and artifacts. Crashes mark interrupted work as abandoned; request cards can be inspected and cancelled from another connection. Responses API `previous_response_id` chains are restart-safe.
 
-### 12. Diagnostics, observability and read-only web console
+### 12. Diagnostics, observability and the web console
 
-CLI diagnostics include `doctor`, `why`, `watch`, `explain` and `model-doctor`. The gateway exposes capacity and fit read models, request-stage timing, metrics, OTLP, audit JSONL and request-level engine-degradation warnings. `blazar engine card` and `GET /api/engines` expose derived capability cards backed by lane predicates and install-time probes; `GET /api/fit` adds confidence, current media pressure and supported parallelism advice. `/ui` is a zero-dependency, read-only operations console with dashboard, models, engines, compute, benchmarks, jobs and sessions.
+CLI diagnostics include `doctor`, `why`, `watch`, `explain` and `model-doctor`. The gateway exposes capacity and fit read models, request-stage timing, metrics, OTLP, audit JSONL and request-level engine-degradation warnings. `blazar engine card` and `GET /api/engines` expose derived capability cards backed by lane predicates and install-time probes; `GET /api/fit` adds confidence, current media pressure and supported parallelism advice. `/ui` is a zero-dependency console with dashboard, models, fabric, routing, config, benchmarks, jobs, sessions and keys tabs. Reads poll the JSON APIs (active tab every 5s) plus a live `/api/events` strip with reconnect replay; actions run the validated write planes — config set/unset/reload, warm/evict, job cancel, key add/rotate/remove, failover pin/unpin and pool member drain/pin.
 
 ### 13. Local-first security and network controls
 
