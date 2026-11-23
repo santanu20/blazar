@@ -139,9 +139,11 @@ function Register-BlazarTask([string]$ExePath) {
         # Unmapped account: DOMAIN\user still names the logon session.
     }
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    # Task Scheduler rejects a restart interval shorter than one minute as a
+    # malformed value, so one minute is the fastest restart this task gets.
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
-        -RestartCount 3 -RestartInterval ([TimeSpan]::FromSeconds(30))
+        -RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1))
     Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
         -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $script:TaskName
