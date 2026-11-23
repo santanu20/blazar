@@ -388,7 +388,7 @@ pub(crate) fn patch_winner(winner: &mut Value, others: &[Value], asked: u64, use
 
 #[cfg(test)]
 mod tests {
-    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
 
     use super::*;
     use serde_json::json;

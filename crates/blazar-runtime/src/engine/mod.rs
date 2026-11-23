@@ -770,7 +770,7 @@ pub fn spawn_stale_probe_vocab_backfill(dirs: BlazarDirs) {
 
 #[cfg(test)]
 mod vocab_tests {
-    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
     use super::*;
     use crate::engine::manifest::MANIFEST_PROBE_VERSION;
 
@@ -4709,7 +4709,7 @@ pub fn rollback_candidate(engines: &[EngineRow]) -> Option<&EngineRow> {
 
 #[cfg(test)]
 mod rollback_tests {
-    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
     use super::*;
 
     fn row(tag: &str, installed_at: i64, active: bool, kind: EngineKind) -> EngineRow {
@@ -5760,7 +5760,7 @@ mod supersede_floor_tests {
 /// Symlink fixtures need unix; the whole module sits out on Windows.
 #[cfg(all(test, unix))]
 mod retire_containment_tests {
-    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
     use super::*;
 
     /// BLZ-7: an engine dir reached through a symlinked engines dir

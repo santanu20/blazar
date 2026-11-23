@@ -103,7 +103,7 @@ pub fn path_is_within(anchor: &Path, target: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
     use super::*;
     use std::path::PathBuf;
 

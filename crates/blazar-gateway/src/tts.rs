@@ -590,7 +590,7 @@ pub async fn audio_speech(
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
         // Drain flag: the reader sets it when the client goes away (send
         // fails) or ffmpeg's output closes, so the feeder never blocks
-        // forever writing a pipe nobody reads (§9 release path).
+        // forever writing a pipe nobody reads.
         let (drained_tx, mut drained_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;

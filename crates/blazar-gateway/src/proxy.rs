@@ -844,7 +844,7 @@ fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
 
 #[cfg(test)]
 #[test]
-#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
 fn unit__constraint_chat_failure_text__signature_and_pin_matrix() {
     let sig = "Failed to initialize samplers: std::exception";
     // Fires: exact signature + pinned constraint.
@@ -860,7 +860,7 @@ fn unit__constraint_chat_failure_text__signature_and_pin_matrix() {
 
 #[cfg(test)]
 #[test]
-#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
 fn unit__overlay_has_constraint__grammar_family_fields() {
     use blazar_core::{Config, ModelOverride};
     let mut cfg = Config::default();

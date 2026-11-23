@@ -2122,7 +2122,7 @@ fn teaching_detail(has_server: bool, requested: &str, available: &[String]) -> S
 }
 
 #[cfg(test)]
-#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
 mod tests {
     use super::*;
 

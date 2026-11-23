@@ -13865,7 +13865,7 @@ mod tests {
         assert!(!p.argv.contains(&"--spec-draft-model".to_string()));
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__spec_mode_input__resolved_off_beats_auto_config() {
         // Live incident shape: the governor (or a per-request
@@ -13899,7 +13899,7 @@ mod tests {
         );
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__spec_mode_input__resolved_ngram_beats_off_config() {
         // The converse: an explicit per-request "ngram" must engage even
@@ -22388,7 +22388,7 @@ mod tests {
     /// profile must state the trained-window ceiling (from config.json
     /// metadata) as the fit bound, keep KV unclaimed, and label the lane
     /// so observers read "engine owns memory" instead of guessing.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__mlx_capacity__ceiling_from_metadata_and_runtime_managed_label() {
         let cfg = Config::default();
@@ -22416,7 +22416,7 @@ mod tests {
     /// Honest degradation: a safetensors row without config.json ctx
     /// metadata must NOT fabricate a ceiling - 0 keeps admission on the
     /// configured default (the pre-B behavior), just explicitly labeled.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__mlx_capacity__missing_metadata_degrades_to_zero_not_a_guess() {
         let cfg = Config::default();

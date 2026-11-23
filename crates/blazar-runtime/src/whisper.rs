@@ -1241,7 +1241,7 @@ async fn help_flag_surface(bin: &Path) -> Option<std::collections::BTreeSet<Stri
 }
 
 #[cfg(test)]
-#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
 #[allow(clippy::cast_possible_truncation)] // WAV fixtures are tiny
 mod tests {
     use super::*;

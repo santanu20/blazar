@@ -9,7 +9,7 @@
 //!
 //! Isolation: `XDG_CONFIG_HOME` -> tempdir (`BlazarDirs::from_env` honors XDG).
 
-#![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)]
+#![allow(non_snake_case)] // suite convention: unit__scenario__expected
 
 use std::path::Path;
 

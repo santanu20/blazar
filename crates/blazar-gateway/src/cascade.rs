@@ -307,7 +307,7 @@ fn rebuild(mut attempts: Vec<(StatusCode, Value)>, served_idx: usize, hdr: Strin
 
 #[cfg(test)]
 mod tests {
-    #![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
 
     use super::*;
 

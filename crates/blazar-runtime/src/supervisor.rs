@@ -2,7 +2,7 @@
 //! healthy, evict on the idle ladder, respawn after crashes with a circuit
 //! breaker, and shut everything down cleanly.
 //!
-//! Invariants (§9): every spawned child has a named stop path (evict /
+//! Invariants: every spawned child has a named stop path (evict /
 //! shutdown), teardown is idempotent, SIGTERM->grace->SIGKILL bounded, and
 //! every state transition publishes an event.
 
@@ -477,7 +477,7 @@ const SLOTS_STREAK_TICKS: u32 = 6;
 /// demand-attested (every queued arrival climbed through each level), so
 /// 2 ticks (20 s) prove what the 6-tick path re-proves for 60 s - bursts
 /// shorter than the standard window still earn their reshape instead of
-/// queueing to death first (spike doc §D1, 2026-10-29).
+/// queueing to death first (docs/research/2026-10-29-slot-reprovisioning-spike.md, D1).
 const SLOTS_FAST_STREAK_TICKS: u32 = 2;
 /// D1 anti-flap: minimum dwell between two fast-path adoptions on the
 /// same model (burst-quiet-burst sawtooth loads). The standard 6-tick
@@ -487,7 +487,7 @@ const SLOTS_FAST_COOLDOWN: Duration = Duration::from_secs(300);
 /// D3 starvation bound for the reshape drain: parking new admissions
 /// longer than this costs more tail latency than the reshape can
 /// recover, so the gate reopens (complete-and-cutover) and the reshape
-/// lands at the next natural quiesce instead (spike doc §D3, 2026-10-29).
+/// lands at the next natural quiesce instead (slot reprovisioning spike, D3).
 const SLOTS_DRAIN_BOUND: Duration = Duration::from_secs(90);
 /// D2 pinned-teach episode dedup: while a manual-`slots` pin keeps a
 /// lane out of adaptation, sustained pressure re-teaches at most this
@@ -499,8 +499,8 @@ const SLOTS_PINNED_TEACH_DEDUP: Duration = Duration::from_secs(600);
 /// multiple of the solo rate. `S = loaded_rate x loaded_conc /
 /// solo_rate`; `S < 1.25` on a GPU-bound model means extra slots buy
 /// queue relief at best while paying a reshape transition - the lane
-/// is taught instead of reshaped (spike doc §4 finding 1 + §D5,
-/// 2026-10-30).
+/// is taught instead of reshaped (slot reprovisioning spike,
+/// section 4 finding 1 + D5, 2026-10-30).
 const DECODE_SCALE_ADOPT_MIN: f64 = 1.25;
 /// D5 evidence freshness: the scaling ratio is only consulted when
 /// BOTH class EWMAs (solo + loaded) were sampled within this window.
@@ -10984,7 +10984,7 @@ drop them from rpc_servers in config.toml",
                 .adopted_slots
                 .get(&model)
                 .map_or(self.cfg().slots, |v| *v.value());
-            // Replica pre-warm cutover (spike doc §D3 alternative): the
+            // Replica pre-warm cutover (slot reprovisioning spike, D3 alternative): the
             // replacement-shape child loads UNDER a `#warm` key while the
             // old child keeps serving, so the reshape lands with zero
             // admission gap instead of a drain + model-load of parking.
@@ -16525,7 +16525,8 @@ mod routing_tests {
     /// D1 burst fast-path: a window peak of >= 2x the effective slots is
     /// demand-attested, so 2 saturated ticks adopt (the 6-tick window
     /// used to outlast sub-minute bursts - C4 0.56x/C8 0.61x queueing,
-    /// spike doc 2026-10-29). The cooldown map records the fast adoption.
+    /// slot reprovisioning spike, 2026-10-29). The cooldown map records
+    /// the fast adoption.
     #[tokio::test]
     async fn unit__adaptive_slots__burst_fast_path_adopts_at_two_ticks() {
         let sup = routing_sup(1);
@@ -17905,7 +17906,7 @@ mod routing_tests {
         assert!(longer > uncached);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__spec_governor__saturation_streak_parks_and_queues() {
         let sup = routing_sup(1);
@@ -17941,7 +17942,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__spec_governor__accept_collapse_parks_without_saturation() {
         let sup = routing_sup(1);
@@ -17964,7 +17965,7 @@ mod routing_tests {
         assert_eq!(sup.spec_governor_snapshot().len(), 0);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__spec_governor__knob_off_is_inert() {
         let sup = routing_sup(1);
@@ -17979,7 +17980,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__spec_governor__default_on_healthy_never_parks() {
         // Defaults ship speculation (spec=auto, ngram fallback) WITH the
@@ -17996,7 +17997,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__spec_governor__overlay_pin_and_config_off_exempt() {
         // Overlay pin: a user policy statement - never governed.
@@ -18032,7 +18033,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__spec_governor__recovers_after_quiet_streak_and_resets_on_bad_window() {
         let sup = routing_sup(1);
@@ -18069,7 +18070,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__governed_spec_default__override_then_config() {
         let sup = routing_sup(1);
@@ -18079,7 +18080,7 @@ mod routing_tests {
         assert_eq!(sup.governed_spec_default("other"), sup.cfg().spec);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__spec_governor_snapshot__sorted_and_labeled() {
         let sup = routing_sup(1);
@@ -18097,7 +18098,7 @@ mod routing_tests {
         );
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__ubatch_governor__saturation_streak_escalates_rung_by_rung() {
         let sup = routing_sup(1);
@@ -18135,7 +18136,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__ubatch_governor__knob_off_is_inert() {
         let sup = routing_sup(1); // ubatch_auto defaults false
@@ -18149,7 +18150,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__ubatch_governor__config_pin_is_exempt() {
         let sup = routing_sup(1);
@@ -18167,7 +18168,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__ubatch_governor__quiet_streak_steps_down_one_rung() {
         let sup = routing_sup(1);
@@ -18205,7 +18206,7 @@ mod routing_tests {
         kill_all(&[ph]);
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__ubatch_governor_snapshot__sorted() {
         let sup = routing_sup(1);
@@ -18217,7 +18218,7 @@ mod routing_tests {
         );
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__prefix_affinity__eviction_does_not_deadlock() {
         let sup = routing_sup(1);
@@ -18244,7 +18245,7 @@ mod routing_tests {
         handle.join().expect("affinity thread");
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__note_transition__cap_eviction_does_not_deadlock() {
         let sup = routing_sup(1);
@@ -18264,7 +18265,7 @@ mod routing_tests {
         handle.join().expect("transitions thread");
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__idle_ram_warm__gate_respects_knob_and_load_mode() {
         let mut cfg = Config::default();
@@ -18280,7 +18281,7 @@ mod routing_tests {
         assert!(Supervisor::idle_ram_warm_enabled(&cfg));
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__repage_file__reads_whole_file_in_chunks() {
         // 9 MiB + change: crosses the 4 MiB warm chunk boundary twice.
@@ -18297,7 +18298,7 @@ mod routing_tests {
         assert!(missing.is_err());
     }
 
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__bank_slot_of__legacy_suffixed_and_foreign() {
         use std::ffi::OsStr;
@@ -18329,7 +18330,7 @@ mod routing_tests {
 
     /// Capability truth table for the session-bank sweep: only
     /// llama-server speaks `/slots/{id}?action=save|restore`.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[test]
     fn unit__bank_capability__only_llama_family_supports_slot_banks() {
         use blazar_core::engine_kind::EngineKind;
@@ -18354,7 +18355,7 @@ mod routing_tests {
     /// non-llama instance never dials the endpoint, so eviction on
     /// unsupported lanes costs zero HTTP (previously up to 2 s of
     /// timeout per slot against an endpoint that 404s).
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__bank_capability__unsupported_kind_skips_save() {
         use blazar_core::engine_kind::EngineKind;
@@ -18389,7 +18390,7 @@ mod routing_tests {
 
     /// The supported lane keeps its contract: a llama instance's save
     /// sweep posts the ctx-scoped slot-0 checkpoint exactly once.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__bank_capability__supported_kind_saves() {
         let (sup, _root) = gpu_sup();
@@ -18430,7 +18431,7 @@ mod routing_tests {
     /// save of an already-banked, sleeping child returns `n_saved: 0`
     /// and the Some(0) branch deleted the GOOD pre-sleep payload. The
     /// sweep must never dial when nothing changed since the last bank.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__bank_capability__not_dirty_never_dials_and_keeps_existing_payload() {
         let (sup, _root) = gpu_sup();
@@ -18736,7 +18737,7 @@ mod routing_tests {
     /// write 44-byte header-only files). The reaper must sweep the
     /// checkpoint BEFORE the child reaches its sleep threshold: a dirty
     /// llama instance banks once and clears the marker.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__reaper_banks_before_sleep__dirty_instance_banks_before_sleep_mark() {
         let (sup, server, inst, pid) = bank_reap_fixture(
@@ -18766,7 +18767,7 @@ mod routing_tests {
 
     /// A clean instance (no request since the last bank) must not burn
     /// a sweep - the marker, not idle age alone, arms the bank.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__reaper_banks_before_sleep__clean_instance_skips_banking() {
         let (sup, server, _inst, pid) = bank_reap_fixture(
@@ -18791,7 +18792,7 @@ mod routing_tests {
 
     /// The capability gate rides the same branch: a non-llama child
     /// never dials (its lanes lack /slots - banking them costs timeouts).
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__reaper_banks_before_sleep__non_llama_kind_skips() {
         let (sup, server, _inst, pid) = bank_reap_fixture(
@@ -18816,7 +18817,7 @@ mod routing_tests {
 
     /// Below the lead-in threshold nothing fires: early ticks leave the
     /// bank armed for later (the sweep only matters near sleep).
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__reaper_banks_before_sleep__below_threshold_waits() {
         let (sup, server, inst, pid) = bank_reap_fixture(
@@ -18846,7 +18847,7 @@ mod routing_tests {
     /// Long-idle encounter (reaper missed the lead-in window): the bank
     /// still runs BEFORE the sleep-mark branch can engage - ordering
     /// inside `reap_once` is the contract, bank first, sleep later.
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__reaper_banks_before_sleep__past_sleep_threshold_banks_before_marking() {
         let (sup, server, inst, pid) = bank_reap_fixture(
@@ -18883,7 +18884,7 @@ mod routing_tests {
     /// engine/model rows to build the current identity from) stays
     /// cold - no dial. Only a manifest whose identity verifies against
     /// the actual serving engine restores (fail-closed, PR1).
-    #[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     #[tokio::test]
     async fn unit__bank_capability__restore_gate_by_kind() {
         use blazar_core::engine_kind::EngineKind;

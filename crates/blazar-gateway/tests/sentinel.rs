@@ -1079,7 +1079,7 @@ async fn integration__bestof__passthrough_chat_lane_teaches_instead_of_ignoring(
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
-#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
 #[tokio::test]
 async fn integration__startup_preload__listed_model_spawns_before_first_request() {
     // F1: a config preload list spawns the model WITHOUT any client
@@ -1101,7 +1101,7 @@ async fn integration__startup_preload__listed_model_spawns_before_first_request(
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
-#[allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
 #[tokio::test]
 async fn integration__startup_preload__unknown_name_warns_and_lives_on() {
     // Warn-not-fail contract: a bogus name teaches `blazar pull` and

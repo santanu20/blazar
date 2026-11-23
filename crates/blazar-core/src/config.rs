@@ -4926,7 +4926,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Config knobs deleted by policy (§ backwards-compat: NONE). Each entry
+    /// Config knobs deleted by policy (removed outright, no compatibility shims). Each entry
     /// is stripped at load with a warning instead of hard-failing the whole
     /// config - an upgraded binary must never lock the daemon out over a
     /// line the user never touched. Unknown keys NOT in this list stay hard
@@ -5747,11 +5747,13 @@ impl Config {
                 self.lazy_mode
             )));
         }
-        // Staged autonomy (docs/research §7.6): advise scans, scheduled
-        // races. The scheduled posture is deliberately narrow - it runs
-        // the same spec-race the manual `optimize --run` path runs,
-        // gated on idle lanes and aborting the moment traffic returns.
-        // Anything outside the vocabulary is still a plain error.
+        // Staged autonomy
+        // (docs/research/2026-10-31-recursive-self-improvement-research.md,
+        // section 7.6): advise scans, scheduled races. The scheduled posture
+        // is deliberately narrow - it runs the same spec-race the manual
+        // `optimize --run` path runs, gated on idle lanes and aborting the
+        // moment traffic returns. Anything outside the vocabulary is still
+        // a plain error.
         match self.autotune.as_deref() {
             None | Some("off" | "advise" | "scheduled") => {}
             Some(other) => {

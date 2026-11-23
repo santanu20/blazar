@@ -5,7 +5,7 @@
 //! and the post-upgrade daemon-restart lanes (systemd success + no-lane
 //! failure) against a stub daemon and a PATH-shimmed systemctl - never
 //! the real system manager.
-#![allow(non_snake_case)] // suite convention: unit__scenario__expected (§6b)
+#![allow(non_snake_case)] // suite convention: unit__scenario__expected
 #![cfg(unix)]
 
 use std::io::{Read, Write};

@@ -388,7 +388,7 @@ fn child_cwd(server_path: &str) -> Option<std::path::PathBuf> {
 
 /// Shared child-process mechanics for every engine kind: null stdin,
 /// piped stdio into tracing + the log tail, kill-on-drop, own process
-/// group (§5 H19: acquired = released by construction). `spawn_env`
+/// group (acquired = released by construction). `spawn_env`
 /// applies AFTER `child_env` - a same-key override is logged, never a
 /// silent clobber.
 fn spawn_child(
