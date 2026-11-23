@@ -44,6 +44,7 @@ tracked here.
 - **`scripts/compat/compat_check.sh` builds request bodies as JSON.** Model names and response ids go through `json.dumps` instead of shell concatenation, curl reports transport errors, and every chat fixture also asserts that no error object came back.
 - **`scripts/regen_config_code_paths.py` calls ripgrep without a shell.** The function name quoted in a doc citation is passed as an argv entry; `re.escape` is regex quoting, not shell quoting.
 - **The Kokoro TTS server answers every failure as JSON.** `kokoro_server.py` returns 400 for a body that is not a JSON object, 413 over 1 MiB, 500 on a synthesis error, clips the audio before the int16 cast and serializes synthesis on the shared model.
+- **The Python SDK narrows its error mapping and caps the handshake.** `blazar` maps only parse, attribute and I/O errors to `BlazarError`, the realtime handshake stops at 64 KiB of headers, and the WebSocket accept key uses `sha1(usedforsecurity=False)`.
 
 ### Removed
 

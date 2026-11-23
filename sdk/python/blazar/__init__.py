@@ -417,7 +417,7 @@ class Client:
                 or payload.get("error")
                 or str(e)
             )
-        except Exception:
+        except (ValueError, AttributeError, OSError):
             message = str(e)
         return BlazarError(e.code, str(message))
 
@@ -498,7 +498,11 @@ class RealtimeSession:
         sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
 
         response = b""
+        # The server controls the handshake size; past 64 KiB it is a
+        # misbehaving peer, not a header block worth buffering.
         while b"\r\n\r\n" not in response:
+            if len(response) > 64 * 1024:
+                raise BlazarError(0, "realtime handshake: response headers too large")
             chunk = sock.recv(4096)
             if not chunk:
                 raise BlazarError(0, "realtime handshake: connection closed")
@@ -511,7 +515,9 @@ class RealtimeSession:
             )
         expected = base64.b64encode(
             hashlib.sha1(
-                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(),
+                # RFC 6455 accept key: a protocol checksum, not a security use.
+                usedforsecurity=False,
             ).digest()
         ).decode()
         if expected.encode() not in response:
