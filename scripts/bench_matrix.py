@@ -2747,11 +2747,14 @@ def stage_mistralrs_view(
     os.symlink(model_path, d / model_path.name)
     if mmproj is not None and mmproj.exists():
         os.symlink(mmproj, d / mmproj.name)
-    # absolute: direct cells spawn the child with cwd=<engine dir>, so a
-    # relative stage path only resolves when the harness happens to run
-    # from the repo root - mistral.rs would reject the model with
-    # "does not exist or is not a file" from any other cwd.
-    return (d / model_path.name).resolve()
+    # absolute WITHOUT following the link: `Path.resolve()` dereferences
+    # the symlink back to the store file, so mistral.rs lists the shared
+    # models dir and the projector poisoning this view exists to prevent
+    # returns (live 2026-11-22: every v0.9.5 direct cell died with
+    # "multimodal GGUF architecture `qwen2`" despite staging). Direct
+    # cells also spawn with cwd=<engine dir>, so a relative path alone
+    # would not resolve from there.
+    return Path(os.path.abspath(os.fspath(d / model_path.name)))
 
 
 def wait_healthy(
@@ -6424,26 +6427,40 @@ def _findings(records: list[dict]) -> list[str]:
     Pure function over records; no new measurement passes."""
     out: list[str] = []
 
-    def speed_ok(provider, tag):
+    # gateway-vs-direct decode parity per engine: ONE summary line per
+    # tag, outliers itemized - config-sweep campaigns emit dozens of
+    # per-knob rows and the parity band is the story, not each knob.
+    # Both sides must be healthy cells: an errored gateway row records
+    # decode 0.0 and would read as a "-100%" parity outlier, and the
+    # direct anchor must be the default-params cell - once a non-default
+    # direct cell succeeds (mistralrs v0.9.5 pa:off, 2026-11-22) the
+    # first-healthy-row lookup would pin parity against the wrong lane
+    def default_direct(tag):
         for r in records:
+            p = r.get("params") or {}
             if (
-                r.get("provider") == provider
+                r.get("provider") == "direct"
                 and r.get("tag") == tag
+                and p.get("np") == 1
+                and p.get("ctx") == 4096
+                and len(p) == 2
                 and "decode_tps_p50" in r
                 and "error" not in r
             ):
                 return r
         return None
 
-    # gateway-vs-direct decode parity per engine: ONE summary line per
-    # tag, outliers itemized - config-sweep campaigns emit dozens of
-    # per-knob rows and the parity band is the story, not each knob
     parity_by_tag: dict[str, list[tuple[str, float]]] = {}
     for r in records:
         tag = r.get("tag")
-        if r.get("provider") != "blazar" or "decode_tps_p50" not in r or tag is None:
+        if (
+            r.get("provider") != "blazar"
+            or "decode_tps_p50" not in r
+            or "error" in r
+            or tag is None
+        ):
             continue
-        d = speed_ok("direct", tag)
+        d = default_direct(tag)
         if d and d.get("decode_tps_p50"):
             label = (
                 r.get("params", {}).get("config")
@@ -6534,7 +6551,12 @@ def _findings(records: list[dict]) -> list[str]:
                         "slot count)."
                     )
                 break
-    # variant axes deltas vs same-engine baseline
+    # variant axes deltas vs same-engine baseline; a baseline cell that
+    # errored (e.g. mistralrs v0.9.5 PA-on 503s on every inference while
+    # pa:off serves fine - 2026-11-22 campaign) is not a baseline: its
+    # decode_tps_p50 is a recorded 0.0, not a speed, and dividing by it
+    # crashed the renderer. Error rows keep their receipts in the error
+    # tables; here they just cannot anchor a delta.
     base_direct: dict[str, dict] = {}
     for r in records:
         if (
@@ -6543,6 +6565,7 @@ def _findings(records: list[dict]) -> list[str]:
             and r.get("params", {}).get("ctx") == 4096
             and len(r.get("params", {})) == 2
             and "decode_tps_p50" in r
+            and "error" not in r
         ):
             base_direct[r["tag"]] = r
     for r in records:
@@ -6551,7 +6574,15 @@ def _findings(records: list[dict]) -> list[str]:
         if r.get("provider") != "direct" or not axis or "decode_tps_p50" not in r:
             continue
         b = base_direct.get(r["tag"])
-        if not b:
+        if not b or not b["decode_tps_p50"]:
+            # the axis cell measured but its baseline failed - surface
+            # the orphan speed instead of silently vanishing it
+            if "error" not in r and r["decode_tps_p50"]:
+                out.append(
+                    f"- {axis}={par[axis]} (`{r['tag']}`): decode "
+                    f"{r['decode_tps_p50']:.1f} t/s, baseline n/a "
+                    f"(same-engine default cell failed to serve)"
+                )
             continue
         # decode delta
         dd = (r["decode_tps_p50"] - b["decode_tps_p50"]) / b["decode_tps_p50"] * 100
@@ -10510,7 +10541,16 @@ def conc_axes_table(recs: list[dict]) -> str:
 # regression alarm: q8_0 KV quantizes the cache the tokens read from, and
 # flash-attention off swaps the attention kernel (different floating-point
 # reduction order) - in both the drift IS the knob, not a bug.
-KNOWN_DRIFT: set[str] = {"cache_q8", "fa_off"}
+# kv_unified off swaps llama.cpp's KV layout for the per-slot split cache;
+# on upstream b12606 the split-KV greedy path is run-unstable even at
+# temp-0/seed-42 (live 2026-11-22 probe: two consecutive serves gave two
+# different fingerprints while --kv-unified stayed bit-stable; the fork
+# engine of 2026-11-20 was bit-identical across both layouts), and the
+# diverging text is a coherent mid-prose continuation with quality rates
+# in tolerance - engine numerics under its own flag, not a gateway
+# regression. single-stream bundles kv_unified=false, so it inherits the
+# same axis.
+KNOWN_DRIFT: set[str] = {"cache_q8", "fa_off", "kv_unified_off", "single-stream"}
 
 
 def quality_lane_status(recs: list[dict], skip_flag: bool = False) -> dict:

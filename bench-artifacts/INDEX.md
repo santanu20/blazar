@@ -18,6 +18,7 @@
 | 2026-11-22-b7-llamacpp | 2026 | quality | 2 | 0.34.3 |
 | 2026-11-22-b7-mlx | 2026 | quality | 1 | 0.34.3 |
 | 2026-11-22-b7-vllm | 2026 | quality | 1 | 0.34.3 |
+| 2026-11-22-postfix-full | 2026 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,greedy_ollama,idle,media,ollama,ppl,quality,reshape,tools | 89 | 0.34.3 |
 | 20260923-media | 20260923 | media | 4 | blazar 0.10.0 |
 | 20260923-media-v2 | 20260923 | media | 5 | blazar 0.10.0 |
 | 20260924-all-engines | 20260924 | blazar,cold,conc,ctxcurve,direct,features,greedy,greedy_gw,idle,media,ollama,ppl,reshape,tools | 105 | blazar 0.11.0 |
