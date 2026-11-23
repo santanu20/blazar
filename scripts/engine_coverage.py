@@ -67,6 +67,9 @@ against the canonical capability families with an evidence status
 for live_certified rows, a receipt artifact. The --check gate validates
 family completeness and ordering, receipt existence, and that matrix
 flags are actually reachable (emitted or probed) on their lane.
+Receipt paths stay repo-relative in the data; the doc renders them
+as links to the published branch, because the site is built from
+docs/ and a repo-relative path would not resolve there.
 
 Modes:
   (default)   human-readable matrix to stdout
@@ -90,6 +93,7 @@ crates/blazar-core/src/dirs.rs.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -104,6 +108,11 @@ FIXTURES = REPO / "scripts" / "manifest_flag_fixtures.json"
 RECEIPTS_FILE = REPO / "scripts" / "certification_receipts.json"
 DOC = REPO / "docs" / "engine-coverage.md"
 DOC_HEADER = "# Engine capability coverage"
+# The doc is published from docs/, where repo-relative receipt paths do not
+# resolve, so proof links point at the branch the site is served from.
+SITE_CONFIG = REPO / "docs" / "_config.yml"
+PUBLISHED_BRANCH = "main"
+REPOSITORY_KEY = re.compile(r'^repository:\s*"?([^"\s]+)"?\s*$', re.MULTILINE)
 
 # Reserved sets mirrored from the Rust extra_args gates. The Rust consts
 # are the source of truth; update this mirror in the same change that
@@ -477,9 +486,7 @@ def load_kv_matrix() -> list[dict[str, object]]:
     return rows
 
 
-def check_kv_matrix(
-    kv_matrix: list[dict[str, object]], problems: list[str]
-) -> None:
+def check_kv_matrix(kv_matrix: list[dict[str, object]], problems: list[str]) -> None:
     """Semantic gate on the KV certification matrix.
 
     - all 4x4 engine pairs dispositioned exactly once
@@ -675,6 +682,28 @@ def audit(
     return out
 
 
+@functools.cache
+def blob_base() -> str:
+    """Base URL for repo paths on the published branch.
+
+    The owner/repo is read from the site config, so proof links cannot
+    drift from the repository the site itself advertises.
+    """
+    match = REPOSITORY_KEY.search(SITE_CONFIG.read_text(encoding="utf-8"))
+    if not match:
+        raise SystemExit(f"{SITE_CONFIG}: `repository:` missing, proof links need it")
+    return f"https://github.com/{match.group(1)}/blob/{PUBLISHED_BRANCH}/"
+
+
+def proof_target(receipt: str) -> str:
+    """Link target for a receipt: itself when already a URL, else its blob."""
+    if receipt.startswith(("http://", "https://")):
+        return receipt
+    if any(ch.isspace() for ch in receipt):
+        raise SystemExit(f"receipt path {receipt!r} has whitespace; encode it first")
+    return blob_base() + receipt
+
+
 def render_markdown(
     audited: list[EngineAudit],
     registry: dict[str, list[str]],
@@ -768,7 +797,7 @@ def render_markdown(
                 note = str(row["note"])
                 receipt = row.get("receipt")
                 if isinstance(receipt, str) and receipt:
-                    note = f"{note} ([proof]({receipt}))"
+                    note = f"{note} ([proof]({proof_target(receipt)}))"
                 evidence = str(row["evidence"]).replace("_", "-")
                 lines.append(
                     f"| {row['family']} | {evidence} | {rendered_flags} | {note} |"
@@ -783,7 +812,7 @@ def render_markdown(
             for flag, meta in certified_hit.items():
                 note = f" - {meta['note']}" if meta["note"] else ""
                 lines.append(
-                    f"- `{flag}` [`{meta['receipt']}`]({meta['receipt']}){note}"
+                    f"- `{flag}` [`{meta['receipt']}`]({proof_target(meta['receipt'])}){note}"
                 )
             lines.append("")
         by_fam: dict[str, list[str]] = {}
@@ -853,7 +882,7 @@ def render_markdown(
             note = str(row["note"])
             receipt = row.get("receipt")
             if isinstance(receipt, str) and receipt:
-                note = f"{note} ([proof]({receipt}))"
+                note = f"{note} ([proof]({proof_target(receipt)}))"
             lines.append(f"| {row['pair']} | {status} | {note} |")
         lines.append("")
     lines.append(
@@ -1049,7 +1078,9 @@ def main() -> int:
     capabilities = load_capabilities()
     kv_matrix = load_kv_matrix()
     if args.markdown:
-        DOC.write_text(render_markdown(audited, registry, receipts, capabilities, kv_matrix))
+        DOC.write_text(
+            render_markdown(audited, registry, receipts, capabilities, kv_matrix)
+        )
         print(f"{DOC}: regenerated")
         return 0
     if args.json:

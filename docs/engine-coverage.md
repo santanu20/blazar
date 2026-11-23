@@ -60,7 +60,7 @@ Registry lane `piper` pins 10 first-class flags (compile + spawn-time emission).
 | lora | unsupported | - | no adapter surface |
 | multimodal | unsupported | - | single-modality audio-out lane (see speech_synthesis) |
 | cancellation_streaming | first-class | - | gateway-owned job cancel |
-| speech_synthesis | live-certified | `--model`, `--output_raw`, `--length_scale`, `--speaker` | piper-TTS wav synthesized and round-trip transcribed by whisper beam-5 child ([proof](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md)) |
+| speech_synthesis | live-certified | `--model`, `--output_raw`, `--length_scale`, `--speaker` | piper-TTS wav synthesized and round-trip transcribed by whisper beam-5 child ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md)) |
 
 ### Not applicable (deliberate, per-flag reasons)
 
@@ -83,7 +83,7 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 | Family | Evidence | Flags | Notes |
 |---|---|---|---|
 | batching_scheduling | first-class | `-np`, `--batch-size`, `--ubatch-size`, `--no-cont-batching` | slots=0 capacity-aware sizing, adaptive_slots governor and the decode gate manage batching |
-| kv_cache_quantization | live-certified | `--cache-type-k`, `--cache-type-v` | q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven ([proof](bench-artifacts/20261111-fp8-kv-quality/README.md)) |
+| kv_cache_quantization | live-certified | `--cache-type-k`, `--cache-type-v` | q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md)) |
 | prefix_caching | first-class | `--no-cache-prompt` | prompt cache default-on; cache_hit_rate hint feeds the spec/cache governors |
 | speculative_decoding | first-class | `--spec-default`, `--spec-draft-n-min`, `--spec-draft-p-min` | spec=auto family selection, ngram fallback and the adaptive spec governor |
 | multi_gpu_parallelism | passthrough | - | rpc/multi-node surface is extra_args-only; single-box layer splits auto-derive |
@@ -95,8 +95,8 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 
 ### Certified against a live engine
 
-- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
-- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
 
 ### Passthrough families
 
@@ -134,7 +134,7 @@ Registry lane `whisper` pins 15 first-class flags (compile + spawn-time emission
 
 ### Certified against a live engine
 
-- `--beam-size` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - beam-5 child; piper-TTS wav transcribed exactly
+- `--beam-size` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - beam-5 child; piper-TTS wav transcribed exactly
 
 ### Passthrough families
 
@@ -154,7 +154,7 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 | Family | Evidence | Flags | Notes |
 |---|---|---|---|
 | batching_scheduling | first-class | `-np`, `--batch-size`, `--ubatch-size`, `--no-cont-batching` | slots=0 capacity-aware sizing, adaptive_slots governor and the decode gate manage batching |
-| kv_cache_quantization | live-certified | `--cache-type-k`, `--cache-type-v` | q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven ([proof](bench-artifacts/20261111-fp8-kv-quality/README.md)) |
+| kv_cache_quantization | live-certified | `--cache-type-k`, `--cache-type-v` | q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md)) |
 | prefix_caching | first-class | `--no-cache-prompt` | prompt cache default-on; cache_hit_rate hint feeds the spec/cache governors |
 | speculative_decoding | first-class | `--spec-default`, `--spec-draft-n-min`, `--spec-draft-p-min` | spec=auto family selection, ngram fallback and the adaptive spec governor |
 | multi_gpu_parallelism | passthrough | - | rpc/multi-node surface is extra_args-only; single-box layer splits auto-derive |
@@ -166,8 +166,8 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 
 ### Certified against a live engine
 
-- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
-- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
 
 ### Passthrough families
 
@@ -193,7 +193,7 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 | Family | Evidence | Flags | Notes |
 |---|---|---|---|
 | batching_scheduling | first-class | `-np`, `--batch-size`, `--ubatch-size`, `--no-cont-batching` | slots=0 capacity-aware sizing, adaptive_slots governor and the decode gate manage batching |
-| kv_cache_quantization | live-certified | `--cache-type-k`, `--cache-type-v` | q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven ([proof](bench-artifacts/20261111-fp8-kv-quality/README.md)) |
+| kv_cache_quantization | live-certified | `--cache-type-k`, `--cache-type-v` | q4_0 KV quality-free at 2048/32k ctx; f8_e4m3 pin-only above 16k - ladder policy is receipt-driven ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md)) |
 | prefix_caching | first-class | `--no-cache-prompt` | prompt cache default-on; cache_hit_rate hint feeds the spec/cache governors |
 | speculative_decoding | first-class | `--spec-default`, `--spec-draft-n-min`, `--spec-draft-p-min` | spec=auto family selection, ngram fallback and the adaptive spec governor |
 | multi_gpu_parallelism | passthrough | - | rpc/multi-node surface is extra_args-only; single-box layer splits auto-derive |
@@ -205,8 +205,8 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 
 ### Certified against a live engine
 
-- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
-- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-k` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
+- `--cache-type-v` [`bench-artifacts/20261111-fp8-kv-quality/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md) - q4_0 KV quality-free at 2048 and 32k ctx (20261005-kv-quality); f8_e4m3 parity at 2048 but +0.141 ppl at 16384 (~2x err bars) - pin-only, ladder never auto-selects
 
 ### Passthrough families
 
@@ -239,7 +239,7 @@ Registry lane `llamacpp` pins 94 first-class flags (compile + spawn-time emissio
 | lora | unsupported | - | no adapter surface |
 | multimodal | unsupported | - | single-modality audio-out lane (see speech_synthesis) |
 | cancellation_streaming | first-class | - | gateway-owned job cancel |
-| speech_synthesis | live-certified | - | zero-CLI-flag python shim: Blazar composes the whole serving path (venv + ONNX model + /tts endpoint); af_heart 24 kHz wav certified live 2026-11-20 ([proof](bench-artifacts/20261120-kokoro-vllm-cert/README.md)) |
+| speech_synthesis | live-certified | - | zero-CLI-flag python shim: Blazar composes the whole serving path (venv + ONNX model + /tts endpoint); af_heart 24 kHz wav certified live 2026-11-20 ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md)) |
 
 Unverified: this lane has no emission-truth registry entry yet - every flag above is listed as unverified until it grows one (see knob_registry.rs).
 
@@ -266,8 +266,8 @@ Registry lane `openaihost` pins 2 first-class flags (compile + spawn-time emissi
 
 ### Certified against a live engine
 
-- `--host` [`docs/research/2026-11-07-openai-host-lane-phase-a.md`](docs/research/2026-11-07-openai-host-lane-phase-a.md) - live litert-lm serve lane probe (127.0.0.1:9379) with gateway chat round-trips; phase-A chunked-TE A/B ran against this server
-- `--port` [`docs/research/2026-11-07-openai-host-lane-phase-a.md`](docs/research/2026-11-07-openai-host-lane-phase-a.md) - live litert-lm serve lane probe (127.0.0.1:9379) with gateway chat round-trips; phase-A chunked-TE A/B ran against this server
+- `--host` [`docs/research/2026-11-07-openai-host-lane-phase-a.md`](https://github.com/santanu20/blazar/blob/main/docs/research/2026-11-07-openai-host-lane-phase-a.md) - live litert-lm serve lane probe (127.0.0.1:9379) with gateway chat round-trips; phase-A chunked-TE A/B ran against this server
+- `--port` [`docs/research/2026-11-07-openai-host-lane-phase-a.md`](https://github.com/santanu20/blazar/blob/main/docs/research/2026-11-07-openai-host-lane-phase-a.md) - live litert-lm serve lane probe (127.0.0.1:9379) with gateway chat round-trips; phase-A chunked-TE A/B ran against this server
 
 ### Not applicable (deliberate, per-flag reasons)
 
@@ -299,8 +299,8 @@ Registry lane `sdcpp` pins 41 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
-- `--hires-upscalers-dir` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048
-- `--upscale-model` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048
+- `--hires-upscalers-dir` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048
+- `--upscale-model` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - RealESRGAN_x4plus end-to-end: 512x512 generation upscaled to 2048x2048
 
 ### Passthrough families
 
@@ -325,7 +325,7 @@ Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
 | Family | Evidence | Flags | Notes |
 |---|---|---|---|
 | batching_scheduling | first-class | `--decode-concurrency`, `--prompt-concurrency` | decode/prompt concurrency knobs |
-| kv_cache_quantization | live-certified | `--kv-bits`, `--kv-group-size`, `--quantized-kv-start` | A/B: 1.9x slower decode, 108MiB saved - memory lever, opt-in ([proof](bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md)) |
+| kv_cache_quantization | live-certified | `--kv-bits`, `--kv-group-size`, `--quantized-kv-start` | A/B: 1.9x slower decode, 108MiB saved - memory lever, opt-in ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md)) |
 | prefix_caching | first-class | `--prompt-cache-size`, `--prompt-cache-bytes` | prompt cache budget knobs |
 | speculative_decoding | first-class | `--draft-model`, `--num-draft-tokens` | draft model + token count knobs |
 | multi_gpu_parallelism | unsupported | - | single-device MLX runtime |
@@ -337,7 +337,7 @@ Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
-- `--kv-bits` [`bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md`](bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md) - A/B on qwen2.5-0.5b: 1.9x slower decode, 108MiB saved - memory lever, opt-in
+- `--kv-bits` [`bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/mlx_kv_bits_ab.md) - A/B on qwen2.5-0.5b: 1.9x slower decode, 108MiB saved - memory lever, opt-in
 
 ### Passthrough families
 
@@ -356,19 +356,19 @@ Registry lane `sglang` pins 71 first-class flags (compile + spawn-time emission)
 | batching_scheduling | first-class | `--schedule-policy`, `--schedule-conservativeness`, `--max-total-tokens`, `--max-prefill-tokens` | scheduler policy and token budget knobs |
 | kv_cache_quantization | first-class | `--kv-cache-dtype` | KV dtype knob on the paged cache |
 | prefix_caching | first-class | `--enable-hierarchical-cache`, `--hicache-ratio`, `--hicache-size`, `--enable-session-radix-cache` | radix + hierarchical cache knobs; hicache L3 codec translates across engines |
-| speculative_decoding | live-certified | `--speculative-algorithm`, `--speculative-num-draft-tokens` | live spec battery: +7% on repetitive traffic, negative on diverse - kept opt-in ([proof](bench-artifacts/20261009-sglang-spec/spec_race_lane.md)) |
+| speculative_decoding | live-certified | `--speculative-algorithm`, `--speculative-num-draft-tokens` | live spec battery: +7% on repetitive traffic, negative on diverse - kept opt-in ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261009-sglang-spec/spec_race_lane.md)) |
 | multi_gpu_parallelism | first-class | `--tp-size`, `--dp-size`, `--pp-size`, `--ep-size` | all four parallel axes are sized by the multi-GPU planner |
 | memory_offload | first-class | `--cpu-offload-gb`, `--mem-fraction-static` | CPU offload and static memory fraction knobs |
 | structured_output | probed | - | xgrammar rides requests; the launch-side grammar backend is not pinned |
-| lora | live-certified | `--enable-lora`, `--lora-paths` | one-child colon routing + hot-attach on the same pid ([proof](docs/research/2026-10-09-sglang-lora-one-child.md)) |
+| lora | live-certified | `--enable-lora`, `--lora-paths` | one-child colon routing + hot-attach on the same pid ([proof](https://github.com/santanu20/blazar/blob/main/docs/research/2026-10-09-sglang-lora-one-child.md)) |
 | multimodal | first-class | `--mm-attention-backend` | multimodal attention backend knob |
 | cancellation_streaming | first-class | - | gateway-owned stream and cancel |
 
 ### Certified against a live engine
 
-- `--enable-lora` [`docs/research/2026-10-09-sglang-lora-one-child.md`](docs/research/2026-10-09-sglang-lora-one-child.md) - one-child colon routing + hot-attach via /api/lora/sync on the same pid
-- `--lora-paths` [`docs/research/2026-10-09-sglang-lora-one-child.md`](docs/research/2026-10-09-sglang-lora-one-child.md) - one-child colon routing + hot-attach via /api/lora/sync on the same pid
-- `--speculative-algorithm` [`bench-artifacts/20261009-sglang-spec/spec_race_lane.md`](bench-artifacts/20261009-sglang-spec/spec_race_lane.md) - live sglang-0.5.21 spec battery: ngram exercised via --speculative-algorithm; +7% on repetitive search prompts, negative on diverse traffic - gain is workload-dependent, kept opt-in (raw cells: live_battery.json, bench-archive release)
+- `--enable-lora` [`docs/research/2026-10-09-sglang-lora-one-child.md`](https://github.com/santanu20/blazar/blob/main/docs/research/2026-10-09-sglang-lora-one-child.md) - one-child colon routing + hot-attach via /api/lora/sync on the same pid
+- `--lora-paths` [`docs/research/2026-10-09-sglang-lora-one-child.md`](https://github.com/santanu20/blazar/blob/main/docs/research/2026-10-09-sglang-lora-one-child.md) - one-child colon routing + hot-attach via /api/lora/sync on the same pid
+- `--speculative-algorithm` [`bench-artifacts/20261009-sglang-spec/spec_race_lane.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261009-sglang-spec/spec_race_lane.md) - live sglang-0.5.21 spec battery: ngram exercised via --speculative-algorithm; +7% on repetitive search prompts, negative on diverse traffic - gain is workload-dependent, kept opt-in (raw cells: live_battery.json, bench-archive release)
 
 ### Passthrough families
 
@@ -405,13 +405,13 @@ Registry lane `mistralrs` pins 39 first-class flags (compile + spawn-time emissi
 | multi_gpu_parallelism | unsupported | - | v0.9.5 advertises no TP/PP surface; single-device lane |
 | memory_offload | first-class | `--device-layers`, `--pa-memory-mb`, `--encoder-cache-memory-mb` | layer split and memory fraction knobs |
 | structured_output | probed | - | request-side grammar only; no launch flag on this lane |
-| lora | live-certified | `--enable-lora` | live child --isq/--enable-lora qwen3-1.7b run; adapter caps are knobs ([proof](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md)) |
+| lora | live-certified | `--enable-lora` | live child --isq/--enable-lora qwen3-1.7b run; adapter caps are knobs ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md)) |
 | multimodal | first-class | `--mmproj`, `--max-image-length` | vision projector routing is first-class |
 | cancellation_streaming | first-class | - | gateway-owned stream and cancel |
 
 ### Certified against a live engine
 
-- `--isq` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - live child --isq q8_0 (qwen3-1.7b temp-0 200 OK); admission stays checkpoint-based
+- `--isq` [`bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261010-engine-utilization/live_spawn_proofs.md) - live child --isq q8_0 (qwen3-1.7b temp-0 200 OK); admission stays checkpoint-based
 
 ### Passthrough families
 
@@ -445,10 +445,10 @@ Registry lane `vllm` pins 10 first-class flags (compile + spawn-time emission).
 
 ### Certified against a live engine
 
-- `--enable-prompt-tokens-details` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): usage.prompt_tokens_details.cached_tokens present in gateway response
-- `--gpu-memory-utilization` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): default 0.85 in child argv; 8 GB lane served + idle reaped to 16 MiB
-- `--max-model-len` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): clamped 32768->16384 per ctx policy, child argv observed
-- `--served-model-name` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): child argv observed with sanitized name; request model string resolved
+- `--enable-prompt-tokens-details` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): usage.prompt_tokens_details.cached_tokens present in gateway response
+- `--gpu-memory-utilization` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): default 0.85 in child argv; 8 GB lane served + idle reaped to 16 MiB
+- `--max-model-len` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): clamped 32768->16384 per ctx policy, child argv observed
+- `--served-model-name` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): child argv observed with sanitized name; request model string resolved
 
 ### Passthrough families
 
@@ -464,8 +464,8 @@ Pair-wise certification verdicts for KV cache interchange (source -> target). `l
 | vllm -> vllm | exact | fs offload tier round trip - content-addressed reload |
 | sglang -> sglang | exact | hicache L3 file tier round trip |
 | mlx -> mlx | exact | mlx-lm prompt-cache file round trip |
-| llama.cpp -> vllm | live-certified | gateway chat through the imported prefix reported cached_tokens > 0 on live engines ([proof](docs/research/2026-11-19-llamacpp-vllm-kv-import-data-plane.md)) |
-| vllm -> llama.cpp | live-certified | tier -> bank -> native slot restore proven live (qwen2.5-coder-0.5b pair: 24 blocks x 64 tokens imported; slot restore of 1536 tokens logged before first use) ([proof](bench-artifacts/2026-11-21-kv-codec-live-certs/README.md)) |
+| llama.cpp -> vllm | live-certified | gateway chat through the imported prefix reported cached_tokens > 0 on live engines ([proof](https://github.com/santanu20/blazar/blob/main/docs/research/2026-11-19-llamacpp-vllm-kv-import-data-plane.md)) |
+| vllm -> llama.cpp | live-certified | tier -> bank -> native slot restore proven live (qwen2.5-coder-0.5b pair: 24 blocks x 64 tokens imported; slot restore of 1536 tokens logged before first use) ([proof](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-21-kv-codec-live-certs/README.md)) |
 | mlx -> vllm | codec-shipped | mlx-lm export codec landed; live pair certificate needs a Metal host for the mlx lane |
 | vllm -> mlx | codec-shipped | staged preload landed; live pair certificate needs a Metal host for the mlx lane |
 | sglang -> vllm | codec-shipped | hicache L3 page codec landed; live pair certificate (both engines, proven reuse) pending - the hicache host-tier guard needs a RAM class with ~15 GiB headroom (guard refusal verified live on the 13.7 GiB cert box) |

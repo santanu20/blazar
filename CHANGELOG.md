@@ -31,6 +31,7 @@ tracked here.
 - **Working notes are no longer published as product docs.** The docs site excludes `docs/research/` and `docs/issues/` (the notes stay in git for provenance) and drops its Research navigation section; the `B7-*` and `W4-FINDINGS` campaign notes leave the repo root.
 - **`bench-artifacts/` tracks only what is cited.** `INDEX.md`, the charts `BENCHMARK.md` embeds and every receipt a registry, doc, README link or code comment cites stay in git; the other 99 report files and the retired root notes are archived on the bench-archive GitHub release. `scripts/engine_coverage.py --check` still fails in a fresh clone when a cited receipt is missing.
 - **The hygiene gate rejects root-level working notes.** `scripts/check_hygiene.sh` fails CI when a root-level `*.md` other than `README.md`, `CHANGELOG.md` and `BENCHMARK.md` is tracked, so a campaign note can no longer land beside the product documents.
+- **Engine-coverage proof links point at the published branch.** `scripts/engine_coverage.py` renders every receipt link in `docs/engine-coverage.md` as a GitHub URL, so the 31 proof links resolve on the docs site and on GitHub instead of 404.
 
 ### Fixed
 
