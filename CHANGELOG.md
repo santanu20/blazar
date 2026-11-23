@@ -30,6 +30,7 @@ tracked here.
 - **Live validation survives wedged children and host-state-dependent lanes.** CLI calls run in their own process group under a hard timeout (a child that ignores SIGKILL is abandoned, never awaited forever); the host-pressure eviction of an offloaded image lane and a live-RAM-clamped offload recipe record as host-state boundaries rather than product failures; the fleet adopt/join teaching legs run on freshly allocated UDP ports under an isolated XDG home; `phase_commands` covers `kv status/inspect/gc` and `engine card`; and the `/api/ps` golden carries the effective-config and host-charge columns.
 - **Working notes are no longer published as product docs.** The docs site excludes `docs/research/` and `docs/issues/` (the notes stay in git for provenance) and drops its Research navigation section; the `B7-*` and `W4-FINDINGS` campaign notes leave the repo root.
 - **`bench-artifacts/` tracks only what is cited.** `INDEX.md`, the charts `BENCHMARK.md` embeds and every receipt a registry, doc, README link or code comment cites stay in git; the other 99 report files and the retired root notes are archived on the bench-archive GitHub release. `scripts/engine_coverage.py --check` still fails in a fresh clone when a cited receipt is missing.
+- **The hygiene gate rejects root-level working notes.** `scripts/check_hygiene.sh` fails CI when a root-level `*.md` other than `README.md`, `CHANGELOG.md` and `BENCHMARK.md` is tracked, so a campaign note can no longer land beside the product documents.
 
 ### Fixed
 

@@ -1,17 +1,19 @@
 #!/bin/sh
 # Hygiene gates: machine-specific absolute paths + AI-agent artifacts +
-# packaging license integrity + CJK-rendering glyph control.
+# root-level working notes + packaging license integrity + CJK-rendering
+# glyph control.
 # Blocks the classes a code review easily misses - real home dirs and
 # agent scratch paths baked into comments/fixtures, external project
-# names leaking into shipped source, non-ASCII glyphs that render via
-# CJK fallback fonts - at CI time. Exits non-zero
+# names leaking into shipped source, campaign or findings notes
+# committed at the top level instead of beside their receipts, non-ASCII
+# glyphs that render via CJK fallback fonts - at CI time. Exits non-zero
 # listing every offending file:line.
 #
 # Usage: check_hygiene.sh [paths...]
-#   With no args, scans every git-tracked file and runs the packaging
-#   license gate. Explicit paths are scanned as-is (used by the
-#   self-test below); the license gate is repo-anchored and skipped in
-#   that mode.
+#   With no args, scans every git-tracked file, rejects root-level
+#   working notes and runs the packaging license gate. Explicit paths
+#   are scanned as-is (used by the self-test below); the root-note and
+#   license gates are repo-anchored and skipped in that mode.
 #
 # CHANGELOG.md is excluded: historical entries cite past paths and
 # project names as record - rewriting history is not the gate's job.
@@ -35,6 +37,14 @@ PATH_PATTERNS='/home/[a-z]|/Users/[a-z]|/root/|/tmp/opencode'
 # AI-agent session artifacts: unexplained external project names that
 # leaked into shipped comments. Extend the denylist as new ones appear.
 ARTIFACT_PATTERNS='geokit'
+
+# Root-level markdown is product surface: the landing page, the release
+# record, the published benchmark report. Any other top-level .md is a
+# working note that belongs beside its receipts (bench-artifacts/<run>/)
+# or under docs/research/. Name a new product document here to allow it.
+ROOT_DOC_ALLOWLIST='BENCHMARK.md
+CHANGELOG.md
+README.md'
 
 # license_field_present FILE PATTERN - true when FILE matches the
 # license declaration pattern. Split out so the self-test can prove
@@ -82,6 +92,23 @@ scan_files() {
     done
 }
 
+# root_note_violations - stdin is one tracked path per line; prints the
+# root-level markdown files that are not named product documents.
+# Repo-anchored, so it runs in no-args mode only.
+root_note_violations() {
+    while IFS= read -r f; do
+        case "$f" in
+            *.md) ;;
+            *) continue ;;
+        esac
+        case "$f" in
+            */*) continue ;;
+        esac
+        printf '%s\n' "$ROOT_DOC_ALLOWLIST" | grep -qxF -- "$f" && continue
+        printf '%s\n' "$f"
+    done
+}
+
 # Glyph gate: CJK script outside allowlisted data sites, plus
 # render-fallback punctuation on NEW lines. Repo-anchored, so it runs
 # in no-args mode only. Reports codepoints, never glyph bytes.
@@ -93,17 +120,28 @@ check_glyphs() {
 
 license_fail=0
 glyph_fail=0
+note_fail=0
 if [ "$#" -gt 0 ]; then
     hits=$(printf '%s\n' "$@" | scan_files)
 else
-    hits=$(git ls-files | scan_files)
+    tracked=$(git ls-files)
+    hits=$(printf '%s\n' "$tracked" | scan_files)
     check_packaging_licenses || license_fail=1
     check_glyphs || glyph_fail=1
+    root_notes=$(printf '%s\n' "$tracked" | root_note_violations)
+    if [ -n "$root_notes" ]; then
+        note_fail=1
+        printf '%s\n' "$root_notes" |
+            while IFS= read -r f; do
+                echo "root-doc gate: $f is a working note at the repo root; keep it beside its receipts (bench-artifacts/<run>/) or under docs/research/ - product documents are named in ROOT_DOC_ALLOWLIST" >&2
+            done
+    fi
 fi
 
-if [ -n "$hits" ] || [ "$license_fail" -ne 0 ] || [ "$glyph_fail" -ne 0 ]; then
+if [ -n "$hits" ] || [ "$license_fail" -ne 0 ] || [ "$glyph_fail" -ne 0 ] ||
+    [ "$note_fail" -ne 0 ]; then
     [ -n "$hits" ] && printf '%s\n' "$hits" >&2
-    echo "hygiene gate: machine-specific paths / AI artifacts / license gaps / glyphs found (see above)" >&2
+    echo "hygiene gate: machine-specific paths / AI artifacts / root-level working notes / license gaps / glyphs found (see above)" >&2
     exit 1
 fi
 echo "hygiene gate: clean"
@@ -141,6 +179,15 @@ fi
 printf 'portable ~ and repo-relative paths only\n' >"$tmp"
 if [ -n "$(printf '%s\n' "$tmp" | scan_files)" ]; then
     echo "hygiene gate: SELF-TEST FAILED (clean file flagged)" >&2
+    exit 1
+fi
+
+# Root-note self-test: fires on a stray root-level note, stays silent on
+# product documents, non-markdown files and notes filed under docs/.
+root_notes=$(printf '%s\n' W4-FINDINGS.md README.md docs/research/note.md \
+    Cargo.toml CHANGELOG.md BENCHMARK.md | root_note_violations)
+if [ "$root_notes" != "W4-FINDINGS.md" ]; then
+    echo "hygiene gate: SELF-TEST FAILED (root-note gate misclassified: $root_notes)" >&2
     exit 1
 fi
 
