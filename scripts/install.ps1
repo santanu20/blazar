@@ -99,7 +99,7 @@ if ($Uninstall) {
             Remove-Item $InstallDir -Force
             Write-Host ">>> removed $InstallDir"
         } else {
-            Write-Host ">>> removed blazar.exe (kept $InstallDir: it holds other files)"
+            Write-Host ">>> removed blazar.exe (kept ${InstallDir}: it holds other files)"
         }
     }
     # F155b: exact-entry PATH removal (split on ';', drop the precise
