@@ -27,6 +27,7 @@ count), never failed - models legitimately choose one call at a time.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -396,7 +397,9 @@ class Battery:
             t6_st = st
             if st == 200:
                 msg = v.get("choices", [{}])[0].get("message", {})
-                text = (msg.get("content") or "") + json.dumps(msg.get("tool_calls") or [])
+                text = (msg.get("content") or "") + json.dumps(
+                    msg.get("tool_calls") or []
+                )
                 t6_text = text
                 if "21" in text or "rain" in text.lower():
                     break
@@ -685,12 +688,10 @@ class Battery:
             ]
             parseable = 0
             for c in complete:
-                try:
+                with contextlib.suppress(ValueError):
                     parseable += (
                         1 if isinstance(json.loads(c["arguments"]), dict) else 0
                     )
-                except ValueError:
-                    pass
             ok = sse_ok and bool(complete) and parseable == len(complete)
             ev = "; ".join(
                 f"{c['id']}:{c['name']}({c['arguments'][:40]})"

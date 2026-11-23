@@ -55,6 +55,7 @@ def fn_line(name: str, path: Path) -> int | None:
     out = subprocess.run(
         FN.format(name=re.escape(name), path=path),
         shell=True,
+        check=False,
         capture_output=True,
         text=True,
         cwd=REPO,
@@ -68,6 +69,7 @@ def find_across_crates(name: str) -> Path | None:
     out = subprocess.run(
         FN.format(name=re.escape(name), path="crates"),
         shell=True,
+        check=False,
         capture_output=True,
         text=True,
         cwd=REPO,

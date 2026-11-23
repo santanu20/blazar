@@ -42,6 +42,7 @@ tracked here.
 - **Benchmark parity and variant deltas anchor on healthy default cells.** An errored gateway row no longer reads as a -100% parity outlier, a failed same-engine baseline surfaces its orphan speed instead of crashing the renderer, and the mistral.rs staged view is no longer dereferenced back into the shared models dir (stray projectors poisoned every v0.9.5 direct cell).
 - **Tool-result grounding is not pinned to draw luck.** The tool-call battery's T6 case re-runs once when a tiny model re-emits the call instead of grounding on the first draw, and reports the attempt count.
 - **Clippy backlog in the planner, autotune and gateway code** - let-else/let-chain collapses, `&Path` signatures, a sync `autotune_schedule_tick` (it held no await point) and a needless `unsafe` block removed from the autotune integration test. No behavior change.
+- **Ruff backlog in the scripts** - `subprocess.run` calls without `check`, a `try/except/pass` replaced by `contextlib.suppress`, an ambiguous `l` loop variable, an unclosed file handle in the effective-config reconciliation check and an unused unpack target. No behavior change.
 
 ## [0.34.3] - 2026-11-21
 

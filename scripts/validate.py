@@ -15022,7 +15022,7 @@ def phase_commands() -> None:
     # this phase, so require its row with the inventory keys intact.
     s1 = cli("kv", "status", "--json")
     try:
-        _kvrows = [json.loads(l) for l in s1.stdout.splitlines() if l.strip()]
+        _kvrows = [json.loads(line) for line in s1.stdout.splitlines() if line.strip()]
         _kvrows_ok = all(
             {"model", "banks", "legacy_banks", "bytes", "newest_ctx"} <= set(r)
             for r in _kvrows
@@ -18668,14 +18668,11 @@ def phase_benchqc() -> None:
         # argv. Pin the line so the reconciliation provably RAN for
         # this spawn - the parsers' correctness is unit-tested in Rust,
         # this proves the wiring fired end-to-end.
-        eff_line = next(
-            (
-                ln.strip()[:120]
-                for ln in open(DAEMON.log_path, errors="replace")
-                if "effective config" in ln
-            ),
-            "",
-        )
+        with open(DAEMON.log_path, errors="replace") as eff_log:
+            eff_line = next(
+                (ln.strip()[:120] for ln in eff_log if "effective config" in ln),
+                "",
+            )
         check(
             ph,
             "effective-config reconciliation ran (post-spawn probe+compare)",
@@ -18975,7 +18972,7 @@ def phase_benchqc() -> None:
         agg_lock = threading.Lock()
 
         def _agg_stream(i: int) -> None:
-            st, _, v = http_json(
+            _, _, v = http_json(
                 "POST",
                 "/v1/chat/completions",
                 {
