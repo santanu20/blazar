@@ -63,7 +63,7 @@ $TaskName = 'blazar'
 
 function Stop-BlazarGraceful([string]$ExePath) {
     # F155: drain in-flight requests first (`blazar stop` HTTP), then
-    # force-kill only survivors — install.sh:170 parity.
+    # force-kill only survivors - install.sh:170 parity.
     try {
         if ($ExePath -and (Test-Path $ExePath)) {
             & $ExePath stop *> $null
@@ -103,7 +103,7 @@ if ($Uninstall) {
         }
     }
     # F155b: exact-entry PATH removal (split on ';', drop the precise
-    # install dir, rejoin) — substring matching over-matches sibling
+    # install dir, rejoin) - substring matching over-matches sibling
     # directories and the leading-';'-only replace left stale entries.
     $userPath = Get-UserPathRaw
     if ($userPath) {
@@ -134,7 +134,7 @@ function Register-BlazarTask([string]$ExePath) {
 
 if (-not $Build -and -not $Repo -and -not $ApiBase) {
     $Repo = 'santanu20/blazar'
-    Write-Host ">>> -Repo unset — using the published repo $Repo"
+    Write-Host ">>> -Repo unset - using the published repo $Repo"
 }
 if (-not $ApiBase) { $ApiBase = "https://api.github.com/repos/$Repo" }
 
@@ -247,7 +247,7 @@ try {
     Stop-BlazarGraceful (Join-Path $InstallDir 'blazar.exe')
     Copy-Item $exe (Join-Path $InstallDir 'blazar.exe') -Force
 
-    # F155b: exact-entry PATH add — `-notlike "*dir*"` over-matched
+    # F155b: exact-entry PATH add - `-notlike "*dir*"` over-matched
     # sibling directories (Programs\blazar vs Programs\blazar-old).
     $userPath = Get-UserPathRaw
     if (-not $userPath) { $userPath = '' }
@@ -262,7 +262,7 @@ try {
     Write-Host ">>> Installed blazar $ver to $installedExe"
     Write-Host ">>> Next: blazar pull <model> (find: blazar search qwen3) | blazar run <model> | blazar doctor"
     # GPU preflight (advise-only; Windows drivers come from the vendor's
-    # own installer — this script never installs kernel drivers). The
+    # own installer - this script never installs kernel drivers). The
     # engine bootstrap below picks its asset by driver presence, so a
     # driverless NVIDIA box would silently serve on CPU: detect and say
     # so instead. Opt out: BLAZAR_AUTO_DRIVER=0.
@@ -333,7 +333,7 @@ try {
     Write-Host '      blazar engine list                       what is installed; blazar engine use <tag> switches the serving engine'
     if ($WithService) { Register-BlazarTask $installedExe }
     elseif ($taskExisted) {
-        # F155b: binary was replaced under an existing task — bring the
+        # F155b: binary was replaced under an existing task - bring the
         # daemon back up on the new build (Register path re-starts it).
         Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Write-Host ">>> restarted scheduled task '$TaskName' on the upgraded binary"

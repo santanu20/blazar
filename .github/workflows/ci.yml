@@ -184,6 +184,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Windows PowerShell 5.1 reads a BOM-less script as the ANSI code page,
+      # where the last byte of an em dash decodes to a quote character and
+      # shifts every string after it. Keep both files ASCII and prove it.
+      - name: PowerShell sources are ASCII
+        shell: pwsh
+        run: |
+          $hits = Select-String -Path scripts/install.ps1, tests/install_ps1_smoke.ps1 -Pattern '[^\x00-\x7F]'
+          if ($hits) { $hits | ForEach-Object { Write-Host ("non-ASCII character at {0}:{1}" -f $_.Path, $_.LineNumber) }; exit 1 }
+          Write-Host 'ascii ok'
       # Parse before running: the parser reports every syntax error in both
       # Windows PowerShell 5.1 and PowerShell 7, where a plain run only
       # surfaces the lines it reaches.
@@ -192,14 +201,14 @@ jobs:
         run: |
           $tokens = $null; $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/install.ps1'), [ref]$tokens, [ref]$errors)
-          if ($errors.Count) { $errors | ForEach-Object { Write-Host $_.Message }; exit 1 }
+          if ($errors.Count) { $errors | ForEach-Object { Write-Host ("line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }; exit 1 }
           Write-Host 'parse ok (Windows PowerShell 5.1)'
       - name: parse scripts/install.ps1 (PowerShell 7)
         shell: pwsh
         run: |
           $tokens = $null; $errors = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/install.ps1'), [ref]$tokens, [ref]$errors)
-          if ($errors.Count) { $errors | ForEach-Object { Write-Host $_.Message }; exit 1 }
+          if ($errors.Count) { $errors | ForEach-Object { Write-Host ("line {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }; exit 1 }
           Write-Host 'parse ok (PowerShell 7)'
       # The only place install.ps1 runs for real: a release download, the
       # plain install, the uninstall, and the -WithService logon task.
