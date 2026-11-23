@@ -359,40 +359,52 @@ class Battery:
         )
 
         # T6 multi-turn: assistant tool_call + tool result in, answer out.
-        st, v, _ = self.chat(
-            [WEATHER],
-            [
-                {"role": "user", "content": "Weather in Tokyo?"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {
-                                "name": "get_weather",
-                                "arguments": json.dumps({"city": "Tokyo"}),
-                            },
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_1",
-                    "content": '{"temp_c": 21, "condition": "light rain"}',
-                },
-            ],
-        )
-        text = ""
-        if st == 200:
-            msg = v.get("choices", [{}])[0].get("message", {})
-            text = (msg.get("content") or "") + json.dumps(msg.get("tool_calls") or [])
-        ok = st == 200 and ("21" in text or "rain" in text.lower())
+        # Task-bearing history + one retry: tiny models occasionally
+        # misread the tool result on the first draw and re-emit the call
+        # instead of grounding (observed live 2026-11-22: "error in the
+        # previous call" re-draw, then a clean grounded answer on the
+        # unchanged rerun) - tool-result transport is what this pins,
+        # not draw luck (same policy as T3).
+        t6_text, t6_st, t6_attempts = "", 0, 0
+        for _ in range(2):
+            t6_attempts += 1
+            st, v, _ = self.chat(
+                [WEATHER],
+                [
+                    {"role": "user", "content": "Weather in Tokyo?"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": json.dumps({"city": "Tokyo"}),
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": '{"temp_c": 21, "condition": "light rain"}',
+                    },
+                ],
+            )
+            t6_st = st
+            if st == 200:
+                msg = v.get("choices", [{}])[0].get("message", {})
+                text = (msg.get("content") or "") + json.dumps(msg.get("tool_calls") or [])
+                t6_text = text
+                if "21" in text or "rain" in text.lower():
+                    break
+        ok = t6_st == 200 and ("21" in t6_text or "rain" in t6_text.lower())
         self.record(
             "T6 tool result -> grounded answer",
             ok,
-            f"status={st} answer={text[:160]!r}",
+            f"status={t6_st} answer={t6_text[:160]!r} attempts={t6_attempts}",
         )
 
         # T7 strict structured output alongside tools capability.
