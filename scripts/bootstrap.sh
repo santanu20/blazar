@@ -131,7 +131,11 @@ if [ -n "$MISSING_TOOLS" ]; then
         case "$PM" in
             apt-get) $SUDO apt-get update && $SUDO apt-get install -y $PKGS ;;
             dnf) $SUDO dnf install -y $PKGS ;;
-            pacman) $SUDO pacman -Sy --noconfirm --needed $PKGS ;;
+            # No -Sy: refreshing the sync database without a full upgrade is a
+            # partial upgrade, which drifts kernel modules against the kernel.
+            # When the package is newer than the system, upgrade the system as
+            # a whole (sudo pacman -Syu) instead.
+            pacman) $SUDO pacman -S --noconfirm --needed $PKGS ;;
             zypper) $SUDO zypper --non-interactive install $PKGS ;;
         esac
     fi
@@ -152,8 +156,8 @@ if [ "$MINIMAL" = 1 ]; then
     status "compile toolchain ready (installer will continue the source build)"
 else
     status "dev environment ready. Next:"
-    status "  cargo test --workspace -- --test-threads=1"
-    status "  cargo clippy --workspace --all-targets -- -D warnings"
+    status "  cargo nextest run --workspace"
+    status "  cargo clippy --workspace --all-targets --all-features -- -D warnings"
     status "  sh tests/install_e2e.sh"
     status "  sh scripts/install.sh --build   # system-wide install from this checkout"
 fi

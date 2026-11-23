@@ -11,7 +11,7 @@
 #
 # Environment:
 #   BLAZAR_PUSH_REMOTE  remote name (default: origin)
-#   BLAZAR_PUSH_FROM    local branch to publish (default: master)
+#   BLAZAR_PUSH_FROM    local branch to publish (default: main)
 #   BLAZAR_PUSH_TO      remote branch (default: main)
 #   BLAZAR_PUSH_FAST    set to 1 to skip the test suite (CI already
 #                          ran it; never for release pushes)
@@ -21,7 +21,7 @@
 set -eu
 
 remote=${BLAZAR_PUSH_REMOTE:-origin}
-src_branch=${BLAZAR_PUSH_FROM:-master}
+src_branch=${BLAZAR_PUSH_FROM:-main}
 dst_branch=${BLAZAR_PUSH_TO:-main}
 
 say() { printf 'push-export: %s\n' "$1"; }
@@ -46,12 +46,17 @@ if [ -n "$dirty" ]; then
     exit 1
 fi
 
-# Gates, in fail-fast order (cheapest first).
+# Gates, in fail-fast order (cheapest first). The Rust gates are the
+# same commands CI runs, so a green run here means a green run there.
 sh scripts/check_hygiene.sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --quiet -- -D warnings
+cargo clippy --workspace --all-targets --all-features --quiet -- -D warnings
 if [ "${BLAZAR_PUSH_FAST:-0}" != "1" ]; then
-    cargo test --workspace -- --test-threads=1
+    cargo nextest --version >/dev/null 2>&1 || {
+        say "cargo-nextest missing - install it with: cargo install cargo-nextest --locked" >&2
+        exit 1
+    }
+    cargo nextest run --workspace
 fi
 
 # Credential-shaped scan on the exact tree being pushed (HEAD), not
