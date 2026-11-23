@@ -26,6 +26,7 @@ tracked here.
 - **`slot_cap` honors the manual overlay pin before the config default.**
 - **Census totals carry the raw card identity**, not the CUDA-carved lister view.
 - **Effective-engine-config verification extended to the SGLang and vLLM lanes**, not just llama.cpp.
+- **Live validation hardened after the 2026-11-22 saturation campaign**: the spec-degrade contract is pinned as a live lane (a spec pair that cannot fit the card boots dense at full residency with a loud teaching, never a refusal and never a legal-but-offloaded spec spawn); four parallel chat streams must all complete with aggregate tok/s holding at least 0.9x the single-stream median; sentinel truncation QC expects `schema_violation` on the `/api/why` trace; and the benchqc gate asserts the post-spawn effective-config reconciliation line.
 - **Live validation survives wedged children and host-state-dependent lanes.** CLI calls run in their own process group under a hard timeout (a child that ignores SIGKILL is abandoned, never awaited forever); the host-pressure eviction of an offloaded image lane and a live-RAM-clamped offload recipe record as host-state boundaries rather than product failures; the fleet adopt/join teaching legs run on freshly allocated UDP ports under an isolated XDG home; `phase_commands` covers `kv status/inspect/gc` and `engine card`; and the `/api/ps` golden carries the effective-config and host-charge columns.
 
 ### Fixed
