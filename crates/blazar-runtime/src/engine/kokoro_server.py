@@ -11,6 +11,8 @@ shim execs this script with. Endpoints:
 
 Voice errors from kokoro (unknown name, empty input) map to 400 with
 the message intact so the gateway can teach; everything else is a 500.
+Every failure is answered as JSON - a lane child must never drop the
+connection, because the gateway surfaces the body as the teaching text.
 The server binds 127.0.0.1 only - it is a lane-local child, not a
 public endpoint.
 """
@@ -20,6 +22,7 @@ import json
 import math
 import os
 import sys
+import threading
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,8 +32,14 @@ from kokoro_onnx import Kokoro
 
 LANE = Path(__file__).resolve().parent
 DEFAULT_VOICE = "af_heart"
+# A request is a small JSON object; anything past this is a client bug.
+MAX_BODY_BYTES = 1 << 20
 
 kokoro = Kokoro(str(LANE / "kokoro.onnx"), str(LANE / "voices.bin"))
+# ThreadingHTTPServer answers requests concurrently while the Kokoro session
+# is one shared object whose create() is not documented as thread-safe, so
+# synthesis is serialized rather than racing on the model.
+synthesis_lock = threading.Lock()
 
 
 def voice_names():
@@ -52,6 +61,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.end_headers()
         self.wfile.write(body)
 
@@ -63,15 +74,45 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.reply_json(404, {"error": "not found"})
 
+    def read_json_body(self):
+        """The request body as a JSON object, or None after replying 4xx."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.reply_json(400, {"error": "Content-Length must be a number"})
+            return None
+        if length < 0:
+            self.reply_json(400, {"error": "Content-Length must not be negative"})
+            return None
+        if length > MAX_BODY_BYTES:
+            # Drain a bounded prefix so the client reads the 413 instead of
+            # hitting a reset while it is still writing the body.
+            remaining = min(length, MAX_BODY_BYTES)
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            self.reply_json(
+                413, {"error": f"request body exceeds {MAX_BODY_BYTES} bytes"}
+            )
+            return None
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self.reply_json(400, {"error": "request body must be JSON"})
+            return None
+        if not isinstance(body, dict):
+            self.reply_json(400, {"error": "request body must be a JSON object"})
+            return None
+        return body
+
     def do_POST(self):
         if self.path != "/tts":
             self.reply_json(404, {"error": "not found"})
             return
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            self.reply_json(400, {"error": "request body must be JSON"})
+        body = self.read_json_body()
+        if body is None:
             return
 
         text = str(body.get("input", "")).strip()
@@ -102,12 +143,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            samples, sample_rate = kokoro.create(
-                text, voice=voice, speed=speed, lang=lang
-            )
+            with synthesis_lock:
+                samples, sample_rate = kokoro.create(
+                    text, voice=voice, speed=speed, lang=lang
+                )
         except ValueError as err:
             # kokoro's own contract violations (unknown voice, bad speed)
             self.reply_json(400, {"error": str(err)})
+            return
+        except Exception as err:
+            # The lane contract promises a 500 over a dropped connection
+            # for anything the model raises that is not a contract error.
+            self.reply_json(500, {"error": f"synthesis failed: {err}"})
             return
 
         buf = io.BytesIO()
@@ -115,7 +162,11 @@ class Handler(BaseHTTPRequestHandler):
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(sample_rate)
-            wav.writeframes((samples * 32767).astype("<i2").tobytes())
+            # Samples outside [-1, 1] would wrap when cast to int16; clipping
+            # keeps the waveform bounded instead of turning into noise.
+            wav.writeframes(
+                (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+            )
         wav_bytes = buf.getvalue()
 
         self.send_response(200)
