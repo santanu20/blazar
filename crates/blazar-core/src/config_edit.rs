@@ -822,6 +822,55 @@ pub fn schema_sections(raw_file: &str) -> Vec<SectionSchema> {
     out
 }
 
+/// Every scalar pin in the file as a dotted key, in document order:
+/// root knobs bare (`log_level`), table leaves dotted
+/// (`sglang.grammar_backend`), dotted headers re-quoted exactly the way
+/// the set/unset grammar accepts them (`model_overrides."qwen3:8b".ctx_size`).
+/// Array-of-tables sections (`[[keys]]`, `[[models]]`, ...) are skipped:
+/// their entries are not dotted-key-addressable - dedicated planes own
+/// them. Powers "pinned in file vs built-in default" badges in editors.
+pub fn file_pins(raw: &str) -> Vec<String> {
+    let bare = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    };
+    let dotted_seg = |s: &str| {
+        if bare(s) {
+            s.to_string()
+        } else {
+            format!("\"{s}\"")
+        }
+    };
+    let mut pins = Vec::new();
+    let mut path: Vec<String> = Vec::new();
+    let mut in_array_section = false;
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.starts_with("[[") {
+            in_array_section = true;
+            path.clear();
+        } else if t.starts_with('[') {
+            in_array_section = false;
+            path = header_segments(line).unwrap_or_default();
+        } else if !in_array_section && !t.starts_with('#') {
+            if let Some(k) = key_before_eq(t) {
+                if path.is_empty() {
+                    pins.push(k.to_string());
+                } else {
+                    let joined = path
+                        .iter()
+                        .map(|s| dotted_seg(s))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    pins.push(format!("{joined}.{k}"));
+                }
+            }
+        }
+    }
+    pins
+}
+
 /// The pinned line for `key` (root span or table leaf, with the
 /// merged model-name retry), if the file pins one. Powers "current
 /// value" displays in editors.
@@ -1322,6 +1371,43 @@ mod tests {
         let pins = table_pins(raw, "semantic_cache");
         assert_eq!(pins, vec!["enabled = true".to_string()]);
         assert_eq!(table_pins(raw, "sglang"), [] as [String; 0]);
+    }
+    #[test]
+    fn unit__file_pins__dotted_keys_skip_arrays_and_comments() {
+        let raw = concat!(
+            "# lead comment with a fake key: bogus = 1\n",
+            "host = \"127.0.0.1\"\n",
+            "log_level = \"debug\"\n",
+            "\n",
+            "[sglang]\n",
+            "grammar_backend = \"outlines\"\n",
+            "\n",
+            "[engine_env]\n",
+            "MY_VAR = \"x\"\n",
+            "\n",
+            "[model_overrides.\"qwen3:8b\"]\n",
+            "ctx_size = 8192\n",
+            "\n",
+            "[[keys]]\n",
+            "name = \"admin\"\n",
+            "key = \"sk-live\"\n",
+            "\n",
+            "[semantic_cache]\n",
+            "enabled = true\n",
+        );
+        assert_eq!(
+            file_pins(raw),
+            vec![
+                "host",
+                "log_level",
+                "sglang.grammar_backend",
+                "engine_env.MY_VAR",
+                // dotted header re-quoted exactly as set/unset accepts
+                "model_overrides.\"qwen3:8b\".ctx_size",
+                // [[keys]] entries skipped: dedicated plane owns them
+                "semantic_cache.enabled",
+            ]
+        );
     }
     #[test]
     fn unit__map_table_pins__subtable_pins_listed_with_model_names() {

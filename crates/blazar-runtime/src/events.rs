@@ -2,6 +2,8 @@
 //! consumers are structured logs, `/api/events` SSE, and the metrics
 //! exporter. No silent anything.
 
+use std::collections::VecDeque;
+
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -276,7 +278,18 @@ impl InstanceState {
 #[derive(Debug, Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<BlazarEvent>,
+    /// Bounded retention of recent events (observability replay for
+    /// consumers that connect late - SSE dashboards refreshing a
+    /// browser lose their stream on every reload). Arc so the derived
+    /// Clone keeps bus semantics: a cloned bus shares one ring.
+    /// Plain mutex: the critical section is a push + trim.
+    ring: std::sync::Arc<std::sync::Mutex<VecDeque<BlazarEvent>>>,
 }
+
+/// Replay depth: enough that a dashboard refresh after a burst (pull
+/// progress, failover ladder) still shows what happened; small enough
+/// that retention stays a rounding error next to the broadcast buffer.
+const REPLAY_DEPTH: usize = 256;
 
 impl Default for EventBus {
     fn default() -> Self {
@@ -288,19 +301,51 @@ impl EventBus {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
+        Self {
+            tx,
+            ring: std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new())),
+        }
     }
 
     /// Publish to all subscribers. Returns the receiver count; publishing
     /// with zero subscribers is not an error (fire-and-forget observability).
+    /// The event is recorded for replay BEFORE broadcasting: a consumer
+    /// that subscribes and then snapshots [`recent`] can therefore see a
+    /// rare duplicate at the boundary (recorded + received live) but
+    /// never a gap - missed events are the failure mode dashboards
+    /// actually care about.
     #[allow(clippy::must_use_candidate)] // observability fire-and-forget
     pub fn publish(&self, event: BlazarEvent) -> usize {
+        {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if ring.len() == REPLAY_DEPTH {
+                ring.pop_front();
+            }
+            ring.push_back(event.clone());
+        }
         self.tx.send(event).unwrap_or(0)
     }
 
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<BlazarEvent> {
         self.tx.subscribe()
+    }
+
+    /// Recent events, oldest first, up to [`REPLAY_DEPTH`]. Replay
+    /// consumers subscribe FIRST, then snapshot this, then stream live:
+    /// replay-then-live covers every event exactly once except a
+    /// microsecond boundary duplicate (see [`publish`]).
+    #[must_use]
+    pub fn recent(&self) -> Vec<BlazarEvent> {
+        self.ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -367,6 +412,42 @@ mod tests {
     async fn unit__bus__no_subscriber__not_an_error() {
         let bus = EventBus::default();
         assert_eq!(bus.publish(BlazarEvent::QueueDepth { n: 1 }), 0);
+    }
+
+    #[test]
+    fn unit__bus__recent_replays_published_events_oldest_first() {
+        let bus = EventBus::default();
+        bus.publish(BlazarEvent::QueueDepth { n: 1 });
+        bus.publish(BlazarEvent::QueueDepth { n: 2 });
+        // A late consumer (dashboard refresh) sees the history it missed.
+        assert_eq!(
+            bus.recent(),
+            vec![
+                BlazarEvent::QueueDepth { n: 1 },
+                BlazarEvent::QueueDepth { n: 2 }
+            ]
+        );
+    }
+
+    #[test]
+    fn unit__bus__recent_is_bounded__oldest_evicted_first() {
+        let bus = EventBus::default();
+        for n in 0..(REPLAY_DEPTH + 10) {
+            bus.publish(BlazarEvent::QueueDepth { n });
+        }
+        let recent = bus.recent();
+        assert_eq!(recent.len(), REPLAY_DEPTH);
+        assert_eq!(
+            recent.first(),
+            Some(&BlazarEvent::QueueDepth { n: 10 }),
+            "the oldest events fell off, the newest REPLAY_DEPTH stayed"
+        );
+        assert_eq!(
+            recent.last(),
+            Some(&BlazarEvent::QueueDepth {
+                n: REPLAY_DEPTH + 9
+            })
+        );
     }
 
     /// Pins the complete 5x5 transition matrix: exactly the 8 documented

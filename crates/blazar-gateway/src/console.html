@@ -679,6 +679,12 @@ function renderConfig() {
   const d = (ce && ce.data) || {};
   const cfg = d.config || {};
   const schema = d.schema || [];
+  const pinned = new Set(d.pins || []);
+  // Pinned-in-file vs built-in-default badge — the `blazar config get`
+  // distinction, per knob.
+  const pinBadge = (key) => pinned.has(key)
+    ? '<span class="badge ok" title="pinned in config.toml — unset restores the default">pinned</span>'
+    : '<span class="badge" title="no file pin — built-in default in effect">default</span>';
   file.textContent = d.file && d.file.present ? "file on disk" : "no file — built-in defaults";
   file.className = "badge " + (d.file && d.file.present ? "ok" : "");
 
@@ -693,11 +699,12 @@ function renderConfig() {
   const rootRows = rootKeys.map((k) => [
     `<b>${esc(k)}</b>`,
     jsonLine(cfg[k]),
+    pinBadge(k),
     `<button class="btn sm" data-action="cfg-edit" data-arg="${esc(k)}" type="button">edit</button> ` +
     `<button class="btn sm danger" data-action="cfg-unset" data-arg="${esc(k)}" type="button">unset</button>`,
   ]);
   $("cfg-root").innerHTML = rootRows.length
-    ? table(["knob", "effective value", "actions"], rootRows)
+    ? table(["knob", "effective value", "pin", "actions"], rootRows)
     : '<p class="gap">no root knobs visible</p>';
 
   // Dedicated planes own array-of-tables sections — point at them
@@ -733,6 +740,7 @@ function renderConfig() {
         rows.push([
           `<b>${esc(k)}</b>`,
           jsonLine(body[k]),
+          pinBadge(dotted(sec.name, k)),
           `<button class="btn sm" data-action="cfg-edit" data-arg="${esc(dotted(sec.name, k))}" type="button">edit</button> ` +
           `<button class="btn sm danger" data-action="cfg-unset" data-arg="${esc(dotted(sec.name, k))}" type="button">unset</button>`,
         ]);
@@ -742,6 +750,7 @@ function renderConfig() {
         rows.push([
           `<b>${esc(leaf)}</b>`,
           jsonLine(body ? body[leaf] : undefined),
+          pinBadge(sec.name + "." + leaf),
           `<button class="btn sm" data-action="cfg-edit" data-arg="${esc(sec.name + "." + leaf)}" type="button">edit</button> ` +
           `<button class="btn sm danger" data-action="cfg-unset" data-arg="${esc(sec.name + "." + leaf)}" type="button">unset</button>`,
         ]);
@@ -751,7 +760,7 @@ function renderConfig() {
     const owner = OWNERS[sec.name];
     const headers = Array.isArray(body)
       ? ["entry", "value"]
-      : [kind === "entries" ? "entry" : "knob", "value", "actions"];
+      : [kind === "entries" ? "entry" : "knob", "value", "pin", "actions"];
     html += `<details><summary>${esc(sec.name)}<span class="muted">${count} ${kind}${sec.is_map ? " · free-form map" : ""}</span></summary><div>` +
       (count ? table(headers, rows)
              : '<p class="gap">empty section</p>') +
@@ -870,7 +879,7 @@ async function startEvents() {
           `<span class="ev-kind">${esc(e.kind)}</span>`,
           `<span class="mono-sm" title="${esc(e.body)}">${esc(e.body.length > 140 ? e.body.slice(0, 140) + "…" : e.body)}</span>`,
         ]))
-      : '<p class="gap">no events yet — engine updates, pulls, failovers and config reloads land here</p>';
+      : '<p class="gap">no events on record — engine updates, pulls, failovers and config reloads land here; recent history replays on every load</p>';
   };
   try {
     const r = await fetch("/api/events", { signal: ctl.signal, headers: adminAuth() || {} });

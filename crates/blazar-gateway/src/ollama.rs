@@ -1203,31 +1203,42 @@ fn pull_event_line(names: &[String], e: &blazar_runtime::BlazarEvent) -> (String
 }
 
 /// GET /api/events - SSE of every `BlazarEvent` (dashboards).
+/// Connects get the bus's bounded replay backlog FIRST (a browser
+/// refresh must not look like "nothing happened while I was away"),
+/// then the live stream. Record-before-send ordering in the bus makes
+/// this no-gap; a microsecond boundary duplicate is possible and
+/// harmless for an observability strip.
 pub async fn events(State(state): State<Arc<AppState>>) -> Response {
     let rx2 = state.bus.subscribe();
     // F18: scrub parity with /api/watch - event payloads today carry
     // names/counts only, but error strings can surface remote URLs.
     let scrub = state.cfg().pii_scrub;
+    let frame = move |e: blazar_runtime::BlazarEvent| {
+        let body = serde_json::to_value(&e).unwrap_or_default();
+        let body = if scrub {
+            crate::scrub::scrub_value(&body)
+        } else {
+            body
+        };
+        Bytes::from(format!("event: {}\ndata: {body}\n\n", event_kind(&e)))
+    };
+    let backlog: Vec<Bytes> = state.bus.recent().into_iter().map(frame.clone()).collect();
     let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
     let mapped = TsExt::filter_map(events, move |ev| match ev {
-        Ok(e) => {
-            let body = serde_json::to_value(&e).unwrap_or_default();
-            let body = if scrub {
-                crate::scrub::scrub_value(&body)
-            } else {
-                body
-            };
-            Some(Ok::<_, std::io::Error>(Bytes::from(format!(
-                "event: {}\ndata: {body}\n\n",
-                event_kind(&e),
-            ))))
-        }
+        Ok(e) => Some(Ok::<_, std::io::Error>(frame(e))),
         Err(_) => None,
     });
+    let combined = futures::stream::iter(
+        backlog
+            .into_iter()
+            .map(Ok::<_, std::io::Error>)
+            .collect::<Vec<_>>(),
+    )
+    .chain(mapped);
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
-        .body(Body::from_stream(mapped))
+        .body(Body::from_stream(combined))
         .unwrap()
 }
 

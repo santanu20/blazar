@@ -155,10 +155,14 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
     let mut engine =
         LlamaCppEngine::new(blazar_runtime::probe_manifest(&stub_bin(), "stub").unwrap());
     engine.child_env = child_env;
+    // One bus, shared by supervisor and gateway state exactly like the
+    // serve path builds it - separate instances would silently detach
+    // /api/events (and the replay ring) from every supervisor publish.
+    let bus = EventBus::default();
     let mut s = Supervisor::new(
         dirs.clone(),
         config.clone(),
-        EventBus::default(),
+        bus.clone(),
         Hardware {
             physical_cores: 4,
             total_ram_mib: 16_000,
@@ -175,12 +179,7 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
     s.reaper_interval = Duration::from_hours(1); // reaper off; tests drive lifecycle
     let sup = Arc::new(s);
     let reaper = sup.spawn_reaper();
-    let state = Arc::new(AppState::new(
-        dirs.clone(),
-        &config,
-        sup.clone(),
-        EventBus::default(),
-    ));
+    let state = Arc::new(AppState::new(dirs.clone(), &config, sup.clone(), bus));
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -641,6 +640,11 @@ async fn e2e__config_set_persists_validates_and_reports_cold_only() {
         .await
         .unwrap();
     assert_eq!(body["config"]["log_level"], "debug");
+    let pins = body["pins"].as_array().expect("pins array");
+    assert!(
+        pins.iter().any(|v| v == "log_level"),
+        "file pins badge source names the knob: {pins:?}"
+    );
 
     // Unknown knob: rejected with teaching, file untouched.
     let r = set("zzz_bogus_knob", "1").await.unwrap();
@@ -697,6 +701,20 @@ async fn e2e__config_unset_removes_pin_then_reports_not_pinned_and_unknown() {
     let cfg_path = ts.state.sup.dirs.config_file();
     let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
     assert!(!raw.contains("log_level"), "pin gone from file: {raw:?}");
+    // The read plane drops the pin from the badge source too.
+    let body: serde_json::Value = c
+        .get(format!("{}/api/config", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pins = body["pins"].as_array().expect("pins array");
+    assert!(
+        !pins.iter().any(|v| v == "log_level"),
+        "unset removes the badge: {pins:?}"
+    );
     // Second unset: honest no-op, not an error (default in effect).
     let r = c
         .post(format!("{}/api/config/unset", ts.base))
@@ -721,6 +739,52 @@ async fn e2e__config_unset_removes_pin_then_reports_not_pinned_and_unknown() {
         .unwrap()
         .status();
     assert_eq!(status, 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__events_sse_replays_backlog_before_live_stream() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // Fire an event NOBODY is watching (zero SSE subscribers at publish
+    // time): a config reload publishes ConfigReloaded through the bus.
+    // (Fresh test dirs carry no config.toml - write one so reload has
+    // something valid to re-read.)
+    let cfg_path = ts.state.sup.dirs.config_file();
+    std::fs::write(&cfg_path, Config::default().to_toml().unwrap()).unwrap();
+    let r = c
+        .post(format!("{}/api/config/reload", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // A LATE consumer connecting now must still see that history: the
+    // bus replays its bounded ring before the live stream - a browser
+    // refresh must not read as "nothing happened while I was away".
+    let r = c
+        .get(format!("{}/api/events", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let mut buf = String::new();
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut r = r;
+        while let Some(chunk) = r.chunk().await.unwrap() {
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            if buf.contains("config_reloaded") {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(seen.is_ok(), "stream produced chunks: {buf:?}");
+    assert!(
+        buf.contains("event: config_reloaded"),
+        "backlog replay carries the historical event: {buf:?}"
+    );
+    assert!(buf.starts_with("event: "), "SSE frame shape from byte one");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 

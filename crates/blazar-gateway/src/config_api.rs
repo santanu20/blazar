@@ -125,11 +125,16 @@ pub async fn get(
             })
         })
         .collect();
+    // Which knobs the FILE pins (dotted keys, set/unset grammar form):
+    // lets editors badge "pinned in file" against "built-in default",
+    // the same distinction `blazar config get` prints.
+    let pins = blazar_core::config_edit::file_pins(&raw_file);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "config": cfg,
             "schema": schema,
+            "pins": pins,
             "file": {"present": state.dirs.config_file().is_file()},
         })),
     )
