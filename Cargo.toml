@@ -76,7 +76,9 @@ async-trait = "0.1"
 dashmap = "6"
 http-body = "1"
 tokio-stream = { version = "0.1", features = ["sync"] }
-iai-callgrind = "0.16.1"
+# Micro-bench harness for blazar-core, trimmed to what `cargo bench` needs so
+# plotters and rayon stay out of the dev tree.
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
