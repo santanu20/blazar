@@ -58,7 +58,9 @@
 #                              target (default: the service user's
 #                              ~/.local/share/blazar; test redirection
 #                              knob, like BLAZAR_UNIT_PATH)
-#   GITHUB_TOKEN               optional API token (rate limits, private repos)
+#   GITHUB_TOKEN               optional GitHub API bearer token: raises the
+#                              unauthenticated rate limit (it travels to curl
+#                              on stdin, so it never shows in a process list)
 
 # Wrap everything in main() so a truncated partial download cannot execute
 # half a script (same guard technique as the ollama installer).
@@ -118,8 +120,10 @@ esac
 
 fetch() {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        curl --fail --silent --show-error --location $SECURE \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" "$@"
+        # The token goes in on stdin ("-H @-" reads headers from there) so
+        # it never appears in a process list.
+        printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" \
+            | curl --fail --silent --show-error --location $SECURE --header @- "$@"
     else
         curl --fail --silent --show-error --location $SECURE "$@"
     fi
@@ -130,9 +134,9 @@ fetch() {
 # failed (DNS, TLS, timeout) - the caller's network-lane message.
 fetch_code() {
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-        curl --silent --show-error --location $SECURE \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -o /dev/null -w '%{http_code}' "$@"
+        printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" \
+            | curl --silent --show-error --location $SECURE --header @- \
+                -o /dev/null -w '%{http_code}' "$@"
     else
         curl --silent --show-error --location $SECURE \
             -o /dev/null -w '%{http_code}' "$@"
@@ -161,9 +165,9 @@ pick_libc() {
 
 # BLAZAR_REPO unset: derive owner/name from the enclosing checkout's
 # git origin so a one-liner run inside a clone (or from the README of a
-# fork) needs no exports. A git remote is the only trustworthy source -
-# there is no hardcoded canonical home, so forks keep installing from
-# their own releases.
+# fork) needs no exports. A git remote is the only trustworthy source, so
+# forks keep installing from their own releases; the upstream repository
+# is only the last-resort fallback when no remote is available.
 derive_repo() {
     command -v git >/dev/null 2>&1 || return 1
     _url=$(cd "$(dirname "$0")" 2>/dev/null && git remote get-url origin 2>/dev/null) || return 1
@@ -239,7 +243,8 @@ ensure_toolchain() {
             status "WARN: toolchain bootstrap failed (output above) - source build unavailable on this box"
             return 1
         fi
-        chown -R "$BUILD_USER:$(id -gn "$BUILD_USER")" "$USER_HOME/.cargo" "$USER_HOME/.rustup" 2>/dev/null
+        chown -R "$BUILD_USER:$(id -gn "$BUILD_USER")" "$USER_HOME/.cargo" "$USER_HOME/.rustup" 2>/dev/null \
+            || status "WARN: could not hand ~/.cargo and ~/.rustup back to $BUILD_USER - root-owned files break user builds; fix with: chown -R $BUILD_USER: $USER_HOME/.cargo $USER_HOME/.rustup"
     elif ! sh "$_bs" --minimal; then
         status "WARN: toolchain bootstrap failed (output above) - source build unavailable on this box"
         return 1
@@ -255,19 +260,51 @@ ensure_toolchain() {
 # nobody is told why. This preflight detects PCI GPU hardware (lspci) and,
 # when the driver userspace is missing, installs it from FIRST-PARTY
 # distro repos only - announce-then-act, never fatal to the install.
+# pacman -S without -y: refreshing the sync database alone and then
+# installing is a partial upgrade (a fresh nvidia package against an older
+# kernel), which Arch does not support. The hint names the supported route.
+pacman_install() {
+    if $SUDO pacman -S --needed --noconfirm "$@"; then
+        return 0
+    fi
+    status "WARN: pacman -S $* failed - upgrade the system as a whole instead: sudo pacman -Syu $*"
+    return 1
+}
+
+# A kernel driver install changes the host (Secure Boot enrollment, hybrid
+# laptops, a reboot), so it needs a yes. BLAZAR_AUTO_DRIVER=1 is that yes
+# written down; with no terminal there is nobody to ask and the driver step
+# is skipped, leaving the manual lanes printed below.
+driver_consent() {
+    [ "${BLAZAR_AUTO_DRIVER:-}" = 1 ] && return 0
+    if [ ! -t 0 ]; then
+        status "NVIDIA kernel driver install skipped (no terminal to ask on) - rerun with BLAZAR_AUTO_DRIVER=1 to install it"
+        return 1
+    fi
+    printf '%s' "Install the NVIDIA kernel driver now? [y/N] "
+    _answer=
+    read -r _answer || true
+    case "$_answer" in
+        y|Y|yes|YES) return 0 ;;
+    esac
+    return 1
+}
+
 # Third-party-only sources (RPMFusion on Fedora, NVIDIA's own repo on
 # openSUSE) are PRINTED with exact commands, never executed: adding a
 # third-party repository as root is a line this installer does not cross.
-# Opt out: BLAZAR_AUTO_DRIVER=0. CUDA asset choice stays in blazar
-# itself (`blazar engine update` picks the newest CUDA build the driver
-# supports - resolve_cuda_asset; runtimes are bundled, no toolkit needed).
+# Opt out: BLAZAR_AUTO_DRIVER=0. The NVIDIA kernel driver itself is only
+# installed on BLAZAR_AUTO_DRIVER=1 or a "y" at the prompt. CUDA asset
+# choice stays in blazar itself (`blazar engine update` picks the newest
+# CUDA build the driver supports - resolve_cuda_asset; runtimes are
+# bundled, no toolkit needed).
 gpu_preflight() {
     [ "$(uname -s)" = Linux ] || return 0
     # An explicit user opt-out is acknowledged before any internal-lane
     # skip (e.g. BLAZAR_INSTALL_ENGINE=0) - the operator asked for silence
     # by name and gets the confirmation line regardless of what else is on.
     if [ "${BLAZAR_AUTO_DRIVER:-1}" != 1 ]; then
-        status "GPU preflight skipped (BLAZAR_AUTO_DRIVER=0)"
+        status "GPU preflight skipped (BLAZAR_AUTO_DRIVER=${BLAZAR_AUTO_DRIVER})"
         return 0
     fi
     [ "${BLAZAR_INSTALL_ENGINE:-1}" != 0 ] || return 0
@@ -293,7 +330,7 @@ gpu_preflight() {
         case "$PM" in
             apt-get) $SUDO apt-get update && $SUDO apt-get install -y pciutils ;;
             dnf) $SUDO dnf install -y pciutils ;;
-            pacman) $SUDO pacman -Sy --noconfirm --needed pciutils ;;
+            pacman) $SUDO pacman -S --needed --noconfirm pciutils ;;
             zypper) $SUDO zypper --non-interactive install pciutils ;;
         esac || { status "WARN: pciutils install failed - GPU preflight skipped"; return 0; }
     fi
@@ -314,32 +351,35 @@ gpu_preflight() {
 
     if [ "$HW_NVIDIA" = 1 ]; then
         if ! command -v nvidia-smi >/dev/null 2>&1; then
-            status "NVIDIA GPU detected (PCI 10de:) but no NVIDIA driver userspace - installing from distro repos"
+            status "NVIDIA GPU detected (PCI 10de:) but no NVIDIA driver userspace"
             NVIDIA_INSTALLED=0
-            case "$PM" in
-                apt-get)
-                    if command -v ubuntu-drivers >/dev/null 2>&1; then
-                        status "  running: ubuntu-drivers autoinstall (picks the right driver branch)"
-                        if $SUDO ubuntu-drivers autoinstall; then NVIDIA_INSTALLED=1; fi
-                    fi
-                    if [ "$NVIDIA_INSTALLED" != 1 ]; then
-                        status "  running: apt-get install -y nvidia-driver (Debian metapackage)"
-                        if $SUDO apt-get update && $SUDO apt-get install -y nvidia-driver; then NVIDIA_INSTALLED=1; fi
-                    fi
-                    ;;
-                dnf)
-                    # akmod-nvidia lives in RPMFusion (third party) - only
-                    # install when the user has already enabled it.
-                    if $SUDO dnf repolist --enabled 2>/dev/null | grep -qi rpmfusion; then
-                        status "  running: dnf install -y akmod-nvidia (kernel module compiles - takes minutes)"
-                        if $SUDO dnf install -y akmod-nvidia; then NVIDIA_INSTALLED=1; fi
-                    fi
-                    ;;
-                pacman)
-                    status "  running: pacman -S nvidia nvidia-utils (official repo)"
-                    if $SUDO pacman -Sy --noconfirm --needed nvidia nvidia-utils; then NVIDIA_INSTALLED=1; fi
-                    ;;
-            esac
+            if driver_consent; then
+                status "installing the driver from distro repos"
+                case "$PM" in
+                    apt-get)
+                        if command -v ubuntu-drivers >/dev/null 2>&1; then
+                            status "  running: ubuntu-drivers autoinstall (picks the right driver branch)"
+                            if $SUDO ubuntu-drivers autoinstall; then NVIDIA_INSTALLED=1; fi
+                        fi
+                        if [ "$NVIDIA_INSTALLED" != 1 ]; then
+                            status "  running: apt-get install -y nvidia-driver (Debian metapackage)"
+                            if $SUDO apt-get update && $SUDO apt-get install -y nvidia-driver; then NVIDIA_INSTALLED=1; fi
+                        fi
+                        ;;
+                    dnf)
+                        # akmod-nvidia lives in RPMFusion (third party) - only
+                        # install when the user has already enabled it.
+                        if $SUDO dnf repolist --enabled 2>/dev/null | grep -qi rpmfusion; then
+                            status "  running: dnf install -y akmod-nvidia (kernel module compiles - takes minutes)"
+                            if $SUDO dnf install -y akmod-nvidia; then NVIDIA_INSTALLED=1; fi
+                        fi
+                        ;;
+                    pacman)
+                        status "  running: pacman -S nvidia nvidia-utils (official repo)"
+                        if pacman_install nvidia nvidia-utils; then NVIDIA_INSTALLED=1; fi
+                        ;;
+                esac
+            fi
             if [ "$NVIDIA_INSTALLED" = 1 ]; then
                 if command -v mokutil >/dev/null 2>&1 &&
                    mokutil --sb-state 2>/dev/null | grep -qi enabled; then
@@ -385,7 +425,7 @@ gpu_preflight() {
                     [ "$HW_INTEL" = 1 ] && ICD_PKGS="${ICD_PKGS:+$ICD_PKGS }vulkan-intel"
                     if [ -n "$ICD_PKGS" ]; then
                         status "  running: pacman -S $ICD_PKGS"
-                        if $SUDO pacman -Sy --noconfirm --needed $ICD_PKGS; then ICD_INSTALLED=1; fi
+                        if pacman_install $ICD_PKGS; then ICD_INSTALLED=1; fi
                     fi
                     ;;
                 zypper)
@@ -461,12 +501,23 @@ if [ "$UNINSTALL" = 1 ]; then
         $SUDO "$SYSTEMCTL" daemon-reload 2>/dev/null || true
     fi
     if [ -f "$USER_HOME/.config/systemd/user/blazar.service" ]; then
-        systemctl --user disable --now blazar 2>/dev/null || true
+        # A user unit lives in the invoking user's manager; under sudo the
+        # bare command would talk to root's (absent) manager instead.
+        if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ]; then
+            _user_ctl="runuser -u $SUDO_USER -- env XDG_RUNTIME_DIR=/run/user/$(id -u "$SUDO_USER") systemctl --user"
+        else
+            _user_ctl="systemctl --user"
+        fi
+        $_user_ctl disable --now blazar 2>/dev/null || true
         rm -f "$USER_HOME/.config/systemd/user/blazar.service" && status "removed legacy user unit"
-        systemctl --user daemon-reload 2>/dev/null || true
+        $_user_ctl daemon-reload 2>/dev/null || true
     fi
     if [ "$(uname -s)" = Darwin ]; then
-        launchctl bootout "gui/$(id -u)/dev.blazar" 2>/dev/null ||
+        # The agent is registered in the invoking user's gui domain; under
+        # sudo `id -u` is root's, and root's domain holds nothing to boot out.
+        _gui_uid=$(id -u)
+        [ -z "${SUDO_USER:-}" ] || _gui_uid=$(id -u "$SUDO_USER")
+        launchctl bootout "gui/${_gui_uid}/dev.blazar" 2>/dev/null ||
             launchctl unload "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" 2>/dev/null || true
         if [ -f "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" ]; then
             rm -f "$USER_HOME/Library/LaunchAgents/dev.blazar.plist" && status "removed launch agent"
@@ -503,11 +554,11 @@ build_from_checkout() {
     as_user sh -c 'command -v cargo >/dev/null 2>&1' || return 1
     CK=$(find_checkout) || return 1
     hdr "build"
-    status "building from source: cargo build --release -p blazar (in ${CK})"
+    status "building from source: cargo build --release --locked -p blazar (in ${CK})"
     # Always build in the invoking user's environment: a root-run build
     # leaves root-owned artifacts in the user's target/ and breaks every
     # later user build.
-    if ! as_user sh -c "cd '$CK' && cargo build --release -p blazar"; then
+    if ! as_user sh -c 'cd "$1" && cargo build --release --locked -p blazar' sh "$CK"; then
         echo "ERROR: source build failed (cargo output above)" >&2
         return 1
     fi
@@ -647,12 +698,17 @@ poll_healthz() {
     # Blazar's own default port - NEVER 11434 (that is ollama's; a
     # fallback poll there would read a FOREIGN server's health).
     PORT=${PORT:-11435}
+    # The gateway answers /healthz with the exact body "ok"; the exact match
+    # keeps a foreign server's "not ok" or "lookup" from passing the poll.
+    healthz_ok() {
+        [ "$(curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | tr -d '[:space:]')" = ok ]
+    }
     i=0
-    while ! curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; do
+    while ! healthz_ok; do
         i=$((i + 1)); [ "$i" -gt 30 ] && break
         sleep 1
     done
-    if curl -s --max-time 2 "http://${HOST}:${PORT}/healthz" 2>/dev/null | grep -q ok; then
+    if healthz_ok; then
         # Port answered - but is THIS install's daemon the one answering?
         # A co-tenant can own :PORT (another blazar instance, a manually
         # started serve) while the just-installed daemon is about to die
@@ -702,10 +758,22 @@ install_system() {
     $SUDO mv -f "$NEW_BIN" "$BIN_DIR/blazar"
     # A user-started daemon owns the port; the unit would crash-loop.
     PIDFILE="$USER_HOME/.local/share/blazar/run/blazar.pid"
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-        kill -TERM "$(cat "$PIDFILE")" 2>/dev/null || true
+    # A stale pidfile holding a recycled PID would otherwise aim TERM at an
+    # unrelated process, so the executable name behind the PID is checked.
+    OLD_PID=$(cat "$PIDFILE" 2>/dev/null || true)
+    case "$OLD_PID" in
+        ''|*[!0-9]*) OLD_PID= ;;
+        *)
+            case "$(ps -p "$OLD_PID" -o comm= 2>/dev/null)" in
+                blazar|*/blazar) ;;
+                *) OLD_PID= ;;
+            esac
+            ;;
+    esac
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        kill -TERM "$OLD_PID" 2>/dev/null || true
         i=0
-        while kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null && [ "$i" -lt 10 ]; do
+        while kill -0 "$OLD_PID" 2>/dev/null && [ "$i" -lt 10 ]; do
             i=$((i + 1)); sleep 1
         done
     fi
@@ -907,12 +975,17 @@ EOF
     menu "blazar engine install --kind openaihost" "LiteRT-LM: mobile/edge/NPU .litertlm bundles (any platform, ~0.4 GiB venv)"
     menu "blazar engine list"                     "what is installed; blazar engine use <tag> switches the serving engine"
     # Fresh-install start, deferred until the engine exists (see the
-    # enable block above). Started even when bootstrap failed: a running
-    # crash-looping unit still answers `systemctl status` diagnostics
-    # better than a silent inactive one.
+    # enable block above). Only started with an engine active: without one
+    # the daemon exits at once and Restart=always would loop it every few
+    # seconds, so the user gets the two commands that bring it up instead.
     if [ "${DEFERRED_START:-0}" = 1 ]; then
-        $SUDO "$SYSTEMCTL" start blazar || error "starting blazar.service failed"
-        poll_healthz "logs: journalctl -u blazar"
+        if as_user "$BIN_DIR/blazar" engine list --json 2>/dev/null | grep -q '"active": *true'; then
+            $SUDO "$SYSTEMCTL" start blazar || error "starting blazar.service failed"
+            poll_healthz "logs: journalctl -u blazar"
+        else
+            status "blazar is installed and enabled but not started: no engine is active yet"
+            status "  with an engine in place: blazar engine update && sudo $SYSTEMCTL start blazar"
+        fi
     fi
     if [ -n "${BLAZAR_INSTALL_MODEL:-}" ]; then
         status "pulling first model: ${BLAZAR_INSTALL_MODEL}..."
@@ -1019,7 +1092,11 @@ TAG=$(printf '%s' "$RELEASE_JSON" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p'
 # Quoted variable = literal case match; a raw expansion in a case pattern
 # would act as a glob (a hostile tag_name like "*" must not match).
 WANTED="blazar-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz"
-printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
+# Only the assets array is parsed: the release body precedes it in the
+# same document and must never be able to pass for an asset line.
+ASSETS_JSON=$(printf '%s' "$RELEASE_JSON" | sed -n '/"assets": *\[/,$p')
+ASSET_LINES=$(mktemp) || error "cannot create a temp file for the asset lookup"
+printf '%s' "$ASSETS_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
     sed -e 's/.*"name": *"\([^"]*\)".*/name \1/' -e 's/.*"digest": *"\([^"]*\)".*/digest \1/' | \
     while read -r KIND VAL; do
         if [ "$KIND" = "name" ]; then
@@ -1032,14 +1109,14 @@ printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -E '"(name|digest)": *"' | \
             # (only the pair emitted right after the matching name counts).
             ASSET=
         fi
-    done > "${TMPDIR:-/tmp}/blazar-asset.$$"
-read -r ASSET EXPECT < "${TMPDIR:-/tmp}/blazar-asset.$$" || true
-rm -f "${TMPDIR:-/tmp}/blazar-asset.$$"
+    done > "$ASSET_LINES"
+read -r ASSET EXPECT < "$ASSET_LINES" || true
+rm -f "$ASSET_LINES"
 [ -n "$ASSET" ] || error "release ${TAG} has no asset matching blazar-${TAG}-${RUST_ARCH}-${ASSET_TRIPLE_SUFFIX}.tar.gz (available: $(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 | tr '\n' ' '))"
 [ -n "$EXPECT" ] || error "release ${TAG} asset ${ASSET} carries no sha256 digest - refusing to install unverified"
 EXPECT=${EXPECT#sha256:}
 
-ASSET_URL=$(printf '%s' "$RELEASE_JSON" | tr ',' '\n' | grep -o '"browser_download_url": *"[^"]*"' |
+ASSET_URL=$(printf '%s' "$ASSETS_JSON" | tr ',' '\n' | grep -o '"browser_download_url": *"[^"]*"' |
     sed -e 's/.*"browser_download_url": *"\([^"]*\)".*/\1/' | grep -F "/$ASSET" | head -1)
 ASSET_URL=${ASSET_URL:-${API_BASE}/releases/download/${TAG}/${ASSET}}
 INSTALL_ORIGIN="release ${TAG}${INSTALL_ORIGIN_NOTE}"

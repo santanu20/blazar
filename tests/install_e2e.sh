@@ -405,7 +405,7 @@ fi
 # the scratch PATH - the driverless branch must fire.
 GPDIR="$TMP/gpu"
 mkdir -p "$GPDIR/scratch" "$GPDIR/fake"
-sed -n '/^gpu_preflight() {/,/^}/p' "$INSTALL_SH" > "$GPDIR/fn.sh"
+sed -n '/^pacman_install() {/,/^}/p;/^driver_consent() {/,/^}/p;/^gpu_preflight() {/,/^}/p' "$INSTALL_SH" > "$GPDIR/fn.sh"
 cat > "$GPDIR/fake/lspci" <<'EOF'
 #!/bin/sh
 case "$3" in ::0300|::0302) printf '0000:01:00.0 0300: 10de:28a0 (rev a1)\n' ;; esac
@@ -426,6 +426,8 @@ cat > "$GPDIR/run.sh" <<EOF
 status() { echo ">>> \$*"; }
 SUDO="$TMP/fakesudo"
 PATH="$GPDIR/scratch"
+# stdin is not a terminal here, so the driver lane needs the written-down yes.
+BLAZAR_AUTO_DRIVER=1
 . "$GPDIR/fn.sh"
 gpu_preflight
 EOF
@@ -442,6 +444,28 @@ echo "$OUT" | grep -q "REBOOT REQUIRED, then run: blazar engine update" &&
 echo "$OUT" | grep -q "newest CUDA build this driver supports" &&
     ok "driverless NVIDIA: latest-compatible-CUDA messaging present" ||
     bad "missing latest-CUDA messaging"
+# Kernel driver install needs a yes. With no BLAZAR_AUTO_DRIVER and no
+# terminal to ask on, the driver step is skipped and nothing is installed.
+rm -f "$GPDIR/fake/apt.log"
+sed -i '/^BLAZAR_AUTO_DRIVER=1$/d' "$GPDIR/run.sh"
+OUT=$(sh "$GPDIR/run.sh" 2>&1)
+if echo "$OUT" | grep -q "kernel driver install skipped (no terminal to ask on)" &&
+   [ ! -f "$GPDIR/fake/apt.log" ]; then
+    ok "driver consent: no terminal, no opt-in - driver install skipped"
+else
+    bad "driver install ran without a yes"; echo "$OUT" | sed 's/^/    /'
+fi
+echo "$OUT" | grep -q "manual lanes" &&
+    ok "driver consent: manual lanes still printed" ||
+    bad "driver consent: manual lanes missing"
+# A \"n\" at the prompt (stdin is a pipe here) declines the same way.
+rm -f "$GPDIR/fake/apt.log"
+OUT=$(printf 'n\n' | sh "$GPDIR/run.sh" 2>&1)
+if echo "$OUT" | grep -q "manual lanes" && [ ! -f "$GPDIR/fake/apt.log" ]; then
+    ok "driver consent: answer n - driver install skipped"
+else
+    bad "driver install ran after a no"; echo "$OUT" | sed 's/^/    /'
+fi
 # Opt-out at function level: nothing installed, skip announced.
 rm -f "$GPDIR/fake/apt.log"
 cat > "$GPDIR/run.sh" <<EOF
@@ -521,6 +545,20 @@ stage_installed
 env $UENV sh "$UNINSTALL" --remove-models --yes >/dev/null 2>&1 </dev/null && RC=0 || RC=$?
 [ "$RC" -ne 0 ] && ok "uninstall --remove-models --yes (either order) refused" || bad "uninstall --remove-models --yes (either order) refused"
 
+# 9d2. --purge removes the config entries but keeps the registry signing
+# key, which cannot be regenerated.
+stage_installed
+mkdir -p "$TMP/home/.config/blazar/registry"
+printf 'test-key\n' > "$TMP/home/.config/blazar/registry/signing-key"
+OUT=$(env $UENV sh "$UNINSTALL" --purge --yes 2>&1 </dev/null) && RC=0 || RC=$?
+[ "$RC" = 0 ] && ok "uninstall --purge completes" || bad "uninstall --purge completes (rc=$RC)"
+[ -f "$TMP/home/.config/blazar/registry/signing-key" ] \
+    && ok "uninstall --purge keeps the registry signing key" || bad "uninstall --purge keeps the registry signing key"
+[ ! -e "$TMP/home/.config/blazar/config.toml" ] \
+    && ok "uninstall --purge removes the config" || bad "uninstall --purge removes the config"
+echo "$OUT" | grep -q "kept .*registry (registry signing key)" \
+    && ok "uninstall --purge says the key was kept" || bad "uninstall --purge says the key was kept"
+
 # 9e. privilege preflight: default sudo + non-tty + no cached creds refused
 # BEFORE mutation. A PATH-shimmed failing sudo makes the credential probe
 # deterministic on any host.
@@ -535,9 +573,9 @@ env -u BLAZAR_SUDO HOME="$TMP/home" PATH="$TMP/fakesbin:$PATH" \
 [ -f "$SYSTEM_BIN/blazar" ] && [ -f "$TMP/home/.local/share/blazar/blazar.db" ] \
     && ok "preflight refusal mutated nothing" || bad "preflight refusal mutated nothing"
 
-# 9f. install deferred-start ordering: fresh install enables WITHOUT --now,
-# then explicitly starts after the engine bootstrap (never crash-loops on a
-# engine-less unit).
+# 9f. install deferred-start ordering: a fresh install enables WITHOUT
+# --now, and the explicit start only follows once an engine is active, so
+# an engine-less unit never crash-loops.
 printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
     "$TAG" "$ASSET" "$SHA" "$BASE" "$ASSET" > "$SRV/release.json"
 : > "$TMP/systemctl.log"
@@ -547,10 +585,36 @@ if grep -qx 'enable blazar' "$TMP/systemctl.log" && ! grep -q 'enable --now blaz
 else
     bad "fresh install enables without --now"
 fi
-if grep -qx 'start blazar' "$TMP/systemctl.log"; then
-    ok "fresh install explicitly starts the unit"
+if ! grep -qx 'start blazar' "$TMP/systemctl.log" \
+   && printf '%s\n' "$OUT" | grep -q 'installed and enabled but not started: no engine is active'; then
+    ok "fresh install without an engine stays stopped"
 else
-    bad "fresh install explicitly starts the unit"
+    bad "fresh install without an engine stays stopped"
+    printf '%s\n' "$OUT" | sed 's/^/    /'
+fi
+# With an engine active the deferred start follows the enable. The asset
+# binary is swapped for a stub that reports one active engine; the real
+# asset and its digest are restored afterwards for the later scenarios.
+ASTAGE="$TMP/stage-active"
+mkdir -p "$ASTAGE"
+cat > "$ASTAGE/blazar" <<'EOF'
+#!/bin/sh
+[ "$*" = "engine list --json" ] && printf '{"active": true}\n'
+exit 0
+EOF
+chmod +x "$ASTAGE/blazar"
+cp "$ROOT/LICENSE-MIT" "$ROOT/LICENSE-APACHE" "$ASTAGE/"
+tar -czf "$SRV/$ASSET" -C "$ASTAGE" .
+SHA_ACTIVE=$(sha256sum "$SRV/$ASSET" | cut -d' ' -f1)
+printf '{"tag_name":"%s","assets":[{"name":"%s","digest":"sha256:%s","browser_download_url":"%s/download/%s"}]}' \
+    "$TAG" "$ASSET" "$SHA_ACTIVE" "$BASE" "$ASSET" > "$SRV/release.json"
+: > "$TMP/systemctl.log"
+OUT=$(env $INSTALL_ENV sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
+if grep -qx 'start blazar' "$TMP/systemctl.log"; then
+    ok "fresh install with an engine explicitly starts the unit"
+else
+    bad "fresh install with an engine explicitly starts the unit"
+    printf '%s\n' "$OUT" | sed 's/^/    /'
 fi
 if [ "$(grep -nx 'enable blazar\|start blazar' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" \
      -lt "$(grep -nx 'start blazar' "$TMP/systemctl.log" | head -1 | cut -d: -f1)" ]; then
@@ -558,6 +622,8 @@ if [ "$(grep -nx 'enable blazar\|start blazar' "$TMP/systemctl.log" | head -1 | 
 else
     bad "enable precedes start"
 fi
+tar -czf "$SRV/$ASSET" -C "$STAGE" .
+SHA=$(sha256sum "$SRV/$ASSET" | cut -d' ' -f1)
 
 # 9g. health poll target pin: the fallback port must be blazar's 11435,
 # never ollama's 11434 (it answers green while blazar is dead). Comments
@@ -689,6 +755,8 @@ name = "blazar"
 path = "src/main.rs"
 EOF
 printf 'fn main() { println!("blazar 0.0.0-test"); }\n' > "$GOOD_CK/crates/blazar-cli/src/main.rs"
+# A real checkout carries its lockfile; the installer builds with --locked.
+cargo generate-lockfile --manifest-path "$GOOD_CK/Cargo.toml" --offline >/dev/null 2>&1
 rm -rf "$SYSTEM_BIN" "$UNIT_OUT" "${TMP:?}/home"
 mkdir -p "$TMP/home"
 OUT=$(env $AUTO_ENV BLAZAR_CHECKOUT="$GOOD_CK" sh "$INSTALL_SH" 2>&1) && RC=0 || RC=$?
