@@ -128,7 +128,17 @@ function Register-BlazarTask([string]$ExePath) {
     # daemon only on CRASH (non-zero exit); `blazar stop` exits 0 and
     # is never undone. F156: restart settings explicit, not defaulted.
     $action = New-ScheduledTaskAction -Execute $ExePath -Argument 'serve'
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    # Task Scheduler wants a SID or DOMAIN\user in the logon trigger; a bare
+    # user name is rejected as a malformed value.
+    $userId = "$env:USERDOMAIN\$env:USERNAME"
+    try {
+        $sid = (New-Object Security.Principal.NTAccount($env:USERNAME)).Translate(
+            [Security.Principal.SecurityIdentifier])
+        $userId = $sid.Value
+    } catch [Security.Principal.IdentityNotMappedException] {
+        # Unmapped account: DOMAIN\user still names the logon session.
+    }
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
         -RestartCount 3 -RestartInterval ([TimeSpan]::FromSeconds(30))
