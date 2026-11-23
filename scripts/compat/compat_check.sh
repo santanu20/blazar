@@ -75,7 +75,9 @@ refute "anthropic-sdk messages: no error object" '"error"' "$body"
 # --- ollama-cli: /api/chat -------------------------------------------------------
 body=$(post /api/chat '{"model":'"$model_json"',"messages":[{"role":"user","content":"Say ok"}],"stream":false}')
 check "ollama-cli chat: message.content" '"message"' "$body"
-check "ollama-cli chat: model echo" "\"model\":\"$MODEL\"" "$body"
+# Ollama answers with the model's Modelfile name; the tag is dropped.
+base_name=${MODEL%%:*}
+check "ollama-cli chat: model echo" "\"model\":\"$base_name\"" "$body"
 refute "ollama-cli chat: no error object" '"error"' "$body"
 
 # --- lifecycle: request card + cancel --------------------------------------------
