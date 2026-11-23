@@ -35,6 +35,7 @@ tracked here.
 - **Engine-coverage proof links point at the published branch.** `scripts/engine_coverage.py` renders every receipt link in `docs/engine-coverage.md` as a GitHub URL, so the 31 proof links resolve on the docs site and on GitHub instead of 404.
 - **CI's test step runs to the end.** nextest stopped after the first failure, hiding 469 (macOS) and 416 (Windows) not-yet-run tests behind a single panic; the step now passes `--no-fail-fast`, so a red run lists every failing test at once.
 - **TLS PEM files are loaded through `rustls-pki-types`.** `rustls-pemfile` is unmaintained and is dropped as a dependency; the gateway now reads the certificate chain and the private key with the `PemObject` API that `rustls` already re-exports, and the two configuration errors keep their messages (`tls_cert contains no certificates`, `tls_key contains no private key`).
+- **GitHub Actions are pinned to current releases.** `actions/checkout` v7.0.1 (was v4.4.0 on the deprecated Node 20 runtime, plus one unpinned `@v4`), `actions/upload-artifact` v7.0.2, `actions/download-artifact` v8.0.2, `actions/setup-python` v7.1.0 and `taiki-e/install-action` v2.90.8; the other five actions were already at their latest commits. The release workflows only run on a tag, so their pins are first exercised at the next release.
 
 ### Removed
 

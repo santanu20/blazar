@@ -19,7 +19,7 @@ jobs:
         os: [ubuntu-22.04, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
@@ -35,7 +35,7 @@ jobs:
         shell: bash
       - name: upload clippy log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: clippy-${{ matrix.os }}
           path: clippy.log
@@ -53,14 +53,14 @@ jobs:
       # --no-fail-fast keeps the remaining tests running after a failure:
       # macOS and Windows runners are not available to every contributor,
       # so a red run has to list every failure at once, not one per run.
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace --no-fail-fast 2>&1 | tee test.log
         shell: bash
       - name: upload test log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-${{ matrix.os }}
           path: test.log
@@ -70,7 +70,7 @@ jobs:
     name: MSRV floor (rust-version from Cargo.toml)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The supported floor is declared once in the workspace Cargo.toml
       # (rust-version). This lane compiles the workspace on exactly that
       # toolchain so a dependency or language feature quietly raising the
@@ -100,7 +100,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck -S warning scripts/*.sh tests/install_e2e.sh
       # e2e installs real artifacts: host blazar binary + the stub engine
@@ -122,7 +122,7 @@ jobs:
     name: ruff + py_compile (scripts)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # F161: the harness had no CI lint gate — the F9 ruff errors lived
       # in the tree for months, uncatchable. Version is pinned so new
       # ruff releases cannot flip CI red overnight; ruff.toml freezes
@@ -159,7 +159,7 @@ jobs:
       checks: write
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # F161: no dep-vulnerability gate existed (7c dependency audit).
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
@@ -169,7 +169,7 @@ jobs:
     name: hygiene gates (paths + AI artifacts)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Keeps the tree free of machine-specific absolute paths and
       # AI-agent artifacts (unexplained external project names, agent
       # scratch paths) — the classes a code review easily misses. The

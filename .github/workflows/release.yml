@@ -42,7 +42,7 @@ jobs:
           - { target: aarch64-pc-windows-msvc, os: windows-latest, smoke: false }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install apt packages
         if: matrix.apt != ''
@@ -99,7 +99,7 @@ jobs:
           Copy-Item LICENSE-MIT, LICENSE-APACHE $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "blazar-$tag-$target.zip"
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: blazar-${{ matrix.target }}
           path: blazar-*.*
@@ -115,7 +115,7 @@ jobs:
     name: fmt + clippy + tests (release gate)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
@@ -128,19 +128,19 @@ jobs:
         shell: bash
       - name: upload clippy log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-gate-clippy
           path: clippy.log
           if-no-files-found: ignore
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest
       - run: cargo nextest run --workspace 2>&1 | tee test.log
         shell: bash
       - name: upload test log (always, for diagnosis)
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-gate-test
           path: test.log
@@ -162,7 +162,7 @@ jobs:
           # shipped binary's closure — the siblings stay untracked.
           cargo cyclonedx --manifest-path crates/blazar-cli/Cargo.toml \
             -f json --spec-version 1.5 --override-filename blazar-sbom
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-gate-sbom
           path: crates/blazar-cli/blazar-sbom.json
@@ -179,12 +179,12 @@ jobs:
     needs: [build, checks]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: blazar-x86_64-unknown-linux-gnu
           path: dist-amd64
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: blazar-aarch64-unknown-linux-gnu
           path: dist-arm64
@@ -198,7 +198,7 @@ jobs:
           tar -xzf dist-arm64/blazar-*.tar.gz -C dist-arm64
           scripts/package-deb.sh dist-amd64/blazar "$ver" amd64 "out/blazar-${ver}-amd64.deb"
           scripts/package-deb.sh dist-arm64/blazar "$ver" arm64 "out/blazar-${ver}-arm64.deb"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: packages-deb
           path: out/*.deb
@@ -209,7 +209,7 @@ jobs:
     needs: [build, checks]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
@@ -238,7 +238,7 @@ jobs:
           # and installers verify digests via the GitHub release API.
           cargo generate-rpm --package crates/blazar-cli \
             --output "blazar-${GITHUB_REF_NAME#v}-x86_64.rpm"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: packages-rpm
           path: blazar-*.rpm
@@ -249,12 +249,12 @@ jobs:
     needs: [build, checks]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: blazar-x86_64-apple-darwin
           path: dist-x64
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: blazar-aarch64-apple-darwin
           path: dist-arm64
@@ -274,7 +274,7 @@ jobs:
               -srcfolder "$stage" -format UDZO -ov \
               "out/blazar-${ver}-macos-${arch}.dmg"
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: packages-dmg
           path: out/*.dmg
@@ -293,7 +293,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
@@ -415,7 +415,7 @@ jobs:
     needs: release
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
         with:
           # SHA pinning defeats the action's branch-name toolchain
@@ -493,7 +493,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # GitHub computes asset digests a short while after upload; the
       # installers refuse unverified downloads, so retry through the race.
       - name: Install (sh)
