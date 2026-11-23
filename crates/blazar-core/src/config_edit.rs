@@ -14,6 +14,7 @@ use crate::config::Config;
 
 /// Key part of a `key = value` TOML line (trimmed), None when no `=`.
 /// Tolerant of `key="v"`, `key = "v"` and leading indentation.
+#[must_use]
 pub fn key_before_eq(line: &str) -> Option<&str> {
     let (k, _) = line.split_once('=')?;
     let k = k.trim();
@@ -27,6 +28,7 @@ pub fn key_before_eq(line: &str) -> Option<&str> {
 /// through `toml::from_str`, never `Config::from_toml` - that also
 /// VALIDATES, and probe values are placeholders that must not trip
 /// value validation. `deny_unknown_fields` is the authority either way.
+#[must_use]
 pub fn known_config_key(key: &str) -> bool {
     if key.contains('.') {
         // Dotted table-leaf keys probe with the header + one leaf line:
@@ -60,6 +62,7 @@ pub fn known_config_key(key: &str) -> bool {
 /// leaves route to their table. Unlike `known_config_key` (which also
 /// matches leaf names inside sections), the defaults scan here never
 /// crosses the first table header.
+#[must_use]
 pub fn top_level_key_known(key: &str) -> bool {
     if !key
         .chars()
@@ -90,6 +93,7 @@ pub fn top_level_key_known(key: &str) -> bool {
 /// user's file (all-Option sections like `[spec_draft]` render only
 /// after a leaf is pinned). First segment only - nested headers
 /// (`[model_overrides."m".sglang]`) count as their root table.
+#[must_use]
 pub fn config_section_names(extra_raw: &str) -> Vec<String> {
     let defaults = Config::default()
         .to_toml()
@@ -108,6 +112,7 @@ pub fn config_section_names(extra_raw: &str) -> Vec<String> {
 /// key, so a parse probe there proves nothing about leaf names. One
 /// probe with a deliberately impossible key tells them apart from
 /// struct sections, which deny unknown fields.
+#[must_use]
 pub fn is_free_form_map_section(section: &str) -> bool {
     toml::from_str::<Config>(&format!("[{section}]\nzzz_probe_leaf = \"s\"\n")).is_ok()
 }
@@ -115,6 +120,7 @@ pub fn is_free_form_map_section(section: &str) -> bool {
 /// probe per section: `[sglang]\n<key> = <scalar>` parses only when the
 /// schema really has that leaf (`sglang.grammar_backend`). Map sections
 /// are excluded up front - they accept any key and would always match.
+#[must_use]
 pub fn bare_leaf_sections(key: &str, raw_file: &str) -> Vec<String> {
     if !key
         .chars()
@@ -133,6 +139,7 @@ pub fn bare_leaf_sections(key: &str, raw_file: &str) -> Vec<String> {
         .collect()
 }
 /// Is this bare key the NAME of a table itself (`warm_peg`, `sglang`)?
+#[must_use]
 pub fn is_section_parent(key: &str, raw_file: &str) -> bool {
     config_section_names(raw_file).iter().any(|s| s == key)
 }
@@ -141,6 +148,7 @@ pub fn is_section_parent(key: &str, raw_file: &str) -> bool {
 /// of `a`, `b`"). Sections whose leaves never serialize ([sglang] is
 /// all-Option) still enumerate this way; map sections and unexpected
 /// error shapes fall back to the leaves the default TOML renders.
+#[must_use]
 pub fn section_leaf_names(section: &str) -> Vec<String> {
     let probe = format!("[{section}]\nzzz_probe_leaf = 0\n");
     if let Err(err) = toml::from_str::<Config>(&probe) {
@@ -183,6 +191,7 @@ pub fn section_leaf_names(section: &str) -> Vec<String> {
 /// struct-section probes above cannot discover these names - the
 /// section probe would scrape serde type words instead (live finding
 /// 2026-11-04: "leaves: struct, `ModelOverride`").
+#[must_use]
 pub fn override_leaf_names() -> Vec<String> {
     let probe = "[model_overrides.m]\nzzz_probe_leaf = 0\n";
     if let Err(err) = toml::from_str::<Config>(probe) {
@@ -210,6 +219,7 @@ pub fn override_leaf_names() -> Vec<String> {
 /// model names quoted so the line copies straight back into
 /// `config get`/`set`. Pinless sub-tables are not pins (same contract
 /// as `table_pins` for struct sections).
+#[must_use]
 pub fn map_table_pins(raw: &str, section: &str) -> Vec<String> {
     let mut pins = Vec::new();
     // Model name of the currently open sub-table, None outside one.
@@ -243,6 +253,7 @@ pub fn map_table_pins(raw: &str, section: &str) -> Vec<String> {
 /// Pinned `key = value` lines of a single-segment `[section]` block in
 /// the file (blank lines and comments skipped) - the parent-key view
 /// for `config get <table>`.
+#[must_use]
 pub fn table_pins(raw: &str, section: &str) -> Vec<String> {
     let mut in_section = false;
     let mut pins = Vec::new();
@@ -264,6 +275,7 @@ pub fn table_pins(raw: &str, section: &str) -> Vec<String> {
 /// inside `[model_overrides."<model>"]` is a different setting. Returns
 /// the candidate file and the removed line (None when the key carries
 /// no top-level pin).
+#[must_use]
 pub fn remove_top_level_pin(raw: &str, key: &str) -> (String, Option<String>) {
     let mut removed = None;
     let mut in_root_scope = true;
@@ -287,6 +299,7 @@ pub fn remove_top_level_pin(raw: &str, key: &str) -> (String, Option<String>) {
 /// Quote-aware split of a dotted path into raw segment ranges:
 /// `a."b.c".d` yields the ranges of `a`, `"b.c"`, `d`. Dots inside double
 /// quotes are part of the name. Unbalanced quotes -> None.
+#[must_use]
 pub fn quoted_seg_ranges(s: &str) -> Option<Vec<(usize, usize)>> {
     let bytes = s.as_bytes();
     let mut ranges = Vec::new();
@@ -310,6 +323,7 @@ pub fn quoted_seg_ranges(s: &str) -> Option<Vec<(usize, usize)>> {
     ranges.push((start, s.len()));
     Some(ranges)
 }
+#[must_use]
 pub fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
     fn clean_seg(s: &str) -> &str {
         s.strip_prefix('"')
@@ -341,6 +355,7 @@ pub fn split_table_path(key: &str) -> Option<(Vec<&str>, &str)> {
 /// Returns `None` unless the key has at least three parts and targets
 /// `model_overrides`; the straight split stays authoritative everywhere
 /// else.
+#[must_use]
 pub fn merged_override_splits(key: &str) -> Option<Vec<(Vec<String>, String)>> {
     let parts: Vec<&str> = key.split('.').collect();
     if parts.len() < 3 || parts[0] != "model_overrides" {
@@ -361,6 +376,7 @@ pub fn merged_override_splits(key: &str) -> Option<Vec<(Vec<String>, String)>> {
 /// `[model_overrides."qwen-7b".sglang]` becomes `model_overrides`,
 /// `qwen-7b`, `sglang`. Array-of-tables headers (`[[...]]`) are a
 /// different structure: `None`.
+#[must_use]
 pub fn header_segments(line: &str) -> Option<Vec<String>> {
     let trimmed = line.trim();
     let body = trimmed.strip_prefix('[')?.strip_suffix(']')?;
@@ -378,6 +394,7 @@ pub fn header_segments(line: &str) -> Option<Vec<String>> {
 }
 /// Emit a table header, quoting segments that are not TOML bare keys
 /// (model names with dots/spaces: `[model_overrides."qwen 7b"]`).
+#[must_use]
 pub fn table_header(path: &[&str]) -> String {
     let joined = path
         .iter()
@@ -465,6 +482,7 @@ pub fn set_table_key(raw: &str, path: &[&str], leaf: &str, stored: &str) -> Stri
 /// knob must never rewrite the same leaf name pinned inside a section
 /// (`port` vs an env var pinned as `[engine_env] port`) - that clobber
 /// was the old section-blind whole-file scan's failure mode.
+#[must_use]
 pub fn set_root_key(raw: &str, key: &str, stored: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut replaced = false;
@@ -501,6 +519,7 @@ pub fn set_root_key(raw: &str, key: &str, stored: &str) -> String {
 /// return the joined span - `config get preload` must print the whole
 /// list, not a bare `preload = [`. (Config string arrays carry validated
 /// model names; bracket characters inside quoted scalars do not occur.)
+#[must_use]
 pub fn top_level_span(lines: &[&str], key: &str) -> Option<String> {
     let start = lines
         .iter()
@@ -591,6 +610,7 @@ pub enum SetOutcome {
 /// scalar probe (values that are not already TOML scalars are stored
 /// as double-quoted strings), dotted table-leaf surgery, bare-key
 /// routing, merged model-name retries, and the quoted-twin hint.
+#[must_use]
 pub fn set_candidate(raw: &str, key: &str, value: &str) -> SetOutcome {
     // Values that are not already TOML scalars (numbers, bools, quoted
     // strings, arrays) are written as double-quoted strings: setting
@@ -785,6 +805,7 @@ pub struct SectionSchema {
 /// the schema knows (unioned with headers already pinned in the user's
 /// file - all-Option sections only render after a leaf is pinned).
 /// `raw_file` is the current config document.
+#[must_use]
 pub fn schema_sections(raw_file: &str) -> Vec<SectionSchema> {
     let defaults = Config::default()
         .to_toml()
@@ -829,6 +850,7 @@ pub fn schema_sections(raw_file: &str) -> Vec<SectionSchema> {
 /// Array-of-tables sections (`[[keys]]`, `[[models]]`, ...) are skipped:
 /// their entries are not dotted-key-addressable - dedicated planes own
 /// them. Powers "pinned in file vs built-in default" badges in editors.
+#[must_use]
 pub fn file_pins(raw: &str) -> Vec<String> {
     let bare = |s: &str| {
         !s.is_empty()
@@ -853,18 +875,19 @@ pub fn file_pins(raw: &str) -> Vec<String> {
         } else if t.starts_with('[') {
             in_array_section = false;
             path = header_segments(line).unwrap_or_default();
-        } else if !in_array_section && !t.starts_with('#') {
-            if let Some(k) = key_before_eq(t) {
-                if path.is_empty() {
-                    pins.push(k.to_string());
-                } else {
-                    let joined = path
-                        .iter()
-                        .map(|s| dotted_seg(s))
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    pins.push(format!("{joined}.{k}"));
-                }
+        } else if !in_array_section
+            && !t.starts_with('#')
+            && let Some(k) = key_before_eq(t)
+        {
+            if path.is_empty() {
+                pins.push(k.to_string());
+            } else {
+                let joined = path
+                    .iter()
+                    .map(|s| dotted_seg(s))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                pins.push(format!("{joined}.{k}"));
             }
         }
     }
@@ -874,6 +897,7 @@ pub fn file_pins(raw: &str) -> Vec<String> {
 /// The pinned line for `key` (root span or table leaf, with the
 /// merged model-name retry), if the file pins one. Powers "current
 /// value" displays in editors.
+#[must_use]
 pub fn get_pin(raw: &str, key: &str) -> Option<String> {
     if let Some((tpath, leaf)) = split_table_path(key) {
         let merged = merged_override_splits(key);
@@ -893,6 +917,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__known_config_key__defaults_options_and_typos() {
         // Serialized-by-default knobs (every scalar/enum shape).
         for k in [
@@ -925,6 +950,7 @@ mod tests {
         }
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__remove_top_level_pin__removes_only_root_scope() {
         // R4 pin: the same knob name at top level and inside a model
         // override table is TWO settings - unset must only touch root.
@@ -982,6 +1008,7 @@ mod tests {
         assert_eq!(top_level_span(&unterminated, "preload"), None);
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__known_config_key__dotted_table_paths() {
         // Real table-leaf knobs across all three engine tables and both
         // scopes (global table + model override nesting).
@@ -1011,6 +1038,7 @@ mod tests {
         }
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__set_table_key__replace_create_and_grouping() {
         // Replace in place inside an existing header, byte-preserving the
         // rest of the section.
@@ -1086,6 +1114,7 @@ mod tests {
         assert!(Config::from_toml(&out4).is_ok());
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__get_and_remove_table_key__roundtrip() {
         let raw = concat!(
             "[sglang]\n",
@@ -1132,6 +1161,7 @@ mod tests {
         assert_eq!(out2, raw, "byte-identical when nothing to remove");
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__split_table_path_and_header_segments__grammar() {
         assert!(split_table_path("slots").is_none(), "bare key");
         assert_eq!(
@@ -1181,6 +1211,7 @@ mod tests {
         assert_eq!(table_header(&["sglang"]), "[sglang]");
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__merged_override_splits__candidates_ascending() {
         // A dotted model name yields one candidate per merge point,
         // shortest name first; the schema picks the valid one downstream.
@@ -1225,6 +1256,7 @@ mod tests {
         assert!(merged_override_splits("slots").is_none());
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__config_set__dotted_model_name_resolves_via_schema() {
         let raw = "[sglang]\ngrammar_backend = \"xgrammar\"\n";
         // The straight split nests one table too deep - pins the bug the
@@ -1264,6 +1296,7 @@ mod tests {
         Config::from_toml(&after).expect("config stays valid after unset");
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__remove_top_level_pin__unpinned_is_none_and_byte_preserving() {
         let raw = "host = \"127.0.0.1\"\n";
         let (out, removed) = remove_top_level_pin(raw, "slots");
@@ -1274,6 +1307,7 @@ mod tests {
         assert!(out.contains("# cache_type"));
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__top_level_key_known__root_knobs_yes_section_leaves_no() {
         // Root knobs (slots renders; child_auth is an Option knob the
         // defaults never render but the schema accepts at root scope).
@@ -1287,6 +1321,7 @@ mod tests {
         assert!(!top_level_key_known("warm_peg"));
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__bare_leaf_sections__resolves_struct_section_leaves() {
         assert_eq!(
             bare_leaf_sections("ttl_secs", ""),
@@ -1310,6 +1345,7 @@ mod tests {
         );
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__config_section_names__defaults_union_file_headers() {
         let names = config_section_names("[stale_custom]\nx = 1\n");
         assert!(names.contains(&"sglang".to_string()));
@@ -1322,6 +1358,7 @@ mod tests {
         assert!(!is_section_parent("ttl_secs", ""));
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__section_leaf_names__schema_enumerates_unrendered_sections() {
         // [sglang] renders empty in defaults (all-Option) - the deny
         // teaching text is the only enumerator.
@@ -1333,6 +1370,7 @@ mod tests {
         assert!(cache.contains(&"enabled".to_string()));
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__set_root_key__section_pin_with_same_leaf_name_survives() {
         // Schema-valid clobber case: root `port` knob vs an env var
         // literally named `port` pinned under [engine_env].
@@ -1348,6 +1386,7 @@ mod tests {
         assert!(fresh.starts_with("port = 9000\n"));
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__config_unset__bare_section_leaf_finds_the_real_pin() {
         // BUG-2 pin: `config unset ttl_secs` used to report "not
         // pinned" while the file kept the value - the root scan misses,
@@ -1366,6 +1405,7 @@ mod tests {
         Config::from_toml(&cand).expect("config stays valid after unset");
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__table_pins__parent_view_reads_file_pins_only() {
         let raw = "# lead comment\n[semantic_cache]\nenabled = true\n\n# inner\n[sglang]\n";
         let pins = table_pins(raw, "semantic_cache");
@@ -1373,6 +1413,7 @@ mod tests {
         assert_eq!(table_pins(raw, "sglang"), [] as [String; 0]);
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__file_pins__dotted_keys_skip_arrays_and_comments() {
         let raw = concat!(
             "# lead comment with a fake key: bogus = 1\n",
@@ -1410,6 +1451,7 @@ mod tests {
         );
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__map_table_pins__subtable_pins_listed_with_model_names() {
         // Live shape: overlays pin model sub-tables whose names routinely
         // carry dots (quoted in the header) or not (plain). The bare
@@ -1442,6 +1484,7 @@ engine = "sglang"
         assert_eq!(pins.len(), 3, "one line per pinned leaf: {pins:?}");
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__map_table_pins__absent_section_and_pinless_subtables_empty() {
         assert!(map_table_pins("host = \"127.0.0.1\"\n", "model_overrides").is_empty());
         // A sub-table header with no pinned leaf shows nothing: nothing
@@ -1452,6 +1495,7 @@ engine = "sglang"
         );
     }
     #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__override_leaf_names__real_fields_not_serde_garbage() {
         // Regression pin: the struct-probe trick scraped serde type words
         // ("struct", "ModelOverride") for the map-valued table and printed

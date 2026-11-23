@@ -3,8 +3,8 @@
 //! shared with the CLI (`blazar config reload`); `GET /api/config`
 //! serves the RUNNING config (secrets redacted) plus the settable-key
 //! schema; `set`/`unset` route through blazar-core's dotted-key editor
-//! - the exact same grammar, oracle validation, and atomic persist the
-//! CLI uses, then hot-reload so the change engages immediately (the
+//! (the exact same grammar, oracle validation, and atomic persist the
+//! CLI uses), then hot-reload so the change engages immediately (the
 //! watcher task and these paths share the (mtime, size) fingerprint
 //! debounce, so a manual reload racing the watcher applies exactly
 //! once).
@@ -212,7 +212,7 @@ pub async fn set(
     ) else {
         return crate::error_response(400, "body needs string `key` and string `value`");
     };
-    let _guard = config_write_lock();
+    let guard = config_write_lock();
     let raw = match state.config_raw() {
         Ok(raw) => raw,
         Err(resp) => return resp,
@@ -223,7 +223,7 @@ pub async fn set(
             if let Err(resp) = state.persist_config_raw(&body) {
                 return resp;
             }
-            drop(_guard);
+            drop(guard);
             let reload = state.sup.reload_config_now().ok();
             let mut receipt = serde_json::json!({
                 "applied": true,
@@ -294,7 +294,7 @@ pub async fn unset(
     let Some(key) = body.get("key").and_then(serde_json::Value::as_str) else {
         return crate::error_response(400, "body needs a string `key`");
     };
-    let _guard = config_write_lock();
+    let guard = config_write_lock();
     let raw = match state.config_raw() {
         Ok(raw) => raw,
         Err(resp) => return resp,
@@ -305,7 +305,7 @@ pub async fn unset(
             if let Err(resp) = state.persist_config_raw(&body) {
                 return resp;
             }
-            drop(_guard);
+            drop(guard);
             let reload = state.sup.reload_config_now().ok();
             let mut receipt = serde_json::json!({
                 "applied": true,
@@ -372,9 +372,8 @@ pub async fn unset(
 /// write lock (the same exclusion `persist_keys` uses - hoisted so key
 /// rotations and config edits serialize against each other too). The
 /// lock spans read -> edit -> persist, so a racing writer can never
-/// interleave read/write. The guard's existence IS the exclusion.
-/// The guard's existence IS the exclusion - the MutexGuard inside is
-/// the point, never read.
+/// interleave read/write. The guard's existence IS the exclusion - the
+/// `MutexGuard` inside is the point, never read.
 #[allow(dead_code)]
 struct ConfigWriteGuard(std::sync::MutexGuard<'static, ()>);
 
@@ -389,6 +388,9 @@ fn config_write_lock() -> ConfigWriteGuard {
     )
 }
 
+/// `Err` is the `Response` the handler returns unchanged; boxing it
+/// would only move bytes from the stack to the heap.
+#[allow(clippy::result_large_err)]
 trait ConfigFileIo {
     fn config_raw(&self) -> Result<String, Response>;
     fn persist_config_raw(&self, body: &str) -> Result<(), Response>;

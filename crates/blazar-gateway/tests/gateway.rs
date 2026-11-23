@@ -592,7 +592,7 @@ async fn e2e__config_get_open_when_authless_admin_gated_with_keys_and_redacts() 
 async fn e2e__config_set_persists_validates_and_reports_cold_only() {
     let ts = start(Config::default()).await;
     let c = client();
-    let mut set = |key: &'static str, value: &'static str| {
+    let set = |key: &'static str, value: &'static str| {
         c.post(format!("{}/api/config/set", ts.base))
             .json(&serde_json::json!({"key": key, "value": value}))
             .send()

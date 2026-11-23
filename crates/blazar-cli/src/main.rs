@@ -29074,6 +29074,7 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             }
         }
         ConfigCmd::Set { key, value } => {
+            use blazar_core::config_edit::SetOutcome;
             let path = dirs().config_file();
             // Fresh-box bootstrap: `config set` may be the first command
             // ever run - ensure the dirs exist and a config file is
@@ -29085,7 +29086,6 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 Config::load(&d).map_err(|e| anyhow!("{e}"))?;
             }
             let raw = std::fs::read_to_string(&path)?;
-            use blazar_core::config_edit::SetOutcome;
             match blazar_core::config_edit::set_candidate(&raw, &key, &value) {
                 SetOutcome::Applied { body, stored } => {
                     blazar_core::persist_config(&path, &body)?;
@@ -29124,6 +29124,7 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
             }
         }
         ConfigCmd::Unset { key } => {
+            use blazar_core::config_edit::UnsetOutcome;
             // Same fresh-box bootstrap as `set`: unset may be the first
             // command ever run on a box - the config file must exist
             // before it can be read below.
@@ -29134,7 +29135,6 @@ async fn config_cmd(cmd: ConfigCmd) -> Result<()> {
                 Config::load(&d).map_err(|e| anyhow!("{e}"))?;
             }
             let raw = std::fs::read_to_string(&path)?;
-            use blazar_core::config_edit::UnsetOutcome;
             match blazar_core::config_edit::unset_candidate(&raw, &key) {
                 UnsetOutcome::Removed {
                     body,

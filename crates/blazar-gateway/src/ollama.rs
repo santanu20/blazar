@@ -1222,7 +1222,7 @@ pub async fn events(State(state): State<Arc<AppState>>) -> Response {
         };
         Bytes::from(format!("event: {}\ndata: {body}\n\n", event_kind(&e)))
     };
-    let backlog: Vec<Bytes> = state.bus.recent().into_iter().map(frame.clone()).collect();
+    let backlog: Vec<Bytes> = state.bus.recent().into_iter().map(frame).collect();
     let events = tokio_stream::wrappers::BroadcastStream::new(rx2);
     let mapped = TsExt::filter_map(events, move |ev| match ev {
         Ok(e) => Some(Ok::<_, std::io::Error>(frame(e))),

@@ -43,6 +43,7 @@ tracked here.
 - **Tool-result grounding is not pinned to draw luck.** The tool-call battery's T6 case re-runs once when a tiny model re-emits the call instead of grounding on the first draw, and reports the attempt count.
 - **Clippy backlog in the planner, autotune and gateway code** - let-else/let-chain collapses, `&Path` signatures, a sync `autotune_schedule_tick` (it held no await point) and a needless `unsafe` block removed from the autotune integration test. No behavior change.
 - **Ruff backlog in the scripts** - `subprocess.run` calls without `check`, a `try/except/pass` replaced by `contextlib.suppress`, an ambiguous `l` loop variable, an unclosed file handle in the effective-config reconciliation check and an unused unpack target. No behavior change.
+- **Clippy is clean workspace-wide under `-D warnings`.** The config editor marks its 23 pure parsers `#[must_use]` and its named tests carry the suite's non-snake-case allowance; the gateway config API fixes a doc list item, a duplicated doc sentence and an underscore-named lock guard, and keeps the HTTP response as the `ConfigFileIo` error type behind a reasoned allow; the CLI `config set`/`unset` arms import before their first statement; the events backlog stops cloning a `Copy` closure. No behavior change.
 
 ## [0.34.3] - 2026-11-21
 
