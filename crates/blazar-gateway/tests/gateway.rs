@@ -510,6 +510,222 @@ async fn e2e__config_reload_hot_swaps_keys_both_directions() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
+async fn e2e__config_get_open_when_authless_admin_gated_with_keys_and_redacts() {
+    // Authless mode: the config plane is the operator's local console.
+    let ts = start(Config::default()).await;
+    let c = client();
+    let r = c
+        .get(format!("{}/api/config", ts.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "authless GET /api/config serves");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(body["config"].is_object(), "running config present");
+    let schema = body["schema"].as_array().expect("schema array");
+    assert!(
+        schema.iter().any(|s| s["name"] == "root"),
+        "schema names the root section: {schema:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+
+    // Keys mode: admin-gated like every management surface, and the
+    // response can never carry a plaintext secret (BLZ-4 class).
+    let cfg = Config {
+        keys: vec![
+            blazar_core::ApiKey {
+                name: "admin".into(),
+                key: "plm_admin".into(),
+                ..blazar_core::ApiKey::default()
+            },
+            blazar_core::ApiKey {
+                name: "ci".into(),
+                key: "plm_ci_scoped_secret".into(),
+                models: vec!["m1".into()],
+                ..blazar_core::ApiKey::default()
+            },
+        ],
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let c = client();
+    assert_eq!(
+        c.get(format!("{}/api/config", ts.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "no bearer denied"
+    );
+    assert_eq!(
+        c.get(format!("{}/api/config", ts.base))
+            .bearer_auth("plm_ci_scoped_secret")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "scoped key denied - config is an admin plane"
+    );
+    let r = c
+        .get(format!("{}/api/config", ts.base))
+        .bearer_auth("plm_admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "unscoped admin key passes");
+    let raw = r.text().await.unwrap();
+    assert!(!raw.contains("plm_admin"), "admin secret never plaintext");
+    assert!(
+        !raw.contains("plm_ci_scoped_secret"),
+        "scoped secret never plaintext"
+    );
+    assert!(
+        raw.contains("plm_admi") && raw.contains("plm_ci_s"),
+        "key entries present in redacted form: {raw:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__config_set_persists_validates_and_reports_cold_only() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let mut set = |key: &'static str, value: &'static str| {
+        c.post(format!("{}/api/config/set", ts.base))
+            .json(&serde_json::json!({"key": key, "value": value}))
+            .send()
+    };
+    // Missing fields are a 400 shape error, not a validation walk.
+    let status = c
+        .post(format!("{}/api/config/set", ts.base))
+        .json(&serde_json::json!({"key": "log_level"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 400, "value-less set rejected at the boundary");
+
+    // A valid cold-only knob: persisted, receipt names the restart need.
+    let r = set("log_level", "debug").await.unwrap();
+    assert_eq!(r.status(), 200, "valid set applies");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["applied"], true);
+    assert!(
+        body["stored"].as_str().unwrap_or("").contains("debug"),
+        "stored echoes the stored form: {}",
+        body["stored"]
+    );
+    let reload = &body["reload"];
+    assert_eq!(reload["applied"], true, "hot reload ran");
+    let cold = reload["cold_only"].as_array().expect("cold_only array");
+    assert!(
+        cold.iter().any(|v| v == "log_level"),
+        "log_level named cold-only: {cold:?}"
+    );
+    let cfg_path = ts.state.sup.dirs.config_file();
+    let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    assert!(
+        raw.contains("log_level = \"debug\""),
+        "pin written to the file: {raw:?}"
+    );
+    // The read plane reports the new effective value.
+    let body: serde_json::Value = c
+        .get(format!("{}/api/config", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["config"]["log_level"], "debug");
+
+    // Unknown knob: rejected with teaching, file untouched.
+    let r = set("zzz_bogus_knob", "1").await.unwrap();
+    assert_eq!(r.status(), 422, "unknown key rejected");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        body["error"]["message"].as_str().unwrap_or("").len() > 10,
+        "teaching message present: {body:?}"
+    );
+    // Section-as-value: the leaves list steers the operator to a real pin.
+    let r = set("sglang", "1").await.unwrap();
+    assert_eq!(r.status(), 422, "section itself is not a value");
+    let body: serde_json::Value = r.json().await.unwrap();
+    let msg = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("leaf") || msg.contains("sglang"),
+        "leaves teaching: {msg}"
+    );
+    let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    assert!(
+        !raw.contains("zzz_bogus_knob") && !raw.contains("sglang ="),
+        "rejected candidates never touch the file: {raw:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__config_unset_removes_pin_then_reports_not_pinned_and_unknown() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // Pin, then remove: the receipt carries the removed line.
+    let r = c
+        .post(format!("{}/api/config/set", ts.base))
+        .json(&serde_json::json!({"key": "log_level", "value": "debug"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = c
+        .post(format!("{}/api/config/unset", ts.base))
+        .json(&serde_json::json!({"key": "log_level"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "pinned knob unsets");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["applied"], true);
+    assert!(
+        body["removed"].as_str().unwrap_or("").contains("log_level"),
+        "removed line reported: {}",
+        body["removed"]
+    );
+    let cfg_path = ts.state.sup.dirs.config_file();
+    let raw = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    assert!(!raw.contains("log_level"), "pin gone from file: {raw:?}");
+    // Second unset: honest no-op, not an error (default in effect).
+    let r = c
+        .post(format!("{}/api/config/unset", ts.base))
+        .json(&serde_json::json!({"key": "log_level"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["applied"], false, "nothing left to remove");
+    assert!(
+        body["note"].as_str().unwrap_or("").contains("default"),
+        "teaching note: {}",
+        body["note"]
+    );
+    // Unknown key: 404 through the shared error shape.
+    let status = c
+        .post(format!("{}/api/config/unset", ts.base))
+        .json(&serde_json::json!({"key": "zzz_bogus_knob"}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 404);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
 async fn e2e__ollama_evict_accepts_the_tags_rendered_name() {
     let ts = start(Config::default()).await;
     let c = client();

@@ -2,10 +2,15 @@
 //!
 //! The page is `console.html`, compiled in with `include_str!`: no
 //! external assets, no CDN, no build pipeline - the console works
-//! offline exactly where the daemon works. It is read-only and
-//! composes the existing JSON endpoints (`/api/version`, `/api/tags`,
-//! `/api/ps`, `/api/fabric`, `/api/quantiles`, `/api/benchmarks`,
-//! `/v1/jobs`, `/api/sessions`); it holds no state of its own.
+//! offline exactly where the daemon works. Observability composes the
+//! existing JSON endpoints (`/api/version`, `/api/tags`, `/api/ps`,
+//! `/api/fabric`, `/api/quantiles`, `/api/benchmarks`, `/api/usage`,
+//! `/api/capacity`, `/v1/jobs`, `/api/sessions`, `/api/pools`,
+//! `/api/failover`, `/api/why`, plus the `/api/events` SSE stream);
+//! mutations go through the validated write planes (`/api/config/set`,
+//! `/api/config/unset`, `/api/config/reload`, `/api/warm`, `/api/evict`,
+//! job cancel, key add/remove/rotate, failover and pool member ops) -
+//! the same contract the CLI uses, so the GUI can never drift from it.
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -38,11 +43,13 @@ mod tests {
         for tab in [
             "dashboard",
             "models",
-            "engines",
-            "compute",
+            "fabric",
+            "routing",
+            "config",
             "benchmarks",
             "jobs",
             "sessions",
+            "keys",
         ] {
             assert!(
                 html.contains(&format!("data-tab=\"{tab}\"")),
@@ -53,18 +60,53 @@ mod tests {
                 "section {tab} present"
             );
         }
-        // Endpoints the page composes - if one moves, this pin flags it.
+        // Read planes the page composes - if one moves, this pin flags it.
         for ep in [
             "/api/version",
             "/api/tags",
             "/api/ps",
             "/api/fabric",
             "/api/quantiles",
+            "/api/usage?days=7",
+            "/api/capacity",
+            "/api/admission-accuracy",
+            "/api/why?limit=10",
+            "/api/mcp",
+            "/api/pools",
+            "/api/failover",
+            "/api/fleet/workers",
+            "/api/config",
             "/api/benchmarks",
             "/v1/jobs",
             "/api/sessions",
+            "/api/keys",
+            // live strip
+            "/api/events",
         ] {
             assert!(html.contains(ep), "fetches {ep}");
         }
+        // Write planes: the console's mutation surface. One pin each so
+        // a renamed route fails here, not silently in the browser.
+        for ep in [
+            "/api/config/set",
+            "/api/config/unset",
+            "/api/config/reload",
+            "/api/warm",
+            "/api/evict",
+            "/api/explain/",
+            "/api/diagnose/",
+            "/api/route/",
+            "/cancel",
+            "/api/keys/rotate",
+            "/api/failover/",
+            "/api/pools/",
+        ] {
+            assert!(html.contains(ep), "mutates through {ep}");
+        }
+        // Every mutation and every dynamic string must route through the
+        // escaping dispatcher - no inline handler strings anywhere.
+        assert!(!html.contains("onclick="), "no inline handlers");
+        assert!(html.contains("data-action="), "action delegation present");
+        assert!(html.contains("encodeURIComponent"), "path args encoded");
     }
 }

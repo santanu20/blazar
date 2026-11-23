@@ -1,13 +1,21 @@
 <!doctype html>
 <!-- blazar web console — embedded at build time (include_str), served at
-     /ui. Read-only: every number comes from an existing JSON endpoint
-     (/api/version, /api/tags, /api/ps, /api/fabric, /api/quantiles,
-     /api/benchmarks, /v1/jobs, /api/sessions). No external assets, no
-     CDN, fully offline. Field drift renders as "—", never as garbage. -->
+     /ui. Composes the daemon's own JSON endpoints only; no external
+     assets, no CDN, fully offline. Observability comes from the read
+     planes (/api/version, /api/tags, /api/ps, /api/fabric, /api/quantiles,
+     /api/benchmarks, /api/usage, /api/capacity, /v1/jobs, /api/sessions,
+     /api/keys, /api/pools, /api/failover, /api/fleet/workers, /api/why);
+     mutations go through the validated write planes (/api/config/set,
+     /api/config/unset, /api/config/reload, /api/warm, /api/evict,
+     /v1/jobs/{id}/cancel, /api/keys + rotate, /api/failover/{chain}/pin,
+     /api/pools/{name}/{action}). The live strip on the dashboard is the
+     same /api/events SSE stream `blazar watch` tails. Field drift renders
+     as "—", never as garbage. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,"><!-- suppress favicon fetch: zero network, zero 404 noise -->
 <title>blazar console</title>
 <style>
   :root {
@@ -17,14 +25,17 @@
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: var(--mono); padding: 20px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
   header h1 { font-size: 18px; letter-spacing: .5px; }
   header h1 b { color: var(--accent); }
   header .meta { color: var(--dim); }
+  header .spacer { flex: 1; }
   nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
   nav button {
     background: var(--panel); color: var(--dim); border: 1px solid var(--border);
     border-radius: 6px 6px 0 0; padding: 6px 14px; font: inherit; cursor: pointer;
+    min-height: 22px;
   }
   nav button.on { color: var(--text); border-bottom: 2px solid var(--accent); background: #1c2431; }
   section { display: none; }
@@ -34,7 +45,9 @@
   .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
   .card .value { font-size: 20px; margin-top: 2px; }
   .card .sub { color: var(--dim); font-size: 11px; margin-top: 2px; }
-  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  /* Dense ops tables scroll within themselves on narrow viewports
+     instead of pushing the whole page sideways. */
+  table { display: block; overflow-x: auto; width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
   th { text-align: left; color: var(--dim); font-weight: normal; font-size: 11px; text-transform: uppercase; padding: 7px 10px; border-bottom: 1px solid var(--border); background: #1c2431; }
   td { padding: 6px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
   tr:last-child td { border-bottom: none; }
@@ -47,19 +60,56 @@
   .bar { background: #21262d; border-radius: 3px; height: 8px; width: 90px; display: inline-block; vertical-align: middle; }
   .bar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
   pre { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: auto; }
+  .btn {
+    background: #21262d; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 12px; font: inherit; cursor: pointer; min-height: 28px;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: #1f6feb33; border-color: var(--accent); }
+  .btn.danger { border-color: var(--err); color: var(--err); }
+  .btn.sm { padding: 1px 8px; min-height: 22px; font-size: 12px; }
+  input, select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 8px; font: inherit; min-height: 28px;
+  }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .receipt { margin-top: 10px; }
+  .receipt pre { white-space: pre-wrap; word-break: break-word; }
+  .badge { display: inline-block; border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; font-size: 11px; color: var(--dim); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  #toasts { position: fixed; top: 12px; right: 12px; z-index: 10; display: flex; flex-direction: column; gap: 6px; max-width: 420px; }
+  .toast { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 6px; padding: 8px 12px; box-shadow: 0 4px 14px #0009; }
+  .toast.ok { border-left-color: var(--ok); }
+  .toast.err { border-left-color: var(--err); }
+  details { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; }
+  details summary { cursor: pointer; padding: 7px 10px; color: var(--text); }
+  details summary .muted { margin-left: 8px; }
+  details > div { padding: 0 10px 10px; }
+  .ev-kind { color: var(--accent); }
+  #ev-status { color: var(--dim); }
+  .mono-sm { font-size: 12px; }
+  code { background: #21262d; border-radius: 4px; padding: 0 4px; }
 </style>
 </head>
 <body>
+<div id="toasts" aria-live="polite"></div>
 <header>
   <h1><b>blazar</b> console</h1>
   <span class="meta" id="hdr-version">version —</span>
   <span class="meta" id="hdr-updated">—</span>
+  <span class="spacer"></span>
+  <span class="meta">admin key:</span>
+  <input id="admin-key-in" type="password" placeholder="sk-…" size="20" aria-label="admin key">
+  <button class="btn sm" id="admin-key-set" type="button">set</button>
+  <button class="btn sm" id="admin-key-clear" type="button">clear</button>
 </header>
 <nav id="tabs">
   <button data-tab="dashboard" class="on">Dashboard</button>
   <button data-tab="models">Models</button>
-  <button data-tab="engines">Engines</button>
-  <button data-tab="compute">Compute</button>
+  <button data-tab="fabric">Fabric</button>
+  <button data-tab="routing">Routing</button>
+  <button data-tab="config">Config</button>
   <button data-tab="benchmarks">Benchmarks</button>
   <button data-tab="jobs">Jobs</button>
   <button data-tab="sessions">Sessions</button>
@@ -68,17 +118,103 @@
 
 <section id="dashboard" class="on">
   <div class="cards" id="dash-cards"></div>
+  <h2>admission accuracy</h2>
+  <div id="dash-admission"></div>
+  <h2>why — sentinel records <span class="muted" id="dash-why-note"></span></h2>
+  <div id="dash-why"></div>
   <h2>live models</h2>
   <div id="dash-models"></div>
+  <h2>live events <span class="muted" id="ev-status">connecting…</span></h2>
+  <div id="dash-events"></div>
 </section>
 
-<section id="models"><div id="models-body"></div></section>
-<section id="engines"><div id="engines-body"></div></section>
-<section id="compute"><div id="compute-body"></div></section>
-<section id="benchmarks"><div id="benchmarks-body"></div></section>
-<section id="jobs"><div id="jobs-body"></div></section>
-<section id="sessions"><div id="sessions-body"></div></section>
-<section id="keys"><div id="keys-body"></div></section>
+<section id="models">
+  <div class="toolbar">
+    <button class="btn" data-action="refresh" data-arg="core" type="button">refresh</button>
+    <span class="muted">actions run against the live daemon — warm loads, evict unloads</span>
+  </div>
+  <div id="models-body"></div>
+  <h2>model detail <span class="muted" id="models-detail-name"></span></h2>
+  <div id="models-detail"><p class="gap">pick explain or diagnose on a model row</p></div>
+</section>
+
+<section id="fabric"><div id="fabric-body"></div></section>
+
+<section id="routing">
+  <div class="toolbar">
+    <button class="btn" data-action="refresh" data-arg="routing" type="button">refresh</button>
+    <input id="route-model-in" placeholder="model name" size="24" aria-label="model name">
+    <button class="btn" data-action="route-lookup" type="button">explain route</button>
+    <span class="muted">routing decision for one model, as the request path sees it</span>
+  </div>
+  <h2>model pools</h2>
+  <div id="routing-pools"></div>
+  <h2>failover chains</h2>
+  <div id="routing-failover"></div>
+  <h2>fleet workers</h2>
+  <div id="routing-fleet"></div>
+  <h2>route lookup</h2>
+  <div id="routing-route"><p class="gap">enter a model name above</p></div>
+</section>
+
+<section id="config">
+  <div class="toolbar">
+    <button class="btn" data-action="refresh" data-arg="config" type="button">refresh</button>
+    <button class="btn primary" data-action="cfg-reload" type="button">reload now</button>
+    <span class="badge" id="cfg-file">file —</span>
+    <span class="muted">set / unset share the CLI's validated dotted-key grammar — invalid values are rejected with teaching, never written</span>
+  </div>
+  <form class="toolbar" id="cfg-editor">
+    <label class="muted" for="cfg-key-in">key</label>
+    <input id="cfg-key-in" placeholder="log_level" size="28" autocomplete="off">
+    <label class="muted" for="cfg-val-in">value</label>
+    <input id="cfg-val-in" placeholder="info" size="28" autocomplete="off">
+    <button class="btn primary" type="submit">set</button>
+    <button class="btn" data-action="cfg-unset-editor" type="button">unset</button>
+    <button class="btn sm" data-action="cfg-example" type="button" title="fill an example">?</button>
+  </form>
+  <div class="receipt" id="cfg-receipt"></div>
+  <h2>root knobs</h2>
+  <div id="cfg-root"></div>
+  <h2>sections</h2>
+  <div id="cfg-sections"></div>
+</section>
+
+<section id="benchmarks">
+  <div class="toolbar"><button class="btn" data-action="refresh" data-arg="benchmarks" type="button">refresh</button></div>
+  <div id="benchmarks-body"></div>
+</section>
+
+<section id="jobs">
+  <div class="toolbar">
+    <button class="btn" data-action="refresh" data-arg="jobs" type="button">refresh</button>
+    <span class="muted">cancel stops queued or running jobs</span>
+  </div>
+  <div id="jobs-body"></div>
+</section>
+
+<section id="sessions">
+  <div class="toolbar"><button class="btn" data-action="refresh" data-arg="sessions" type="button">refresh</button></div>
+  <div id="sessions-body"></div>
+</section>
+
+<section id="keys">
+  <div class="toolbar">
+    <button class="btn" data-action="refresh" data-arg="keys" type="button">refresh</button>
+    <span class="muted">secrets print exactly once on create / rotate — copy them now</span>
+  </div>
+  <form class="toolbar" id="key-add">
+    <label class="muted" for="key-name-in">name</label>
+    <input id="key-name-in" placeholder="ci-runner" size="16" autocomplete="off">
+    <label class="muted" for="key-models-in">models</label>
+    <input id="key-models-in" placeholder="qwen3:8b, bge-m3 (blank = admin)" size="30" autocomplete="off">
+    <label class="muted" for="key-mcp-in">mcp servers</label>
+    <input id="key-mcp-in" placeholder="blank = all" size="16" autocomplete="off">
+    <button class="btn primary" type="submit">add key</button>
+  </form>
+  <div class="receipt" id="keys-receipt"></div>
+  <div id="keys-body"></div>
+</section>
 
 <script>
 "use strict";
@@ -101,14 +237,18 @@ const when = (x) => val(x, (v) => {
   return isNaN(d) ? esc(v) : d.toLocaleString();
 });
 const ago = (secs) => val(secs, (v) => (typeof v === "number" ? v.toFixed(0) + "s" : esc(v)));
+// Compact one-line rendering of any JSON value for table cells.
+const jsonLine = (v) => {
+  if (v === null || v === undefined) return '<span class="gap">—</span>';
+  if (typeof v === "number" || typeof v === "boolean") return esc(String(v));
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  const line = s.replace(/\s+/g, " ");
+  return `<span title="${esc(line)}">${esc(line.length > 90 ? line.slice(0, 90) + "…" : line)}</span>`;
+};
+const num = (v) => (typeof v === "number" && isFinite(v) ? v.toLocaleString() : jsonLine(v));
 
-async function fetchJSON(url, headers) {
-  const r = await fetch(url, { headers: headers || {} });
-  if (!r.ok) throw new Error("HTTP " + r.status);
-  return r.json();
-}
-
-// Management surfaces (key listing) are admin-bearer-gated; the
+// ---- auth ---------------------------------------------------------------
+// Management surfaces are admin-bearer-gated when [[keys]] exist; the
 // operator pastes an unscoped key once per tab session — never
 // persisted beyond it.
 function adminAuth() {
@@ -116,8 +256,82 @@ function adminAuth() {
   return k ? { "Authorization": "Bearer " + k } : undefined;
 }
 
-function errorRow(msg) {
-  return `<p class="note err">unavailable — ${esc(msg)} <span class="muted">(${esc(location.host)})</span></p>`;
+async function fetchJSON(url, headers) {
+  const r = await fetch(url, { headers: headers || {} });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+// Mutations return the parsed body on 2xx and throw {status, body} on
+// anything else so receipts can surface the server's teaching verbatim.
+async function sendJSON(url, method, body) {
+  const r = await fetch(url, {
+    method,
+    headers: Object.assign({ "Content-Type": "application/json" }, adminAuth() || {}),
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await r.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch (_) { parsed = { raw: text }; }
+  if (!r.ok) {
+    const e = new Error("HTTP " + r.status);
+    e.status = r.status;
+    e.body = parsed;
+    throw e;
+  }
+  return parsed;
+}
+
+// ---- toasts + receipts --------------------------------------------------
+function toast(msg, kind) {
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
+// Server teaching (422 leaves / ambiguity lists, validation errors)
+// renders verbatim — the same messages the CLI prints.
+function errText(e) {
+  const b = e && e.body;
+  if (b && b.error) return [b.error.message || String(b.error), b.error.hint];
+  if (b && b.raw) return [b.raw];
+  if (b && b.message) return [b.message];
+  const map = { 400: "bad request", 401: "unauthorized — paste an admin key", 403: "forbidden — admin (unscoped) key required", 404: "not found", 409: "conflict", 422: "rejected", 500: "server error", 502: "bad gateway", 503: "unavailable" };
+  return ["HTTP " + (e && e.status) + (map[e && e.status] ? " — " + map[e.status] : "")];
+}
+
+function receipt(id, ok, title, detail) {
+  const el = $(id);
+  if (!el) return;
+  const cls = ok ? "ok" : "err";
+  let html = `<p class="${cls}"><b>${esc(title)}</b></p>`;
+  if (detail) html += `<pre>${esc(detail)}</pre>`;
+  el.innerHTML = html;
+}
+
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => toast("copied to clipboard", "ok"), () => toast("clipboard blocked — copy manually", "err"));
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); toast("copied to clipboard", "ok"); }
+  catch (_) { toast("clipboard blocked — copy manually", "err"); }
+  ta.remove();
+}
+
+// ---- generic shape-tolerant renderers -----------------------------------
+// First-level key/value table for objects whose exact shape varies by
+// daemon version — honest rendering of whatever is there.
+function kvTable(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return "";
+  const rows = Object.keys(obj).map((k) => [`<b>${esc(k)}</b>`, jsonLine(obj[k])]);
+  return table(["field", "value"], rows);
 }
 
 function table(headers, rows) {
@@ -127,65 +341,139 @@ function table(headers, rows) {
   return "<table>" + head + body + "</table>";
 }
 
+function errorRow(msg) {
+  return `<p class="note err">unavailable — ${esc(msg)} <span class="muted">(${esc(location.host)})</span></p>`;
+}
+
 function utilBar(p) {
   const v = (typeof p === "number" && p >= 0 && p <= 100) ? p : null;
   return val(v, (x) => `<span class="bar"><i style="width:${x.toFixed(0)}%"></i></span> ${x.toFixed(0)}%`);
 }
 
-// ---- endpoint pulls ----------------------------------------------------
-async function pull() {
-  const out = {};
-  const jobs = [
-    fetchJSON("/api/version").then((v) => out.version = v).catch((e) => out.versionErr = e),
-    fetchJSON("/api/tags").then((v) => out.tags = v).catch((e) => out.tagsErr = e),
-    fetchJSON("/api/ps").then((v) => out.ps = v).catch((e) => out.psErr = e),
-    fetchJSON("/api/fabric").then((v) => out.fabric = v).catch((e) => out.fabricErr = e),
-    fetchJSON("/api/quantiles").then((v) => out.quant = v).catch((e) => out.quantErr = e),
-    fetchJSON("/api/benchmarks").then((v) => out.bench = v).catch((e) => out.benchErr = e),
-    fetchJSON("/v1/jobs").then((v) => out.jobs = v).catch((e) => out.jobsErr = e),
-    fetchJSON("/api/sessions").then((v) => out.sessions = v).catch((e) => out.sessionsErr = e),
-    fetchJSON("/api/keys", adminAuth()).then((v) => out.keys = v).catch((e) => out.keysErr = e),
-  ];
-  await Promise.all(jobs);
-  return out;
+// ---- endpoint registry + per-tab refresh --------------------------------
+// Each tab declares the endpoints it renders; the 5s tick refreshes only
+// the active tab's set (stale > 4s, never overlapping an in-flight one).
+const REGISTRY = {
+  version:   { url: "/api/version", tabs: ["dashboard"] },
+  tags:      { url: "/api/tags", tabs: ["dashboard", "models"] },
+  ps:        { url: "/api/ps", tabs: ["dashboard", "models"] },
+  quant:     { url: "/api/quantiles", tabs: ["dashboard"] },
+  usage:     { url: "/api/usage?days=7", tabs: ["dashboard"] },
+  capacity:  { url: "/api/capacity", tabs: ["dashboard"] },
+  admission: { url: "/api/admission-accuracy", tabs: ["dashboard"] },
+  why:       { url: "/api/why?limit=10", tabs: ["dashboard"] },
+  fabric:    { url: "/api/fabric", tabs: ["fabric"] },
+  mcp:       { url: "/api/mcp", tabs: ["fabric"], auth: true },
+  pools:     { url: "/api/pools", tabs: ["routing"], auth: true },
+  failover:  { url: "/api/failover", tabs: ["routing"], auth: true },
+  fleet:     { url: "/api/fleet/workers", tabs: ["routing"], auth: true },
+  config:    { url: "/api/config", tabs: ["config"], auth: true },
+  bench:     { url: "/api/benchmarks", tabs: ["benchmarks"] },
+  jobs:      { url: "/v1/jobs", tabs: ["jobs"] },
+  sessions:  { url: "/api/sessions", tabs: ["sessions"] },
+  keys:      { url: "/api/keys", tabs: ["keys"], auth: true },
+};
+const TAB_GROUPS = {
+  dashboard: ["version", "tags", "ps", "quant", "usage", "capacity", "admission", "why"],
+  models: ["tags", "ps"],
+  fabric: ["fabric", "mcp"],
+  routing: ["pools", "failover", "fleet"],
+  config: ["config"],
+  benchmarks: ["bench"],
+  jobs: ["jobs"],
+  sessions: ["sessions"],
+  keys: ["keys"],
+};
+const S = {}; // name -> {data, err, at, inflight}
+
+async function refreshName(name) {
+  const reg = REGISTRY[name];
+  if (!reg || (S[name] && S[name].inflight)) return;
+  if (!S[name]) S[name] = { inflight: false };
+  S[name].inflight = true;
+  try {
+    const data = await fetchJSON(reg.url, reg.auth ? adminAuth() : undefined);
+    S[name] = { data, err: null, at: Date.now(), inflight: false };
+  } catch (e) {
+    S[name] = { data: null, err: e, at: Date.now(), inflight: false };
+  }
+}
+
+async function refreshTab(tab, force) {
+  const names = TAB_GROUPS[tab] || [];
+  await Promise.all(names.map((n) => {
+    const stale = !S[n] || (Date.now() - S[n].at > 4000);
+    return (force || stale) ? refreshName(n) : Promise.resolve();
+  }));
+  renderAll();
+}
+
+function refreshGroup(groupName) {
+  // Action buttons name a group; map groups onto tabs they affect.
+  const map = { core: "models", routing: "routing", config: "config", benchmarks: "benchmarks", jobs: "jobs", sessions: "sessions", keys: "keys" };
+  const tab = map[groupName] || "dashboard";
+  return refreshTab(tab, true);
 }
 
 // ---- renderers ---------------------------------------------------------
-function render(d) {
-  $("hdr-version").textContent = d.version
-    ? `v${d.version.version || "?"} · ${location.host}`
-    : "daemon —";
+function renderAll() {
+  const v = S.version && S.version.data;
+  $("hdr-version").textContent = v ? `v${v.version || "?"} · ${location.host}` : "daemon —";
   $("hdr-updated").textContent = "updated " + new Date().toLocaleTimeString();
-  renderDashboard(d);
-  renderModels(d);
-  renderEngines(d);
-  renderCompute(d);
-  renderBenchmarks(d);
-  renderJobs(d);
-  renderSessions(d);
-  renderKeys(d);
+  renderDashboard(); renderModels(); renderFabric(); renderRouting();
+  renderConfig(); renderBenchmarks(); renderJobs(); renderSessions(); renderKeys();
 }
 
-function renderDashboard(d) {
-  const q = d.quant || {};
+function renderDashboard() {
+  const d = S;
+  const q = (d.quant && d.quant.data) || {};
   const cards = [];
   const card = (label, value, sub) =>
     cards.push(`<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`);
-  if (d.quantErr) card("latency", '<span class="gap">—</span>', esc(d.quantErr.message));
+  if (d.quant && d.quant.err) card("latency", '<span class="gap">—</span>', esc(d.quant.err.message));
   else {
     const t = q.ttft_ms || {}, tp = q.tpot_ms || {};
     card("ttft p50", ms(t.p50_ms), `p95 ${t.p95_ms ?? "—"} · p99 ${t.p99_ms ?? "—"} · n=${t.count ?? 0}`);
     card("tpot p50", ms(tp.p50_ms), `p95 ${tp.p95_ms ?? "—"} · n=${tp.count ?? 0}`);
     const pc = q.prompt_cache || {};
-    card("prompt cache", val(pc.hit_rate, (v) => (v * 100).toFixed(1) + "%"),
+    card("prompt cache", val(pc.hit_rate, (x) => (x * 100).toFixed(1) + "%"),
       `${(pc.cached_tokens ?? 0).toLocaleString()} / ${(pc.prompt_tokens ?? 0).toLocaleString()} tokens`);
     const sc = q.semantic_cache || {};
     card("semantic cache", (sc.hits ?? 0) + " hits", `${sc.misses ?? 0} misses · ${sc.stores ?? 0} stores`);
   }
+  if (d.usage && d.usage.data) {
+    const days = (d.usage.data.days || []).filter((x) => x && typeof x === "object");
+    const reqs = days.reduce((a, r) => a + (Number(r.requests) || 0), 0);
+    const toks = days.reduce((a, r) => {
+      const t = r.tokens ?? r.total_tokens ?? (r.prompt_tokens || 0) + (r.completion_tokens || 0);
+      return a + (Number(t) || 0);
+    }, 0);
+    card("requests 7d", num(reqs), `${d.usage.data.days_window ?? "?"}-day window`);
+    card("tokens 7d", num(toks), "prompt + completion");
+  } else if (d.usage && d.usage.err) card("usage", '<span class="gap">—</span>', esc(d.usage.err.message));
   $("dash-cards").innerHTML = cards.join("");
-  if (d.psErr) { $("dash-models").innerHTML = errorRow(d.psErr.message); return; }
+
+  if (d.admission && d.admission.err) $("dash-admission").innerHTML = errorRow(d.admission.err.message);
+  else if (d.admission && d.admission.data) $("dash-admission").innerHTML = kvTable(d.admission.data);
+  else $("dash-admission").innerHTML = '<p class="gap">no snapshot yet</p>';
+
+  if (d.why && d.why.err) {
+    $("dash-why").innerHTML = errorRow(d.why.err.message);
+    $("dash-why-note").textContent = "";
+  } else {
+    const why = (d.why && d.why.data) || {};
+    const recs = Array.isArray(why) ? why : why.records || why.rows || [];
+    $("dash-why-note").textContent = `${recs.length} recent`;
+    const keys = recs.length ? Object.keys(recs[0]).slice(0, 6) : [];
+    const rows = recs.map((r) => keys.map((k) => (typeof r[k] === "number" ? when(r[k]) : jsonLine(r[k]))));
+    $("dash-why").innerHTML = keys.length
+      ? table(keys, rows)
+      : '<p class="gap">sentinel ring empty — nothing flagged</p>';
+  }
+
+  if (d.ps && d.ps.err) { $("dash-models").innerHTML = errorRow(d.ps.err.message); return; }
   // /api/ps is the ollama-compat surface: rich fields ride `blazar_*` keys.
-  const rows = ((d.ps && d.ps.models) || []).map((m) => [
+  const rows = (((d.ps && d.ps.data && d.ps.data.models) || [])).map((m) => [
     `<b>${esc(m.name)}</b>`,
     val(m.blazar_engine), val(m.blazar_state, (s) => `<span class="${s === "ready" || s === "loaded" ? "ok" : "muted"}">${esc(s)}</span>`),
     val(m.blazar_ctx), val(m.blazar_slots), val(m.blazar_in_flight), ago(m.blazar_idle_secs),
@@ -195,10 +483,11 @@ function renderDashboard(d) {
     table(["model", "engine", "state", "ctx", "slots", "in-flight", "idle", "device", "gpu"], rows);
 }
 
-function renderModels(d) {
-  if (d.tagsErr) { $("models-body").innerHTML = errorRow(d.tagsErr.message); return; }
-  const resident = new Map(((d.ps && d.ps.models) || []).map((m) => [m.name, m]));
-  const models = (d.tags && d.tags.models) || [];
+function renderModels() {
+  const tagsE = S.tags, psE = S.ps;
+  if (tagsE && tagsE.err) { $("models-body").innerHTML = errorRow(tagsE.err.message); return; }
+  const resident = new Map((((psE && psE.data && psE.data.models) || [])).map((m) => [m.name, m]));
+  const models = (tagsE && tagsE.data && tagsE.data.models) || [];
   const rows = models.map((m) => {
     const live = resident.get(m.name);
     return [
@@ -207,76 +496,275 @@ function renderModels(d) {
       when(m.expires_at),
       live ? `<span class="ok">${esc(live.blazar_state || live.state)}</span>` : '<span class="muted">cold</span>',
       live ? val(live.blazar_ctx ?? live.ctx) : '<span class="gap">—</span>',
+      `<button class="btn sm" data-action="warm" data-arg="${esc(m.name)}" type="button">warm</button> ` +
+      `<button class="btn sm" data-action="evict" data-arg="${esc(m.name)}" type="button">evict</button> ` +
+      `<button class="btn sm" data-action="explain" data-arg="${esc(m.name)}" type="button">explain</button> ` +
+      `<button class="btn sm" data-action="diagnose" data-arg="${esc(m.name)}" type="button">diagnose</button>`,
     ];
   });
-  $("models-body").innerHTML = table(["model", "size", "expires", "state", "ctx"], rows);
+  $("models-body").innerHTML = table(["model", "size", "expires", "state", "ctx", "actions"], rows);
 }
 
-function renderEngines(d) {
-  if (d.fabricErr) { $("engines-body").innerHTML = errorRow(d.fabricErr.message); return; }
-  const engines = (d.fabric && d.fabric.engines) || [];
-  const rows = engines.map((e) => [
-    `<b>${esc(e.tag)}</b>`,
-    val(e.kind),
-    e.active ? '<span class="ok">active</span>' : '<span class="muted">installed</span>',
-    when(e.installed_at),
-  ]);
-  $("engines-body").innerHTML =
-    table(["tag", "kind", "status", "installed"], rows) +
-    `<p class="note">one active engine per daemon — kind switches restart the daemon</p>`;
-}
-
-function renderCompute(d) {
-  if (d.fabricErr) { $("compute-body").innerHTML = errorRow(d.fabricErr.message); return; }
-  const f = d.fabric || {};
-  const cpu = f.cpu || {};
-  let html = `<div class="cards">
-    <div class="card"><div class="label">cpu</div><div class="value">${val(cpu.physical_cores)}</div><div class="sub">cores</div></div>
-    <div class="card"><div class="label">ram</div><div class="value">${bytes(cpu.total_ram_bytes)}</div><div class="sub">total</div></div>
-  </div>`;
-  const devices = f.devices || [];
-  const devRows = devices.map((dev) => [
-    `<b>${esc(dev.id)}</b>`, val(dev.name), bytes(dev.total_vram_bytes),
-    bytes(dev.free_vram_bytes), utilBar(dev.utilization_percent),
-    (dev.residents || []).length + (dev.external || []).length,
-  ]);
-  html += `<h2>devices</h2>` +
-    table(["device", "name", "vram", "free", "utilization", "tenants"], devRows);
-  for (const dev of devices) {
-    const res = (dev.residents || []).map((r) => [
-      `<b>${esc(r.model)}</b>`, val(r.engine), val(r.pid), val(r.state),
-      val(r.slots), val(r.in_flight), bytes(r.vram_bytes),
+function renderFabric() {
+  const fe = S.fabric;
+  let html = "";
+  if (fe && fe.err) html += errorRow(fe.err.message);
+  else {
+    const f = (fe && fe.data) || {};
+    const engines = f.engines || [];
+    const engRows = engines.map((e) => [
+      `<b>${esc(e.tag)}</b>`,
+      val(e.kind),
+      e.active ? '<span class="ok">active</span>' : '<span class="muted">installed</span>',
+      when(e.installed_at),
     ]);
-    const ext = (dev.external || []).map((a) => [val(a.pid), bytes(a.vram_bytes), val(a.note)]);
-    if (res.length || ext.length) {
-      html += `<h2>${esc(dev.id)} tenants</h2>`;
-      if (res.length) html += table(["model", "engine", "pid", "state", "slots", "in-flight", "vram"], res);
-      if (ext.length) html += table(["external pid", "vram", "note"], ext);
+    html += `<h2>engines</h2>` +
+      table(["tag", "kind", "status", "installed"], engRows) +
+      `<p class="note">one active engine per daemon — kind switches restart the daemon</p>`;
+    const cpu = f.cpu || {};
+    html += `<h2>host</h2><div class="cards">
+      <div class="card"><div class="label">cpu</div><div class="value">${val(cpu.physical_cores)}</div><div class="sub">cores</div></div>
+      <div class="card"><div class="label">ram</div><div class="value">${bytes(cpu.total_ram_bytes)}</div><div class="sub">total</div></div>
+    </div>`;
+    const devices = f.devices || [];
+    const devRows = devices.map((dev) => [
+      `<b>${esc(dev.id)}</b>`, val(dev.name), bytes(dev.total_vram_bytes),
+      bytes(dev.free_vram_bytes), utilBar(dev.utilization_percent),
+      (dev.residents || []).length + (dev.external || []).length,
+    ]);
+    html += `<h2>devices</h2>` +
+      table(["device", "name", "vram", "free", "utilization", "tenants"], devRows);
+    for (const dev of devices) {
+      const res = (dev.residents || []).map((r) => [
+        `<b>${esc(r.model)}</b>`, val(r.engine), val(r.pid), val(r.state),
+        val(r.slots), val(r.in_flight), bytes(r.vram_bytes),
+      ]);
+      const ext = (dev.external || []).map((a) => [val(a.pid), bytes(a.vram_bytes), val(a.note)]);
+      if (res.length || ext.length) {
+        html += `<h2>${esc(dev.id)} tenants</h2>`;
+        if (res.length) html += table(["model", "engine", "pid", "state", "slots", "in-flight", "vram"], res);
+        if (ext.length) html += table(["external pid", "vram", "note"], ext);
+      }
+    }
+    const peers = f.peers || [];
+    html += `<h2>remote compute</h2>`;
+    if (!peers.length) html += `<p class="gap">no remotes configured — see \`blazar remote\` and \`blazar route\`</p>`;
+    for (const p of peers) {
+      const devs = (p.devices || []).map((x) => [
+        `<b>${esc(x.name)}</b>`, bytes(x.total_vram_bytes), bytes(x.free_vram_bytes),
+      ]);
+      const res = (p.residents || []).map((r) => [
+        `<b>${esc(r.model)}</b>`, val(r.engine), val(r.state), val(r.slots), val(r.in_flight),
+      ]);
+      html += `<h2>${esc(p.name)} <span class="muted">${esc(p.url || "")}</span></h2>`;
+      if (devs.length) html += table(["device", "vram", "free"], devs);
+      if (res.length) html += table(["model", "engine", "state", "slots", "in-flight"], res);
+      if (!devs.length && !res.length) html += `<p class="gap">no capacity probed yet</p>`;
+    }
+    const notes = f.notes || [];
+    if (notes.length) html += `<p class="note">${notes.map(esc).join(" · ")}</p>`;
+  }
+  const me = S.mcp;
+  html += `<h2>mcp servers</h2>`;
+  if (me && me.err) {
+    const m = String(me.err.message);
+    html += `<p class="gap">listing unavailable — ${esc(m)}${m.includes("401") || m.includes("403") ? " — paste an admin key in the header" : ""}</p>`;
+  } else {
+    const md = (me && me.data) || {};
+    const list = md.servers || md.mcp;
+    if (Array.isArray(list) && list.length) {
+      const rows = list.map((s) => [
+        `<b>${val(s.name)}</b>`, jsonLine(s.command ?? s.url), jsonLine(s.enabled), jsonLine(s.tools),
+      ]);
+      html += table(["name", "command / url", "enabled", "tools"], rows);
+    } else if (Object.keys(md).length) {
+      html += kvTable(md); // unexpected shape — render what is there, honestly
+    } else html += `<p class="gap">no MCP servers configured — see \`blazar mcp\`</p>`;
+  }
+  $("fabric-body").innerHTML = html;
+}
+
+function renderRouting() {
+  // pools
+  const pe = S.pools;
+  if (pe && pe.err) $("routing-pools").innerHTML = errorRow(pe.err.message);
+  else {
+    const pools = ((pe && pe.data && pe.data.pools) || []);
+    let html = "";
+    if (!pools.length) html = '<p class="gap">no model pools configured — see \`blazar pool\`</p>';
+    for (const p of pools) {
+      const members = p.members || [];
+      const rows = members.map((m) => [
+        `<b>${esc(m.effective ?? m.model)}</b>`,
+        val(m.peer, (x) => x ? esc(x) : '<span class="gap">local</span>'),
+        val(m.tier), ms(m.est_wait_ms), bytes(m.free_vram),
+        m.down === true ? '<span class="err">down</span>' : (m.drained === true ? '<span class="warn">drained</span>' : '<span class="ok">up</span>'),
+        m.pinned === true ? '<span class="ok">pinned</span>' : '<span class="gap">—</span>',
+        (m.effective !== undefined
+          ? `<button class="btn sm" data-action="pool-op" data-arg="${esc(p.name)}" data-arg2="${esc(m.effective)}" data-arg3="${m.pinned === true ? "unpin" : "pin"}" type="button">${m.pinned === true ? "unpin" : "pin"}</button> ` +
+            `<button class="btn sm" data-action="pool-op" data-arg="${esc(p.name)}" data-arg2="${esc(m.effective)}" data-arg3="${m.drained === true ? "undrain" : "drain"}" type="button">${m.drained === true ? "undrain" : "drain"}</button>`
+          : '<span class="gap">—</span>'),
+      ]);
+      html += `<h2>${esc(p.name)} <span class="muted">strategy ${esc(p.strategy ?? "?")}</span></h2>` +
+        table(["member", "peer", "tier", "est wait", "free vram", "state", "pin", "actions"], rows) +
+        (p.decision ? `<p class="note">current decision: ${jsonLine(p.decision)}</p>` : "");
+    }
+    $("routing-pools").innerHTML = html;
+  }
+
+  // failover chains
+  const fe2 = S.failover;
+  if (fe2 && fe2.err) $("routing-failover").innerHTML = errorRow(fe2.err.message);
+  else {
+    const chains = ((fe2 && fe2.data && fe2.data.chains) || []);
+    if (!chains.length) $("routing-failover").innerHTML = '<p class="gap">no failover chains configured — see \`blazar failover\`</p>';
+    else {
+      const rows = chains.map((c) => {
+        const name = c.alias || c.name;
+        const targets = (c.targets || []).map((t) => {
+          const isPinned = c.pinned === t.index;
+          return `<span class="muted">${t.index}:</span>${val(t.label)}` +
+            (isPinned ? ' <span class="ok">●</span>' : "") +
+            ` <button class="btn sm" data-action="failover-pin" data-arg="${esc(name)}" data-arg2="${t.index}" type="button" ${c.pinned === t.index ? "disabled" : ""}>pin</button>`;
+        }).join(" → ");
+        return [
+          `<b>${esc(name)}</b>`,
+          targets || '<span class="gap">—</span>',
+          c.pinned === null || c.pinned === undefined
+            ? '<span class="ok">auto</span>'
+            : `<span class="warn">pinned → ${esc(c.targets && c.targets[c.pinned] ? c.targets[c.pinned].label : c.pinned)}</span>`,
+          val(c.sticky, (x) => x ? "yes" : "no"),
+          val(c.switches),
+          `<button class="btn sm danger" data-action="failover-unpin" data-arg="${esc(name)}" type="button" ${c.pinned === null || c.pinned === undefined ? "disabled" : ""}>unpin</button>`,
+        ];
+      });
+      $("routing-failover").innerHTML =
+        table(["chain", "targets", "state", "sticky", "switches", "actions"], rows) +
+        `<p class="note">pin steers the chain to one target until unpinned — same contract as \`blazar failover\`</p>`;
     }
   }
-  const peers = f.peers || [];
-  html += `<h2>remote compute</h2>`;
-  if (!peers.length) html += `<p class="gap">no remotes configured — see \`blazar remote\` and \`blazar route\`</p>`;
-  for (const p of peers) {
-    const devs = (p.devices || []).map((x) => [
-      `<b>${esc(x.name)}</b>`, bytes(x.total_vram_bytes), bytes(x.free_vram_bytes),
-    ]);
-    const res = (p.residents || []).map((r) => [
-      `<b>${esc(r.model)}</b>`, val(r.engine), val(r.state), val(r.slots), val(r.in_flight),
-    ]);
-    html += `<h2>${esc(p.name)} <span class="muted">${esc(p.url || "")}</span></h2>`;
-    if (devs.length) html += table(["device", "vram", "free"], devs);
-    if (res.length) html += table(["model", "engine", "state", "slots", "in-flight"], res);
-    if (!devs.length && !res.length) html += `<p class="gap">no capacity probed yet</p>`;
+
+  // fleet workers
+  const fle = S.fleet;
+  if (fle && fle.err) {
+    const m = String(fle.err.message);
+    $("routing-fleet").innerHTML = m.includes("404")
+      ? '<p class="gap">fleet membership disabled (fleet_enabled = false) — set rpc_servers statically instead</p>'
+      : errorRow(m);
+  } else {
+    const fw = (fle && fle.data) || {};
+    const workers = fw.workers || [];
+    const rows = workers.map((w) => Object.keys(w).slice(0, 6).map((k) =>
+      typeof w[k] === "number" ? when(w[k]) : jsonLine(w[k])));
+    $("routing-fleet").innerHTML =
+      table(["worker", "fields…"], rows.length ? rows : []) ||
+      '<p class="gap">no fleet workers registered</p>';
+    if (!rows.length) $("routing-fleet").innerHTML = `<p class="gap">no fleet workers registered</p>` +
+      `<p class="note">heartbeat ${esc(fw.heartbeat_interval_secs ?? "?")}s · ttl ${esc(fw.ttl_secs ?? "?")}s</p>`;
   }
-  const notes = f.notes || [];
-  if (notes.length) html += `<p class="note">${notes.map(esc).join(" · ")}</p>`;
-  $("compute-body").innerHTML = html;
 }
 
-function renderBenchmarks(d) {
-  if (d.benchErr) { $("benchmarks-body").innerHTML = errorRow(d.benchErr.message); return; }
-  const rows = ((d.bench && d.bench.rows) || []).map((r) => [
+function renderConfig() {
+  const ce = S.config;
+  const file = $("cfg-file");
+  if (ce && ce.err) {
+    const m = String(ce.err.message);
+    $("cfg-root").innerHTML = errorRow(m);
+    $("cfg-sections").innerHTML = (m.includes("401") || m.includes("403"))
+      ? '<p class="muted">the config plane is admin-gated when [[keys]] exist — paste an unscoped key in the header</p>' : "";
+    file.textContent = "file —";
+    file.className = "badge";
+    return;
+  }
+  const d = (ce && ce.data) || {};
+  const cfg = d.config || {};
+  const schema = d.schema || [];
+  file.textContent = d.file && d.file.present ? "file on disk" : "no file — built-in defaults";
+  file.className = "badge " + (d.file && d.file.present ? "ok" : "");
+
+  // Root knobs: the schema's known root leaves (full set) plus any
+  // scalar top-level keys the running config carries — value shown is
+  // the EFFECTIVE one; unset removes the pin so the default re-applies.
+  const rootSchema = schema.find((s) => s.name === "root");
+  const sectionNames = new Set(schema.filter((s) => s.name !== "root").map((s) => s.name));
+  const rootKeys = Array.from(new Set(
+    ((rootSchema && rootSchema.leaves) || []).concat(
+      Object.keys(cfg).filter((k) => !sectionNames.has(k) && cfg[k] !== null && typeof cfg[k] !== "object"))));
+  const rootRows = rootKeys.map((k) => [
+    `<b>${esc(k)}</b>`,
+    jsonLine(cfg[k]),
+    `<button class="btn sm" data-action="cfg-edit" data-arg="${esc(k)}" type="button">edit</button> ` +
+    `<button class="btn sm danger" data-action="cfg-unset" data-arg="${esc(k)}" type="button">unset</button>`,
+  ]);
+  $("cfg-root").innerHTML = rootRows.length
+    ? table(["knob", "effective value", "actions"], rootRows)
+    : '<p class="gap">no root knobs visible</p>';
+
+  // Dedicated planes own array-of-tables sections — point at them
+  // instead of offering a dotted-key grammar those sections lack.
+  const OWNERS = {
+    models: "models — pull / evict via the Models tab or `blazar pull`",
+    keys: "API keys — add / rotate / remove via the Keys tab or `blazar keys`",
+    model_pools: "pools — membership via config file or `blazar pool`; runtime member ops in the Routing tab",
+    mcp: "mcp servers — `blazar mcp` (env secrets redacted here)",
+    remote: "remote peers — `blazar remote`",
+    lora: "lora adapters — `blazar lora`",
+  };
+  // Quote a table key for the dotted grammar when it is not a bare
+  // identifier (model names carry colons, dashes are fine, dots are not).
+  const dotted = (sec, k) => /^[A-Za-z0-9_-]+$/.test(k) ? `${sec}.${k}` : `${sec}."${k}"`;
+
+  let html = "";
+  for (const sec of schema) {
+    if (sec.name === "root") continue;
+    const body = cfg[sec.name];
+    let rows = [], kind = "knobs";
+    if (Array.isArray(body)) {
+      kind = "entries";
+      for (const [i, entry] of body.entries()) {
+        const fields = (entry && typeof entry === "object")
+          ? Object.keys(entry).map((f) => `<span class="muted">${esc(f)}:</span>${jsonLine(entry[f])}`).join(" ")
+          : jsonLine(entry);
+        rows.push([`<b>[${i}]</b>`, fields]);
+      }
+    } else if (sec.is_map) {
+      kind = "entries";
+      for (const k of (body && typeof body === "object" ? Object.keys(body) : [])) {
+        rows.push([
+          `<b>${esc(k)}</b>`,
+          jsonLine(body[k]),
+          `<button class="btn sm" data-action="cfg-edit" data-arg="${esc(dotted(sec.name, k))}" type="button">edit</button> ` +
+          `<button class="btn sm danger" data-action="cfg-unset" data-arg="${esc(dotted(sec.name, k))}" type="button">unset</button>`,
+        ]);
+      }
+    } else {
+      for (const leaf of (sec.leaves || [])) {
+        rows.push([
+          `<b>${esc(leaf)}</b>`,
+          jsonLine(body ? body[leaf] : undefined),
+          `<button class="btn sm" data-action="cfg-edit" data-arg="${esc(sec.name + "." + leaf)}" type="button">edit</button> ` +
+          `<button class="btn sm danger" data-action="cfg-unset" data-arg="${esc(sec.name + "." + leaf)}" type="button">unset</button>`,
+        ]);
+      }
+    }
+    const count = rows.length;
+    const owner = OWNERS[sec.name];
+    const headers = Array.isArray(body)
+      ? ["entry", "value"]
+      : [kind === "entries" ? "entry" : "knob", "value", "actions"];
+    html += `<details><summary>${esc(sec.name)}<span class="muted">${count} ${kind}${sec.is_map ? " · free-form map" : ""}</span></summary><div>` +
+      (count ? table(headers, rows)
+             : '<p class="gap">empty section</p>') +
+      (Array.isArray(body) && owner ? `<p class="note">${esc(owner)}</p>` : "") +
+      `</div></details>`;
+  }
+  $("cfg-sections").innerHTML = html || '<p class="gap">no sections</p>';
+}
+
+function renderBenchmarks() {
+  const be = S.bench;
+  if (be && be.err) { $("benchmarks-body").innerHTML = errorRow(be.err.message); return; }
+  const rows = (((be && be.data && be.data.rows) || [])).map((r) => [
     `<b>${esc(r.model)}</b>`, val(r.engine_tag),
     when(r.measured_at),
     val(r.score, (v) => v.toFixed(1)),
@@ -288,20 +776,31 @@ function renderBenchmarks(d) {
     `<p class="note">stored records only — nothing re-runs here. Fill gaps with \`blazar bench\` / \`blazar tune\` / \`blazar autopilot --apply\`.</p>`;
 }
 
-function renderJobs(d) {
-  if (d.jobsErr) { $("jobs-body").innerHTML = errorRow(d.jobsErr.message); return; }
-    const list = Array.isArray(d.jobs) ? d.jobs : (d.jobs && d.jobs.data) || (d.jobs && d.jobs.jobs) || [];
-  const rows = list.map((j) => [
-    `<b>${esc(j.id)}</b>`, val(j.kind), val(j.state, (s) =>
-      `<span class="${s === "done" ? "ok" : s === "failed" ? "err" : "warn"}">${esc(s)}</span>`),
-    val(j.model), when(j.created_at), when(j.updated_at),
-  ]);
-  $("jobs-body").innerHTML = table(["id", "kind", "state", "model", "created", "updated"], rows);
+function renderJobs() {
+  const je = S.jobs;
+  if (!je) return; // not fetched yet (registry model: tabs pull on visit)
+  if (je && je.err) { $("jobs-body").innerHTML = errorRow(je.err.message); return; }
+  const list = Array.isArray(je.data) ? je.data : (je.data && (je.data.data || je.data.jobs)) || [];
+  const rows = list.map((j) => {
+    const state = j.state || j.status;
+    const cancellable = !["done", "failed", "cancelled", "canceled", "succeeded"].includes(state);
+    return [
+      `<b>${esc(j.id)}</b>`, val(j.kind), val(state, (s) =>
+        `<span class="${s === "done" || s === "succeeded" ? "ok" : s === "failed" ? "err" : "warn"}">${esc(s)}</span>`),
+      val(j.model), when(j.created_at), when(j.updated_at),
+      cancellable
+        ? `<button class="btn sm danger" data-action="job-cancel" data-arg="${esc(j.id)}" type="button">cancel</button>`
+        : '<span class="gap">—</span>',
+    ];
+  });
+  $("jobs-body").innerHTML = table(["id", "kind", "state", "model", "created", "updated", "actions"], rows);
 }
 
-function renderSessions(d) {
-  if (d.sessionsErr) { $("sessions-body").innerHTML = errorRow(d.sessionsErr.message); return; }
-  const list = Array.isArray(d.sessions) ? d.sessions : (d.sessions && d.sessions.sessions) || [];
+function renderSessions() {
+  const se = S.sessions;
+  if (!se) return; // not fetched yet (registry model: tabs pull on visit)
+  if (se && se.err) { $("sessions-body").innerHTML = errorRow(se.err.message); return; }
+  const list = Array.isArray(se.data) ? se.data : (se.data && se.data.sessions) || [];
   if (!list.length) {
     $("sessions-body").innerHTML = `<p class="gap">no sessions on record</p>`;
     return;
@@ -314,38 +813,22 @@ function renderSessions(d) {
   $("sessions-body").innerHTML = table(headers, rows);
 }
 
-function renderKeys(d) {
-  const prompt = `<p class="muted">admin key (unscoped): ` +
-    `<input id="admin-key-in" type="password" placeholder="sk-…" size="24"> ` +
-    `<button id="admin-key-set">load</button> ` +
-    `<span class="muted">kept for this tab only</span></p>`;
-  const bind = () => {
-    const set = $("admin-key-set");
-    if (!set) return;
-    set.addEventListener("click", () => {
-      const v = $("admin-key-in").value.trim();
-      if (v) sessionStorage.setItem("blazar-admin-key", v);
-      tick();
-    });
-  };
-  if (d.keysErr) {
-    // 401/403 = the paste above unlocks the listing; 403 "no keys
-    // configured" = authless gateway, nothing to list.
-    const msg = String(d.keysErr.message || "");
-    $("keys-body").innerHTML = prompt +
+function renderKeys() {
+  const ke = S.keys;
+  if (ke && ke.err) {
+    const msg = String(ke.err.message);
+    $("keys-body").innerHTML =
       `<p class="note err">key listing unavailable — ${esc(msg)}</p>` +
-      (msg.includes("401") ? `<p class="muted">paste an unscoped (admin) key above, or run \`blazar keys\`</p>` : "");
-    bind();
+      (msg.includes("401") || msg.includes("403")
+        ? `<p class="muted">paste an unscoped (admin) key in the header, or run \`blazar keys\`</p>` : "");
     return;
   }
-  const list = (d.keys && d.keys.keys) || [];
+  const list = ((ke && ke.data && ke.data.keys) || []);
   if (!list.length) {
-    $("keys-body").innerHTML = prompt +
-      `<p class="gap">no keys on record</p>`;
-    bind();
+    $("keys-body").innerHTML = `<p class="gap">no keys on record — add one above (the plane is authless until the first key exists)</p>`;
     return;
   }
-  const headers = ["name", "models", "rpm", "tpm", "daily", "conc", "mcp servers", "mcp tools", "usage today"];
+  const headers = ["name", "models", "rpm", "tpm", "daily", "conc", "mcp servers", "mcp tools", "usage today", "actions"];
   const rows = list.map((k) => {
     const grants = (arr) => Array.isArray(arr) && arr.length
       ? esc(arr.join(", "))
@@ -361,12 +844,298 @@ function renderKeys(d) {
       grants(k.mcp_servers),
       grants(k.mcp_tools),
       `${esc(u.day || "-")} · ${val(u.requests)} req · ${val(u.tokens)} tok`,
+      `<button class="btn sm" data-action="key-rotate" data-arg="${esc(k.name)}" type="button">rotate</button> ` +
+      `<button class="btn sm danger" data-action="key-remove" data-arg="${esc(k.name)}" type="button">remove</button>`,
     ];
   });
-  $("keys-body").innerHTML = prompt + table(headers, rows) +
-    `<p class="muted">${esc(d.keys.token_accounting || "")}</p>`;
-  bind();
+  $("keys-body").innerHTML = table(headers, rows) +
+    `<p class="muted">${esc((ke.data && ke.data.token_accounting) || "")}</p>`;
 }
+
+// ---- live events (SSE) ---------------------------------------------------
+// /api/events sends named SSE events (event: <kind>) — a raw fetch
+// reader parses every frame kind uniformly, unknown future kinds
+// included, and survives authless and admin-keyed daemons alike.
+const EV_RING = [];
+let evAbort = null;
+async function startEvents() {
+  if (evAbort) return;
+  const ctl = new AbortController();
+  evAbort = ctl;
+  const draw = () => {
+    $("ev-status").textContent = `${EV_RING.length} buffered · live`;
+    $("dash-events").innerHTML = EV_RING.length
+      ? table(["time", "event", "payload"], EV_RING.map((e) => [
+          `<span class="muted">${esc(e.at)}</span>`,
+          `<span class="ev-kind">${esc(e.kind)}</span>`,
+          `<span class="mono-sm" title="${esc(e.body)}">${esc(e.body.length > 140 ? e.body.slice(0, 140) + "…" : e.body)}</span>`,
+        ]))
+      : '<p class="gap">no events yet — engine updates, pulls, failovers and config reloads land here</p>';
+  };
+  try {
+    const r = await fetch("/api/events", { signal: ctl.signal, headers: adminAuth() || {} });
+    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        let kind = "message", data = "";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event:")) kind = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+        EV_RING.unshift({ at: new Date().toLocaleTimeString(), kind, body: data });
+        if (EV_RING.length > 40) EV_RING.length = 40;
+        draw();
+      }
+    }
+  } catch (e) {
+    if (ctl.signal.aborted) return;
+    $("ev-status").textContent = "disconnected — reconnecting";
+  }
+  if (!ctl.signal.aborted) {
+    evAbort = null;
+    setTimeout(startEvents, 3000);
+  }
+}
+
+// ---- actions ------------------------------------------------------------
+// One dispatcher, event-delegated: buttons carry data-action + data-arg.
+// Where each action's failure receipt lands; null = toast only.
+const ACT_AREA = {
+  warm: "models-detail", evict: "models-detail", explain: "models-detail", diagnose: "models-detail",
+  "route-lookup": "routing-route", "key-rotate": "keys-receipt", "key-remove": "keys-receipt",
+  "cfg-reload": "cfg-receipt", "cfg-unset": "cfg-receipt", "cfg-unset-editor": "cfg-receipt",
+};
+
+async function act(action, btn) {
+  const arg = btn.dataset.arg, arg2 = btn.dataset.arg2, arg3 = btn.dataset.arg3;
+  try {
+    switch (action) {
+      case "refresh":
+        await refreshGroup(arg);
+        toast("refreshed", "ok");
+        return;
+      case "warm": {
+        const r = await sendJSON("/api/warm", "POST", { model: arg, wait: false });
+        toast(`warm queued for ${arg}`, "ok");
+        receipt("models-detail", true, `warm ${arg}`, JSON.stringify(r, null, 2));
+        refreshName("ps").then(renderAll);
+        return;
+      }
+      case "evict": {
+        if (!confirm(`evict ${arg}? resident memory frees; the model reloads on next use`)) return;
+        const r = await sendJSON("/api/evict", "POST", { model: arg });
+        toast(`evicted ${arg}`, "ok");
+        receipt("models-detail", true, `evict ${arg}`, JSON.stringify(r, null, 2));
+        refreshTab("models", true);
+        return;
+      }
+      case "explain": {
+        const r = await fetchJSON("/api/explain/" + encodeURIComponent(arg));
+        $("models-detail-name").textContent = `— ${arg}`;
+        $("models-detail").innerHTML = kvTable(r) || `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`;
+        return;
+      }
+      case "diagnose": {
+        const r = await fetchJSON("/api/diagnose/" + encodeURIComponent(arg));
+        $("models-detail-name").textContent = `— ${arg}`;
+        let html = "";
+        for (const leg of ["residency", "usage", "why", "route"]) {
+          html += `<h2>${leg}</h2>`;
+          const v = r[leg];
+          html += v === null || v === undefined
+            ? '<p class="gap">leg unavailable</p>'
+            : `<pre>${esc(JSON.stringify(v, null, 2))}</pre>`;
+        }
+        $("models-detail").innerHTML = html + `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`;
+        return;
+      }
+      case "route-lookup": {
+        const m = ($("route-model-in").value || "").trim();
+        if (!m) { toast("enter a model name first", "err"); return; }
+        const r = await fetchJSON("/api/route/" + encodeURIComponent(m), adminAuth());
+        $("routing-route").innerHTML = kvTable(r) || `<pre>${esc(JSON.stringify(r, null, 2))}</pre>`;
+        return;
+      }
+      case "job-cancel": {
+        if (!confirm(`cancel job ${arg}?`)) return;
+        const r = await sendJSON("/v1/jobs/" + encodeURIComponent(arg) + "/cancel", "POST");
+        toast(`cancel requested for ${arg}`, "ok");
+        refreshTab("jobs", true);
+        return;
+      }
+      case "key-rotate": {
+        if (!confirm(`rotate ${arg}? the old secret stops working immediately`)) return;
+        const r = await sendJSON("/api/keys/rotate?name=" + encodeURIComponent(arg), "POST");
+        const secret = r && typeof r.key === "string" ? r.key : null;
+        receipt("keys-receipt", true, `rotated ${arg} — new secret (shown exactly once)`,
+          JSON.stringify(r, null, 2));
+        if (secret) {
+          const b = document.createElement("button");
+          b.className = "btn sm"; b.type = "button"; b.textContent = "copy secret";
+          b.addEventListener("click", () => copyText(secret));
+          $("keys-receipt").querySelector("pre").appendChild(document.createTextNode(" "));
+          $("keys-receipt").querySelector("pre").appendChild(b);
+        }
+        refreshName("keys").then(renderAll);
+        return;
+      }
+      case "key-remove": {
+        if (!confirm(`remove key ${arg}? requests using it fail immediately`)) return;
+        await sendJSON("/api/keys?name=" + encodeURIComponent(arg), "DELETE");
+        toast(`removed ${arg}`, "ok");
+        refreshTab("keys", true);
+        return;
+      }
+      case "failover-pin": {
+        if (!confirm(`pin chain ${arg} to target ${arg2}?`)) return;
+        const r = await sendJSON("/api/failover/" + encodeURIComponent(arg) + "/pin", "POST", { target: Number(arg2) });
+        toast(`pinned ${arg} → ${arg2}`, "ok");
+        refreshTab("routing", true);
+        return;
+      }
+      case "failover-unpin": {
+        if (!confirm(`unpin ${arg}? the chain returns to automatic resolution`)) return;
+        const r = await sendJSON("/api/failover/" + encodeURIComponent(arg) + "/unpin", "POST");
+        toast(`unpinned ${arg}`, "ok");
+        refreshTab("routing", true);
+        return;
+      }
+      case "pool-op": {
+        if (arg3 === "drain" && !confirm(`drain ${arg2} from pool ${arg}? it stops receiving traffic`)) return;
+        const r = await sendJSON("/api/pools/" + encodeURIComponent(arg) + "/" + encodeURIComponent(arg3), "POST", { member: arg2 });
+        toast(`${arg3} ${arg2}`, "ok");
+        refreshTab("routing", true);
+        return;
+      }
+      case "cfg-reload": {
+        const r = await sendJSON("/api/config/reload", "POST");
+        const reload = r && r.reload || r;
+        const cold = (reload && reload.cold_only) || [];
+        receipt("cfg-receipt", true, "config reloaded" + (cold.length ? ` — needs restart for: ${cold.join(", ")}` : " — fully hot"),
+          JSON.stringify(r, null, 2));
+        toast("config reloaded" + (cold.length ? " (cold knobs listed)" : ""), "ok");
+        refreshTab("config", true);
+        return;
+      }
+      case "cfg-edit": {
+        $("cfg-key-in").value = arg;
+        $("cfg-val-in").value = "";
+        $("cfg-val-in").focus();
+        return;
+      }
+      case "cfg-unset": {
+        if (!confirm(`unset ${arg}? the built-in default takes over (restart for cold knobs)`)) return;
+        const r = await sendJSON("/api/config/unset", "POST", { key: arg });
+        const cold = (r && r.reload && r.reload.cold_only) || [];
+        receipt("cfg-receipt", r && r.applied !== false, `unset ${arg}` + (cold.length ? ` — needs restart for: ${cold.join(", ")}` : ""),
+          JSON.stringify(r, null, 2));
+        refreshTab("config", true);
+        return;
+      }
+      case "cfg-unset-editor": {
+        const key = ($("cfg-key-in").value || "").trim();
+        if (!key) { toast("enter a key to unset", "err"); return; }
+        if (!confirm(`unset ${key}? the built-in default takes over`)) return;
+        const r = await sendJSON("/api/config/unset", "POST", { key });
+        const cold = (r && r.reload && r.reload.cold_only) || [];
+        receipt("cfg-receipt", r && r.applied !== false, `unset ${key}` + (cold.length ? ` — needs restart for: ${cold.join(", ")}` : ""),
+          JSON.stringify(r, null, 2));
+        refreshTab("config", true);
+        return;
+      }
+      case "cfg-example": {
+        $("cfg-key-in").value = "log_level";
+        $("cfg-val-in").value = "debug";
+        return;
+      }
+    }
+  } catch (e) {
+    const [msg, hint] = errText(e);
+    const id = ACT_AREA[action];
+    if (id) receipt(id, false, `${action} failed`, msg + (hint ? "\nhint: " + hint : ""));
+    toast(msg, "err");
+  }
+}
+
+document.body.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-action]");
+  if (!btn || btn.tagName !== "BUTTON" || btn.disabled) return;
+  act(btn.dataset.action, btn);
+});
+
+$("cfg-editor").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const key = ($("cfg-key-in").value || "").trim();
+  const value = ($("cfg-val-in").value || "").trim();
+  if (!key) { toast("enter a key", "err"); return; }
+  if (!value) { toast("enter a value (use unset to remove)", "err"); return; }
+  try {
+    const r = await sendJSON("/api/config/set", "POST", { key, value });
+    const cold = (r && r.reload && r.reload.cold_only) || [];
+    receipt("cfg-receipt", true, `set ${key} = ${(r && r.stored) ?? value}` + (cold.length ? ` — needs restart for: ${cold.join(", ")}` : ""),
+      JSON.stringify(r, null, 2));
+    toast(`${key} set`, "ok");
+    refreshTab("config", true);
+  } catch (e) {
+    const [msg, hint] = errText(e);
+    receipt("cfg-receipt", false, `set ${key} rejected`, msg + (hint ? "\nhint: " + hint : ""));
+    toast("set rejected — see config tab", "err");
+  }
+});
+
+$("key-add").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const name = ($("key-name-in").value || "").trim();
+  if (!name) { toast("enter a key name", "err"); return; }
+  const csv = (s) => (s || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const body = { name, models: csv($("key-models-in").value), mcp_servers: csv($("key-mcp-in").value) };
+  try {
+    const r = await sendJSON("/api/keys", "POST", body);
+    const secret = r && typeof r.key === "string" ? r.key : null;
+    receipt("keys-receipt", true, `key ${name} created — secret shown exactly once`, JSON.stringify(r, null, 2));
+    if (secret) {
+      const b = document.createElement("button");
+      b.className = "btn sm"; b.type = "button"; b.textContent = "copy secret";
+      b.addEventListener("click", () => copyText(secret));
+      $("keys-receipt").querySelector("pre").appendChild(document.createTextNode(" "));
+      $("keys-receipt").querySelector("pre").appendChild(b);
+    }
+    toast(`key ${name} created`, "ok");
+    $("key-name-in").value = ""; $("key-models-in").value = ""; $("key-mcp-in").value = "";
+    refreshTab("keys", true);
+  } catch (e) {
+    const [msg, hint] = errText(e);
+    receipt("keys-receipt", false, `key ${name} rejected`, msg + (hint ? "\nhint: " + hint : ""));
+  }
+});
+
+$("admin-key-set").addEventListener("click", () => {
+  const v = $("admin-key-in").value.trim();
+  if (v) sessionStorage.setItem("blazar-admin-key", v);
+  for (const n of Object.keys(REGISTRY)) delete S[n];
+  refreshTab(document.querySelector("#tabs button.on").dataset.tab, true);
+  toast("admin key set — refreshing gated planes", "ok");
+});
+$("admin-key-clear").addEventListener("click", () => {
+  sessionStorage.removeItem("blazar-admin-key");
+  $("admin-key-in").value = "";
+  for (const n of Object.keys(REGISTRY)) delete S[n];
+  refreshTab(document.querySelector("#tabs button.on").dataset.tab, true);
+  toast("admin key cleared");
+});
+$("admin-key-in").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") { ev.preventDefault(); $("admin-key-set").click(); }
+});
 
 // ---- tabs + refresh ----------------------------------------------------
 const tabs = document.querySelectorAll("#tabs button");
@@ -374,13 +1143,18 @@ tabs.forEach((b) => b.addEventListener("click", () => {
   tabs.forEach((x) => x.classList.toggle("on", x === b));
   document.querySelectorAll("section").forEach((s) =>
     s.classList.toggle("on", s.id === b.dataset.tab));
+  refreshTab(b.dataset.tab, false);
 }));
 
+function activeTab() { return document.querySelector("#tabs button.on").dataset.tab; }
+
 async function tick() {
-  try { render(await pull()); } catch (e) { $("hdr-updated").textContent = "refresh failed — " + esc(e.message); }
+  try { await refreshTab(activeTab(), false); }
+  catch (e) { $("hdr-updated").textContent = "refresh failed — " + esc(e.message); }
 }
-tick();
-setInterval(tick, 5000); // dashboard cadence; every tab re-renders from the same pull
+refreshTab("dashboard", true);
+setInterval(tick, 5000); // active-tab cadence; every tab re-renders from its own pull
+startEvents();
 </script>
 </body>
 </html>

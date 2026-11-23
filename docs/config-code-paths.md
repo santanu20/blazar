@@ -18,6 +18,13 @@ flag or sizing decision; **runtime/gateway** = supervisor / blazar-runtime behav
 scrub, TLS, telemetry); **cli** = blazar-cli surface.
 
 Companion harness: `scripts/bench_matrix.py` config-knob A/B cells measure the
+
+> Edit-path note: the validated set/unset grammar every knob goes through
+> (dotted keys, quoted model names, ambiguity teaching, hint-twin scalars)
+> lives in `crates/blazar-core/src/config_edit.rs` - single-sourced for
+> `blazar config set`/`unset` (blazar-cli) and the HTTP write planes
+> `POST /api/config/set`/`unset` (blazar-gateway config_api.rs), so GUI,
+> CLI, and file edits can never drift apart.
 perf-relevant subset on/off through the real gateway; the golden-QC gate
 (`qc_sha256`) fingerprints each cell's greedy output so speed-only regressions in
 token quality are surfaced as drift.

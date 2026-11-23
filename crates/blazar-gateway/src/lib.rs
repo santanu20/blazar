@@ -783,6 +783,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/fleet/leave", post(fleet::leave))
         .route("/api/fleet/workers", get(fleet::workers))
         .route("/api/fleet/invite", post(fleet::invite))
+        .route("/api/config", get(config_api::get))
+        .route("/api/config/set", post(config_api::set))
+        .route("/api/config/unset", post(config_api::unset))
         .route("/api/config/reload", post(config_api::reload))
         .route("/api/why", get(ollama::why))
         .route("/api/diagnose/{model}", get(ollama::diagnose))
@@ -964,6 +967,14 @@ async fn status_enrich_mw(resp: axum::response::Response) -> axum::response::Res
     out
 }
 
+/// Process-wide config.toml write lock shared by every HTTP mutation
+/// path ([[keys]] rotations via `persist_keys`, `/api/config/set`,
+/// `/api/config/unset`) so their read-modify-write cycles serialize
+/// against each other. SIGHUP reload reads are lock-free; writes
+/// serialize. CLI writes from other processes rely on the atomic
+/// temp+rename persist (last writer wins, `.bak` keeps the loser).
+pub(crate) static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Persist the live key set back to config.toml ([[keys]] tables).
 /// Full-file round-trip (the established `create`/`config set` pattern):
 /// parse -> swap keys -> validate -> atomic write (temp + rename, F67).
@@ -974,8 +985,7 @@ async fn status_enrich_mw(resp: axum::response::Response) -> axum::response::Res
 /// updated; a failed persist is loud, never silent - the next daemon
 /// restart loses the change).
 fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
-    static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = PERSIST_LOCK
+    let _guard = CONFIG_WRITE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = state.dirs.config_file();
@@ -1007,7 +1017,7 @@ fn persist_keys(state: &AppState, entries: &[ApiKey]) -> Response {
     }
 }
 
-fn error_response(code: u16, msg: &str) -> Response {
+pub(crate) fn error_response(code: u16, msg: &str) -> Response {
     // Single typed chokepoint (error_codes owns the body shape); the
     // status-derived code keeps this u16-signature wrapper's callers
     // unchanged while the construction lives in one place.
@@ -1029,7 +1039,7 @@ async fn unknown_route(method: axum::http::Method, uri: axum::http::Uri) -> Resp
 }
 
 /// Redacted secret for listings: enough to recognize, not enough to use.
-fn redact(secret: &str) -> String {
+pub(crate) fn redact(secret: &str) -> String {
     let prefix: String = secret.chars().take(8).collect();
     format!("{prefix}...")
 }

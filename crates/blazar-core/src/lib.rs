@@ -5,6 +5,7 @@
 pub mod capability_matrix;
 pub mod catalog;
 pub mod config;
+pub mod config_edit;
 pub mod coreside;
 pub mod dirs;
 pub mod engine_kind;
