@@ -62,7 +62,7 @@ function Get-UserPathRaw {
 
 function Set-UserPathRaw([string]$Value) {
     [Microsoft.Win32.Registry]::SetValue('HKEY_CURRENT_USER\Environment', 'Path', $Value,
-        [Microsoft.Win32.RegistryKind]::ExpandString)
+        [Microsoft.Win32.RegistryValueKind]::ExpandString)
 }
 
 $TaskName = 'blazar'
