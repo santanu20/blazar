@@ -178,3 +178,31 @@ jobs:
       - run: sh scripts/check_hygiene.sh
       - run: python3 scripts/check_glyphs.py
 
+  windows-installer:
+    name: windows installer smoke
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Parse before running: the parser reports every syntax error in both
+      # Windows PowerShell 5.1 and PowerShell 7, where a plain run only
+      # surfaces the lines it reaches.
+      - name: parse scripts/install.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $tokens = $null; $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/install.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { $errors | ForEach-Object { Write-Host $_.Message }; exit 1 }
+          Write-Host 'parse ok (Windows PowerShell 5.1)'
+      - name: parse scripts/install.ps1 (PowerShell 7)
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'scripts/install.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { $errors | ForEach-Object { Write-Host $_.Message }; exit 1 }
+          Write-Host 'parse ok (PowerShell 7)'
+      # The only place install.ps1 runs for real: a release download, the
+      # plain install, the uninstall, and the -WithService logon task.
+      - name: installer smoke (install, uninstall, -WithService)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/install_ps1_smoke.ps1 -Version v0.34.3
