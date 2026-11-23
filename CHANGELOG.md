@@ -18,6 +18,7 @@ tracked here.
 - **Gateway saturation acceptance harness with CI verdicts** (`scripts/bench_saturation.py`, `ACCEPTANCE.md`): matched-argv concurrency ladders that fail when gateway overhead exceeds the acceptance band.
 - **W1-W9 measurement campaigns**: honest gateway-overhead proof under matched concurrency, lane quality matrix, hardened tool-call battery with a direct-engine arm, force-length saturation verdicts, and the C=4 admission-pacing follow-up closed as not-a-defect. Receipts under `bench-artifacts/`.
 - **2026-11-22 post-fix campaign receipts.** `BENCHMARK.md` is re-rendered from `bench-artifacts/2026-11-22-postfix-full/`, and the tool-call battery receipts are refreshed under `bench-artifacts/20261122-toolcall/` and `20261123-toolcall/`.
+- **`scripts/bench_archive.py` keeps `bench-artifacts/` in step.** It prints which receipts are cited, `--check` fails when the tracked set drifts from the cited set, and `--apply` writes a reproducible archive tarball, untracks uncited reports and force-adds newly cited ones; CI runs its self-test and `--check`.
 
 ### Changed
 

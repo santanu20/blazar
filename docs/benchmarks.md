@@ -92,6 +92,8 @@ registries, docs and README cite are tracked there; the other
 per-campaign reports, the raw cells (JSONL), per-campaign charts, and
 media payloads live on the
 [bench-archive release](https://github.com/santanu20/blazar/releases/tag/bench-archive-2026-10).
+`python3 scripts/bench_archive.py --apply` updates that set after a
+campaign and writes the archive tarball.
 The full methodology, checker-verified quality
 suites, and every caveat are documented in
 [BENCHMARK.md](https://github.com/santanu20/blazar/blob/main/BENCHMARK.md#reproduce).

@@ -139,6 +139,12 @@ jobs:
       # Renderer self-test: campaign-scoped findings/frontier/index paths a
       # media-only artifact cannot reach; pure-fixture, no GPU needed.
       - run: python3 scripts/bench_render_selftest.py
+      # Bench receipt gate: bench-artifacts/ holds only what the tree cites.
+      # The self-test proves the cite-gated plan and the archive format on a
+      # throwaway repo; --check fails once a tracked receipt is no longer
+      # cited, or a cited report was written but not force-added.
+      - run: python3 scripts/bench_archive.py --selftest
+      - run: python3 scripts/bench_archive.py --check
 
   audit:
     name: cargo audit (dep CVEs)

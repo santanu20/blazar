@@ -22,10 +22,12 @@ __pycache__/
 # reports) stay local by default. A small exception set is force-added past
 # these rules and listed by `git ls-files bench-artifacts`: INDEX.md, the
 # charts BENCHMARK.md embeds, and the receipts that a registry, doc, README
-# link or code comment cites. A newly cited receipt therefore needs
-# `git add -f`; scripts/engine_coverage.py --check fails with "receipt
-# artifact missing" in a fresh clone when one is left out. Reports that
-# nothing cites are archived on the bench-archive GitHub release.
+# link or code comment cites. `python3 scripts/bench_archive.py` prints that
+# set; run it after a campaign, because `--apply` force-adds newly cited
+# reports, untracks reports nothing cites and writes the archive tarball for
+# the bench-archive GitHub release (commit the index afterwards). Without
+# it scripts/engine_coverage.py --check fails with "receipt artifact
+# missing" in a fresh clone.
 # Regenerate charts from cells with scripts/bench_charts.py.
 # staging/ symlinks point at user-local models; cells-stderr/ is
 # debugging-only; corpus.txt captures working-tree prose incl. machine
