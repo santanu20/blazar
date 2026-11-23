@@ -42,6 +42,7 @@ tracked here.
 - **`scripts/push-export.sh` defaults to `main` and runs the CI gates.** It aborted by default since the branch rename (it expected `master`); it now runs clippy with `--all-features` and `cargo nextest run --workspace`, and `scripts/bootstrap.sh` uses `pacman -S` and points at the same commands.
 - **The Windows installer touches only its own daemon and files.** `install.ps1` stops the daemon by executable path and a `serve` command line instead of every process named `blazar`; uninstall removes `blazar.exe` and keeps an install directory that holds other files; the user PATH is rewritten without expanding environment strings; TLS 1.2 is forced for Windows PowerShell.
 - **`scripts/compat/compat_check.sh` builds request bodies as JSON.** Model names and response ids go through `json.dumps` instead of shell concatenation, curl reports transport errors, and every chat fixture also asserts that no error object came back.
+- **`scripts/regen_config_code_paths.py` calls ripgrep without a shell.** The function name quoted in a doc citation is passed as an argv entry; `re.escape` is regex quoting, not shell quoting.
 
 ### Removed
 

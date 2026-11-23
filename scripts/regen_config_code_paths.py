@@ -33,9 +33,23 @@ REPO = Path(__file__).resolve().parent.parent
 DOC = REPO / "docs" / "config-code-paths.md"
 
 CITE = re.compile(r"`(?P<path>[^`\s]+\.rs):(?P<line>\d+)` in `(?P<fn>[^`]+)`")
-FN = "rg --no-heading --line-number -- '^\\s*(?:pub(?:\\(crate\\))? )?(?:async )?(?:unsafe )?fn {name}\\b' {path}"
+FN = r"^\s*(?:pub(?:\(crate\))? )?(?:async )?(?:unsafe )?fn {name}\b"
 JUNK_ANCHORS = {"the", "?", "", "a", "it"}
 STAMP = re.compile(r"Generated \d{4}-\d{2}-\d{2} against working tree `[^`]+`")
+
+
+def rg_first_line(name: str, path: str) -> str:
+    # rg runs from an argv list, never through a shell: re.escape is regex
+    # quoting, not shell quoting, and the fn name comes from a doc citation.
+    pattern = FN.format(name=re.escape(name))
+    out = subprocess.run(
+        ["rg", "--no-heading", "--line-number", "--", pattern, path],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    ).stdout.strip()
+    return out.splitlines()[0] if out else ""
 
 
 def repo_rel(raw: str) -> Path:
@@ -52,31 +66,17 @@ def repo_rel(raw: str) -> Path:
 def fn_line(name: str, path: Path) -> int | None:
     if not path.is_file():
         return None
-    out = subprocess.run(
-        FN.format(name=re.escape(name), path=path),
-        shell=True,
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO,
-    ).stdout.strip()
-    if not out:
+    first = rg_first_line(name, str(path))
+    if not first:
         return None
-    return int(out.splitlines()[0].split(":", 1)[0])
+    return int(first.split(":", 1)[0])
 
 
 def find_across_crates(name: str) -> Path | None:
-    out = subprocess.run(
-        FN.format(name=re.escape(name), path="crates"),
-        shell=True,
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=REPO,
-    ).stdout.strip()
-    if not out:
+    first = rg_first_line(name, "crates")
+    if not first:
         return None
-    hit = Path(out.splitlines()[0].split(":", 1)[0])
+    hit = Path(first.split(":", 1)[0])
     return hit.resolve()
 
 
