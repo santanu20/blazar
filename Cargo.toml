@@ -40,7 +40,6 @@ tower-http = { version = "0.7", features = ["cors"] }
 # (ring has no ML-KEM yet), so PQ key exchange is traded away for
 # ring's portability. Revisit when ring ships post-quantum.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 # rustls-no-provider: the ring provider rides the workspace `rustls`

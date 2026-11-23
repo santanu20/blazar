@@ -2153,18 +2153,25 @@ pub async fn serve(
 fn rustls_server_config(
     config: &blazar_core::Config,
 ) -> Result<rustls::ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
-    use rustls::pki_types::CertificateDer;
-    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::fs::File::open(&config.tls_cert)?,
-    ))
-    .collect::<Result<_, _>>()?;
+    use rustls::pki_types::{
+        CertificateDer, PrivateKeyDer,
+        pem::{self, PemObject},
+    };
+    let certs: Vec<CertificateDer> =
+        CertificateDer::pem_file_iter(&config.tls_cert)?.collect::<Result<_, _>>()?;
     if certs.is_empty() {
         return Err("tls_cert contains no certificates".into());
     }
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(
-        &config.tls_key,
-    )?))?
-    .ok_or("tls_key contains no private key")?;
+    // A key file with no key section is a configuration mistake, not a
+    // parse failure: keep the message that names the setting.
+    let key = PrivateKeyDer::from_pem_file(&config.tls_key).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            match e {
+                pem::Error::NoItemsFound => "tls_key contains no private key".into(),
+                other => other.into(),
+            }
+        },
+    )?;
     Ok(rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?)
@@ -2172,7 +2179,33 @@ fn rustls_server_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_guard_refusal, counter};
+    use super::{bind_guard_refusal, counter, rustls_server_config};
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__rustls_server_config__cert_file_without_certificates_is_named() {
+        // The key file holds no certificate section, so it stands in for
+        // a tls_cert that was pointed at the wrong file.
+        let cfg = blazar_core::Config {
+            tls_cert: "tests/fixtures/tls-key.pem".into(),
+            tls_key: "tests/fixtures/tls-key.pem".into(),
+            ..blazar_core::Config::default()
+        };
+        let err = rustls_server_config(&cfg).expect_err("no certificate section");
+        assert_eq!(err.to_string(), "tls_cert contains no certificates");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__rustls_server_config__key_file_without_private_key_is_named() {
+        let cfg = blazar_core::Config {
+            tls_cert: "tests/fixtures/tls-cert.pem".into(),
+            tls_key: "tests/fixtures/tls-cert.pem".into(),
+            ..blazar_core::Config::default()
+        };
+        let err = rustls_server_config(&cfg).expect_err("no key section");
+        assert_eq!(err.to_string(), "tls_key contains no private key");
+    }
 
     #[test]
     #[allow(non_snake_case)]

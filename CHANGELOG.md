@@ -34,6 +34,7 @@ tracked here.
 - **The hygiene gate rejects root-level working notes.** `scripts/check_hygiene.sh` fails CI when a root-level `*.md` other than `README.md`, `CHANGELOG.md` and `BENCHMARK.md` is tracked, so a campaign note can no longer land beside the product documents.
 - **Engine-coverage proof links point at the published branch.** `scripts/engine_coverage.py` renders every receipt link in `docs/engine-coverage.md` as a GitHub URL, so the 31 proof links resolve on the docs site and on GitHub instead of 404.
 - **CI's test step runs to the end.** nextest stopped after the first failure, hiding 469 (macOS) and 416 (Windows) not-yet-run tests behind a single panic; the step now passes `--no-fail-fast`, so a red run lists every failing test at once.
+- **TLS PEM files are loaded through `rustls-pki-types`.** `rustls-pemfile` is unmaintained and is dropped as a dependency; the gateway now reads the certificate chain and the private key with the `PemObject` API that `rustls` already re-exports, and the two configuration errors keep their messages (`tls_cert contains no certificates`, `tls_key contains no private key`).
 
 ### Removed
 
