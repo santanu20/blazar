@@ -593,7 +593,7 @@ fn finite_unit(value: f64, fallback: f64) -> f64 {
 fn normalize_state(state: &str) -> String {
     state
         .split_whitespace()
-        .flat_map(str::to_lowercase)
+        .map(str::to_lowercase)
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -657,6 +657,16 @@ mod tests {
             .unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(tree.stats().transpositions, 1);
+    }
+
+    #[test]
+    fn unit__frontier_check__does_not_mutate_visits() {
+        let mut tree = SearchTree::new("root", SearchConfig::default());
+        tree.expand(0, vec![proposal("open", 0.7, 0.2, 0.7)])
+            .unwrap();
+        let before = tree.nodes()[1].visits;
+        assert!(tree.has_open_frontier());
+        assert_eq!(tree.nodes()[1].visits, before);
     }
 
     #[test]
