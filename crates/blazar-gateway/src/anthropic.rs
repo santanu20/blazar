@@ -442,8 +442,15 @@ pub async fn messages(
     // opt in (the loop owns every child round; judging candidates on
     // top would double-call the engine).
     let mcp_child = if let Some(sel) = &mcp_sel {
-        match crate::mcp::chat_via_mcp(&state, &engine, &mut openai_body, sel, key_ext.as_deref(), None)
-            .await
+        match crate::mcp::chat_via_mcp(
+            &state,
+            &engine,
+            &mut openai_body,
+            sel,
+            key_ext.as_deref(),
+            None,
+        )
+        .await
         {
             Ok(child) => Some(child),
             Err(resp) => return resp,
