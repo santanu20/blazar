@@ -52,6 +52,14 @@ impl TaskProfile {
             .as_ref()
             .map(|oracle| oracle.expression.as_str())
     }
+    pub(crate) fn table_label(&self) -> Option<&str> {
+        self.table.as_ref().map(|oracle| oracle.label.as_str())
+    }
+
+    pub(crate) fn table_value(&self) -> Option<f64> {
+        self.table.as_ref().map(|oracle| oracle.value)
+    }
+
 
     pub(crate) fn math_valid(&self, content: &str) -> Option<bool> {
         let expected = self.math_expected()?;
@@ -156,9 +164,9 @@ pub(crate) fn pick_candidate(
                 .and_then(|text| serde_json::from_str::<Value>(text).ok())
                 .is_some_and(|instance| sentinel.schema_check(schema, &instance).is_none())
         });
-        let math_valid = if profile.math_expected().is_some() {
+        let task_valid = if profile.has_deterministic_verifier() {
             profile
-                .math_valid(&response_content(body).unwrap_or_default())
+                .task_valid(&response_content(body).unwrap_or_default())
                 .unwrap_or(false)
         } else {
             true
@@ -173,12 +181,12 @@ pub(crate) fn pick_candidate(
             .and_then(|key| counts.get(key))
             .copied()
             .unwrap_or(0);
-        let hard_gates = u8::from(schema_valid) + u8::from(math_valid);
+        let hard_gates = u8::from(schema_valid) + u8::from(task_valid);
         (
             u8::from(http_success),
             hard_gates,
             u8::from(schema_valid),
-            u8::from(math_valid),
+            u8::from(task_valid),
             u8::from(complete),
             u8::from(non_empty),
             votes,
@@ -196,6 +204,8 @@ pub(crate) fn pick_candidate(
         .unwrap_or(0);
     let verifier = if profile.math_expected().is_some() {
         "math_exact"
+    } else if profile.table_label().is_some() {
+        "table_lookup_exact"
     } else if schema.is_some() {
         "json_schema+consensus"
     } else {
@@ -408,7 +418,14 @@ fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
         {
             continue;
         }
-        let Ok(value) = raw_value.parse::<f64>() else {
+        let Some(value_token) = raw_value
+            .split_whitespace()
+            .next()
+            .map(|token| token.trim_end_matches(['.', '!', '?']))
+        else {
+            continue;
+        };
+        let Ok(value) = value_token.parse::<f64>() else {
             continue;
         };
         if !value.is_finite() {
@@ -634,6 +651,41 @@ mod tests {
         assert_eq!(profile.table_valid("Birch=19"), Some(false));
         assert_eq!(profile.table_valid("Pine=18"), Some(false));
         assert!(profile.table_feedback().is_some());
+    }
+
+    #[test]
+    fn unit__table_oracle__parses_last_row_with_trailing_instruction() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Oak=12, Pine=19, Birch=26. Return the highest label and value."
+            }]
+        });
+        let profile = TaskProfile::from_request(&request);
+        assert_eq!(profile.table_label(), Some("Birch"));
+        assert_eq!(profile.table_value(), Some(26.0));
+        assert_eq!(profile.table_valid("Birch=26"), Some(true));
+        assert_eq!(profile.table_valid("Pine=19"), Some(false));
+    }
+
+    #[test]
+    fn unit__pick_candidate__table_oracle_beats_wrong_majority() {
+        let sentinel = crate::sentinel::Sentinel::new(false, 0, None);
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Oak=12, Pine=19, Birch=26. Return the highest label and value."
+            }]
+        });
+        let candidates = vec![
+            (200, json!({"choices":[{"message":{"content":"Pine=19"},"finish_reason":"stop"}]})),
+            (200, json!({"choices":[{"message":{"content":"Pine=19"},"finish_reason":"stop"}]})),
+            (200, json!({"choices":[{"message":{"content":"Birch=26"},"finish_reason":"stop"}]})),
+        ];
+        let decision = pick_candidate(&sentinel, &candidates, None, &request);
+        assert_eq!(decision.winner_index, 2);
+        assert_eq!(decision.agreement, 1);
+        assert_eq!(decision.verifier, "table_lookup_exact");
     }
 
     #[test]
