@@ -351,7 +351,12 @@ fn merge_usage(total: &mut Option<Value>, body: &Value) {
 }
 
 fn patch_usage(body: &mut Value, usage: Option<Value>) {
-    if let Some(usage) = usage {
+    if let Some(mut usage) = usage {
+        let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
+        let completion = usage.get("completion_tokens").and_then(Value::as_u64);
+        if let (Some(prompt), Some(completion)) = (prompt, completion) {
+            usage["total_tokens"] = Value::from(prompt.saturating_add(completion));
+        }
         body["usage"] = usage;
     }
 }
@@ -1003,6 +1008,19 @@ mod tests {
         assert_eq!(usage["completion_tokens"], 12);
         assert_eq!(usage["total_tokens"], 42);
         assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 5);
+
+        // Best-of-N sums prompt and completion tokens but may leave the
+        // winner's original total_tokens untouched. Normalize after merging.
+        let mut response = json!({});
+        patch_usage(
+            &mut response,
+            Some(json!({
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "total_tokens": 15
+            })),
+        );
+        assert_eq!(response["usage"]["total_tokens"], 42);
     }
 
     #[test]
