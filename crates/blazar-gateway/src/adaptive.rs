@@ -994,6 +994,11 @@ fn parse_search_expansion(
         .collect()
 }
 
+fn has_chat_response_envelope(body: &Value) -> bool {
+    body.pointer("/choices/0/message")
+        .is_some_and(Value::is_object)
+}
+
 fn install_search_answer(body: &mut Value, answer: &str) -> bool {
     let Some(message) = body.pointer_mut("/choices/0/message") else {
         return false;
@@ -1117,13 +1122,24 @@ async fn run_local_search_inner(
                     continue;
                 }
             };
+        if !response.status.is_success() {
+            let _ = tree.expand(leaf, Vec::new());
+            rejected = rejected.saturating_add(1);
+            stop_reason = "upstream_error".to_string();
+            continue;
+        }
         let Ok(expansion_body) = serde_json::from_slice::<Value>(&response.body) else {
             let _ = tree.expand(leaf, Vec::new());
             rejected = rejected.saturating_add(1);
-            current = Some(response);
             stop_reason = "unparseable_expansion".to_string();
             continue;
         };
+        if !has_chat_response_envelope(&expansion_body) {
+            let _ = tree.expand(leaf, Vec::new());
+            rejected = rejected.saturating_add(1);
+            stop_reason = "invalid_response_envelope".to_string();
+            continue;
+        }
         merge_usage(&mut usage_total, &expansion_body);
         let proposals = parse_search_expansion(
             state,
@@ -1747,13 +1763,24 @@ async fn run_remote_search_inner(
                 continue;
             }
         };
+        if !response.status.is_success() {
+            let _ = tree.expand(leaf, Vec::new());
+            rejected = rejected.saturating_add(1);
+            stop_reason = "upstream_error".to_string();
+            continue;
+        }
         let Ok(expansion_body) = serde_json::from_slice::<Value>(&response.body) else {
             let _ = tree.expand(leaf, Vec::new());
             rejected = rejected.saturating_add(1);
-            current = Some(response);
             stop_reason = "unparseable_expansion".to_string();
             continue;
         };
+        if !has_chat_response_envelope(&expansion_body) {
+            let _ = tree.expand(leaf, Vec::new());
+            rejected = rejected.saturating_add(1);
+            stop_reason = "invalid_response_envelope".to_string();
+            continue;
+        }
         merge_usage(&mut usage_total, &expansion_body);
         let proposals = parse_search_expansion(
             state,
@@ -2365,6 +2392,19 @@ mod tests {
         assert_eq!(plan.max_tool_rounds, MAX_TOOL_ROUNDS);
         assert_eq!(plan.max_tool_calls, MAX_TOOL_CALLS);
         assert!(plan.max_schema_retries <= MAX_DEEP_SCHEMA_RETRIES);
+    }
+
+    #[test]
+    fn unit__search_response_envelope__rejects_expansion_json_without_chat_choice() {
+        assert!(has_chat_response_envelope(&json!({
+            "choices": [{"message": {"role": "assistant", "content": "{}"}}]
+        })));
+        assert!(!has_chat_response_envelope(&json!({
+            "branches": [{"step": "reason"}]
+        })));
+        assert!(!has_chat_response_envelope(&json!({
+            "choices": [{"text": "not a chat message"}]
+        })));
     }
 
     #[test]
