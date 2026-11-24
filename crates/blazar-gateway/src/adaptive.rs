@@ -1648,7 +1648,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn unit__auto_math__gets_a_bounded_verifier_repair() {
         let request = json!({
             "messages": [{
@@ -1662,6 +1661,7 @@ mod tests {
         assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 2);
     }
 
+    #[test]
     fn unit__candidate_quality__schema_validity_beats_completion_only() {
         let invalid_but_complete = CandidateQuality {
             http_success: true,
