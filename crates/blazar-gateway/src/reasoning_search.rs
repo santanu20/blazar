@@ -291,24 +291,24 @@ pub struct SearchStats {
     pub max_depth_reached: usize,
     pub verified_terminals: usize,
     pub rejected_nodes: usize,
-    pub transpositions: usize,
+    pub duplicate_states: usize,
     pub prm_evaluated_nodes: usize,
     pub prm_calibrated_nodes: usize,
     pub best_value: f64,
     pub best_uncertainty: f64,
 }
 
-/// Search tree with PUCT selection, uncertainty bonuses, transposition
-/// deduplication, backpropagation and a token-aware exploration schedule.
+/// Search tree with PUCT selection, uncertainty bonuses, exact-state
+/// duplicate suppression, backpropagation and a token-aware exploration schedule.
 #[derive(Clone, Debug)]
 pub struct SearchTree {
     config: SearchConfig,
     nodes: Vec<SearchNode>,
-    transpositions: HashMap<String, usize>,
+    state_index: HashMap<String, usize>,
     expansions: usize,
     tokens: usize,
     max_depth_reached: usize,
-    transposition_hits: usize,
+    duplicate_state_hits: usize,
     stop_reason: Option<StopReason>,
 }
 
@@ -316,8 +316,8 @@ impl SearchTree {
     #[must_use]
     pub fn new(root_state: impl Into<String>, config: SearchConfig) -> Self {
         let root_state = root_state.into();
-        let mut transpositions = HashMap::new();
-        transpositions.insert(normalize_state(&root_state), 0);
+        let mut state_index = HashMap::new();
+        state_index.insert(normalize_state(&root_state), 0);
         Self {
             config: SearchConfig {
                 max_nodes: config.max_nodes.max(1),
@@ -344,11 +344,11 @@ impl SearchTree {
                 estimated_state_tokens: 0,
                 value_sum: 0.5,
             }],
-            transpositions,
+            state_index,
             expansions: 0,
             tokens: 0,
             max_depth_reached: 0,
-            transposition_hits: 0,
+            duplicate_state_hits: 0,
             stop_reason: None,
         }
     }
@@ -480,8 +480,8 @@ impl SearchTree {
         }
     }
 
-    /// Expand one open node. Duplicate states are collapsed into the existing
-    /// transposition; rejected proposals are recorded but never selectable.
+    /// Expand one open node. Byte-identical states are suppressed; this is
+    /// duplicate detection, not a shared-node transposition DAG.
     pub fn expand(
         &mut self,
         parent_id: usize,
@@ -518,8 +518,8 @@ impl SearchTree {
                 break;
             }
             let normalized_state = normalize_state(&proposal.state);
-            if self.transpositions.contains_key(&normalized_state) {
-                self.transposition_hits = self.transposition_hits.saturating_add(1);
+            if self.state_index.contains_key(&normalized_state) {
+                self.duplicate_state_hits = self.duplicate_state_hits.saturating_add(1);
                 continue;
             }
             let id = self.nodes.len();
@@ -549,7 +549,7 @@ impl SearchTree {
                 estimated_state_tokens: proposal.estimated_state_tokens,
                 value_sum: value.mean,
             });
-            self.transpositions.insert(normalized_state, id);
+            self.state_index.insert(normalized_state, id);
             self.nodes[parent_id].children.push(id);
             self.max_depth_reached = self.max_depth_reached.max(depth);
             if status == NodeStatus::Terminal && proposal.verification == Verification::Passed {
@@ -643,7 +643,7 @@ impl SearchTree {
             max_depth_reached: self.max_depth_reached,
             verified_terminals,
             rejected_nodes,
-            transpositions: self.transposition_hits,
+            duplicate_states: self.duplicate_state_hits,
             prm_evaluated_nodes,
             prm_calibrated_nodes,
             best_value: best.map_or(0.0, SearchNode::mean_value),
@@ -723,15 +723,28 @@ fn answer_priority(node: &SearchNode) -> f64 {
         Verification::Unknown => 0.0,
         Verification::Failed => -2.0,
     };
-    hard + node.mean_value() - node.value.uncertainty * 0.1
+    hard + node.mean_value() + finite_unit(node.prior, 0.0) * 0.15
+        - node.value.uncertainty * 0.1
 }
 
 fn sanitize_estimate(estimate: ValueEstimate) -> ValueEstimate {
+    let calibrated = estimate.calibrated && estimate.available;
     ValueEstimate {
-        mean: finite_unit(estimate.mean, 0.5),
-        uncertainty: finite_unit(estimate.uncertainty, 1.0),
+        // An uncalibrated score is not a usable reward. Keep the observation
+        // available for diagnostics, but make it neutral and maximally uncertain
+        // so it cannot influence pruning, PUCT value backups or final ranking.
+        mean: if calibrated {
+            finite_unit(estimate.mean, 0.5)
+        } else {
+            0.5
+        },
+        uncertainty: if calibrated {
+            finite_unit(estimate.uncertainty, 1.0)
+        } else {
+            1.0
+        },
         available: estimate.available,
-        calibrated: estimate.calibrated && estimate.available,
+        calibrated,
     }
 }
 
@@ -744,11 +757,10 @@ fn finite_unit(value: f64, fallback: f64) -> f64 {
 }
 
 fn normalize_state(state: &str) -> String {
-    state
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Text normalization can change code, identifiers, string literals or
+    // indentation-sensitive languages. Use exact state identity until a
+    // task-specific canonicalizer can prove semantic equivalence.
+    state.to_string()
 }
 
 #[cfg(test)]
@@ -796,19 +808,67 @@ mod tests {
     }
 
     #[test]
-    fn unit__transpositions__deduplicates_equivalent_states() {
+    fn unit__state_deduplication__suppresses_only_identical_states() {
         let mut tree = SearchTree::new("root", SearchConfig::default());
         let ids = tree
             .expand(
                 0,
                 vec![
-                    proposal("same  partial state", 0.6, 0.2, 0.5),
-                    proposal("SAME partial STATE", 0.7, 0.1, 0.7),
+                    proposal("same partial state", 0.6, 0.2, 0.5),
+                    proposal("same partial state", 0.7, 0.1, 0.7),
                 ],
             )
             .unwrap();
         assert_eq!(ids.len(), 1);
-        assert_eq!(tree.stats().transpositions, 1);
+        assert_eq!(tree.stats().duplicate_states, 1);
+    }
+
+    #[test]
+    fn unit__state_deduplication__preserves_case_and_whitespace() {
+        let mut tree = SearchTree::new("root", SearchConfig::default());
+        let ids = tree
+            .expand(
+                0,
+                vec![
+                    proposal("let value = \\\"A\\\";", 0.6, 0.2, 0.5),
+                    proposal("let value = \\\"a\\\";", 0.6, 0.2, 0.5),
+                    proposal("    let value = \\\"A\\\";", 0.6, 0.2, 0.5),
+                ],
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(tree.stats().duplicate_states, 0);
+    }
+
+    #[test]
+    fn unit__uncalibrated_reward__cannot_change_candidate_selection() {
+        let mut tree = SearchTree::new("root", SearchConfig::default());
+        tree.expand(
+            0,
+            vec![
+                SearchProposal {
+                    state: "high uncalibrated score".into(),
+                    answer: Some("untrusted-high".into()),
+                    prior: 0.2,
+                    value: ValueEstimate::new(0.99, 0.0, false),
+                    verification: Verification::Unknown,
+                    estimated_state_tokens: 4,
+                },
+                SearchProposal {
+                    state: "low uncalibrated score".into(),
+                    answer: Some("prior-preferred".into()),
+                    prior: 0.8,
+                    value: ValueEstimate::new(0.01, 0.0, false),
+                    verification: Verification::Unknown,
+                    estimated_state_tokens: 4,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(tree.best_answer().unwrap().1, "prior-preferred");
+        assert_eq!(tree.nodes()[1].value.mean, 0.5);
+        assert_eq!(tree.nodes()[2].value.mean, 0.5);
+        assert_eq!(tree.nodes()[1].value.uncertainty, 1.0);
     }
 
     #[test]
