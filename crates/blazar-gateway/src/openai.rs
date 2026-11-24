@@ -882,7 +882,20 @@ pub async fn openai_proxy(
         {
             let default_tokens = state.cfg().reserve_default_tokens;
             let estimate = parsed_body.as_ref().map_or(default_tokens, |v| {
-                crate::keys::completion_ceiling(v, default_tokens)
+                let per_call = crate::keys::completion_ceiling(v, default_tokens);
+                let call_multiplier = adaptive_mode.map_or(1_u64, |mode| {
+                    let plan = crate::adaptive::Plan::for_request(mode, v);
+                    let proposed = plan.strategy(v);
+                    // Remote candidate fan-out is currently serialized into
+                    // the sequential strategy by run_remote_chat.
+                    let effective = if proposed == crate::adaptive::Strategy::ParallelVerifiedCandidates {
+                        crate::adaptive::Strategy::SequentialRevision
+                    } else {
+                        proposed
+                    };
+                    u64::try_from(plan.max_model_calls(effective)).unwrap_or(1)
+                });
+                per_call.saturating_mul(call_multiplier)
             });
             match state.keys.reserve(&entry, estimate) {
                 Ok(l) => budget_lease = l,
