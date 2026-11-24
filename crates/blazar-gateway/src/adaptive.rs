@@ -454,7 +454,7 @@ impl CandidateSummary {
             summary.candidates = field("used=")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(1)
-                .max(1);
+                .clamp(1, crate::bestof::MAX_BEST_OF as usize);
             summary.fanout = summary.candidates > 1;
             let key = field("vote_key").and_then(|value| u64::from_str_radix(value, 16).ok())
                 .or_else(|| crate::reasoning::answer_hash(&response_content(body).unwrap_or_default()));
@@ -588,6 +588,28 @@ fn assess_candidate(
         agreement: summary.agreement_for(body),
         candidates: summary.candidates.max(1),
     }
+}
+
+fn reasoning_receipt(
+    receipt: String,
+    plan: &Plan,
+    summary: &CandidateSummary,
+    body: &Value,
+) -> String {
+    let judge = if plan.task_profile.math_expected().is_some() {
+        "math_exact"
+    } else if plan.verify_schema {
+        "json_schema+answer_consensus"
+    } else if summary.fanout {
+        "answer_consensus"
+    } else {
+        "response_contract"
+    };
+    format!(
+        "{receipt} judge={judge} agreement={}/{}",
+        summary.agreement_for(body),
+        summary.candidates.max(1)
+    )
 }
 
 fn revision_feedback(
@@ -989,21 +1011,20 @@ async fn run_local_chat_inner(
     {
         current.headers.insert("x-blazar-structured-output", value);
     }
-    Ok(rebuild_response(
-        current,
-        &loop_receipt(
-            &plan,
-            strategy,
-            model_calls,
-            candidates,
-            schema_verified,
-            revisions,
-            degraded.as_deref(),
-            accepted,
-            rejected,
-            &stop_reason,
-        ),
-    ))
+    let receipt = loop_receipt(
+        &plan,
+        strategy,
+        model_calls,
+        candidates,
+        schema_verified,
+        revisions,
+        degraded.as_deref(),
+        accepted,
+        rejected,
+        &stop_reason,
+    );
+    let receipt = reasoning_receipt(receipt, &plan, &candidate_summary, &current_body);
+    Ok(rebuild_response(current, &receipt))
 }
 
 #[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
@@ -1374,21 +1395,20 @@ async fn run_remote_chat_inner(
             &current.body,
         );
     }
-    Ok(rebuild_axum_response(
-        current,
-        &loop_receipt(
-            &plan,
-            strategy,
-            model_calls,
-            1,
-            schema_verified,
-            revisions,
-            None,
-            accepted,
-            rejected,
-            &stop_reason,
-        ),
-    ))
+    let receipt = loop_receipt(
+        &plan,
+        strategy,
+        model_calls,
+        candidate_summary.candidates,
+        schema_verified,
+        revisions,
+        None,
+        accepted,
+        rejected,
+        &stop_reason,
+    );
+    let receipt = reasoning_receipt(receipt, &plan, &candidate_summary, &current_body);
+    Ok(rebuild_axum_response(current, &receipt))
 }
 
 /// Per-adapter inputs shared by the normalized gateway execution entry point.
