@@ -83,7 +83,11 @@ impl Plan {
             complexity,
             max_tool_rounds,
             max_tool_calls,
-            max_schema_retries: if verify_schema { MAX_SCHEMA_RETRIES } else { 0 },
+            max_schema_retries: if verify_schema {
+                if mode == Mode::Deep { MAX_SCHEMA_RETRIES + 1 } else { MAX_SCHEMA_RETRIES }
+            } else {
+                0
+            },
             verify_schema,
         }
     }
@@ -200,11 +204,15 @@ impl Plan {
         }
     }
 
-    pub(crate) const fn max_model_calls(strategy: Strategy) -> usize {
-        match strategy {
-            Strategy::Direct => 1,
-            Strategy::SequentialRevision => 2,
-            Strategy::ParallelVerifiedCandidates => 3,
+    /// Hard call ceiling for this plan. Deep mode grants additional
+    /// evaluator-driven repairs, not unconditional self-rewrites.
+    pub(crate) const fn max_model_calls(&self, strategy: Strategy) -> usize {
+        match (strategy, self.mode) {
+            (Strategy::Direct, _) => 1,
+            (Strategy::SequentialRevision, Mode::Auto) => 2,
+            (Strategy::SequentialRevision, Mode::Deep) => 3,
+            (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 3,
+            (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 4,
         }
     }
 
@@ -366,15 +374,15 @@ fn append_revision_prompt(
     messages.push(assistant);
     let prompt = if let Some(feedback) = schema_feedback {
         format!(
-            "The previous response did not satisfy the requested JSON schema. \
-             Validation feedback: {feedback} Return only a corrected JSON value that satisfies the schema. \
-             Do not include commentary or an explanation."
+            "The previous candidate failed an objective response-contract check. \\
+             Validation feedback: {feedback} Address this specific defect while preserving \\
+             all already-correct information. Return only the complete final answer."
         )
     } else {
-        "Review the previous answer against the original user request for completeness, \
-         factual consistency, and compliance with the requested format. Correct only \
-         identifiable omissions or errors. Return the improved final answer only; do \
-         not provide an analysis, checklist, or explanation of your revision."
+        "The previous candidate was incomplete or empty according to the gateway's \\
+         response-completion checks. Produce a complete answer to the original request. \\
+         Preserve correct information and do not add unsupported claims. Return only \\
+         the final answer."
             .to_string()
     };
     messages.push(serde_json::json!({"role": "user", "content": prompt}));
@@ -398,6 +406,122 @@ fn schema_violation(
         },
         None => Some("response did not contain JSON text at choices[0].message.content".into()),
     }
+}
+
+/// Contract-level assessment for an answer candidate. This deliberately
+/// does not claim factual or semantic correctness: without a task-specific
+/// independent verifier, Blazar can prove transport, response-envelope,
+/// completion and requested-schema properties only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateQuality {
+    http_success: bool,
+    parseable: bool,
+    schema_valid: Option<bool>,
+    complete: bool,
+    non_empty: bool,
+}
+
+impl CandidateQuality {
+    fn rank(self) -> (u8, u8, u8, u8, u8) {
+        (
+            u8::from(self.http_success),
+            u8::from(self.schema_valid != Some(false)),
+            u8::from(self.complete),
+            u8::from(self.non_empty),
+            u8::from(self.parseable),
+        )
+    }
+
+    fn is_better_than(self, incumbent: Self) -> bool {
+        self.rank() > incumbent.rank()
+    }
+
+    fn is_satisfied(self) -> bool {
+        self.http_success
+            && self.parseable
+            && self.schema_valid != Some(false)
+            && self.complete
+            && self.non_empty
+    }
+
+    fn needs_revision(self) -> bool {
+        self.http_success
+            && (self.schema_valid == Some(false) || !self.complete || !self.non_empty)
+    }
+}
+
+fn assess_candidate(
+    state: &crate::state::AppState,
+    plan: &Plan,
+    schema: Option<&Value>,
+    status: reqwest::StatusCode,
+    body: &Value,
+) -> CandidateQuality {
+    let schema_valid = if plan.verify_schema {
+        Some(schema_violation(state, plan, schema, body).is_none())
+    } else {
+        None
+    };
+    let content = response_content(body).unwrap_or_default();
+    let finish_reason = body
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str);
+    let complete = match finish_reason {
+        Some("length") => false,
+        Some("stop" | "content_filter") | None => true,
+        Some(_) => false,
+    };
+    CandidateQuality {
+        http_success: status.is_success(),
+        parseable: true,
+        schema_valid,
+        complete,
+        non_empty: !content.trim().is_empty(),
+    }
+}
+
+fn revision_feedback(
+    quality: CandidateQuality,
+    schema_feedback: Option<&str>,
+) -> Option<String> {
+    if let Some(feedback) = schema_feedback {
+        return Some(feedback.to_string());
+    }
+    if !quality.needs_revision() {
+        return None;
+    }
+    if !quality.non_empty {
+        return Some("response content is empty; provide a complete answer".into());
+    }
+    if !quality.complete {
+        return Some(
+            "response ended before a normal completion (finish_reason is not stop); complete the answer without dropping required content".into()
+        );
+    }
+    None
+}
+
+fn loop_receipt(
+    plan: &Plan,
+    strategy: Strategy,
+    model_calls: usize,
+    candidates: usize,
+    schema_verified: Option<bool>,
+    revisions: usize,
+    degraded: Option<&str>,
+    accepted: usize,
+    rejected: usize,
+    stop_reason: &str,
+) -> String {
+    let base = plan.execution_receipt(
+        strategy,
+        model_calls,
+        candidates,
+        schema_verified,
+        revisions,
+        degraded,
+    );
+    format!("{base} accepted={accepted} rejected={rejected} stop={stop_reason}")
 }
 
 /// Execute one internal local model round through Blazar's normal proxy
@@ -579,86 +703,130 @@ async fn run_local_chat_inner(
         .unwrap_or(&engine.name)
         .to_string();
     let mut revisions = 0usize;
-    let mut verified = None;
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut schema_repair_attempts = 0usize;
     let mut usage_total = None;
+    let mut stop_reason = "quality_gate_pass".to_string();
 
-    // Every local model call goes through proxy_request, preserving the
-    // normal admission, key-budget, usage, Sentinel and service-time path.
+    // All local calls stay on the normal proxy/accounting path.
     let asked_candidates =
         (strategy == Strategy::ParallelVerifiedCandidates).then(|| Plan::max_candidates(strategy));
     let mut current =
         local_proxy_round(state, engine, &request, headers, key, asked_candidates).await?;
-    let (candidates, degraded, mut model_calls) = if let Some(asked) = asked_candidates {
+    let (candidates, mut degraded, mut model_calls) = if let Some(asked) = asked_candidates {
         let (used, reason) = candidate_usage(&current.headers, usize::try_from(asked).unwrap_or(1));
         (used, reason, used)
     } else {
         (1, None, 1)
     };
-    if let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) {
-        merge_usage(&mut usage_total, &parsed);
-        verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
-    }
-    if !current.status.is_success() {
-        return Ok(rebuild_response(
-            current,
-            &plan.execution_receipt(
-                strategy,
-                model_calls,
-                candidates,
-                verified,
-                revisions,
-                degraded.as_deref(),
-            ),
-        ));
-    }
-    let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) else {
-        return Ok(rebuild_response(
-            current,
-            &plan.execution_receipt(
-                strategy,
-                model_calls,
-                candidates,
-                verified,
-                revisions,
-                degraded.as_deref(),
-            ),
-        ));
-    };
-    if message_has_tool_calls(&parsed) {
-        return Ok(rebuild_response(
-            current,
-            &plan.execution_receipt(
-                strategy,
-                model_calls,
-                candidates,
-                verified,
-                revisions,
-                degraded.as_deref(),
-            ),
-        ));
-    }
 
-    let schema_feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
-    let should_revise = (schema_feedback.is_some() || strategy == Strategy::SequentialRevision)
-        && model_calls < Plan::max_model_calls(strategy);
-    if should_revise {
-        let assistant = parsed
-            .pointer("/choices/0/message")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"role": "assistant", "content": ""}));
-        let feedback = schema_feedback
-            .as_deref()
-            .map(|detail| detail.chars().take(512).collect::<String>());
-        append_revision_prompt(&mut request, &assistant, feedback.as_deref()).map_err(|error| {
-            crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
-        })?;
-        model_calls += 1;
-        revisions += 1;
-        current = local_proxy_round(state, engine, &request, headers, key, None).await?;
-        if let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) {
-            merge_usage(&mut usage_total, &parsed);
-            if plan.verify_schema {
-                verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
+    let mut current_body = match serde_json::from_slice::<Value>(&current.body) {
+        Ok(body) => body,
+        Err(_) => {
+            stop_reason = "unparseable_initial_response".into();
+            return Ok(rebuild_response(
+                current,
+                &loop_receipt(&plan, strategy, model_calls, candidates, None, revisions,
+                    degraded.as_deref(), accepted, rejected, &stop_reason),
+            ));
+        }
+    };
+    merge_usage(&mut usage_total, &current_body);
+    let mut best_quality = assess_candidate(
+        state, &plan, schema.as_ref(), current.status, &current_body,
+    );
+    let mut schema_verified = best_quality.schema_valid;
+
+    if !current.status.is_success() {
+        stop_reason = "upstream_error".into();
+    } else if message_has_tool_calls(&current_body) {
+        // Caller-owned function calls remain handoffs; the controller does
+        // not execute them or mistake them for a final natural-language answer.
+        stop_reason = "tool_handoff".into();
+    } else {
+        loop {
+            let schema_detail = if best_quality.schema_valid == Some(false) {
+                schema_violation(state, &plan, schema.as_ref(), &current_body)
+            } else {
+                None
+            };
+            let feedback = revision_feedback(best_quality, schema_detail.as_deref());
+            let Some(feedback) = feedback else {
+                stop_reason = "quality_gate_pass".into();
+                break;
+            };
+            if model_calls >= plan.max_model_calls(strategy) {
+                stop_reason = "model_call_budget".into();
+                break;
+            }
+            if best_quality.schema_valid == Some(false)
+                && schema_repair_attempts >= plan.max_schema_retries
+            {
+                stop_reason = "schema_repair_budget".into();
+                break;
+            }
+
+            let assistant = current_body
+                .pointer("/choices/0/message")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"role": "assistant", "content": ""}));
+            let detail: String = feedback.chars().take(512).collect();
+            append_revision_prompt(&mut request, &assistant, Some(&detail)).map_err(|error| {
+                crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
+            })?;
+            if best_quality.schema_valid == Some(false) {
+                schema_repair_attempts += 1;
+            }
+
+            let revised = match local_proxy_round(state, engine, &request, headers, key, None).await {
+                Ok(response) => response,
+                Err(error) => {
+                    stop_reason = "revision_error".into();
+                    if degraded.is_none() {
+                        degraded = Some("revision_error".into());
+                    }
+                    tracing::warn!(model = %model, "adaptive revision failed; retaining the best prior candidate");
+                    let _ = error;
+                    break;
+                }
+            };
+            model_calls += 1;
+            revisions += 1;
+
+            let revised_body = match serde_json::from_slice::<Value>(&revised.body) {
+                Ok(body) => body,
+                Err(_) => {
+                    rejected += 1;
+                    stop_reason = "unparseable_revision".into();
+                    break;
+                }
+            };
+            merge_usage(&mut usage_total, &revised_body);
+            let revised_quality = assess_candidate(
+                state, &plan, schema.as_ref(), revised.status, &revised_body,
+            );
+            if !revised_quality.is_better_than(best_quality) {
+                rejected += 1;
+                stop_reason = "no_objective_improvement".into();
+                break;
+            }
+
+            // Accept only a strict improvement. Equal-quality rewrites and
+            // regressions never replace the incumbent response.
+            current = revised;
+            current_body = revised_body;
+            best_quality = revised_quality;
+            schema_verified = best_quality.schema_valid;
+            accepted += 1;
+
+            if message_has_tool_calls(&current_body) {
+                stop_reason = "tool_handoff".into();
+                break;
+            }
+            if best_quality.is_satisfied() {
+                stop_reason = "quality_gate_pass".into();
+                break;
             }
         }
     }
@@ -682,18 +850,13 @@ async fn run_local_chat_inner(
     }
     Ok(rebuild_response(
         current,
-        &plan.execution_receipt(
-            strategy,
-            model_calls,
-            candidates,
-            verified,
-            revisions,
-            degraded.as_deref(),
+        &loop_receipt(
+            &plan, strategy, model_calls, candidates, schema_verified, revisions,
+            degraded.as_deref(), accepted, rejected, &stop_reason,
         ),
     ))
 }
 
-#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 async fn remote_round(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -813,8 +976,8 @@ async fn run_remote_chat_inner(
 ) -> Result<axum::response::Response, axum::response::Response> {
     let original_request = request.clone();
     let plan = Plan::for_request(mode, &request);
-    // Best-of-N has a local-engine headroom-aware scheduler. Remote calls
-    // use sequential refinement until remote candidate admission is exposed.
+    // Remote fan-out is not exposed by the current remote admission contract.
+    // Keep candidate evaluation and repair semantics identical, using serial calls.
     let proposed = plan.strategy(&request);
     let strategy = if proposed == Strategy::ParallelVerifiedCandidates {
         Strategy::SequentialRevision
@@ -832,57 +995,122 @@ async fn run_remote_chat_inner(
         .to_string();
     let mut model_calls = 0usize;
     let mut revisions = 0usize;
-    let mut verified = None;
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut schema_repair_attempts = 0usize;
+    let mut schema_verified = None;
     let mut usage_total = None;
+    let mut stop_reason = "quality_gate_pass".to_string();
+
     let first = remote_round(state, model, method, path_query, headers, &request).await?;
     model_calls += 1;
     let mut current = first;
     if !current.status.is_success() {
+        stop_reason = "upstream_error".into();
         return Ok(rebuild_axum_response(
             current,
-            &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
+            &loop_receipt(&plan, strategy, model_calls, 1, None, revisions,
+                None, accepted, rejected, &stop_reason),
         ));
     }
-    let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) else {
-        return Ok(rebuild_axum_response(
-            current,
-            &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
-        ));
+    let mut current_body = match serde_json::from_slice::<Value>(&current.body) {
+        Ok(body) => body,
+        Err(_) => {
+            stop_reason = "unparseable_initial_response".into();
+            return Ok(rebuild_axum_response(
+                current,
+                &loop_receipt(&plan, strategy, model_calls, 1, None, revisions,
+                    None, accepted, rejected, &stop_reason),
+            ));
+        }
     };
-    merge_usage(&mut usage_total, &parsed);
-    if message_has_tool_calls(&parsed) {
-        return Ok(rebuild_axum_response(
-            current,
-            &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
-        ));
-    }
-    let feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
-    if plan.verify_schema {
-        verified = Some(feedback.is_none());
-    }
-    if (feedback.is_some() || strategy == Strategy::SequentialRevision)
-        && model_calls < Plan::max_model_calls(strategy)
-    {
-        let assistant = parsed
-            .pointer("/choices/0/message")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"role": "assistant", "content": ""}));
-        let detail = feedback
-            .as_deref()
-            .map(|value| value.chars().take(512).collect::<String>());
-        append_revision_prompt(&mut request, &assistant, detail.as_deref()).map_err(|error| {
-            crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
-        })?;
-        current = remote_round(state, model, method, path_query, headers, &request).await?;
-        model_calls += 1;
-        revisions += 1;
-        if let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) {
-            merge_usage(&mut usage_total, &parsed);
-            if plan.verify_schema {
-                verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
+    merge_usage(&mut usage_total, &current_body);
+    let mut best_quality = assess_candidate(
+        state, &plan, schema.as_ref(), current.status, &current_body,
+    );
+    schema_verified = best_quality.schema_valid;
+
+    if message_has_tool_calls(&current_body) {
+        stop_reason = "tool_handoff".into();
+    } else {
+        loop {
+            let schema_detail = if best_quality.schema_valid == Some(false) {
+                schema_violation(state, &plan, schema.as_ref(), &current_body)
+            } else {
+                None
+            };
+            let feedback = revision_feedback(best_quality, schema_detail.as_deref());
+            let Some(feedback) = feedback else {
+                stop_reason = "quality_gate_pass".into();
+                break;
+            };
+            if model_calls >= plan.max_model_calls(strategy) {
+                stop_reason = "model_call_budget".into();
+                break;
+            }
+            if best_quality.schema_valid == Some(false)
+                && schema_repair_attempts >= plan.max_schema_retries
+            {
+                stop_reason = "schema_repair_budget".into();
+                break;
+            }
+
+            let assistant = current_body
+                .pointer("/choices/0/message")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"role": "assistant", "content": ""}));
+            let detail: String = feedback.chars().take(512).collect();
+            append_revision_prompt(&mut request, &assistant, Some(&detail)).map_err(|error| {
+                crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
+            })?;
+            if best_quality.schema_valid == Some(false) {
+                schema_repair_attempts += 1;
+            }
+
+            let revised = match remote_round(state, model, method, path_query, headers, &request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    stop_reason = "revision_error".into();
+                    tracing::warn!(model = %model_name, "adaptive remote revision failed; retaining the best prior candidate");
+                    let _ = error;
+                    break;
+                }
+            };
+            model_calls += 1;
+            revisions += 1;
+            let revised_body = match serde_json::from_slice::<Value>(&revised.body) {
+                Ok(body) => body,
+                Err(_) => {
+                    rejected += 1;
+                    stop_reason = "unparseable_revision".into();
+                    break;
+                }
+            };
+            merge_usage(&mut usage_total, &revised_body);
+            let revised_quality = assess_candidate(
+                state, &plan, schema.as_ref(), revised.status, &revised_body,
+            );
+            if !revised_quality.is_better_than(best_quality) {
+                rejected += 1;
+                stop_reason = "no_objective_improvement".into();
+                break;
+            }
+            current = revised;
+            current_body = revised_body;
+            best_quality = revised_quality;
+            schema_verified = best_quality.schema_valid;
+            accepted += 1;
+            if message_has_tool_calls(&current_body) {
+                stop_reason = "tool_handoff".into();
+                break;
+            }
+            if best_quality.is_satisfied() {
+                stop_reason = "quality_gate_pass".into();
+                break;
             }
         }
     }
+
     if let Ok(mut final_body) = serde_json::from_slice::<Value>(&current.body) {
         patch_usage(&mut final_body, usage_total);
         current.body = axum::body::Bytes::from(
@@ -897,7 +1125,10 @@ async fn run_remote_chat_inner(
     }
     Ok(rebuild_axum_response(
         current,
-        &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
+        &loop_receipt(
+            &plan, strategy, model_calls, 1, schema_verified, revisions,
+            None, accepted, rejected, &stop_reason,
+        ),
     ))
 }
 
@@ -1155,6 +1386,65 @@ mod tests {
         assert_eq!(plan.max_tool_rounds, MAX_TOOL_ROUNDS);
         assert_eq!(plan.max_tool_calls, MAX_TOOL_CALLS);
         assert!(plan.max_schema_retries <= MAX_SCHEMA_RETRIES);
+    }
+
+    #[test]
+    fn unit__candidate_quality__schema_validity_beats_completion_only() {
+        let invalid_but_complete = CandidateQuality {
+            http_success: true, parseable: true, schema_valid: Some(false),
+            complete: true, non_empty: true,
+        };
+        let valid_but_truncated = CandidateQuality {
+            http_success: true, parseable: true, schema_valid: Some(true),
+            complete: false, non_empty: true,
+        };
+        assert!(valid_but_truncated.is_better_than(invalid_but_complete));
+    }
+
+    #[test]
+    fn unit__candidate_quality__completion_beats_truncation() {
+        let truncated = CandidateQuality {
+            http_success: true, parseable: true, schema_valid: None,
+            complete: false, non_empty: true,
+        };
+        let complete = CandidateQuality { complete: true, ..truncated };
+        assert!(complete.is_better_than(truncated));
+        assert!(!truncated.is_better_than(complete));
+    }
+
+    #[test]
+    fn unit__candidate_quality__ties_preserve_incumbent() {
+        let incumbent = CandidateQuality {
+            http_success: true, parseable: true, schema_valid: None,
+            complete: true, non_empty: true,
+        };
+        assert!(!incumbent.is_better_than(incumbent));
+    }
+
+    #[test]
+    fn unit__candidate_quality__empty_and_failed_candidates_need_repair() {
+        let empty = CandidateQuality {
+            http_success: true, parseable: true, schema_valid: None,
+            complete: true, non_empty: false,
+        };
+        let failed = CandidateQuality { http_success: false, ..empty };
+        assert!(empty.needs_revision());
+        assert!(!failed.needs_revision());
+    }
+
+    #[test]
+    fn unit__deep_mode__allocates_bounded_iterative_repairs() {
+        let request = json!({
+            "messages": [{"role": "user", "content": "Return valid JSON."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        let plan = Plan::for_request(Mode::Deep, &request);
+        assert_eq!(plan.max_schema_retries, 2);
+        assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 3);
+        assert_eq!(plan.max_model_calls(Strategy::ParallelVerifiedCandidates), 4);
     }
 
     #[test]
