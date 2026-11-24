@@ -335,6 +335,15 @@ pub(crate) async fn fan_out(
     if let Some(answer_hash) = decision.answer_hash {
         hdr.push_str(&format!(" vote_key={answer_hash:016x}"));
     }
+    let vote_tallies = decision
+        .vote_tallies
+        .iter()
+        .map(|(hash, count)| format!("{hash:016x}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    if !vote_tallies.is_empty() {
+        hdr.push_str(&format!(" vote_tallies={vote_tallies}"));
+    }
     let status = *status;
     let raw = raw.clone();
     // A non-JSON winner body (degenerate case - the ladder ranks those
