@@ -15,7 +15,7 @@ struct ArithmeticOracle {
     expected: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct TableOracle {
     label: String,
     value: f64,
@@ -411,7 +411,7 @@ fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
     }
 
     let mut entries = Vec::<(String, f64)>::new();
-    for segment in text.split([',', ';', '\\n']) {
+    for segment in text.split([',', ';', '\n']) {
         let segment = segment.trim();
         let Some((label, raw_value)) = segment
             .split_once('=')
