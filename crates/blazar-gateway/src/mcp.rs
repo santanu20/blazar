@@ -2110,7 +2110,13 @@ mod tests {
     fn unit__rebuild__adaptive_receipt_is_sanitized() {
         let plan = crate::adaptive::Plan::for_request(
             crate::adaptive::Mode::Auto,
-            &json!({"messages": [{"role": "user", "content": "private prompt"}]}),
+            &json!({
+                "messages": [{"role": "user", "content": "private prompt"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object"}}
+                }
+            }),
         );
         let resp = rebuild(
             reqwest::StatusCode::OK,
