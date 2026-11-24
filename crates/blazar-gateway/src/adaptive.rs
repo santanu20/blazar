@@ -923,11 +923,12 @@ fn verify_search_answer(
     }
 }
 
-fn parse_search_expansion(
+async fn parse_search_expansion(
     state: &crate::state::AppState,
     plan: &Plan,
     schema: Option<&Value>,
     value_model: &dyn crate::reasoning_search::ProcessRewardModel,
+    task_context: &str,
     parent_state: &str,
     response: &Value,
     branch_limit: usize,
@@ -949,55 +950,129 @@ fn parse_search_expansion(
         return Vec::new();
     };
 
-    branches
-        .iter()
-        .take(branch_limit)
-        .filter_map(|branch| {
-            let step = branch.get("step").and_then(Value::as_str)?.trim();
-            if step.is_empty() || step.len() > 4_096 {
-                return None;
-            }
-            let answer = branch
-                .get("final_answer")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|answer| !answer.is_empty() && answer.len() <= 16_384)
-                .map(str::to_string);
-            let mut state_text = String::with_capacity(parent_state.len() + step.len() + 8);
-            if !parent_state.is_empty() {
-                state_text.push_str(parent_state);
-                state_text.push_str("\n");
-            }
-            state_text.push_str(step);
-            if state_text.len() > 16_384 {
-                return None;
-            }
+    let mut prepared = Vec::<(
+        String,
+        Option<String>,
+        f64,
+        crate::reasoning_search::Verification,
+        usize,
+    )>::new();
+    for branch in branches.iter().take(branch_limit) {
+        let Some(step) = branch.get("step").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        if step.is_empty() || step.len() > 4_096 {
+            continue;
+        }
+        let answer = branch
+            .get("final_answer")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|answer| !answer.is_empty() && answer.len() <= 16_384)
+            .map(str::to_string);
+        let mut state_text = String::with_capacity(parent_state.len() + step.len() + 8);
+        if !parent_state.is_empty() {
+            state_text.push_str(parent_state);
+            state_text.push_str("
+");
+        }
+        state_text.push_str(step);
+        if state_text.len() > 16_384 {
+            continue;
+        }
+        let verification = answer.as_deref().map_or(
+            crate::reasoning_search::Verification::Unknown,
+            |final_answer| verify_search_answer(state, plan, schema, final_answer),
+        );
+        let prior = branch.get("prior").and_then(Value::as_f64).unwrap_or(0.5);
+        let estimated_state_tokens = step
+            .len()
+            .saturating_add(answer.as_ref().map_or(0, String::len))
+            .div_ceil(4)
+            .max(1);
+        prepared.push((state_text, answer, prior, verification, estimated_state_tokens));
+    }
 
-            let verification = answer.as_deref().map_or(
-                crate::reasoning_search::Verification::Unknown,
-                |final_answer| verify_search_answer(state, plan, schema, final_answer),
-            );
-            // Score the partial prefix through the independent value-model
-            // interface. The default adapter is explicitly uncalibrated; it
-            // never treats the generator's own confidence as a PRM score.
-            let prior = branch.get("prior").and_then(Value::as_f64).unwrap_or(0.5);
-            let value = value_model.evaluate(&state_text);
-            let estimated_state_tokens = step
-                .len()
-                .saturating_add(answer.as_ref().map_or(0, String::len))
-                .div_ceil(4)
-                .max(1);
-            Some(crate::reasoning_search::SearchProposal {
-                state: state_text.clone(),
-                answer,
-                prior,
-                value,
-                verification,
-                estimated_state_tokens,
-            })
-        })
+    // Process-reward calls for one expansion are concurrent but bounded by
+    // branch_limit (currently <= 3). A failed evaluator returns an uncalibrated
+    // neutral estimate and cannot block exact terminal verifiers.
+    let estimates = futures::future::join_all(
+        prepared
+            .iter()
+            .map(|(state_text, _, _, _, _)| value_model.evaluate(task_context, state_text)),
+    )
+    .await;
+    prepared
+        .into_iter()
+        .zip(estimates)
+        .map(
+            |((state_text, answer, prior, verification, estimated_state_tokens), value)| {
+                crate::reasoning_search::SearchProposal {
+                    state: state_text,
+                    answer,
+                    prior,
+                    value,
+                    verification,
+                    estimated_state_tokens,
+                }
+            },
+        )
         .collect()
 }
+
+fn search_task_context(request: &Value) -> String {
+    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let Some(latest_user) = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return String::new();
+    };
+    match latest_user.get("content") {
+        Some(Value::String(text)) => text.chars().take(8_192).collect(),
+        Some(Value::Array(parts)) => {
+            let mut output = String::new();
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    continue;
+                }
+                let Some(text) = part.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let remaining = 8_192usize.saturating_sub(output.len());
+                if remaining == 0 {
+                    break;
+                }
+                output.push_str(&text.chars().take(remaining).collect::<String>());
+                if output.len() < 8_192 {
+                    output.push('\n');
+                }
+            }
+            output
+        }
+        _ => String::new(),
+    }
+}
+
+fn configured_process_reward_model(
+    state: &crate::state::AppState,
+) -> Box<dyn crate::reasoning_search::ProcessRewardModel> {
+    let config = state.cfg();
+    let Some(prm_config) = config.reasoning_prm.as_ref() else {
+        return Box::new(crate::reasoning_search::UncalibratedValueModel);
+    };
+    match crate::reasoning_search::HttpProcessRewardModel::new(prm_config) {
+        Ok(model) => Box::new(model),
+        Err(error) => {
+            tracing::warn!(%error, "configured process-reward model unavailable; using uncalibrated fallback");
+            Box::new(crate::reasoning_search::UncalibratedValueModel)
+        }
+    }
+}
+
 
 fn has_chat_response_envelope(body: &Value) -> bool {
     body.pointer("/choices/0/message")
@@ -1092,7 +1167,8 @@ async fn run_local_search_inner(
             uncertainty_bonus: 0.45,
         },
     );
-    let value_model = crate::reasoning_search::UncalibratedValueModel;
+    let value_model = configured_process_reward_model(state);
+    let task_context = search_task_context(&original_request);
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
     let mut current: Option<BufferedResponse> = None;
@@ -1150,11 +1226,13 @@ async fn run_local_search_inner(
             state,
             &plan,
             schema.as_ref(),
-            &value_model,
+            value_model.as_ref(),
+            &task_context,
             &parent_state,
             &expansion_body,
             branch_limit,
-        );
+        )
+        .await;
         let added = tree.expand(leaf, proposals).unwrap_or_default();
         let added_accepted = added
             .iter()
@@ -1243,7 +1321,8 @@ async fn run_local_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source={} prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_evaluated_nodes={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        value_model.source(),
         budget.max_model_calls,
         budget.max_expansions,
         budget.max_nodes,
@@ -1254,6 +1333,7 @@ async fn run_local_search_inner(
         stats.max_depth_reached,
         stats.estimated_state_tokens,
         stats.transpositions,
+        stats.prm_evaluated_nodes,
         stats.prm_calibrated_nodes,
         stats.best_value,
         stats.best_uncertainty,
@@ -1725,7 +1805,8 @@ async fn run_remote_search_inner(
             uncertainty_bonus: 0.45,
         },
     );
-    let value_model = crate::reasoning_search::UncalibratedValueModel;
+    let value_model = configured_process_reward_model(state);
+    let task_context = search_task_context(&original_request);
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
     let mut current: Option<BufferedResponse> = None;
@@ -1791,11 +1872,13 @@ async fn run_remote_search_inner(
             state,
             &plan,
             schema.as_ref(),
-            &value_model,
+            value_model.as_ref(),
+            &task_context,
             &parent_state,
             &expansion_body,
             branch_limit,
-        );
+        )
+        .await;
         let added = tree.expand(leaf, proposals).unwrap_or_default();
         let added_accepted = added
             .iter()
@@ -1884,7 +1967,8 @@ async fn run_remote_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source={} prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_evaluated_nodes={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        value_model.source(),
         budget.max_model_calls,
         budget.max_expansions,
         budget.max_nodes,
@@ -1895,6 +1979,7 @@ async fn run_remote_search_inner(
         stats.max_depth_reached,
         stats.estimated_state_tokens,
         stats.transpositions,
+        stats.prm_evaluated_nodes,
         stats.prm_calibrated_nodes,
         stats.best_value,
         stats.best_uncertainty,
