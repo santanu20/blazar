@@ -906,7 +906,7 @@ pub(crate) struct ChatExecutionContext<'a> {
     pub(crate) mcp_selector: Option<&'a str>,
     pub(crate) key: Option<&'a crate::keys::KeyCtx>,
     pub(crate) headers: &'a HeaderMap,
-    /// OpenAI enters before the SLO gate. Anthropic and Ollama arrive with
+    /// `OpenAI` enters before the SLO gate. Anthropic and Ollama arrive with
     /// their protocol-boundary admission guard already held.
     pub(crate) acquire_slo_guard: bool,
 }
