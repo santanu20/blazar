@@ -208,7 +208,11 @@ impl Plan {
             // not only JSON Schema tasks. Explicit deterministic sampling retains
             // a single path.
             Strategy::ParallelVerifiedCandidates
-        } else if self.verify_schema || self.mode == Mode::Deep || self.complexity >= 3 {
+        } else if self.verify_schema
+            || self.task_profile.math_expected().is_some()
+            || self.mode == Mode::Deep
+            || self.complexity >= 3
+        {
             // Auto must retain one repair call for invalid structured output,
             // even when the request is otherwise classified as simple.
             Strategy::SequentialRevision
@@ -225,8 +229,8 @@ impl Plan {
             (Strategy::SequentialRevision, Mode::Auto) => 2,
             (Strategy::SequentialRevision, Mode::Deep) => 4,
             (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 3,
-            // Three initial candidates plus up to three verifier-guided revisions.
-            (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 6,
+            // Three initial candidates plus up to four verifier-guided revisions.
+            (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 7,
         }
     }
 
@@ -859,9 +863,6 @@ async fn run_local_chat_inner(
     };
     merge_usage(&mut usage_total, &current_body);
     let mut candidate_summary = CandidateSummary::from_response(&current.headers, &current_body);
-    if let Some(reason) = degraded.as_deref() {
-        candidate_summary.judge.get_or_insert_with(|| reason.to_string());
-    }
     let mut best_quality = assess_candidate(
         state, &plan, schema.as_ref(), current.status, &current_body, &candidate_summary,
     );
@@ -1647,6 +1648,20 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn unit__auto_math__gets_a_bounded_verifier_repair() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Calculate 17 * (23 - 8) + 144 / 12. Return only the number."
+            }]
+        });
+        let plan = Plan::for_request(Mode::Auto, &request);
+        assert_eq!(plan.task_profile.math_expected(), Some(267.0));
+        assert_eq!(plan.strategy(&request), Strategy::SequentialRevision);
+        assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 2);
+    }
+
     fn unit__candidate_quality__schema_validity_beats_completion_only() {
         let invalid_but_complete = CandidateQuality {
             http_success: true,
@@ -1802,7 +1817,7 @@ mod tests {
         assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 3);
         assert_eq!(
             plan.max_model_calls(Strategy::ParallelVerifiedCandidates),
-            6
+            7
         );
     }
 
