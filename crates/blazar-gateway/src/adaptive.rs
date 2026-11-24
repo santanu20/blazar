@@ -923,14 +923,8 @@ pub(crate) async fn execute_chat(
 ) -> Result<reqwest::Response, axum::response::Response> {
     let _inflight = if context.acquire_slo_guard {
         Some(
-            adaptive_admission_guard(
-                state,
-                engine,
-                openai_body,
-                context.headers,
-                context.key,
-            )
-            .await?,
+            adaptive_admission_guard(state, engine, openai_body, context.headers, context.key)
+                .await?,
         )
     } else {
         None
@@ -946,7 +940,15 @@ pub(crate) async fn execute_chat(
         )
         .await
     } else {
-        run_local_chat(state, engine, openai_body, mode, context.headers, context.key).await
+        run_local_chat(
+            state,
+            engine,
+            openai_body,
+            mode,
+            context.headers,
+            context.key,
+        )
+        .await
     }
 }
 
