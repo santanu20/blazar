@@ -9,6 +9,9 @@
 //! inject a trained/calibrated PRM before interpreting values as probabilities.
 
 use std::collections::HashMap;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ValueEstimate {
@@ -16,7 +19,9 @@ pub struct ValueEstimate {
     pub mean: f64,
     /// Epistemic uncertainty in [0, 1].
     pub uncertainty: f64,
-    /// True only when the provider was calibrated on held-out outcomes.
+    /// True when a process-reward service returned a valid value.
+    pub available: bool,
+    /// True only when its calibration identity matched the configured pin.
     pub calibrated: bool,
 }
 
@@ -26,6 +31,7 @@ impl ValueEstimate {
         Self {
             mean: 0.5,
             uncertainty: 1.0,
+            available: false,
             calibrated: false,
         }
     }
@@ -35,6 +41,7 @@ impl ValueEstimate {
         Self {
             mean: finite_unit(mean, 0.5),
             uncertainty: finite_unit(uncertainty, 1.0),
+            available: true,
             calibrated,
         }
     }
@@ -49,17 +56,131 @@ impl Default for ValueEstimate {
 /// A process-level evaluator. Implementations should score a partial state,
 /// not merely judge a completed answer. A remote PRM adapter can implement
 /// this trait without coupling the search policy to a specific provider.
+#[async_trait::async_trait]
 pub trait ProcessRewardModel: Send + Sync {
-    fn evaluate(&self, partial_state: &str) -> ValueEstimate;
+    /// Score one partial state against the original task. Implementations
+    /// must be independently trained/evaluated; do not call the generator
+    /// itself and label the result as a PRM.
+    async fn evaluate(&self, task: &str, partial_state: &str) -> ValueEstimate;
+
+    /// Low-cardinality source label exposed in the search receipt.
+    fn source(&self) -> &'static str;
 }
 
 /// Safe fallback when no independently trained PRM is configured.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UncalibratedValueModel;
 
+#[async_trait::async_trait]
 impl ProcessRewardModel for UncalibratedValueModel {
-    fn evaluate(&self, _partial_state: &str) -> ValueEstimate {
+    async fn evaluate(&self, _task: &str, _partial_state: &str) -> ValueEstimate {
         ValueEstimate::uncalibrated()
+    }
+
+    fn source(&self) -> &'static str {
+        "uncalibrated_fallback"
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpProcessRewardModel {
+    client: reqwest::Client,
+    endpoint: String,
+    bearer_token: Option<String>,
+    expected_calibration_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProcessRewardRequest<'a> {
+    protocol: &'static str,
+    task: &'a str,
+    partial_state: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ProcessRewardResponse {
+    score: f64,
+    uncertainty: f64,
+    calibration_id: Option<String>,
+}
+
+impl HttpProcessRewardModel {
+    pub fn new(config: &blazar_core::ReasoningPrmConfig) -> Result<Self, String> {
+        if config.url.trim().is_empty() {
+            return Err("reasoning_prm.url is empty".into());
+        }
+        let bearer_token = config
+            .api_key_env
+            .as_deref()
+            .map(std::env::var)
+            .transpose()
+            .map_err(|_| {
+                format!(
+                    "reasoning PRM API key environment variable {:?} is not set",
+                    config.api_key_env
+                )
+            })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .map_err(|error| format!("build reasoning PRM HTTP client: {error}"))?;
+        Ok(Self {
+            client,
+            endpoint: config.url.clone(),
+            bearer_token,
+            expected_calibration_id: config.calibration_id.clone(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ProcessRewardModel for HttpProcessRewardModel {
+    async fn evaluate(&self, task: &str, partial_state: &str) -> ValueEstimate {
+        let payload = ProcessRewardRequest {
+            protocol: "blazar-process-reward-v1",
+            task,
+            partial_state,
+        };
+        let mut request = self.client.post(&self.endpoint).json(&payload);
+        if let Some(token) = self.bearer_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let response = match request.send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                tracing::debug!(
+                    status = %response.status(),
+                    "reasoning PRM returned a non-success status; using uncalibrated fallback"
+                );
+                return ValueEstimate::uncalibrated();
+            }
+            Err(error) => {
+                tracing::debug!(%error, "reasoning PRM request failed; using uncalibrated fallback");
+                return ValueEstimate::uncalibrated();
+            }
+        };
+        let bytes = match response.bytes().await {
+            Ok(bytes) if bytes.len() <= 8_192 => bytes,
+            _ => return ValueEstimate::uncalibrated(),
+        };
+        let Ok(result) = serde_json::from_slice::<ProcessRewardResponse>(&bytes) else {
+            return ValueEstimate::uncalibrated();
+        };
+        if !result.score.is_finite()
+            || !result.uncertainty.is_finite()
+            || !(0.0..=1.0).contains(&result.score)
+            || !(0.0..=1.0).contains(&result.uncertainty)
+        {
+            return ValueEstimate::uncalibrated();
+        }
+        let calibrated = self.expected_calibration_id.as_deref().is_some_and(|expected| {
+            result.calibration_id.as_deref() == Some(expected)
+        });
+        ValueEstimate::new(result.score, result.uncertainty, calibrated)
+    }
+
+    fn source(&self) -> &'static str {
+        "configured_http_prm"
     }
 }
 
@@ -170,6 +291,7 @@ pub struct SearchStats {
     pub verified_terminals: usize,
     pub rejected_nodes: usize,
     pub transpositions: usize,
+    pub prm_evaluated_nodes: usize,
     pub prm_calibrated_nodes: usize,
     pub best_value: f64,
     pub best_uncertainty: f64,
@@ -502,6 +624,11 @@ impl SearchTree {
             .iter()
             .filter(|node| node.status == NodeStatus::Rejected)
             .count();
+        let prm_evaluated_nodes = self
+            .nodes
+            .iter()
+            .filter(|node| node.value.available)
+            .count();
         let prm_calibrated_nodes = self
             .nodes
             .iter()
@@ -516,6 +643,7 @@ impl SearchTree {
             verified_terminals,
             rejected_nodes,
             transpositions: self.transposition_hits,
+            prm_evaluated_nodes,
             prm_calibrated_nodes,
             best_value: best.map_or(0.0, SearchNode::mean_value),
             best_uncertainty: best.map_or(1.0, |node| node.value.uncertainty),
@@ -598,7 +726,12 @@ fn answer_priority(node: &SearchNode) -> f64 {
 }
 
 fn sanitize_estimate(estimate: ValueEstimate) -> ValueEstimate {
-    ValueEstimate::new(estimate.mean, estimate.uncertainty, estimate.calibrated)
+    ValueEstimate {
+        mean: finite_unit(estimate.mean, 0.5),
+        uncertainty: finite_unit(estimate.uncertainty, 1.0),
+        available: estimate.available,
+        calibrated: estimate.calibrated && estimate.available,
+    }
 }
 
 fn finite_unit(value: f64, fallback: f64) -> f64 {
