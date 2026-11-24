@@ -29,6 +29,7 @@ pub mod model_doctor;
 pub mod pd;
 pub mod quantiles;
 pub(crate) mod reasoning;
+pub mod reasoning_search;
 pub mod requests;
 pub mod sglang_native;
 pub mod stage_timing;
