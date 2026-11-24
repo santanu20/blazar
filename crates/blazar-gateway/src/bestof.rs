@@ -143,10 +143,9 @@ pub(crate) fn request_schema(child_body: &Value) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-/// Deterministic judge: schema-valid beats invalid, `finish_reason:
-/// stop` beats other endings, lower candidate index breaks ties.
-/// Non-2xx candidates rank last (they carry no content to judge).
-pub(crate) fn pick_winner(
+/// Legacy deterministic ladder retained for Best-of-N unit-test compatibility.
+#[cfg(test)]
+fn pick_winner(
     sentinel: &crate::sentinel::Sentinel,
     candidates: &[(u16, Value)],
     schema: Option<&Value>,
