@@ -1116,7 +1116,7 @@ pub(crate) fn caller_tool_results(all_calls: &[Value], mcp_calls: &[Value]) -> V
         .collect()
 }
 
-fn teaching_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn teaching_error(status: StatusCode, msg: &str) -> Response {
     let body = json!({"error": {"message": msg, "type": "blazar_error",
         "blazar_code": crate::error_codes::generic_for_status(status.as_u16()).as_str()}});
     Response::builder()
@@ -1452,10 +1452,12 @@ async fn chat_via_mcp_inner(
                 body_bytes,
                 rounds,
                 so_kind,
-                adaptive_plan.as_ref(),
-                tool_calls_total,
-                schema_verified,
-                verification_retries,
+                RebuildMeta {
+                    adaptive_plan: adaptive_plan.as_ref(),
+                    tool_calls: tool_calls_total,
+                    schema_verified,
+                    schema_retries: verification_retries,
+                },
             ));
         }
         let parsed: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
@@ -1672,18 +1674,23 @@ async fn chat_via_mcp_inner(
     }
 }
 
-/// Rebuild a `reqwest::Response` from buffered parts, stamping the
-/// receipt header on the way out.
+/// Optional receipts and accounting metadata for a rebuilt mediated response.
+#[derive(Clone, Copy, Default)]
+struct RebuildMeta<'a> {
+    adaptive_plan: Option<&'a crate::adaptive::Plan>,
+    tool_calls: usize,
+    schema_verified: Option<bool>,
+    schema_retries: usize,
+}
+
+/// Rebuild a reqwest response from buffered parts, stamping receipts.
 fn rebuild(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: axum::body::Bytes,
     rounds: usize,
     so_kind: Option<&'static str>,
-    adaptive_plan: Option<&crate::adaptive::Plan>,
-    tool_calls: usize,
-    schema_verified: Option<bool>,
-    schema_retries: usize,
+    meta: RebuildMeta<'_>,
 ) -> reqwest::Response {
     let mut builder = axum::http::Response::builder().status(
         axum::http::StatusCode::from_u16(status.as_u16())
@@ -1696,10 +1703,10 @@ fn rebuild(
         builder = builder.header(k, v);
     }
     builder = builder.header("x-blazar-mcp", format!("rounds={rounds}"));
-    if let Some(plan) = adaptive_plan {
+    if let Some(plan) = meta.adaptive_plan {
         builder = builder.header(
             "x-blazar-adaptive-result",
-            plan.receipt(rounds, tool_calls, schema_verified, schema_retries),
+            plan.receipt(rounds, meta.tool_calls, meta.schema_verified, meta.schema_retries),
         );
     }
     // The mediated path never passes through the proxy response builder,
@@ -2066,10 +2073,7 @@ mod tests {
             axum::body::Bytes::new(),
             1,
             Some("json_schema"),
-            None,
-            0,
-            None,
-            0,
+            RebuildMeta::default(),
         );
         assert_eq!(
             resp.headers()
@@ -2089,10 +2093,7 @@ mod tests {
             axum::body::Bytes::new(),
             0,
             None,
-            None,
-            0,
-            None,
-            0,
+            RebuildMeta::default(),
         );
         assert!(bare.headers().get("x-blazar-structured-output").is_none());
     }

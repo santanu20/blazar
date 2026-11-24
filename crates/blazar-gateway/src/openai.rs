@@ -842,6 +842,33 @@ pub async fn openai_proxy(
     {
         return rej.to_response();
     }
+    // Gateway-wide adaptive inference header. The controller runs after
+    // model routing; local engines and OpenAI-compatible remotes share it.
+    let adaptive_mode = match crate::adaptive::mode_from_headers(&headers) {
+        Ok(mode) => mode,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    if adaptive_mode.is_some() {
+        if !uri.path().ends_with("/chat/completions") {
+            return openai_error(
+                400,
+                "X-Blazar-Adaptive is supported on /v1/chat/completions only",
+            );
+        }
+        if parsed_body.is_none()
+            || parsed_body
+                .as_ref()
+                .and_then(|value| value.get("stream"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return openai_error(
+                400,
+                "X-Blazar-Adaptive requires a JSON request with stream:false",
+            );
+        }
+    }
+
     // Remote routing: `<remote-name>:<model>` never loads locally.
     // Strict-lane reservation runs BEFORE the forward (same contract
     // as the ollama remote lane), and the response body carries the
@@ -862,15 +889,44 @@ pub async fn openai_proxy(
                 Err(rej) => return rej.to_response(),
             }
         }
-        let mut out = crate::remotes::forward_with_health(
-            &state,
-            &model,
-            &method,
-            &path_and_query(&uri),
-            &headers,
-            body,
-        )
-        .await;
+        let mut out = if let Some(mode) = adaptive_mode {
+            let Some(request) = parsed_body.as_ref() else {
+                return openai_error(400, "adaptive remote request body must be JSON");
+            };
+            match state
+                .mcp
+                .resolve(crate::mcp::selector_from(&headers, Some(request)))
+            {
+                Err(msg) => return openai_error(400, &msg),
+                Ok(Some(_)) => {
+                    return openai_error(
+                        400,
+                        "gateway MCP execution is currently supported on local engine lanes; adaptive inference itself supports OpenAI-compatible remotes",
+                    );
+                }
+                Ok(None) => {}
+            }
+            crate::adaptive::run_remote_chat(
+                &state,
+                &model,
+                &method,
+                &path_and_query(&uri),
+                &headers,
+                request,
+                mode,
+            )
+            .await
+        } else {
+            crate::remotes::forward_with_health(
+                &state,
+                &model,
+                &method,
+                &path_and_query(&uri),
+                &headers,
+                body,
+            )
+            .await
+        };
         if let Some(Extension(k)) = key_ext.as_ref() {
             out = maybe_charge_remote(out, &state, &k.name, budget_lease);
         }
@@ -1058,19 +1114,6 @@ pub async fn openai_proxy(
         return *resp;
     }
 
-    // Adaptive tool execution is explicit and scoped to the buffered MCP chat lane.
-    // Validate before early-return lanes so the header is never silently ignored.
-    let adaptive_mode = match crate::adaptive::mode_from_headers(&headers) {
-        Ok(mode) => mode,
-        Err(msg) => return openai_error(400, &msg),
-    };
-    if adaptive_mode.is_some() && !uri.path().ends_with("/chat/completions") {
-        return openai_error(
-            400,
-            "X-Blazar-Adaptive is supported only on /v1/chat/completions with MCP mediation",
-        );
-    }
-
     // PD disaggregation pair: chat traffic for models that asked for
     // sglang.disagg_pair routes through the two role children (prefill
     // warmup + decode forward) instead of the single-lane path. All
@@ -1200,11 +1243,11 @@ pub async fn openai_proxy(
         );
     }
 
-    // MCP tool catalog (opt-in, chat lane): the selector rides the `mcp`
-    // body field or `x-blazar-mcp` header. Resolved BEFORE single-flight
-    // registers a leader - the mediated tool loop must not leave followers
-    // waiting on an entry that never resolves through proxy_request.
-    if chat_family && let Some(v) = parsed_body.as_mut() {
+    // MCP is optional: the adaptive controller also runs for ordinary
+    // chat requests with no gateway-side tool catalog.
+    if uri.path().ends_with("/chat/completions")
+        && let Some(v) = parsed_body.as_mut()
+    {
         let sel = match state
             .mcp
             .resolve(crate::mcp::selector_from(&headers, Some(v)))
@@ -1212,47 +1255,54 @@ pub async fn openai_proxy(
             Ok(sel) => sel,
             Err(msg) => return openai_error(400, &msg),
         };
-        if let Some(sel) = sel {
+        if adaptive_mode.is_some() || sel.is_some() {
             if recipe_lane.is_some() {
                 return openai_error(
                     400,
-                    "mcp is not available on the recipe-rendered completion lane \
-                     (pinned recipe or mlx tool grammar) - clear the pin or use the chat lane",
+                    "adaptive/MCP execution is unavailable on the recipe-rendered completion lane; clear the prompt_recipe pin or use a native chat lane",
                 );
             }
             if v["stream"].as_bool().unwrap_or(false) {
                 return openai_error(
                     400,
-                    "mcp tool loop requires stream:false in this release - the gateway mediates buffered tool rounds",
+                    "adaptive/MCP execution requires stream:false; the gateway mediates buffered rounds",
                 );
             }
             v["stream"] = serde_json::Value::Bool(false);
-            return match crate::mcp::chat_via_mcp(
-                &state,
-                &engine,
-                v,
-                &sel,
-                key_ext.as_deref(),
-                adaptive_mode,
-            )
-            .await
-            {
+            let child = if let Some(mode) = adaptive_mode {
+                crate::adaptive::execute_chat(
+                    &state,
+                    &engine,
+                    v,
+                    mode,
+                    sel.as_deref(),
+                    key_ext.as_deref(),
+                )
+                .await
+            } else if let Some(selector) = sel.as_deref() {
+                crate::mcp::chat_via_mcp(
+                    &state,
+                    &engine,
+                    v,
+                    selector,
+                    key_ext.as_deref(),
+                    None,
+                )
+                .await
+            } else {
+                unreachable!("adaptive or MCP selector entered the dispatch branch")
+            };
+            return match child {
                 Ok(child) => {
                     let status = axum::http::StatusCode::from_u16(child.status().as_u16())
                         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
                     let headers = child.headers().clone();
-                    // A body-read failure must not collapse to empty
-                    // bytes: that would hand the client the child's
-                    // success status over an empty body.
                     let bytes = match child.bytes().await {
                         Ok(bytes) => bytes,
-                        Err(e) => {
+                        Err(error) => {
                             return openai_error(
                                 502,
-                                &format!(
-                                    "mcp response body read failed (child status {}): {e}",
-                                    status.as_u16()
-                                ),
+                                &format!("adaptive/MCP response body read failed: {error}"),
                             );
                         }
                     };
@@ -1262,22 +1312,13 @@ pub async fn openai_proxy(
                             builder = builder.header(name, value);
                         }
                     }
-                    builder
-                        .body(axum::body::Body::from(bytes))
-                        .unwrap_or_else(|e| {
-                            openai_error(502, &format!("mcp response rebuild failed: {e}"))
-                        })
+                    builder.body(axum::body::Body::from(bytes)).unwrap_or_else(|error| {
+                        openai_error(502, &format!("adaptive/MCP response rebuild failed: {error}"))
+                    })
                 }
-                Err(resp) => resp,
+                Err(response) => response,
             };
         }
-    }
-
-    if adaptive_mode.is_some() {
-        return openai_error(
-            400,
-            "X-Blazar-Adaptive requires an active MCP selector (mcp body field, X-Blazar-Mcp, or mcp_default); adaptive execution never gains tool access implicitly",
-        );
     }
 
     // Single-flight BEFORE slot admission (chat lane): the bounded
