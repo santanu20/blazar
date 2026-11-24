@@ -11,6 +11,8 @@
 //! spend another model call. Its thresholds require calibration against
 //! held-out workloads before any quality-optimality claim is justified.
 
+use std::collections::HashMap;
+
 use axum::http::HeaderMap;
 use serde_json::Value;
 
@@ -63,6 +65,7 @@ pub(crate) struct Plan {
     pub max_tool_calls: usize,
     pub max_schema_retries: usize,
     pub verify_schema: bool,
+    pub task_profile: crate::reasoning::TaskProfile,
 }
 
 impl Plan {
@@ -84,15 +87,12 @@ impl Plan {
             max_tool_rounds,
             max_tool_calls,
             max_schema_retries: if verify_schema {
-                if mode == Mode::Deep {
-                    MAX_SCHEMA_RETRIES + 1
-                } else {
-                    MAX_SCHEMA_RETRIES
-                }
+                if mode == Mode::Deep { 3 } else { MAX_SCHEMA_RETRIES }
             } else {
                 0
             },
             verify_schema,
+            task_profile: crate::reasoning::TaskProfile::from_request(request),
         }
     }
 
@@ -199,7 +199,13 @@ impl Plan {
             .is_some_and(|choices| choices > 1);
         if has_caller_tools || requests_multiple_choices {
             Strategy::Direct
-        } else if self.mode == Mode::Deep && self.verify_schema {
+        } else if self.mode == Mode::Deep
+            && request.get("seed").is_none()
+            && request.get("temperature").and_then(Value::as_f64) != Some(0.0)
+        {
+            // Deep mode explores independent trajectories for ordinary chat,
+            // not only JSON Schema tasks. Explicit deterministic sampling retains
+            // a single path.
             Strategy::ParallelVerifiedCandidates
         } else if self.verify_schema || self.mode == Mode::Deep || self.complexity >= 3 {
             // Auto must retain one repair call for invalid structured output,
@@ -216,16 +222,18 @@ impl Plan {
         match (strategy, self.mode) {
             (Strategy::Direct, _) => 1,
             (Strategy::SequentialRevision, Mode::Auto) => 2,
-            (Strategy::SequentialRevision, Mode::Deep)
-            | (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 3,
-            (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 4,
+            (Strategy::SequentialRevision, Mode::Deep) => 4,
+            (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 3,
+            // Three initial candidates plus up to three verifier-guided revisions.
+            (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 6,
         }
     }
 
-    pub(crate) const fn max_candidates(strategy: Strategy) -> u64 {
-        match strategy {
-            Strategy::ParallelVerifiedCandidates => 2,
-            Strategy::Direct | Strategy::SequentialRevision => 1,
+    pub(crate) const fn max_candidates(&self, strategy: Strategy) -> u64 {
+        match (strategy, self.mode) {
+            (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 3,
+            (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 2,
+            (Strategy::Direct | Strategy::SequentialRevision, _) => 1,
         }
     }
 
@@ -414,26 +422,111 @@ fn schema_violation(
     }
 }
 
-/// Contract-level assessment for an answer candidate. This deliberately
-/// does not claim factual or semantic correctness: without a task-specific
-/// independent verifier, Blazar can prove transport, response-envelope,
-/// completion and requested-schema properties only.
-#[allow(clippy::struct_excessive_bools)] // Each field is an independent response-contract gate.
+/// Request-local vote accounting. Parallel fan-out supplies the winning
+/// answer's initial vote count; later revisions extend the bounded vote map.
+#[derive(Clone, Debug, Default)]
+struct CandidateSummary {
+    candidates: usize,
+    fanout: bool,
+    votes: HashMap<u64, usize>,
+    judge: Option<String>,
+}
+
+impl CandidateSummary {
+    fn from_response(headers: &reqwest::header::HeaderMap, body: &Value) -> Self {
+        let mut summary = Self {
+            candidates: 1,
+            ..Self::default()
+        };
+        if let Some(receipt) = headers
+            .get("x-blazar-adaptive-candidates")
+            .and_then(|value| value.to_str().ok())
+        {
+            let field = |prefix: &str| {
+                receipt
+                    .split_whitespace()
+                    .find_map(|part| part.strip_prefix(prefix))
+            };
+            summary.candidates = field("used=")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            summary.fanout = summary.candidates > 1;
+            let key = field("vote_key").and_then(|value| u64::from_str_radix(value, 16).ok())
+                .or_else(|| crate::reasoning::answer_hash(&response_content(body).unwrap_or_default()));
+            let count = field("agreement=")
+                .and_then(|value| value.split('/').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1);
+            if let Some(key) = key {
+                summary.votes.insert(key, count);
+            }
+            summary.judge = field("judge=").map(str::to_string);
+        } else if let Some(key) =
+            crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
+        {
+            summary.votes.insert(key, 1);
+        }
+        summary
+    }
+
+    fn add_revision(&mut self, body: &Value) {
+        let hash = crate::reasoning::answer_hash(&response_content(body).unwrap_or_default());
+        if !self.fanout {
+            self.candidates = 1;
+            self.votes.clear();
+            if let Some(hash) = hash {
+                self.votes.insert(hash, 1);
+            }
+            return;
+        }
+        self.candidates = self.candidates.saturating_add(1);
+        if let Some(hash) = hash {
+            *self.votes.entry(hash).or_default() += 1;
+        }
+    }
+
+    fn agreement_for(&self, body: &Value) -> usize {
+        crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
+            .and_then(|hash| self.votes.get(&hash).copied())
+            .unwrap_or(0)
+    }
+}
+
+/// Contract-level assessment distinguishes deterministic checks (schema and
+/// recognized arithmetic) from answer agreement, which is only a consistency
+/// signal and never proof of factual correctness.
+#[allow(clippy::struct_excessive_bools)] // Independent response-contract gates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CandidateQuality {
     http_success: bool,
     parseable: bool,
     schema_valid: Option<bool>,
+    math_valid: Option<bool>,
     complete: bool,
     non_empty: bool,
+    agreement: usize,
+    candidates: usize,
 }
 
 impl CandidateQuality {
-    fn rank(self) -> (u8, u8, u8, u8, u8) {
+    fn consensus_score(self) -> usize {
+        self.agreement.saturating_mul(1000) / self.candidates.max(1)
+    }
+
+    fn has_majority(self) -> bool {
+        self.candidates <= 1
+            || self.math_valid == Some(true)
+            || self.agreement.saturating_mul(2) > self.candidates
+    }
+
+    fn rank(self) -> (u8, u8, u8, u8, usize, u8, u8) {
         (
             u8::from(self.http_success),
             u8::from(self.schema_valid != Some(false)),
+            u8::from(self.math_valid != Some(false)),
             u8::from(self.complete),
+            self.consensus_score(),
             u8::from(self.non_empty),
             u8::from(self.parseable),
         )
@@ -447,12 +540,19 @@ impl CandidateQuality {
         self.http_success
             && self.parseable
             && self.schema_valid != Some(false)
+            && self.math_valid != Some(false)
             && self.complete
             && self.non_empty
+            && self.has_majority()
     }
 
     fn needs_revision(self) -> bool {
-        self.http_success && (self.schema_valid == Some(false) || !self.complete || !self.non_empty)
+        self.http_success
+            && (self.schema_valid == Some(false)
+                || self.math_valid == Some(false)
+                || !self.complete
+                || !self.non_empty
+                || !self.has_majority())
     }
 }
 
@@ -462,6 +562,7 @@ fn assess_candidate(
     schema: Option<&Value>,
     status: reqwest::StatusCode,
     body: &Value,
+    summary: &CandidateSummary,
 ) -> CandidateQuality {
     let schema_valid = if plan.verify_schema {
         Some(schema_violation(state, plan, schema, body).is_none())
@@ -469,6 +570,7 @@ fn assess_candidate(
         None
     };
     let content = response_content(body).unwrap_or_default();
+    let math_valid = plan.task_profile.math_valid(content);
     let finish_reason = body
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str);
@@ -477,12 +579,24 @@ fn assess_candidate(
         http_success: status.is_success(),
         parseable: true,
         schema_valid,
+        math_valid,
         complete,
         non_empty: !content.trim().is_empty(),
+        agreement: summary.agreement_for(body),
+        candidates: summary.candidates.max(1),
     }
 }
 
-fn revision_feedback(quality: CandidateQuality, schema_feedback: Option<&str>) -> Option<String> {
+fn revision_feedback(
+    quality: CandidateQuality,
+    schema_feedback: Option<&str>,
+    math_feedback: Option<&str>,
+) -> Option<String> {
+    if quality.math_valid == Some(false) {
+        return math_feedback.map(str::to_string).or_else(|| {
+            Some("The deterministic arithmetic verifier rejected the answer. Recompute and return the corrected result.".into())
+        });
+    }
     if let Some(feedback) = schema_feedback {
         return Some(feedback.to_string());
     }
@@ -495,6 +609,11 @@ fn revision_feedback(quality: CandidateQuality, schema_feedback: Option<&str>) -
     if !quality.complete {
         return Some(
             "response ended before a normal completion (finish_reason is not stop); complete the answer without dropping required content".into()
+        );
+    }
+    if !quality.has_majority() {
+        return Some(
+            "Independent candidate answers disagreed. Re-evaluate the original problem, check the key steps, and provide one clearly stated final answer.".into()
         );
     }
     None
@@ -711,7 +830,7 @@ async fn run_local_chat_inner(
 
     // All local calls stay on the normal proxy/accounting path.
     let asked_candidates =
-        (strategy == Strategy::ParallelVerifiedCandidates).then(|| Plan::max_candidates(strategy));
+        (strategy == Strategy::ParallelVerifiedCandidates).then(|| plan.max_candidates(strategy));
     let mut current =
         local_proxy_round(state, engine, &request, headers, key, asked_candidates).await?;
     let (candidates, mut degraded, mut model_calls) = if let Some(asked) = asked_candidates {
@@ -740,8 +859,13 @@ async fn run_local_chat_inner(
         ));
     };
     merge_usage(&mut usage_total, &current_body);
-    let mut best_quality =
-        assess_candidate(state, &plan, schema.as_ref(), current.status, &current_body);
+    let mut candidate_summary = CandidateSummary::from_response(&current.headers, &current_body);
+    if let Some(reason) = degraded.as_deref() {
+        candidate_summary.judge.get_or_insert_with(|| reason.to_string());
+    }
+    let mut best_quality = assess_candidate(
+        state, &plan, schema.as_ref(), current.status, &current_body, &candidate_summary,
+    );
     let mut schema_verified = best_quality.schema_valid;
 
     if !current.status.is_success() {
@@ -757,7 +881,11 @@ async fn run_local_chat_inner(
             } else {
                 None
             };
-            let feedback = revision_feedback(best_quality, schema_detail.as_deref());
+            let feedback = revision_feedback(
+                best_quality,
+                schema_detail.as_deref(),
+                plan.task_profile.math_feedback().as_deref(),
+            );
             let Some(feedback) = feedback else {
                 stop_reason = "quality_gate_pass".into();
                 break;
@@ -806,11 +934,22 @@ async fn run_local_chat_inner(
                 break;
             };
             merge_usage(&mut usage_total, &revised_body);
-            let revised_quality =
-                assess_candidate(state, &plan, schema.as_ref(), revised.status, &revised_body);
+            candidate_summary.add_revision(&revised_body);
+            let revised_quality = assess_candidate(
+                state, &plan, schema.as_ref(), revised.status, &revised_body, &candidate_summary,
+            );
             if !revised_quality.is_better_than(best_quality) {
                 rejected += 1;
                 stop_reason = "no_objective_improvement".into();
+                // When candidate voting is still inconclusive, a rejected
+                // sample contributes evidence and the incumbent is retained.
+                if model_calls < plan.max_model_calls(strategy)
+                    && !best_quality.has_majority()
+                    && best_quality.math_valid != Some(true)
+                    && best_quality.schema_valid != Some(false)
+                {
+                    continue;
+                }
                 break;
             }
 
