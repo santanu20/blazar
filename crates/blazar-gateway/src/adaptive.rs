@@ -465,12 +465,28 @@ impl CandidateSummary {
                 .or_else(|| {
                     crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
                 });
-            let count = field("agreement=")
-                .and_then(|value| value.split('/').next())
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1)
-                .min(summary.candidates);
-            if let Some(key) = key {
+            if let Some(tallies) = field("vote_tallies=") {
+                for entry in tallies.split(',') {
+                    let Some((hash, count)) = entry.split_once(':') else {
+                        continue;
+                    };
+                    let (Some(hash), Some(count)) = (
+                        u64::from_str_radix(hash, 16).ok(),
+                        count.parse::<usize>().ok(),
+                    ) else {
+                        continue;
+                    };
+                    summary.votes.insert(hash, count.min(summary.candidates));
+                }
+            }
+            if summary.votes.is_empty()
+                && let Some(key) = key
+            {
+                let count = field("agreement=")
+                    .and_then(|value| value.split('/').next())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .min(summary.candidates);
                 summary.votes.insert(key, count);
             }
         } else if let Some(key) =
@@ -1167,6 +1183,15 @@ async fn remote_candidate_rounds(
         );
         if let Some(hash) = decision.answer_hash {
             receipt.push_str(&format!(" vote_key={hash:016x}"));
+        }
+        let vote_tallies = decision
+            .vote_tallies
+            .iter()
+            .map(|(hash, count)| format!("{hash:016x}:{count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !vote_tallies.is_empty() {
+            receipt.push_str(&format!(" vote_tallies={vote_tallies}"));
         }
         if let Ok(value) = axum::http::HeaderValue::from_str(&receipt) {
             winner.headers.insert("x-blazar-adaptive-candidates", value);
