@@ -1617,6 +1617,196 @@ pub(crate) async fn run_remote_chat(
 }
 
 #[allow(clippy::result_large_err, clippy::too_many_lines)] // One bounded remote evaluate/revise/accept state machine.
+async fn run_remote_search_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    model: &str,
+    method: &axum::http::Method,
+    path_query: &str,
+    headers: &HeaderMap,
+    request: Value,
+    mode: Mode,
+) -> Result<axum::response::Response, axum::response::Response> {
+    let plan = Plan::for_request(mode, &request);
+    let strategy = plan.strategy(&request);
+    let schema = request
+        .pointer("/response_format/json_schema/schema")
+        .filter(|schema| schema.is_object())
+        .cloned();
+    let original_request = request.clone();
+    let max_calls = plan.max_model_calls(strategy);
+    let expansion_budget = max_calls.saturating_sub(1).max(1);
+    let mut tree = crate::reasoning_search::SearchTree::new(
+        "root",
+        crate::reasoning_search::SearchConfig {
+            max_nodes: 40,
+            max_depth: 8,
+            max_expansions: expansion_budget,
+            max_tokens: expansion_budget.saturating_mul(768),
+            branch_factor: 3,
+            exploration: 1.6,
+            uncertainty_bonus: 0.45,
+        },
+    );
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
+    let mut current: Option<BufferedResponse> = None;
+    let mut usage_total = None;
+    let mut model_calls = 0usize;
+    let mut revisions = 0usize;
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+    let mut stop_reason = "search_budget".to_string();
+
+    while model_calls < expansion_budget && started.elapsed() < deadline {
+        let Some(leaf) = tree.select_leaf() else {
+            stop_reason = "no_expandable_state".to_string();
+            break;
+        };
+        let parent_state = tree.nodes()[leaf].state.clone();
+        let branch_limit = tree.current_branch_limit();
+        let mut expansion_request = original_request.clone();
+        append_search_expansion_prompt(&mut expansion_request, &parent_state, branch_limit)
+            .map_err(|error| {
+                crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
+            })?;
+        let response =
+            match remote_round(state, model, method, path_query, headers, &expansion_request).await
+            {
+            Ok(response) => response,
+            Err(_error) => {
+                let _ = tree.expand(leaf, Vec::new());
+                rejected = rejected.saturating_add(1);
+                stop_reason = "expansion_error".to_string();
+                continue;
+            }
+        };
+        model_calls = model_calls.saturating_add(1);
+        revisions = revisions.saturating_add(1);
+        let Ok(expansion_body) = serde_json::from_slice::<Value>(&response.body) else {
+            let _ = tree.expand(leaf, Vec::new());
+            rejected = rejected.saturating_add(1);
+            current = Some(response);
+            stop_reason = "unparseable_expansion".to_string();
+            continue;
+        };
+        merge_usage(&mut usage_total, &expansion_body);
+        let proposals = parse_search_expansion(
+            state,
+            &plan,
+            schema.as_ref(),
+            &parent_state,
+            &expansion_body,
+            branch_limit,
+        );
+        let added = tree.expand(leaf, proposals).unwrap_or_default();
+        accepted = accepted.saturating_add(added.len());
+        current = Some(response);
+
+        if tree.stats().verified_terminals > 0 {
+            stop_reason = "verified_answer".to_string();
+            break;
+        }
+        if added.is_empty() && tree.select_leaf().is_none() {
+            stop_reason = "no_expandable_state".to_string();
+            break;
+        }
+    }
+
+    let best = tree
+        .best_answer()
+        .map(|(id, answer, verification)| (id, answer.to_string(), verification));
+    let (mut current, selected_answer, selected_verification) =
+        if let Some((_, answer, verification)) = best {
+            let Some(response) = current else {
+                return Err(crate::mcp::teaching_error(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "reasoning search produced an answer without a response envelope",
+                ));
+            };
+            (response, Some(answer), Some(verification))
+        } else {
+        // Reserve one call for a conventional final answer if search could not
+        // produce a terminal state. It is explicitly unverified without an
+        // independent verifier; search never returns an internal JSON trace.
+        if model_calls < max_calls && started.elapsed() < deadline {
+            let response = remote_round(state, model, method, path_query, headers, &original_request)
+                    .await?;
+            model_calls = model_calls.saturating_add(1);
+            if let Ok(body) = serde_json::from_slice::<Value>(&response.body) {
+                merge_usage(&mut usage_total, &body);
+            }
+            stop_reason = "search_fallback".to_string();
+            let verification = serde_json::from_slice::<Value>(&response.body)
+                .ok()
+                .and_then(|body| response_content(&body).map(|answer| {
+                    verify_search_answer(state, &plan, schema.as_ref(), answer)
+                }))
+                .unwrap_or(crate::reasoning_search::Verification::Unknown);
+            (response, None, Some(verification))
+        } else {
+            return Err(crate::mcp::teaching_error(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "reasoning search exhausted its compute deadline before producing a user-facing answer",
+            ));
+        }
+    };
+
+    let Ok(mut final_body) = serde_json::from_slice::<Value>(&current.body) else {
+        return Ok(rebuild_axum_response(
+            current,
+            &format!("mode=deep strategy=prefix_puct stop=unparseable_final"),
+        ));
+    };
+    if let Some(answer) = selected_answer.as_deref() {
+        if !install_search_answer(&mut final_body, answer) {
+            return Err(crate::mcp::teaching_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "reasoning search response was missing the OpenAI chat response envelope",
+            ));
+        }
+    }
+    patch_usage(&mut final_body, usage_total);
+    current.body = axum::body::Bytes::from(
+        serde_json::to_vec(&final_body).unwrap_or_else(|_| current.body.to_vec()),
+    );
+    let schema_verified = if plan.verify_schema {
+        Some(schema_violation(state, &plan, schema.as_ref(), &final_body).is_none())
+    } else {
+        selected_verification
+            .map(|verification| verification == crate::reasoning_search::Verification::Passed)
+    };
+    let stats = tree.stats();
+    let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
+    let search_receipt = format!(
+        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} stop={stop_reason}",
+        stats.nodes,
+        stats.expansions,
+        stats.max_depth_reached,
+        stats.tokens,
+        stats.transpositions,
+        stats.prm_calibrated_nodes,
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&search_receipt) {
+        current.headers.insert("x-blazar-adaptive-search", value);
+    }
+    let receipt = loop_receipt(
+        &plan,
+        strategy,
+        model_calls,
+        stats.nodes.saturating_sub(1),
+        schema_verified,
+        revisions,
+        None,
+        accepted,
+        rejected,
+        &stop_reason,
+    );
+    Ok(rebuild_axum_response(
+        current,
+        &format!("{receipt} {search_receipt}"),
+    ))
+}
+
 async fn run_remote_chat_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -1629,6 +1819,9 @@ async fn run_remote_chat_inner(
     let original_request = request.clone();
     let plan = Plan::for_request(mode, &request);
     let strategy = plan.strategy(&request);
+    if mode == Mode::Deep && strategy == Strategy::ParallelVerifiedCandidates {
+        return run_remote_search_inner(state, model, method, path_query, headers, request, mode).await;
+    }
     let schema = request
         .pointer("/response_format/json_schema/schema")
         .filter(|schema| schema.is_object())
