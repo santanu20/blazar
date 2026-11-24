@@ -1025,6 +1025,12 @@ pub struct Config {
     /// `<remote>:<model>` route there instead of loading locally.
     #[serde(default)]
     pub remotes: Vec<Remote>,
+    /// Optional independently hosted process-reward endpoint for Deep
+    /// partial-state search. Its API key is read from the named environment
+    /// variable and is never persisted. Scores are marked calibrated only
+    /// when the response calibration_id matches this pinned value.
+    #[serde(default)]
+    pub reasoning_prm: Option<ReasoningPrmConfig>,
     /// Ordered failover chains (`[[failover]]`): a virtual `alias`
     /// served by the first healthy target, escalating on failure with
     /// anti-flap benching. See `FailoverChain`.
@@ -3496,6 +3502,37 @@ impl SamplerDefaults {
     }
 }
 
+/// Optional external process-reward service for scoring partial
+/// reasoning states. Protocol: POST JSON to url with
+/// `{protocol, task, partial_state}`; response JSON is
+/// `{score, uncertainty, calibration_id}`. A score is marked calibrated
+/// only when the returned calibration_id matches the configured pin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReasoningPrmConfig {
+    /// Absolute HTTPS endpoint or loopback HTTP endpoint.
+    pub url: String,
+    /// Environment variable name holding the bearer key; the key itself is
+    /// never stored in config.toml.
+    pub api_key_env: Option<String>,
+    /// Expected evaluator calibration identity. Omit to treat all scores as
+    /// uncalibrated, even when the endpoint responds successfully.
+    pub calibration_id: Option<String>,
+    /// Per-evaluation timeout in milliseconds. Must be in 100..=5000.
+    pub timeout_ms: u64,
+}
+
+impl Default for ReasoningPrmConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            api_key_env: None,
+            calibration_id: None,
+            timeout_ms: 750,
+        }
+    }
+}
+
 /// One external OpenAI-compatible server (another blazar, vLLM, MLX
 /// server, llamactl - anything speaking `/v1/*`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -4258,6 +4295,7 @@ impl Default for Config {
             otlp_endpoint: String::new(),
             otlp_service: String::new(),
             remotes: Vec::new(),
+            reasoning_prm: None,
             cache_type: String::new(),
             cache_type_k: String::new(),
             cache_type_v: String::new(),
@@ -5561,6 +5599,65 @@ impl Config {
                             remote.name, remote.url
                         )));
                     }
+                }
+            }
+        }
+        if let Some(prm) = &self.reasoning_prm {
+            if prm.url.trim().is_empty() {
+                return Err(CoreError::Config(
+                    "reasoning_prm.url must be a non-empty absolute endpoint".into(),
+                ));
+            }
+            if !matches!(
+                remote_scheme_policy(&prm.url),
+                RemoteSchemePolicy::HttpsOk | RemoteSchemePolicy::LoopbackHttpOk
+            ) {
+                return Err(CoreError::Config(
+                    "reasoning_prm.url must use HTTPS or loopback HTTP; cleartext LAN/public endpoints are refused"
+                        .into(),
+                ));
+            }
+            let authority = prm
+                .url
+                .split_once("://")
+                .map(|(_, rest)| rest.split('/').next().unwrap_or_default())
+                .unwrap_or_default();
+            if authority.contains('@') {
+                return Err(CoreError::Config(
+                    "reasoning_prm.url must not embed credentials; use api_key_env".into(),
+                ));
+            }
+            if !(100..=5_000).contains(&prm.timeout_ms) {
+                return Err(CoreError::Config(
+                    "reasoning_prm.timeout_ms must be in 100..=5000".into(),
+                ));
+            }
+            if let Some(env_name) = prm.api_key_env.as_deref() {
+                let mut chars = env_name.chars();
+                let first_is_valid = chars
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase() || ch == '_');
+                if env_name.len() > 128
+                    || !first_is_valid
+                    || !chars.all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+                {
+                    return Err(CoreError::Config(
+                        "reasoning_prm.api_key_env must be an environment-variable name (A-Z, 0-9, _)"
+                            .into(),
+                    ));
+                }
+            }
+            if let Some(calibration_id) = prm.calibration_id.as_deref() {
+                if calibration_id.is_empty()
+                    || calibration_id.len() > 128
+                    || !calibration_id
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+                {
+                    return Err(CoreError::Config(
+                        "reasoning_prm.calibration_id must be 1..=128 ASCII letters, digits, _, - or ."
+                            .into(),
+                    ));
                 }
             }
         }
