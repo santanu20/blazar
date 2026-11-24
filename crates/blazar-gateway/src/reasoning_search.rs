@@ -93,8 +93,8 @@ pub struct SearchProposal {
     pub value: ValueEstimate,
     /// Hard-verifier result for terminal proposals, otherwise Unknown.
     pub verification: Verification,
-    /// Approximate generated tokens charged to the search budget.
-    pub tokens: usize,
+    /// Estimated state tokens charged to the search budget (not provider usage).
+    pub estimated_state_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -363,7 +363,7 @@ impl SearchTree {
             } else {
                 NodeStatus::Open
             };
-            self.tokens = self.tokens.saturating_add(proposal.tokens);
+            self.tokens = self.tokens.saturating_add(proposal.estimated_state_tokens);
             self.nodes.push(SearchNode {
                 id,
                 parent: Some(parent_id),
@@ -589,7 +589,7 @@ mod tests {
             prior,
             value: ValueEstimate::new(value, uncertainty, true),
             verification: Verification::Unknown,
-            tokens: 4,
+            estimated_state_tokens: 4,
         }
     }
 
