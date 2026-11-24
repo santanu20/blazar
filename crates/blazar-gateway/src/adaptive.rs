@@ -942,9 +942,13 @@ fn parse_search_expansion(
                     }
                     if plan.verify_schema {
                         let schema_valid = schema
-                            .and_then(|schema| serde_json::from_str::<Value>(final_answer).ok().map(|value| {
-                                state.sentinel.schema_check(schema, &value).is_none()
-                            }))
+                            .and_then(|schema| {
+                                serde_json::from_str::<Value>(final_answer)
+                                    .ok()
+                                    .map(|value| {
+                                        state.sentinel.schema_check(schema, &value).is_none()
+                                    })
+                            })
                             .unwrap_or(false);
                         return if schema_valid {
                             crate::reasoning_search::Verification::Passed
@@ -1055,16 +1059,9 @@ async fn run_local_search_inner(
             .map_err(|error| {
                 crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
             })?;
-        let response = match local_proxy_round(
-            state,
-            engine,
-            &expansion_request,
-            headers,
-            key,
-            None,
-        )
-        .await
-        {
+        let response =
+            match local_proxy_round(state, engine, &expansion_request, headers, key, None).await
+            {
             Ok(response) => response,
             Err(_error) => {
                 let _ = tree.expand(leaf, Vec::new());
@@ -1105,18 +1102,19 @@ async fn run_local_search_inner(
         }
     }
 
-    let best = tree.best_answer().map(|(id, answer, verification)| {
-        (id, answer.to_string(), verification)
-    });
-    let (mut current, selected_answer, selected_verification) = if let Some((_, answer, verification)) = best {
-        let Some(response) = current else {
-            return Err(crate::mcp::teaching_error(
-                axum::http::StatusCode::BAD_GATEWAY,
-                "reasoning search produced an answer without a response envelope",
-            ));
-        };
-        (response, Some(answer), Some(verification))
-    } else {
+    let best = tree
+        .best_answer()
+        .map(|(id, answer, verification)| (id, answer.to_string(), verification));
+    let (mut current, selected_answer, selected_verification) =
+        if let Some((_, answer, verification)) = best {
+            let Some(response) = current else {
+                return Err(crate::mcp::teaching_error(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "reasoning search produced an answer without a response envelope",
+                ));
+            };
+            (response, Some(answer), Some(verification))
+        } else {
         // Reserve one call for a conventional final answer if search could not
         // produce a terminal state. It is explicitly unverified without an
         // independent verifier; search never returns an internal JSON trace.
@@ -1161,7 +1159,8 @@ async fn run_local_search_inner(
     let schema_verified = if plan.verify_schema {
         Some(schema_violation(state, &plan, schema.as_ref(), &final_body).is_none())
     } else {
-        selected_verification.map(|verification| verification == crate::reasoning_search::Verification::Passed)
+        selected_verification
+            .map(|verification| verification == crate::reasoning_search::Verification::Passed)
     };
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
@@ -1195,7 +1194,10 @@ async fn run_local_search_inner(
         Some(&original_request),
         &current.body,
     );
-    Ok(rebuild_response(current, &format!("{receipt} {search_receipt}")))
+    Ok(rebuild_response(
+        current,
+        &format!("{receipt} {search_receipt}"),
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
