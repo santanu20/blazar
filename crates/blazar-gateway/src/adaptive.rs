@@ -180,7 +180,11 @@ impl Plan {
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty());
-        if has_caller_tools {
+        let requests_multiple_choices = request
+            .get("n")
+            .and_then(Value::as_u64)
+            .is_some_and(|choices| choices > 1);
+        if has_caller_tools || requests_multiple_choices {
             Strategy::Direct
         } else if self.mode == Mode::Deep && self.verify_schema {
             Strategy::ParallelVerifiedCandidates
@@ -345,6 +349,10 @@ fn message_has_tool_calls(body: &Value) -> bool {
     body.pointer("/choices/0/message/tool_calls")
         .and_then(Value::as_array)
         .is_some_and(|calls| !calls.is_empty())
+        || body.pointer("/choices/0/message/function_call").is_some()
+        || body.pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == "tool_calls" || reason == "function_call")
 }
 
 pub(crate) fn stamp(response: &mut axum::response::Response, receipt: Option<&str>) {
@@ -564,8 +572,7 @@ async fn run_local_chat_inner(
     }
 
     let schema_feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
-    let should_revise = (schema_feedback.is_some()
-        || strategy == Strategy::SequentialRevision)
+    let should_revise = (schema_feedback.is_some() || strategy == Strategy::SequentialRevision)
         && model_calls < plan.max_model_calls(strategy);
     if should_revise {
         let assistant = parsed
@@ -626,7 +633,14 @@ async fn run_local_chat_inner(
     }
     Ok(rebuild_response(
         current,
-        &plan.execution_receipt(strategy, model_calls, candidates, verified, revisions, degraded.as_deref()),
+        &plan.execution_receipt(
+            strategy,
+            model_calls,
+            candidates,
+            verified,
+            revisions,
+            degraded.as_deref(),
+        ),
     ))
 }
 
@@ -914,6 +928,26 @@ mod tests {
         });
         assert_eq!(
             Plan::for_request(Mode::Auto, &simple).strategy(&simple),
+            Strategy::Direct
+        );
+        let caller_tools = json!({
+            "messages": [{"role": "user", "content": "Use a tool."}],
+            "tools": [{"type": "function", "function": {"name": "search"}}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Deep, &caller_tools).strategy(&caller_tools),
+            Strategy::Direct
+        );
+        let multiple_choices = json!({
+            "messages": [{"role": "user", "content": "Give alternatives."}],
+            "n": 2,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Deep, &multiple_choices).strategy(&multiple_choices),
             Strategy::Direct
         );
         let complex = json!({
