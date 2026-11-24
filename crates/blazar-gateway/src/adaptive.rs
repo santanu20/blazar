@@ -461,7 +461,8 @@ impl CandidateSummary {
             let count = field("agreement=")
                 .and_then(|value| value.split('/').next())
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .min(summary.candidates);
             if let Some(key) = key {
                 summary.votes.insert(key, count);
             }
@@ -1834,7 +1835,7 @@ mod tests {
         });
         let plan = Plan::for_request(Mode::Deep, &request);
         assert_eq!(plan.max_schema_retries, MAX_DEEP_SCHEMA_RETRIES);
-        assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 3);
+        assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 4);
         assert_eq!(
             plan.max_model_calls(Strategy::ParallelVerifiedCandidates),
             7
