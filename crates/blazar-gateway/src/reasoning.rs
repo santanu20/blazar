@@ -112,8 +112,10 @@ pub(crate) fn pick_candidate(
             .and_then(|key| counts.get(key))
             .copied()
             .unwrap_or(0);
+        let hard_gates = u8::from(schema_valid) + u8::from(math_valid);
         (
             u8::from(http_success),
+            hard_gates,
             u8::from(schema_valid),
             u8::from(math_valid),
             u8::from(complete),
