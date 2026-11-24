@@ -93,9 +93,13 @@ pub(crate) fn pick_candidate(
                 .and_then(|text| serde_json::from_str::<Value>(text).ok())
                 .is_some_and(|instance| sentinel.schema_check(schema, &instance).is_none())
         });
-        let math_valid = profile
-            .math_valid(&response_content(body).unwrap_or_default())
-            .unwrap_or(true);
+        let math_valid = if profile.math_expected().is_some() {
+            profile
+                .math_valid(&response_content(body).unwrap_or_default())
+                .unwrap_or(false)
+        } else {
+            true
+        };
         let finish_reason = body
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str);
@@ -267,9 +271,13 @@ fn arithmetic_oracle_from_text(text: &str) -> Option<ArithmeticOracle> {
             continue;
         };
         let tail = &text[cue_index + cue.len()..];
-        let start = tail.find(|ch: char| ch.is_ascii_digit() || matches!(ch, '(' | '+' | '-'))?;
+        let Some(start) =
+            tail.find(|ch: char| ch.is_ascii_digit() || matches!(ch, '(' | '+' | '-'))
+        else {
+            continue;
+        };
         let expression_tail = &tail[start..];
-        let end = expression_tail
+        let Some(end) = expression_tail
             .char_indices()
             .take_while(|(_, ch)| {
                 ch.is_ascii_digit()
@@ -277,12 +285,17 @@ fn arithmetic_oracle_from_text(text: &str) -> Option<ArithmeticOracle> {
                     || matches!(ch, '.' | '+' | '-' | '*' | '/' | '(' | ')' | '^')
             })
             .map(|(index, ch)| index + ch.len_utf8())
-            .last()?;
+            .last()
+        else {
+            continue;
+        };
         let expression = expression_tail[..end].trim().trim_end_matches('.').trim();
         if !expression.chars().any(|ch| matches!(ch, '+' | '-' | '*' | '/' | '^')) {
             continue;
         }
-        let expected = parse_expression(expression)?;
+        let Some(expected) = parse_expression(expression) else {
+            continue;
+        };
         return Some(ArithmeticOracle {
             expression: expression.to_string(),
             expected,
