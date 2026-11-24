@@ -977,7 +977,7 @@ fn parse_search_expansion(
             // never treats the generator's own confidence as a PRM score.
             let prior = branch.get("prior").and_then(Value::as_f64).unwrap_or(0.5);
             let value = value_model.evaluate(&state_text);
-            let tokens = step
+            let estimated_state_tokens = step
                 .len()
                 .saturating_add(answer.as_ref().map_or(0, String::len))
                 .div_ceil(4)
@@ -988,7 +988,7 @@ fn parse_search_expansion(
                 prior,
                 value,
                 verification,
-                tokens,
+                estimated_state_tokens,
             })
         })
         .collect()
@@ -1193,7 +1193,7 @@ async fn run_local_search_inner(
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
-        stats.tokens,
+        stats.estimated_state_tokens,
         stats.transpositions,
         stats.prm_calibrated_nodes,
         stats.best_value,
@@ -1817,7 +1817,7 @@ async fn run_remote_search_inner(
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
-        stats.tokens,
+        stats.estimated_state_tokens,
         stats.transpositions,
         stats.prm_calibrated_nodes,
         stats.best_value,
