@@ -20,10 +20,22 @@ from typing import Any
 
 CASES: tuple[dict[str, Any], ...] = (
     {
-        "id": "arithmetic",
+        "id": "arithmetic_nested",
         "messages": [{"role": "user", "content":
             "Calculate 17 * (23 - 8) + 144 / 12. Return only the number."}],
-        "expected": "267",
+        "expected": 267,
+    },
+    {
+        "id": "arithmetic_precedence",
+        "messages": [{"role": "user", "content":
+            "Compute 3 * (42 - 17) + 6^2. Return only the number."}],
+        "expected": 111,
+    },
+    {
+        "id": "arithmetic_fraction",
+        "messages": [{"role": "user", "content":
+            "Evaluate (144 / 12) * (19 - 7) / 5 * 5. Return only the number."}],
+        "expected": 144,
     },
     {
         "id": "table_lookup",
@@ -65,10 +77,13 @@ def percentile(values: list[float], q: float) -> float | None:
 
 def check(case: dict[str, Any], content: str) -> bool:
     expected = case["expected"]
-    if case["id"] == "arithmetic":
-        # This task explicitly requests only the number. Substring matching
-        # would incorrectly pass explanations containing a wrong result too.
-        return re.fullmatch(r"\s*267\s*[.!]?\s*", content) is not None
+    if case["id"].startswith("arithmetic_"):
+        # Exact numeric match; never accept an explanation that merely
+        # contains the expected number among unrelated/wrong calculations.
+        match = re.fullmatch(r"\s*([-+]?\d+(?:\.\d+)?)\s*[.!]?\s*", content)
+        return match is not None and math.isclose(
+            float(match.group(1)), float(expected), rel_tol=1e-9, abs_tol=1e-9
+        )
     if isinstance(expected, tuple):
         # Require the correct label/value pair, not merely both tokens
         # appearing somewhere in an unrelated answer.
@@ -117,16 +132,19 @@ def request_once(endpoint: str, model: str, case: dict[str, Any],
     started = time.perf_counter()
     status = 0
     receipt = None
+    candidate_receipt = None
     response: dict[str, Any] = {}
     error = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as result:
             status = result.status
             receipt = result.headers.get("x-blazar-adaptive-result")
+            candidate_receipt = result.headers.get("x-blazar-adaptive-candidates")
             response = json.loads(result.read())
     except urllib.error.HTTPError as exc:
         status = exc.code
         receipt = exc.headers.get("x-blazar-adaptive-result")
+        candidate_receipt = exc.headers.get("x-blazar-adaptive-candidates")
         try:
             response = json.loads(exc.read())
         except (json.JSONDecodeError, OSError):
@@ -147,6 +165,7 @@ def request_once(endpoint: str, model: str, case: dict[str, Any],
         "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
         "adaptive_receipt": receipt,
+        "candidate_receipt": candidate_receipt,
         "error": error,
     }
 
@@ -167,6 +186,74 @@ def summarise(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "receipts": sorted(
             {row["adaptive_receipt"] for row in rows if row["adaptive_receipt"]}
         ),
+    }
+
+
+def per_case_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["case"]), []).append(row)
+    return {
+        case: {
+            "requests": len(items),
+            "pass_rate": (
+                sum(bool(item["success"]) for item in items) / len(items)
+                if items else 0.0
+            ),
+            "p50_latency_ms": statistics.median(
+                [float(item["latency_ms"]) for item in items]
+            ) if items else None,
+        }
+        for case, items in sorted(grouped.items())
+    }
+
+
+def bootstrap_mean_ci(
+    values: list[float], *, seed: int, rounds: int = 2000
+) -> tuple[float, float] | None:
+    if len(values) < 2:
+        return None
+    rng = random.Random(seed)
+    estimates = [
+        statistics.fmean(rng.choices(values, k=len(values)))
+        for _ in range(rounds)
+    ]
+    return percentile(estimates, 0.025), percentile(estimates, 0.975)
+
+
+def paired_comparison(
+    baseline: list[dict[str, Any]],
+    candidate: list[dict[str, Any]],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    left = {(row["case"], row["run"]): row for row in baseline}
+    right = {(row["case"], row["run"]): row for row in candidate}
+    keys = sorted(left.keys() & right.keys())
+    accuracy_delta = [
+        float(bool(right[key]["success"])) - float(bool(left[key]["success"]))
+        for key in keys
+    ]
+    latency_delta = [
+        float(right[key]["latency_ms"]) - float(left[key]["latency_ms"])
+        for key in keys
+    ]
+    token_delta = [
+        float(right[key]["total_tokens"]) - float(left[key]["total_tokens"])
+        for key in keys
+    ]
+    accuracy_ci = bootstrap_mean_ci(accuracy_delta, seed=seed)
+    latency_ci = bootstrap_mean_ci(latency_delta, seed=seed + 1)
+    return {
+        "paired_requests": len(keys),
+        "accuracy_lift": statistics.fmean(accuracy_delta) if accuracy_delta else None,
+        "accuracy_lift_95pct_bootstrap_ci": list(accuracy_ci) if accuracy_ci else None,
+        "latency_delta_ms_mean": statistics.fmean(latency_delta) if latency_delta else None,
+        "latency_delta_ms_95pct_bootstrap_ci": list(latency_ci) if latency_ci else None,
+        "total_token_delta": sum(token_delta) if token_delta else 0,
+        "wins": sum(delta > 0 for delta in accuracy_delta),
+        "ties": sum(delta == 0 for delta in accuracy_delta),
+        "losses": sum(delta < 0 for delta in accuracy_delta),
     }
 
 
@@ -230,7 +317,17 @@ def main() -> int:
     report["execution_order"] = execution_order
     for mode in modes:
         rows = samples[mode]
-        report["results"][mode] = {"summary": summarise(rows), "samples": rows}
+        report["results"][mode] = {
+            "summary": summarise(rows),
+            "per_case": per_case_summary(rows),
+            "samples": rows,
+        }
+
+    if "off" in samples:
+        report["paired_vs_off"] = {
+            mode: paired_comparison(samples["off"], samples[mode], seed=args.seed + 10)
+            for mode in modes if mode != "off"
+        }
 
     rendered = json.dumps(report, indent=2, sort_keys=True)
     print(rendered)
