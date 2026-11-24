@@ -9778,6 +9778,61 @@ rpc_servers = "127.0.0.1:51001,127.0.0.1:51002"
     }
 
     #[test]
+    fn unit__validation__reasoning_prm_requires_secure_endpoint_and_pinned_config() {
+        let prm = ReasoningPrmConfig {
+            url: "https://prm.example.net/v1/score".into(),
+            api_key_env: Some("BLAZAR_PRM_API_KEY".into()),
+            calibration_id: Some("math-prm-2026-11".into()),
+            timeout_ms: 1_000,
+        };
+        let cfg = Config {
+            reasoning_prm: Some(prm.clone()),
+            ..Config::default()
+        };
+        cfg.validate().expect("HTTPS PRM config should validate");
+
+        let encoded = toml::to_string(&cfg).expect("serialize config");
+        let decoded: Config = toml::from_str(&encoded).expect("deserialize config");
+        assert_eq!(decoded.reasoning_prm, Some(prm));
+
+        let bad_url = Config {
+            reasoning_prm: Some(ReasoningPrmConfig {
+                url: "http://10.0.0.7:8000/score".into(),
+                ..prm.clone()
+            }),
+            ..Config::default()
+        };
+        assert!(bad_url.validate().is_err());
+
+        let embedded_credentials = Config {
+            reasoning_prm: Some(ReasoningPrmConfig {
+                url: "https://user:secret@prm.example.net/score".into(),
+                ..prm.clone()
+            }),
+            ..Config::default()
+        };
+        assert!(embedded_credentials.validate().is_err());
+
+        let invalid_env = Config {
+            reasoning_prm: Some(ReasoningPrmConfig {
+                api_key_env: Some("BLAZAR-PRM-KEY".into()),
+                ..prm.clone()
+            }),
+            ..Config::default()
+        };
+        assert!(invalid_env.validate().is_err());
+
+        let invalid_timeout = Config {
+            reasoning_prm: Some(ReasoningPrmConfig {
+                timeout_ms: 10_000,
+                ..prm
+            }),
+            ..Config::default()
+        };
+        assert!(invalid_timeout.validate().is_err());
+    }
+
+    #[test]
     fn unit__validation__model_pools_parse_and_gate() {
         // Full TOML shape: strategy defaults to ordered, members ride
         // their own table array, remote labels resolve.
