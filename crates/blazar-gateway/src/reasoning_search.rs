@@ -265,6 +265,15 @@ impl SearchTree {
         self.config.exploration * (0.25 + 0.75 * remaining)
     }
 
+    /// Read-only frontier check. Unlike select_leaf, this does not increment
+    /// visits or otherwise perturb the search policy.
+    #[must_use]
+    pub fn has_open_frontier(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            node.status == NodeStatus::Open && node.depth < self.config.max_depth
+        })
+    }
+
     /// Select an expandable leaf with PUCT and an uncertainty bonus.
     /// None means the hard search budget is exhausted or all paths are closed.
     pub fn select_leaf(&mut self) -> Option<usize> {
