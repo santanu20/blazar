@@ -587,7 +587,11 @@ mod tests {
         assert_eq!(decision.verifier, "answer_consensus");
         assert_eq!(decision.vote_tallies.len(), 2);
         assert_eq!(
-            decision.vote_tallies.iter().map(|(_, votes)| votes).sum::<usize>(),
+            decision
+                .vote_tallies
+                .iter()
+                .map(|(_, votes)| votes)
+                .sum::<usize>(),
             3
         );
     }
