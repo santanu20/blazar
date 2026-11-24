@@ -880,7 +880,7 @@ async fn run_local_chat_inner(
     let mut rejected = 0usize;
     let mut schema_repair_attempts = 0usize;
     let mut usage_total = None;
-    let stop_reason: String;
+    let mut stop_reason: String;
 
     // All local calls stay on the normal proxy/accounting path.
     let asked_candidates =
@@ -1285,7 +1285,7 @@ async fn run_remote_chat_inner(
     let mut rejected = 0usize;
     let mut schema_repair_attempts = 0usize;
     let mut usage_total = None;
-    let stop_reason: String;
+    let mut stop_reason: String;
 
     let asked_candidates =
         (strategy == Strategy::ParallelVerifiedCandidates).then(|| plan.max_candidates(strategy));
