@@ -879,7 +879,12 @@ fn append_search_expansion_prompt(
     // request deadline budgets remain the authoritative compute ceilings.
     request["max_tokens"] = Value::from(512_u64);
     if let Some(object) = request.as_object_mut() {
-        for field in ["max_completion_tokens", "max_output_tokens", "n", "logprobs"] {
+        for field in [
+            "max_completion_tokens",
+            "max_output_tokens",
+            "n",
+            "logprobs",
+        ] {
             object.remove(field);
         }
     }
