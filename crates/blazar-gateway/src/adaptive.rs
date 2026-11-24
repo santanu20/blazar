@@ -1067,16 +1067,15 @@ async fn run_local_search_inner(
                 crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
             })?;
         let response =
-            match local_proxy_round(state, engine, &expansion_request, headers, key, None).await
-            {
-            Ok(response) => response,
-            Err(_error) => {
-                let _ = tree.expand(leaf, Vec::new());
-                rejected = rejected.saturating_add(1);
-                stop_reason = "expansion_error".to_string();
-                continue;
-            }
-        };
+            match local_proxy_round(state, engine, &expansion_request, headers, key, None).await {
+                Ok(response) => response,
+                Err(_error) => {
+                    let _ = tree.expand(leaf, Vec::new());
+                    rejected = rejected.saturating_add(1);
+                    stop_reason = "expansion_error".to_string();
+                    continue;
+                }
+            };
         model_calls = model_calls.saturating_add(1);
         revisions = revisions.saturating_add(1);
         let Ok(expansion_body) = serde_json::from_slice::<Value>(&response.body) else {
@@ -1118,22 +1117,26 @@ async fn run_local_search_inner(
     let best = tree
         .best_answer()
         .map(|(id, answer, verification)| (id, answer.to_string(), verification));
-    let (mut current, selected_answer, selected_verification) =
-        if let Some((_, answer, verification)) = best {
-            let Some(response) = current else {
-                return Err(crate::mcp::teaching_error(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "reasoning search produced an answer without a response envelope",
-                ));
-            };
-            (response, Some(answer), Some(verification))
-        } else {
+    let (mut current, selected_answer, selected_verification) = if let Some((
+        _,
+        answer,
+        verification,
+    )) = best
+    {
+        let Some(response) = current else {
+            return Err(crate::mcp::teaching_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "reasoning search produced an answer without a response envelope",
+            ));
+        };
+        (response, Some(answer), Some(verification))
+    } else {
         // Reserve one call for a conventional final answer if search could not
         // produce a terminal state. It is explicitly unverified without an
         // independent verifier; search never returns an internal JSON trace.
         if model_calls < max_calls && started.elapsed() < deadline {
-            let response = local_proxy_round(state, engine, &original_request, headers, key, None)
-                .await?;
+            let response =
+                local_proxy_round(state, engine, &original_request, headers, key, None).await?;
             model_calls = model_calls.saturating_add(1);
             if let Ok(body) = serde_json::from_slice::<Value>(&response.body) {
                 merge_usage(&mut usage_total, &body);
@@ -1141,9 +1144,10 @@ async fn run_local_search_inner(
             stop_reason = "search_fallback".to_string();
             let verification = serde_json::from_slice::<Value>(&response.body)
                 .ok()
-                .and_then(|body| response_content(&body).map(|answer| {
-                    verify_search_answer(state, &plan, schema.as_ref(), answer)
-                }))
+                .and_then(|body| {
+                    response_content(&body)
+                        .map(|answer| verify_search_answer(state, &plan, schema.as_ref(), answer))
+                })
                 .unwrap_or(crate::reasoning_search::Verification::Unknown);
             (response, None, Some(verification))
         } else {
@@ -1676,9 +1680,16 @@ async fn run_remote_search_inner(
             .map_err(|error| {
                 crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
             })?;
-        let response =
-            match remote_round(state, model, method, path_query, headers, &expansion_request).await
-            {
+        let response = match remote_round(
+            state,
+            model,
+            method,
+            path_query,
+            headers,
+            &expansion_request,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(_error) => {
                 let _ = tree.expand(leaf, Vec::new());
@@ -1728,22 +1739,26 @@ async fn run_remote_search_inner(
     let best = tree
         .best_answer()
         .map(|(id, answer, verification)| (id, answer.to_string(), verification));
-    let (mut current, selected_answer, selected_verification) =
-        if let Some((_, answer, verification)) = best {
-            let Some(response) = current else {
-                return Err(crate::mcp::teaching_error(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "reasoning search produced an answer without a response envelope",
-                ));
-            };
-            (response, Some(answer), Some(verification))
-        } else {
+    let (mut current, selected_answer, selected_verification) = if let Some((
+        _,
+        answer,
+        verification,
+    )) = best
+    {
+        let Some(response) = current else {
+            return Err(crate::mcp::teaching_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "reasoning search produced an answer without a response envelope",
+            ));
+        };
+        (response, Some(answer), Some(verification))
+    } else {
         // Reserve one call for a conventional final answer if search could not
         // produce a terminal state. It is explicitly unverified without an
         // independent verifier; search never returns an internal JSON trace.
         if model_calls < max_calls && started.elapsed() < deadline {
-            let response = remote_round(state, model, method, path_query, headers, &original_request)
-                    .await?;
+            let response =
+                remote_round(state, model, method, path_query, headers, &original_request).await?;
             model_calls = model_calls.saturating_add(1);
             if let Ok(body) = serde_json::from_slice::<Value>(&response.body) {
                 merge_usage(&mut usage_total, &body);
@@ -1751,9 +1766,10 @@ async fn run_remote_search_inner(
             stop_reason = "search_fallback".to_string();
             let verification = serde_json::from_slice::<Value>(&response.body)
                 .ok()
-                .and_then(|body| response_content(&body).map(|answer| {
-                    verify_search_answer(state, &plan, schema.as_ref(), answer)
-                }))
+                .and_then(|body| {
+                    response_content(&body)
+                        .map(|answer| verify_search_answer(state, &plan, schema.as_ref(), answer))
+                })
                 .unwrap_or(crate::reasoning_search::Verification::Unknown);
             (response, None, Some(verification))
         } else {
@@ -1832,7 +1848,8 @@ async fn run_remote_chat_inner(
     let plan = Plan::for_request(mode, &request);
     let strategy = plan.strategy(&request);
     if mode == Mode::Deep && strategy == Strategy::ParallelVerifiedCandidates {
-        return run_remote_search_inner(state, model, method, path_query, headers, request, mode).await;
+        return run_remote_search_inner(state, model, method, path_query, headers, request, mode)
+            .await;
     }
     let schema = request
         .pointer("/response_format/json_schema/schema")
