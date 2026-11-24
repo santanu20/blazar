@@ -47,9 +47,21 @@ impl TaskProfile {
         self.arithmetic.as_ref().map(|oracle| oracle.expected)
     }
 
+    #[cfg(test)]
+    pub(crate) fn math_expression(&self) -> Option<&str> {
+        self.arithmetic.as_ref().map(|oracle| oracle.expression.as_str())
+    }
+
+
     pub(crate) fn table_label(&self) -> Option<&str> {
         self.table.as_ref().map(|oracle| oracle.label.as_str())
     }
+
+    #[cfg(test)]
+    pub(crate) fn table_value(&self) -> Option<f64> {
+        self.table.as_ref().map(|oracle| oracle.value)
+    }
+
 
     pub(crate) fn math_valid(&self, content: &str) -> Option<bool> {
         let expected = self.math_expected()?;
