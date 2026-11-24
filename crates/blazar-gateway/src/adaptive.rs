@@ -878,6 +878,11 @@ fn append_search_expansion_prompt(
     // Limit each internal expansion response. The aggregate model-call and
     // request deadline budgets remain the authoritative compute ceilings.
     request["max_tokens"] = Value::from(512_u64);
+    if let Some(object) = request.as_object_mut() {
+        for field in ["max_completion_tokens", "max_output_tokens", "n", "logprobs"] {
+            object.remove(field);
+        }
+    }
     Ok(())
 }
 
@@ -1184,7 +1189,7 @@ async fn run_local_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
@@ -1808,7 +1813,7 @@ async fn run_remote_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
