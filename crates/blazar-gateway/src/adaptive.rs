@@ -84,7 +84,11 @@ impl Plan {
             max_tool_rounds,
             max_tool_calls,
             max_schema_retries: if verify_schema {
-                if mode == Mode::Deep { MAX_SCHEMA_RETRIES + 1 } else { MAX_SCHEMA_RETRIES }
+                if mode == Mode::Deep {
+                    MAX_SCHEMA_RETRIES + 1
+                } else {
+                    MAX_SCHEMA_RETRIES
+                }
             } else {
                 0
             },
@@ -447,8 +451,7 @@ impl CandidateQuality {
     }
 
     fn needs_revision(self) -> bool {
-        self.http_success
-            && (self.schema_valid == Some(false) || !self.complete || !self.non_empty)
+        self.http_success && (self.schema_valid == Some(false) || !self.complete || !self.non_empty)
     }
 }
 
@@ -482,10 +485,7 @@ fn assess_candidate(
     }
 }
 
-fn revision_feedback(
-    quality: CandidateQuality,
-    schema_feedback: Option<&str>,
-) -> Option<String> {
+fn revision_feedback(quality: CandidateQuality, schema_feedback: Option<&str>) -> Option<String> {
     if let Some(feedback) = schema_feedback {
         return Some(feedback.to_string());
     }
@@ -729,15 +729,24 @@ async fn run_local_chat_inner(
             stop_reason = "unparseable_initial_response".into();
             return Ok(rebuild_response(
                 current,
-                &loop_receipt(&plan, strategy, model_calls, candidates, None, revisions,
-                    degraded.as_deref(), accepted, rejected, &stop_reason),
+                &loop_receipt(
+                    &plan,
+                    strategy,
+                    model_calls,
+                    candidates,
+                    None,
+                    revisions,
+                    degraded.as_deref(),
+                    accepted,
+                    rejected,
+                    &stop_reason,
+                ),
             ));
         }
     };
     merge_usage(&mut usage_total, &current_body);
-    let mut best_quality = assess_candidate(
-        state, &plan, schema.as_ref(), current.status, &current_body,
-    );
+    let mut best_quality =
+        assess_candidate(state, &plan, schema.as_ref(), current.status, &current_body);
     let mut schema_verified = best_quality.schema_valid;
 
     if !current.status.is_success() {
@@ -781,7 +790,8 @@ async fn run_local_chat_inner(
                 schema_repair_attempts += 1;
             }
 
-            let revised = match local_proxy_round(state, engine, &request, headers, key, None).await {
+            let revised = match local_proxy_round(state, engine, &request, headers, key, None).await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     stop_reason = "revision_error".into();
@@ -805,9 +815,8 @@ async fn run_local_chat_inner(
                 }
             };
             merge_usage(&mut usage_total, &revised_body);
-            let revised_quality = assess_candidate(
-                state, &plan, schema.as_ref(), revised.status, &revised_body,
-            );
+            let revised_quality =
+                assess_candidate(state, &plan, schema.as_ref(), revised.status, &revised_body);
             if !revised_quality.is_better_than(best_quality) {
                 rejected += 1;
                 stop_reason = "no_objective_improvement".into();
@@ -853,8 +862,16 @@ async fn run_local_chat_inner(
     Ok(rebuild_response(
         current,
         &loop_receipt(
-            &plan, strategy, model_calls, candidates, schema_verified, revisions,
-            degraded.as_deref(), accepted, rejected, &stop_reason,
+            &plan,
+            strategy,
+            model_calls,
+            candidates,
+            schema_verified,
+            revisions,
+            degraded.as_deref(),
+            accepted,
+            rejected,
+            &stop_reason,
         ),
     ))
 }
@@ -1011,8 +1028,18 @@ async fn run_remote_chat_inner(
         stop_reason = "upstream_error".into();
         return Ok(rebuild_axum_response(
             current,
-            &loop_receipt(&plan, strategy, model_calls, 1, None, revisions,
-                None, accepted, rejected, &stop_reason),
+            &loop_receipt(
+                &plan,
+                strategy,
+                model_calls,
+                1,
+                None,
+                revisions,
+                None,
+                accepted,
+                rejected,
+                &stop_reason,
+            ),
         ));
     }
     let mut current_body = match serde_json::from_slice::<Value>(&current.body) {
@@ -1021,8 +1048,18 @@ async fn run_remote_chat_inner(
             stop_reason = "unparseable_initial_response".into();
             return Ok(rebuild_axum_response(
                 current,
-                &loop_receipt(&plan, strategy, model_calls, 1, None, revisions,
-                    None, accepted, rejected, &stop_reason),
+                &loop_receipt(
+                    &plan,
+                    strategy,
+                    model_calls,
+                    1,
+                    None,
+                    revisions,
+                    None,
+                    accepted,
+                    rejected,
+                    &stop_reason,
+                ),
             ));
         }
     };
@@ -1069,7 +1106,9 @@ async fn run_remote_chat_inner(
                 schema_repair_attempts += 1;
             }
 
-            let revised = match remote_round(state, model, method, path_query, headers, &request).await {
+            let revised = match remote_round(state, model, method, path_query, headers, &request)
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     stop_reason = "revision_error".into();
@@ -1089,9 +1128,8 @@ async fn run_remote_chat_inner(
                 }
             };
             merge_usage(&mut usage_total, &revised_body);
-            let revised_quality = assess_candidate(
-                state, &plan, schema.as_ref(), revised.status, &revised_body,
-            );
+            let revised_quality =
+                assess_candidate(state, &plan, schema.as_ref(), revised.status, &revised_body);
             if !revised_quality.is_better_than(best_quality) {
                 rejected += 1;
                 stop_reason = "no_objective_improvement".into();
@@ -1128,8 +1166,16 @@ async fn run_remote_chat_inner(
     Ok(rebuild_axum_response(
         current,
         &loop_receipt(
-            &plan, strategy, model_calls, 1, schema_verified, revisions,
-            None, accepted, rejected, &stop_reason,
+            &plan,
+            strategy,
+            model_calls,
+            1,
+            schema_verified,
+            revisions,
+            None,
+            accepted,
+            rejected,
+            &stop_reason,
         ),
     ))
 }
@@ -1393,12 +1439,18 @@ mod tests {
     #[test]
     fn unit__candidate_quality__schema_validity_beats_completion_only() {
         let invalid_but_complete = CandidateQuality {
-            http_success: true, parseable: true, schema_valid: Some(false),
-            complete: true, non_empty: true,
+            http_success: true,
+            parseable: true,
+            schema_valid: Some(false),
+            complete: true,
+            non_empty: true,
         };
         let valid_but_truncated = CandidateQuality {
-            http_success: true, parseable: true, schema_valid: Some(true),
-            complete: false, non_empty: true,
+            http_success: true,
+            parseable: true,
+            schema_valid: Some(true),
+            complete: false,
+            non_empty: true,
         };
         assert!(valid_but_truncated.is_better_than(invalid_but_complete));
     }
@@ -1406,10 +1458,16 @@ mod tests {
     #[test]
     fn unit__candidate_quality__completion_beats_truncation() {
         let truncated = CandidateQuality {
-            http_success: true, parseable: true, schema_valid: None,
-            complete: false, non_empty: true,
+            http_success: true,
+            parseable: true,
+            schema_valid: None,
+            complete: false,
+            non_empty: true,
         };
-        let complete = CandidateQuality { complete: true, ..truncated };
+        let complete = CandidateQuality {
+            complete: true,
+            ..truncated
+        };
         assert!(complete.is_better_than(truncated));
         assert!(!truncated.is_better_than(complete));
     }
@@ -1417,8 +1475,11 @@ mod tests {
     #[test]
     fn unit__candidate_quality__ties_preserve_incumbent() {
         let incumbent = CandidateQuality {
-            http_success: true, parseable: true, schema_valid: None,
-            complete: true, non_empty: true,
+            http_success: true,
+            parseable: true,
+            schema_valid: None,
+            complete: true,
+            non_empty: true,
         };
         assert!(!incumbent.is_better_than(incumbent));
     }
@@ -1429,7 +1490,10 @@ mod tests {
             http_success: true, parseable: true, schema_valid: None,
             complete: true, non_empty: false,
         };
-        let failed = CandidateQuality { http_success: false, ..empty };
+        let failed = CandidateQuality {
+            http_success: false,
+            ..empty
+        };
         assert!(empty.needs_revision());
         assert!(!failed.needs_revision());
     }
@@ -1461,7 +1525,10 @@ mod tests {
         let plan = Plan::for_request(Mode::Deep, &request);
         assert_eq!(plan.max_schema_retries, 2);
         assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 3);
-        assert_eq!(plan.max_model_calls(Strategy::ParallelVerifiedCandidates), 4);
+        assert_eq!(
+            plan.max_model_calls(Strategy::ParallelVerifiedCandidates),
+            4
+        );
     }
 
     #[test]
