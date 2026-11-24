@@ -2666,7 +2666,8 @@ async fn proxy_core_chat(
             let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&openai_body) else {
                 return api_error(400, "mcp loop could not parse the translated body");
             };
-            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel, mcp_key.as_ref(), None).await {
+            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel, mcp_key.as_ref(), None).await
+            {
                 Ok(child) => Some(child),
                 Err(resp) => return resp,
             }
