@@ -1009,9 +1009,6 @@ async fn run_local_search_inner(
 ) -> Result<reqwest::Response, axum::response::Response> {
     let plan = Plan::for_request(mode, &request);
     let strategy = plan.strategy(&request);
-    if mode == Mode::Deep && strategy == Strategy::ParallelVerifiedCandidates {
-        return run_local_search_inner(state, engine, request, mode, headers, key).await;
-    }
     let schema = request
         .pointer("/response_format/json_schema/schema")
         .filter(|schema| schema.is_object())
@@ -1214,6 +1211,9 @@ async fn run_local_chat_inner(
     let original_request = request.clone();
     let plan = Plan::for_request(mode, &request);
     let strategy = plan.strategy(&request);
+    if mode == Mode::Deep && strategy == Strategy::ParallelVerifiedCandidates {
+        return run_local_search_inner(state, engine, request, mode, headers, key).await;
+    }
     let schema = request
         .pointer("/response_format/json_schema/schema")
         .filter(|schema| schema.is_object())
