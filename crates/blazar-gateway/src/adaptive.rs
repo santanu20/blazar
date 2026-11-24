@@ -808,6 +808,9 @@ async fn run_remote_chat_inner(
         ));
     }
     let feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
+    if plan.verify_schema {
+        verified = Some(feedback.is_none());
+    }
     if (feedback.is_some() || strategy == Strategy::SequentialRevision)
         && model_calls < Plan::max_model_calls(strategy)
     {
