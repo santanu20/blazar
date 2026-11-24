@@ -186,6 +186,24 @@ pub async fn messages(
             "best_of requires stream=false - a winner cannot be judged before completion",
         );
     }
+    let adaptive_mode = match crate::adaptive::mode_from_headers(&headers) {
+        Ok(mode) => mode,
+        Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
+    };
+    if adaptive_mode.is_some() && best_of.is_some() {
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            "X-Blazar-Adaptive and best_of cannot be combined; adaptive mode selects its own bounded strategy",
+        );
+    }
+    if adaptive_mode.is_some() && stream {
+        return anthropic_error(
+            400,
+            "invalid_request_error",
+            "X-Blazar-Adaptive requires stream:false; the adaptive runtime uses buffered execution",
+        );
+    }
     // F53 + BLZ-3: atomic admission AFTER validation so 400s consume
     // no budget, with the gates and the charge in one lock step.
     if let Some(key) = key_ext.as_ref().map(|axum::extract::Extension(k)| k)
@@ -316,12 +334,11 @@ pub async fn messages(
         Err(msg) => return anthropic_error(400, "invalid_request_error", &msg),
         Ok(sel) => sel,
     };
-    if stream && mcp_sel.is_some() {
+    if stream && (mcp_sel.is_some() || adaptive_mode.is_some()) {
         return anthropic_error(
             400,
             "invalid_request_error",
-            "mcp tool loop requires stream:false in this release - the gateway mediates \
-             buffered tool rounds",
+            "MCP/adaptive execution requires stream:false - the gateway mediates buffered execution rounds",
         );
     }
     // F44: pooled client (10-min total timeout) instead of a per-request
@@ -417,6 +434,7 @@ pub async fn messages(
     // MCP receipt survives the dialect rebuild via this capture (see
     // `mcp::stamp`).
     let mut mcp_hdr: Option<String> = None;
+    let mut adaptive_hdr: Option<String> = None;
     // A2: wall anchor for the decode-throughput observation below -
     // predates both the fan and the single send. Also the D5
     // class-routing anchor: the guard is held from here through the
@@ -441,9 +459,34 @@ pub async fn messages(
     // MCP mediation takes precedence over the fan on the requests that
     // opt in (the loop owns every child round; judging candidates on
     // top would double-call the engine).
-    let mcp_child = if let Some(sel) = &mcp_sel {
-        match crate::mcp::chat_via_mcp(&state, &engine, &mut openai_body, sel, key_ext.as_deref())
-            .await
+    let adaptive_child = if let Some(mode) = adaptive_mode {
+        match crate::adaptive::execute_chat(
+            &state,
+            &engine,
+            &mut openai_body,
+            mode,
+            crate::adaptive::ChatExecutionContext {
+                mcp_selector: mcp_sel.as_deref(),
+                key: key_ext.as_deref(),
+                headers: &headers,
+                acquire_slo_guard: false,
+            },
+        )
+        .await
+        {
+            Ok(child) => Some(child),
+            Err(resp) => return resp,
+        }
+    } else if let Some(sel) = &mcp_sel {
+        match crate::mcp::chat_via_mcp(
+            &state,
+            &engine,
+            &mut openai_body,
+            sel,
+            key_ext.as_deref(),
+            None,
+        )
+        .await
         {
             Ok(child) => Some(child),
             Err(resp) => return resp,
@@ -451,11 +494,16 @@ pub async fn messages(
     } else {
         None
     };
-    let resp = match mcp_child {
+    let resp = match adaptive_child {
         Some(child) => {
             mcp_hdr = child
                 .headers()
                 .get("x-blazar-mcp")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            adaptive_hdr = child
+                .headers()
+                .get("x-blazar-adaptive-result")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             child
@@ -523,6 +571,12 @@ pub async fn messages(
         let mut r = anthropic_error(status.as_u16(), "api_error", &msg);
         crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
         crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
+        if let Some(value) = adaptive_hdr
+            .as_deref()
+            .and_then(|v| axum::http::HeaderValue::from_str(v).ok())
+        {
+            r.headers_mut().insert("x-blazar-adaptive-result", value);
+        }
         return r;
     }
     let translated = translate_response(&openai, &model);
@@ -549,6 +603,12 @@ pub async fn messages(
     let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
     crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
     crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
+    if let Some(value) = adaptive_hdr
+        .as_deref()
+        .and_then(|v| axum::http::HeaderValue::from_str(v).ok())
+    {
+        resp.headers_mut().insert("x-blazar-adaptive-result", value);
+    }
     if let Some(member) = &pool_member
         && let Ok(v) = axum::http::HeaderValue::from_str(member)
     {

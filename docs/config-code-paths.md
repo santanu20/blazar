@@ -30,7 +30,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 273 fields, 0 dead
+## Config (top-level keys) - 274 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -146,6 +146,7 @@ token quality are surfaced as drift.
 | otlp_endpoint | String::new() | gateway-http | `crates/blazar-gateway/src/otlp.rs:38` in `new`; `crates/blazar-gateway/src/otlp.rs:38` in `new` |
 | otlp_service | String::new() | gateway-http | `crates/blazar-gateway/src/otlp.rs:38` in `new`; `crates/blazar-gateway/src/otlp.rs:38` in `new` |
 | remotes | Vec::new() | gateway-http + cli | `crates/blazar-gateway/src/ollama.rs:708` in `ps`; `crates/blazar-gateway/src/ollama.rs:708` in `ps`; `crates/blazar-cli/src/main.rs:9469` in `doctor_remotes`; `crates/blazar-cli/src/main.rs:9469` in `doctor_remotes` |
+| reasoning_prm | None | gateway-http | `crates/blazar-gateway/src/adaptive.rs` in `configured_process_reward_model`; `crates/blazar-gateway/src/reasoning_search.rs` in `HttpProcessRewardModel::new` (HTTPS/loopback endpoint, environment-held bearer token and calibration ID) |
 | engine_env | BTreeMap::new() | runtime/gateway + cli | `crates/blazar-runtime/src/supervisor.rs:6014` in `resolve_routed_engine`; `crates/blazar-cli/tests/config_set.rs:26` in `seed`; `crates/blazar-cli/tests/config_set.rs:36` in `e2e__config_set_string_value_quoted_and_placed_above_tables` |
 | model_overrides | BTreeMap::new() | runtime/gateway + engine-argv + gateway-http + cli | `crates/blazar-runtime/tests/replicas.rs:86` in `supervisor`; `crates/blazar-runtime/src/supervisor.rs:6326` in `spawn_instance_forced`; `crates/blazar-core/src/profile.rs:264` in `compile`; `blazar-core/src/profile.rs:1718` in `the`; `crates/blazar-gateway/src/latechunk.rs:206` in `guard_token_budget`; `crates/blazar-gateway/src/preflight.rs:132` in `enforce_prompt_fits`; `blazar-cli/src/main.rs:750` in `?`; `crates/blazar-cli/src/main.rs:18203` in `create_cmd` |
 | spec_draft_cpu_range | String::new() | engine-argv | `blazar-core/src/profile.rs:958` in `the`; `blazar-core/src/profile.rs:963` in `the` |
@@ -308,6 +309,15 @@ token quality are surfaced as drift.
 | discovery_port | 11439 | runtime+cli | `crates/blazar-runtime/src/discovery.rs` (beacon bind, `seek_gateways`); `crates/blazar-cli/src/main.rs` (`join_cmd`, worker `--discover`); `crates/blazar-core/src/config.rs` (must differ from HTTP `port`) |
 | agent_port | 11440 | runtime+cli | `crates/blazar-runtime/src/adoption.rs` (`run_agent` TCP invite listener + UDP adopt beacon); `crates/blazar-cli/src/main.rs` (`adopt_cmd` `scan_agents`) |
 | agent_policy | "ask-owner" | runtime+cli | `crates/blazar-runtime/src/adoption.rs` (`decide_invite` ask-owner queues / token auto-approves); `crates/blazar-cli/src/main.rs` (`agent_cmd` run/list/approve/deny); `crates/blazar-core/src/config.rs` (validator allows only `ask-owner`/`token`) |
+
+## ReasoningPrmConfig - 4 fields, 0 dead
+
+| field | default | lane | consumption site (fn) |
+|---|---|---|---|
+| url | String::new() | gateway-http | `crates/blazar-gateway/src/reasoning_search.rs` in `HttpProcessRewardModel::new` (HTTPS or loopback HTTP endpoint) |
+| api_key_env | None | gateway-http | `crates/blazar-gateway/src/reasoning_search.rs` in `HttpProcessRewardModel::new` (resolves the bearer key from the named environment variable) |
+| calibration_id | None | gateway-http | `crates/blazar-gateway/src/reasoning_search.rs` in `HttpProcessRewardModel::new` (only an exact configured ID match marks a value calibrated) |
+| timeout_ms | 750 | gateway-http | `crates/blazar-gateway/src/reasoning_search.rs` in `HttpProcessRewardModel::new` (per-evaluation HTTP timeout) |
 
 ## MistralrsTuning ([mistralrs]) - 27 fields, 0 dead
 

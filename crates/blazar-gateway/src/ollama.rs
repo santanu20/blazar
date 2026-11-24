@@ -1347,6 +1347,16 @@ pub async fn chat(
         Ok(v) => v,
         Err(e) => return api_error(400, &format!("invalid JSON: {e}")),
     };
+    let adaptive_mode = match crate::adaptive::mode_from_headers(&headers) {
+        Ok(mode) => mode,
+        Err(msg) => return api_error(400, &msg),
+    };
+    if adaptive_mode.is_some() && req.get("stream").and_then(Value::as_bool).unwrap_or(true) {
+        return api_error(
+            400,
+            "X-Blazar-Adaptive requires stream:false; the adaptive runtime uses buffered execution",
+        );
+    }
     let model_field = req["model"].as_str().unwrap_or_default().to_string();
     // A3 cascade routing: a chain ask re-enters this handler per
     // candidate (each pays its own admission against its resolved row)
@@ -1474,6 +1484,12 @@ pub async fn chat(
     // POOL-aware (C4): select among same-named remotes with prefix
     // stickiness + circuit health, not just the first configured entry.
     if crate::remotes::split_remote(&model_field, &state.cfg()).is_some() {
+        if adaptive_mode.is_some() {
+            return api_error(
+                400,
+                "X-Blazar-Adaptive for remote models is currently supported through OpenAI-compatible /v1/chat/completions; the Ollama remote lane preserves its existing byte/dialect contract",
+            );
+        }
         // F11: remote lanes pay key admission against the full
         // `remote:model` string (same semantics as the OpenAI lane's
         // split: a scope entry like `my-remote:*` admits, anything
@@ -1948,10 +1964,10 @@ pub async fn chat(
         Ok(sel) => sel,
         Err(msg) => return api_error(400, &msg),
     };
-    if stream && mcp_sel.is_some() {
+    if stream && (mcp_sel.is_some() || adaptive_mode.is_some()) {
         return api_error(
             400,
-            "mcp tool loop requires stream:false in this release - the gateway mediates buffered tool rounds",
+            "MCP/adaptive execution requires stream:false - the gateway mediates buffered execution rounds",
         );
     }
     let model_name = row.name.clone();
@@ -1992,6 +2008,8 @@ pub async fn chat(
                 voice,
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
+                adaptive_mode,
+                headers.clone(),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -2562,6 +2580,8 @@ async fn proxy_core_chat(
     // generate lane has no voice tee yet its MCP calls are still
     // authorization-checked.
     mcp_key: Option<crate::keys::KeyCtx>,
+    adaptive_mode: Option<crate::adaptive::Mode>,
+    adaptive_headers: axum::http::HeaderMap,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -2655,7 +2675,40 @@ async fn proxy_core_chat(
         // so it takes precedence over the best-of fan on requests that
         // opt in. The recipe-rendered completion lane speaks a
         // different wire shape - teach instead of guessing.
-        let mcp_child = if let Some(sel) = &mcp_sel {
+        if adaptive_mode.is_some() && best_of.is_some() {
+            return api_error(
+                400,
+                "X-Blazar-Adaptive and best_of cannot be combined; adaptive mode selects its own bounded strategy",
+            );
+        }
+        if adaptive_mode.is_some() && ollama_compat {
+            return api_error(
+                400,
+                "X-Blazar-Adaptive is unavailable on the recipe-rendered completion lane; use a native chat lane",
+            );
+        }
+        let mcp_child = if let Some(mode) = adaptive_mode {
+            let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&openai_body) else {
+                return api_error(400, "adaptive loop could not parse the translated body");
+            };
+            match crate::adaptive::execute_chat(
+                state,
+                engine,
+                &mut v,
+                mode,
+                crate::adaptive::ChatExecutionContext {
+                    mcp_selector: mcp_sel.as_deref(),
+                    key: mcp_key.as_ref(),
+                    headers: &adaptive_headers,
+                    acquire_slo_guard: false,
+                },
+            )
+            .await
+            {
+                Ok(child) => Some(child),
+                Err(resp) => return resp,
+            }
+        } else if let Some(sel) = &mcp_sel {
             if ollama_compat {
                 return api_error(
                     400,
@@ -2666,7 +2719,8 @@ async fn proxy_core_chat(
             let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&openai_body) else {
                 return api_error(400, "mcp loop could not parse the translated body");
             };
-            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel, mcp_key.as_ref()).await {
+            match crate::mcp::chat_via_mcp(state, engine, &mut v, sel, mcp_key.as_ref(), None).await
+            {
                 Ok(child) => Some(child),
                 Err(resp) => return resp,
             }
@@ -2683,6 +2737,7 @@ async fn proxy_core_chat(
         // MCP receipt survives the dialect rebuild via this capture (see
         // `mcp::stamp`).
         let mut mcp_hdr: Option<String> = None;
+        let mut adaptive_hdr: Option<String> = None;
         let fan = match best_of.filter(|n| *n >= 2) {
             Some(want) => crate::bestof::fan_out(state, engine, &url, &openai_body, want).await,
             None => crate::bestof::FanOut::Skip,
@@ -2698,6 +2753,11 @@ async fn proxy_core_chat(
                 mcp_hdr = child
                     .headers()
                     .get("x-blazar-mcp")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                adaptive_hdr = child
+                    .headers()
+                    .get("x-blazar-adaptive-result")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 child
@@ -2808,6 +2868,7 @@ async fn proxy_core_chat(
             let mut r = api_error(status, &format!("engine error: {text}"));
             crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
             crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
+            crate::adaptive::stamp(&mut r, adaptive_hdr.as_deref());
             return r;
         }
         let openai: Value = match resp.json().await {
@@ -2890,6 +2951,7 @@ async fn proxy_core_chat(
             let mut r = api_error(502, &format!("engine error: {msg}"));
             crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
             crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
+            crate::adaptive::stamp(&mut r, adaptive_hdr.as_deref());
             return r;
         }
         let mut ollama = match shape {
@@ -2954,12 +3016,14 @@ async fn proxy_core_chat(
                 .insert(semcache::HDR_CACHE, HeaderValue::from_static("miss"));
             crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
             crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
+            crate::adaptive::stamp(&mut resp, adaptive_hdr.as_deref());
             stamp_so_receipt(&mut resp, &openai_body);
             return resp;
         }
         let mut resp = axum::Json(ollama).into_response();
         crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
         crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
+        crate::adaptive::stamp(&mut resp, adaptive_hdr.as_deref());
         stamp_so_receipt(&mut resp, &openai_body);
         return resp;
     }
@@ -4241,6 +4305,8 @@ pub async fn generate(
                 None, // voice tee is chat-lane only (generate has no reply object)
                 None,
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
+                None,
+                headers.clone(),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint

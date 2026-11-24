@@ -1,6 +1,7 @@
 //! Blazar gateway: `OpenAI` + ollama-compat HTTP surface over the
 //! supervisor. Router assembly + bearer auth.
 
+pub mod adaptive;
 pub mod anthropic;
 pub mod audit;
 pub mod batch;
@@ -27,6 +28,8 @@ pub mod jobs;
 pub mod model_doctor;
 pub mod pd;
 pub mod quantiles;
+pub(crate) mod reasoning;
+pub mod reasoning_search;
 pub mod requests;
 pub mod sglang_native;
 pub mod stage_timing;

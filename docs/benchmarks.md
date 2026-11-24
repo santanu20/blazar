@@ -135,3 +135,42 @@ KV-cache quality receipts:
 - FP8 (`f8_e4m3`) vs f16 KV on qwen2.5-0.5b: perplexity parity at 2048 ctx, +0.141 at 16384 (~2x err bars) - pin-only, the fit ladder never auto-selects it. [bench-artifacts/20261111-fp8-kv-quality/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md)
 - TTFT: `chunked_prefill_size 2048` = -24.7% uncached-prefill TTFT on a 10K-token prompt (35.1s -> 26.4s), zero quality loss (scheduling knob); warm radix-cache hits ~0.04s regardless; includes an arXiv-verified survey of modern TTFT algorithms. [bench-artifacts/20261112-ttft-chunked-prefill/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-ttft-chunked-prefill/README.md)
 - PD disaggregation overhead on a single GPU: direct lane vs `disagg_pair` + sgl-router = +27-44% steady-state e2e (router hop + mooncake transfer; ~2.5x cold from the 3-process spawn) - PD here is the topology/wiring tier, not a single-box perf win. [bench-artifacts/20261112-pd-overhead/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-pd-overhead/README.md)
+
+## Adaptive reasoning A/B harness
+
+Blazar's adaptive inference controller has two policies:
+
+- **Auto:** conservative request-shape planning, deterministic task/JSON-Schema checks, bounded repair and incumbent-preserving selection.
+- **Deep:** budgeted PUCT search over partial reasoning states on local engines and OpenAI-compatible remote Chat Completions. The generator proposes compact next-state summaries, the tree selects which branch to expand, and independent hard verifiers can accept or reject terminal answers.
+
+Run the same fixed task set against the same model in each mode:
+
+    python3 scripts/bench_adaptive.py --base-url http://127.0.0.1:11435 --model MODEL --runs 20 --warmup 2 --seed 20261124 --output /tmp/adaptive.json
+
+The harness compares off, auto and deep. It includes three exact arithmetic expressions, a keyed numeric table lookup and a strict JSON-Schema extraction task. Mode order is randomized/interleaved within each case/run. Reports contain per-case pass rates, p50/p95 latency, measured prompt/completion/total provider tokens, errors, adaptive/candidate/search receipts, and paired accuracy/latency deltas with bootstrap intervals versus off.
+
+**Deep search contract:**
+
+- **Partial-state representation:** each branch stores its parent, cumulative state, depth, prior, value estimate, uncertainty, optional terminal answer and verifier state. The tree suppresses byte-identical states, rejects hard-verifier failures, tracks visits and backpropagates values. This is exact-state duplicate detection, not a shared-node transposition DAG.
+- **Selection:** PUCT balances calibrated process values and generator-provided proposal priors, with an uncertainty bonus. Uncalibrated evaluator outputs are neutralized before pruning, backup or final ranking; when no calibrated value is available, the prior remains only a proposal heuristic, not a reward label. Branch width and exploration coefficient narrow as the estimated state-token budget is consumed.
+- **Expansion:** each expansion asks for up to three concise, checkable next-state summaries. The generated expansion is constrained to JSON and capped at 512 output tokens. It is not a request to expose private chain-of-thought.
+- **Adaptive hard stopping budgets:** request-shape planning allocates 3 expansions for simple hard-verifier tasks, 4 for simple unconstrained tasks, 5 for medium requests and 6 for high-complexity request shapes, plus one reserved conventional-answer fallback. Seven model calls remains the absolute ceiling. The current allocation yields 10–19 nodes, depth 4–8, branch factor 3 and 2,304–4,608 estimated state tokens. These are observable scheduling heuristics, not a learned estimate of semantic difficulty. Each expansion is capped at 512 output tokens; the request deadline is 120 seconds. Existing admission/queue/key-budget constraints remain authoritative. Search-state token estimates are **not** substituted for provider-reported usage.
+- **Hard verification:** requested JSON Schema and narrowly recognized deterministic arithmetic/table tasks can independently pass/fail terminal answers. If more than one deterministic verifier applies, all applicable hard checks must pass.
+- **Unverified generation:** when no independent verifier applies, a terminal answer remains marked Unknown; the search receipt does not claim it is verified. The PUCT policy is a search controller, not a correctness oracle.
+
+**Process-reward status:** the tree consumes an async ProcessRewardModel interface. The default UncalibratedValueModel returns neutral value with maximal uncertainty. An optional HTTP adapter is implemented for an independently operated PRM service. Add a `[reasoning_prm]` section to `config.toml` with `url`, optional `api_key_env`, optional `calibration_id`, and `timeout_ms` (100–5,000 ms). The service receives `{protocol: "blazar-process-reward-v1", task, partial_state}` and returns `{score, uncertainty, calibration_id}`. Its calibration bit is true only when the returned ID matches the configured pin. URL policy permits HTTPS or loopback HTTP; bearer keys are read from the named environment variable and never persisted in the config. Failed calls, malformed scores and unmatched/missing calibration IDs are retained as unavailable or uncalibrated observations and are neutralized before they can affect search quality decisions. Calls for one expansion are concurrent and bounded by branch width. No PRM endpoint is enabled by default: adapter support is not evidence that a calibrated evaluator has been deployed. Validate calibration and out-of-distribution behavior on search-generated partial states before using PRM scores as trusted signals.
+
+**Benchmark interpretation:** this five-task suite is a diagnostic smoke test, not a held-out reasoning leaderboard. It validates the task verifiers, branch search, request receipts and cost accounting; it cannot establish general reasoning ability or SOTA. Quality claims require frozen model revisions, held-out domain suites with independent checkers, matched token/FLOP/latency budgets, per-domain ablations, calibration/error analysis and confidence intervals. Compare at least greedy, self-consistency, Best-of-N, beam search, PUCT without value model and calibrated PRM-guided PUCT.
+
+**Latent recurrent Transformer boundary:** PUCT search still operates over request/response-visible partial states. It does not loop hidden representations through internal Transformer blocks. The generic Blazar Engine interface exposes process lifecycle/health, not the model forward pass or per-layer KV-cache state. True latent recurrence needs a model-specific engine capability, recurrent layer-window execution, loop-aware cache semantics, stable damping/halting and architecture-aware MoE behavior. Recent work on variable-depth Looped Transformers and loop-aware KV caches is a separate runtime/model project; repeated API calls are not a substitute.
+
+Research directions informing the next phase:
+
+- [PRM-guided adaptive trajectory search (ICML 2026)](https://proceedings.mlr.press/v306/bilal26a.html)
+- [Budget-guided MCTS for test-time scaling (2026)](https://proceedings.mlr.press/v306/miyamoto26a.html)
+- [MCTS over partial reasoning states (2026)](https://arxiv.org/abs/2608.30395)
+- [Uncertainty-Aware Tree Search (ICLR 2026)](https://openreview.net/forum?id=tOSQtPmfGE). Its reported negative/neutral downstream results under search-induced distribution shift are a reason to validate PRM/PUM reliability on generated search states, not to assume uncertainty bonuses improve accuracy.
+- [T-LoopFormer variable-depth recurrence (2026)](https://arxiv.org/abs/2609.15160)
+- [LoopCache for recurrent KV state (2026)](https://arxiv.org/abs/2611.24301)
+
+Do not describe Blazar as state-of-the-art until broad, reproducible held-out benchmarks demonstrate a statistically defensible improvement over appropriate baselines at comparable compute.

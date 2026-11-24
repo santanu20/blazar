@@ -25,6 +25,7 @@ rustls = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 reqwest = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }

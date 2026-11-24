@@ -16,9 +16,11 @@
 //! application/json, text/event-stream`; JSON or SSE-framed responses;
 //! `Mcp-Session-Id` carried on every request after initialize).
 //!
-//! Bounds: `MCP_MAX_ROUNDS` tool rounds per request, per-server
-//! `timeout_secs` on every call, streaming requests are refused with a
-//! teaching 400 (the loop is buffered by design in this release).
+//! Bounds: legacy requests retain `MCP_MAX_ROUNDS`; adaptive requests
+//! use a request-shape budget capped at six rounds and twenty tool calls.
+//! The configured aggregate request deadline and per-server
+//! `timeout_secs` remain hard ceilings. Streaming requests are refused
+//! with a teaching 400 (the loop is buffered by design in this release).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1114,7 +1116,7 @@ pub(crate) fn caller_tool_results(all_calls: &[Value], mcp_calls: &[Value]) -> V
         .collect()
 }
 
-fn teaching_error(status: StatusCode, msg: &str) -> Response {
+pub(crate) fn teaching_error(status: StatusCode, msg: &str) -> Response {
     let body = json!({"error": {"message": msg, "type": "blazar_error",
         "blazar_code": crate::error_codes::generic_for_status(status.as_u16()).as_str()}});
     Response::builder()
@@ -1250,11 +1252,12 @@ pub(crate) async fn chat_via_mcp(
     openai_body: &mut Value,
     sel: &str,
     key: Option<&crate::keys::KeyCtx>,
+    adaptive_mode: Option<crate::adaptive::Mode>,
 ) -> Result<reqwest::Response, Response> {
     let budget = std::time::Duration::from_secs(state.mcp.max_request_secs());
     match tokio::time::timeout(
         budget,
-        chat_via_mcp_inner(state, engine, openai_body, sel, key),
+        chat_via_mcp_inner(state, engine, openai_body, sel, key, adaptive_mode),
     )
     .await
     {
@@ -1279,6 +1282,7 @@ async fn chat_via_mcp_inner(
     openai_body: &mut Value,
     sel: &str,
     key: Option<&crate::keys::KeyCtx>,
+    adaptive_mode: Option<crate::adaptive::Mode>,
 ) -> Result<reqwest::Response, Response> {
     // Hard posture first: a key with mcp_access = "off" never engages
     // MCP at all - any selector (including the config default) is
@@ -1381,6 +1385,19 @@ async fn chat_via_mcp_inner(
         }
     }
 
+    // Compute the plan only after the authorized MCP catalog has been
+    // injected. Tool definitions affect complexity, but never authority.
+    let adaptive_plan =
+        adaptive_mode.map(|mode| crate::adaptive::Plan::for_request(mode, openai_body));
+    let response_schema = adaptive_plan
+        .as_ref()
+        .filter(|plan| plan.verify_schema)
+        .and_then(|_| {
+            openai_body
+                .pointer("/response_format/json_schema/schema")
+                .cloned()
+        });
+
     let url = format!(
         "{}/v1/chat/completions",
         crate::proxy::child_base(&engine.endpoint)
@@ -1389,6 +1406,12 @@ async fn chat_via_mcp_inner(
     // Computed once: the constraint receipt the proxy lane would stamp.
     let so_kind = crate::proxy::structured_output_kind(Some(openai_body));
     let mut rounds = 0usize;
+    let max_tool_rounds = adaptive_plan
+        .as_ref()
+        .map_or(MCP_MAX_ROUNDS, |plan| plan.max_tool_rounds);
+    let mut tool_calls_total = 0usize;
+    let mut verification_retries = 0usize;
+    let mut schema_verified = None;
     loop {
         let bytes = serde_json::to_vec(openai_body).unwrap_or_default();
         let send = crate::proxy::child_auth(
@@ -1423,7 +1446,19 @@ async fn chat_via_mcp_inner(
                 Some(openai_body),
                 &body_bytes,
             );
-            return Ok(rebuild(status, &headers, body_bytes, rounds, so_kind));
+            return Ok(rebuild(
+                status,
+                &headers,
+                body_bytes,
+                rounds,
+                so_kind,
+                RebuildMeta {
+                    adaptive_plan: adaptive_plan.as_ref(),
+                    tool_calls: tool_calls_total,
+                    schema_verified,
+                    schema_retries: verification_retries,
+                },
+            ));
         }
         let parsed: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
         let calls = parsed
@@ -1441,8 +1476,57 @@ async fn chat_via_mcp_inner(
             .cloned()
             .collect();
         if mcp_calls.is_empty() {
-            // No gateway tool requested: this is the final answer (or a
-            // caller-tool call the client executes as usual).
+            // Adaptive structured-output verification is deterministic and
+            // bounded to one repair attempt. The intermediate candidate and
+            // validation detail stay inside this request-local body.
+            if calls.is_empty()
+                && let (Some(plan), Some(schema)) =
+                    (adaptive_plan.as_ref(), response_schema.as_ref())
+            {
+                let content = parsed
+                    .pointer("/choices/0/message/content")
+                    .and_then(Value::as_str);
+                let violation = match content {
+                    Some(text) => match serde_json::from_str::<Value>(text) {
+                        Ok(candidate) => state.sentinel.schema_check(schema, &candidate),
+                        Err(error) => Some(format!("response content is not valid JSON: {error}")),
+                    },
+                    None => Some(
+                        "response did not contain JSON text at choices[0].message.content"
+                            .to_string(),
+                    ),
+                };
+                if let Some(why) = violation {
+                    if verification_retries < plan.max_schema_retries {
+                        verification_retries += 1;
+                        if let Some(messages) = openai_body["messages"].as_array_mut() {
+                            let mut assistant = parsed
+                                .pointer("/choices/0/message")
+                                .cloned()
+                                .unwrap_or_else(|| json!({"role": "assistant", "content": ""}));
+                            assistant["role"] = json!("assistant");
+                            messages.push(assistant);
+                            let detail = why.chars().take(512).collect::<String>();
+                            let feedback = format!("Validation feedback: {detail}");
+                            let repair_prompt = [
+                                "The previous response did not satisfy the requested JSON schema.",
+                                &feedback,
+                                "Return only a corrected JSON object that satisfies the schema.",
+                                "Do not include commentary.",
+                            ]
+                            .join(" ");
+                            messages.push(json!({
+                                "role": "user",
+                                "content": repair_prompt
+                            }));
+                            continue;
+                        }
+                    }
+                    schema_verified = Some(false);
+                } else {
+                    schema_verified = Some(true);
+                }
+            }
             crate::metadata_card::persist_from_response(
                 state,
                 openai_body
@@ -1452,14 +1536,26 @@ async fn chat_via_mcp_inner(
                 Some(openai_body),
                 &body_bytes,
             );
-            return Ok(rebuild(status, &headers, body_bytes, rounds, so_kind));
+            return Ok(rebuild(
+                status,
+                &headers,
+                body_bytes,
+                rounds,
+                so_kind,
+                RebuildMeta {
+                    adaptive_plan: adaptive_plan.as_ref(),
+                    tool_calls: tool_calls_total,
+                    schema_verified,
+                    schema_retries: verification_retries,
+                },
+            ));
         }
         rounds += 1;
-        if rounds > MCP_MAX_ROUNDS {
+        if rounds > max_tool_rounds {
             return Err(teaching_error(
                 StatusCode::BAD_GATEWAY,
                 &format!(
-                    "mcp loop exceeded {MCP_MAX_ROUNDS} tool rounds - tighten the prompt or raise the bound"
+                    "mcp loop exceeded {max_tool_rounds} tool rounds - lower X-Blazar-Adaptive to auto or raise mcp_max_request_secs if the task needs more time"
                 ),
             ));
         }
@@ -1467,6 +1563,16 @@ async fn chat_via_mcp_inner(
         // response are served sequentially; per-server timeouts bound it).
         let mut results = Vec::with_capacity(mcp_calls.len());
         for call in &mcp_calls {
+            if adaptive_plan
+                .as_ref()
+                .is_some_and(|plan| tool_calls_total >= plan.max_tool_calls)
+            {
+                results.push(Err(
+                    "adaptive tool-call budget exhausted; this call was not executed".into(),
+                ));
+                continue;
+            }
+            tool_calls_total = tool_calls_total.saturating_add(1);
             let fname = call
                 .pointer("/function/name")
                 .and_then(Value::as_str)
@@ -1570,14 +1676,23 @@ async fn chat_via_mcp_inner(
     }
 }
 
-/// Rebuild a `reqwest::Response` from buffered parts, stamping the
-/// receipt header on the way out.
+/// Optional receipts and accounting metadata for a rebuilt mediated response.
+#[derive(Clone, Copy, Default)]
+struct RebuildMeta<'a> {
+    adaptive_plan: Option<&'a crate::adaptive::Plan>,
+    tool_calls: usize,
+    schema_verified: Option<bool>,
+    schema_retries: usize,
+}
+
+/// Rebuild a reqwest response from buffered parts, stamping receipts.
 fn rebuild(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: axum::body::Bytes,
     rounds: usize,
     so_kind: Option<&'static str>,
+    meta: RebuildMeta<'_>,
 ) -> reqwest::Response {
     let mut builder = axum::http::Response::builder().status(
         axum::http::StatusCode::from_u16(status.as_u16())
@@ -1590,6 +1705,17 @@ fn rebuild(
         builder = builder.header(k, v);
     }
     builder = builder.header("x-blazar-mcp", format!("rounds={rounds}"));
+    if let Some(plan) = meta.adaptive_plan {
+        builder = builder.header(
+            "x-blazar-adaptive-result",
+            plan.receipt(
+                rounds,
+                meta.tool_calls,
+                meta.schema_verified,
+                meta.schema_retries,
+            ),
+        );
+    }
     // The mediated path never passes through the proxy response builder,
     // so the structured-output receipt rides here instead.
     if let Some(kind) = so_kind {
@@ -1954,6 +2080,7 @@ mod tests {
             axum::body::Bytes::new(),
             1,
             Some("json_schema"),
+            RebuildMeta::default(),
         );
         assert_eq!(
             resp.headers()
@@ -1973,8 +2100,47 @@ mod tests {
             axum::body::Bytes::new(),
             0,
             None,
+            RebuildMeta::default(),
         );
         assert!(bare.headers().get("x-blazar-structured-output").is_none());
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__rebuild__adaptive_receipt_is_sanitized() {
+        let plan = crate::adaptive::Plan::for_request(
+            crate::adaptive::Mode::Auto,
+            &json!({
+                "messages": [{"role": "user", "content": "private prompt"}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object"}}
+                }
+            }),
+        );
+        let resp = rebuild(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            axum::body::Bytes::new(),
+            1,
+            None,
+            RebuildMeta {
+                adaptive_plan: Some(&plan),
+                tool_calls: 2,
+                schema_verified: Some(true),
+                schema_retries: 1,
+            },
+        );
+        let receipt = resp
+            .headers()
+            .get("x-blazar-adaptive-result")
+            .and_then(|v| v.to_str().ok())
+            .expect("adaptive receipt is present");
+        assert!(receipt.contains("mode=auto"));
+        assert!(receipt.contains("rounds=1"));
+        assert!(receipt.contains("calls=2"));
+        assert!(receipt.contains("schema=pass"));
+        assert!(!receipt.contains("private prompt"));
     }
 
     #[allow(non_snake_case)]

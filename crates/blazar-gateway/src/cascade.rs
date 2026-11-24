@@ -152,6 +152,7 @@ pub(crate) fn degrade(tried: &[String], failed_idx: usize, reason: &str, msg: &s
     resp
 }
 
+#[allow(clippy::too_many_lines)] // One bounded cascade attempt ladder, kept together for review.
 pub(crate) async fn run(
     state: &Arc<AppState>,
     trace_ext: Option<Extension<TraceId>>,
@@ -164,6 +165,16 @@ pub(crate) async fn run(
         Ok(Some(c)) => c,
         Err(msg) => return Some(crate::ollama::api_error(400, &msg)),
     };
+    if crate::adaptive::mode_from_headers(&headers)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return Some(crate::ollama::api_error(
+            400,
+            "X-Blazar-Adaptive cannot be combined with the cascade routing lane; disable cascade for this request or select one model directly",
+        ));
+    }
     let asks_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(true);
     if asks_stream {
         return Some(crate::ollama::api_error(
