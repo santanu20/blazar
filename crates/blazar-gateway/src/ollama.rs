@@ -2696,10 +2696,12 @@ async fn proxy_core_chat(
                 engine,
                 &mut v,
                 mode,
-                mcp_sel.as_deref(),
-                mcp_key.as_ref(),
-                &adaptive_headers,
-                false,
+                crate::adaptive::ChatExecutionContext {
+                    mcp_selector: mcp_sel.as_deref(),
+                    key: mcp_key.as_ref(),
+                    headers: &adaptive_headers,
+                    acquire_slo_guard: false,
+                },
             )
             .await
             {

@@ -465,10 +465,12 @@ pub async fn messages(
             &engine,
             &mut openai_body,
             mode,
-            mcp_sel.as_deref(),
-            key_ext.as_deref(),
-            &headers,
-            false,
+            crate::adaptive::ChatExecutionContext {
+                mcp_selector: mcp_sel.as_deref(),
+                key: key_ext.as_deref(),
+                headers: &headers,
+                acquire_slo_guard: false,
+            },
         )
         .await
         {

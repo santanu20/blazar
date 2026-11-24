@@ -264,39 +264,6 @@ struct BufferedResponse {
     body: axum::body::Bytes,
 }
 
-async fn read_child_response(response: reqwest::Response) -> Result<BufferedResponse, String> {
-    let status = response.status();
-    let headers = response.headers().clone();
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_ADAPTIVE_RESPONSE_BYTES as u64)
-    {
-        return Err(format!(
-            "adaptive response exceeded the {MAX_ADAPTIVE_RESPONSE_BYTES}-byte response cap"
-        ));
-    }
-    let mut response = response;
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("child response body read failed: {error}"))?
-    {
-        let next_len = body.len().saturating_add(chunk.len());
-        if next_len > MAX_ADAPTIVE_RESPONSE_BYTES {
-            return Err(format!(
-                "adaptive response exceeded the {MAX_ADAPTIVE_RESPONSE_BYTES}-byte response cap"
-            ));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(BufferedResponse {
-        status,
-        headers,
-        body: axum::body::Bytes::from(body),
-    })
-}
-
 fn rebuild_response(response: BufferedResponse, receipt: &str) -> reqwest::Response {
     let mut builder = axum::http::Response::builder().status(
         axum::http::StatusCode::from_u16(response.status.as_u16())
@@ -450,9 +417,10 @@ async fn local_proxy_round(
     child_headers.remove("x-blazar-mcp");
     child_headers.remove("x-blazar-adaptive-result");
     let body = axum::body::Bytes::from(serde_json::to_vec(request).unwrap_or_default());
-    let sf_gate = candidates
-        .map(crate::proxy::SfGate::AdaptiveCandidates)
-        .unwrap_or(crate::proxy::SfGate::AdaptiveDirect);
+    let sf_gate = candidates.map_or(
+        crate::proxy::SfGate::AdaptiveDirect,
+        crate::proxy::SfGate::AdaptiveCandidates,
+    );
     let response = crate::proxy::proxy_request(
         state,
         engine,
@@ -508,6 +476,7 @@ fn candidate_usage(headers: &reqwest::header::HeaderMap, asked: usize) -> (usize
     (used, reason)
 }
 
+#[allow(clippy::result_large_err)] // Admission failures use the gateway's standard Axum response.
 async fn adaptive_admission_guard(
     state: &std::sync::Arc<crate::state::AppState>,
     engine: &blazar_runtime::EngineRef,
@@ -609,9 +578,6 @@ async fn run_local_chat_inner(
         .and_then(Value::as_str)
         .unwrap_or(&engine.name)
         .to_string();
-    let mut degraded = None;
-    let mut candidates = 1usize;
-    let mut model_calls = 0usize;
     let mut revisions = 0usize;
     let mut verified = None;
     let mut usage_total = None;
@@ -622,14 +588,12 @@ async fn run_local_chat_inner(
         (strategy == Strategy::ParallelVerifiedCandidates).then(|| Plan::max_candidates(strategy));
     let mut current =
         local_proxy_round(state, engine, &request, headers, key, asked_candidates).await?;
-    if let Some(asked) = asked_candidates {
+    let (candidates, degraded, mut model_calls) = if let Some(asked) = asked_candidates {
         let (used, reason) = candidate_usage(&current.headers, usize::try_from(asked).unwrap_or(1));
-        candidates = used;
-        model_calls = used;
-        degraded = reason;
+        (used, reason, used)
     } else {
-        model_calls = 1;
-    }
+        (1, None, 1)
+    };
     if let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) {
         merge_usage(&mut usage_total, &parsed);
         verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
@@ -937,6 +901,16 @@ async fn run_remote_chat_inner(
     ))
 }
 
+/// Per-adapter inputs shared by the normalized gateway execution entry point.
+pub(crate) struct ChatExecutionContext<'a> {
+    pub(crate) mcp_selector: Option<&'a str>,
+    pub(crate) key: Option<&'a crate::keys::KeyCtx>,
+    pub(crate) headers: &'a HeaderMap,
+    /// OpenAI enters before the SLO gate. Anthropic and Ollama arrive with
+    /// their protocol-boundary admission guard already held.
+    pub(crate) acquire_slo_guard: bool,
+}
+
 /// Shared protocol-adapter entry point. MCP is an optional tool provider;
 /// ordinary inference uses the same controller without requiring MCP.
 #[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
@@ -945,22 +919,34 @@ pub(crate) async fn execute_chat(
     engine: &blazar_runtime::EngineRef,
     openai_body: &mut Value,
     mode: Mode,
-    mcp_selector: Option<&str>,
-    key: Option<&crate::keys::KeyCtx>,
-    headers: &HeaderMap,
-    acquire_slo_guard: bool,
+    context: ChatExecutionContext<'_>,
 ) -> Result<reqwest::Response, axum::response::Response> {
-    // OpenAI enters before the usual SLO gate. Anthropic and Ollama already
-    // hold a guard at their protocol translation boundary.
-    let _inflight = if acquire_slo_guard {
-        Some(adaptive_admission_guard(state, engine, openai_body, headers, key).await?)
+    let _inflight = if context.acquire_slo_guard {
+        Some(
+            adaptive_admission_guard(
+                state,
+                engine,
+                openai_body,
+                context.headers,
+                context.key,
+            )
+            .await?,
+        )
     } else {
         None
     };
-    if let Some(selector) = mcp_selector {
-        crate::mcp::chat_via_mcp(state, engine, openai_body, selector, key, Some(mode)).await
+    if let Some(selector) = context.mcp_selector {
+        crate::mcp::chat_via_mcp(
+            state,
+            engine,
+            openai_body,
+            selector,
+            context.key,
+            Some(mode),
+        )
+        .await
     } else {
-        run_local_chat(state, engine, openai_body, mode, headers, key).await
+        run_local_chat(state, engine, openai_body, mode, context.headers, context.key).await
     }
 }
 

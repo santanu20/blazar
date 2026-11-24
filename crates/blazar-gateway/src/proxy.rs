@@ -1454,12 +1454,10 @@ pub async fn proxy_request(
     let mut adaptive_candidate_want = None;
     let mut adaptive_candidate_receipt: Option<String> = None;
     match sf_gate {
-        SfGate::AdaptiveDirect => {}
+        // Adaptive direct and timed-out requests both proceed uncoalesced.
+        SfGate::AdaptiveDirect | SfGate::TimedOut => {}
         SfGate::AdaptiveCandidates(want) => adaptive_candidate_want = Some(want),
         SfGate::Held(g) => sf = Some(g),
-        // The bounded wait already ran pre-admission; proceeding
-        // uncoalesced matches the legacy timeout outcome.
-        SfGate::TimedOut => {}
         SfGate::Ineligible => {
             if state.cfg().singleflight && is_chat_route(path_query) && body.len() <= 32 * 1024 {
                 let asks_stream = parsed

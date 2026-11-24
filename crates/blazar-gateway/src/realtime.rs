@@ -1327,7 +1327,7 @@ async fn run_session(
                                 &cancel,
                                 &mut fc_seq,
                             );
-                            let Some(end) = drive_turn(
+                            let Some(end) = Box::pin(drive_turn(
                                 turn,
                                 &mut stream,
                                 &sink,
@@ -1335,7 +1335,7 @@ async fn run_session(
                                 &mut ctx,
                                 &mut item_seq,
                                 &cancel,
-                            )
+                            ))
                             .await
                             else {
                                 sink_close(&sink).await;
@@ -1376,7 +1376,7 @@ async fn run_session(
                             &turn_buf,
                             &mut fc_seq,
                         );
-                        let Some(end) = drive_turn(
+                        let Some(end) = Box::pin(drive_turn(
                             turn,
                             &mut stream,
                             &sink,
@@ -1384,7 +1384,7 @@ async fn run_session(
                             &mut ctx,
                             &mut item_seq,
                             &cancel,
-                        )
+                        ))
                         .await
                         else {
                             sink_close(&sink).await;

@@ -1276,10 +1276,12 @@ pub async fn openai_proxy(
                     &engine,
                     v,
                     mode,
-                    sel.as_deref(),
-                    key_ext.as_deref(),
-                    &headers,
-                    true,
+                    crate::adaptive::ChatExecutionContext {
+                        mcp_selector: sel.as_deref(),
+                        key: key_ext.as_deref(),
+                        headers: &headers,
+                        acquire_slo_guard: true,
+                    },
                 )
                 .await
             } else if let Some(selector) = sel.as_deref() {
