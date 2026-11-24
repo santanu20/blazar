@@ -254,15 +254,33 @@ impl SearchTree {
     /// and reduces the exploration coefficient, following budget-guided MCTS.
     #[must_use]
     pub fn current_branch_limit(&self) -> usize {
-        let remaining = self.remaining_tokens() as f64 / self.config.max_tokens as f64;
-        let factor = (1.0 + (self.config.branch_factor - 1) as f64 * remaining).ceil();
-        (factor as usize).clamp(1, self.config.branch_factor)
+        let remaining = self.remaining_tokens();
+        let total = self.config.max_tokens.max(1);
+        let extra = self
+            .config
+            .branch_factor
+            .saturating_sub(1)
+            .saturating_mul(remaining)
+            .div_ceil(total);
+        1_usize.saturating_add(extra)
+            .clamp(1, self.config.branch_factor)
     }
 
     #[must_use]
     pub fn current_exploration(&self) -> f64 {
-        let remaining = self.remaining_tokens() as f64 / self.config.max_tokens as f64;
-        self.config.exploration * (0.25 + 0.75 * remaining)
+        self.config.exploration * (0.25 + 0.75 * self.remaining_fraction())
+    }
+
+    fn remaining_fraction(&self) -> f64 {
+        // Keep all conversions in an explicit, bounded fixed-point domain:
+        // no lossy usize->f64 cast and no dependence on host word size.
+        const SCALE: u128 = 1_000_000;
+        let remaining = u128::try_from(self.remaining_tokens()).unwrap_or(u128::MAX);
+        let total = u128::try_from(self.config.max_tokens)
+            .unwrap_or(u128::MAX)
+            .max(1);
+        let scaled = remaining.saturating_mul(SCALE).div_ceil(total).min(SCALE);
+        f64::from(u32::try_from(scaled).unwrap_or(1_000_000)) / 1_000_000.0
     }
 
     /// Read-only frontier check. Unlike select_leaf, this does not increment
@@ -728,6 +746,20 @@ mod tests {
         .unwrap();
         assert_eq!(tree.best_answer().unwrap().1, "correct");
         assert_eq!(tree.finish(), StopReason::VerifiedAnswer);
+    }
+
+    #[test]
+    fn unit__branch_limit__uses_integer_budget_ratio_without_overflow() {
+        let mut tree = SearchTree::new(
+            "root",
+            SearchConfig {
+                max_tokens: usize::MAX,
+                branch_factor: 4,
+                ..SearchConfig::default()
+            },
+        );
+        assert_eq!(tree.current_branch_limit(), 4);
+        assert!(tree.current_exploration().is_finite());
     }
 
     #[test]
