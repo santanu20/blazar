@@ -213,7 +213,7 @@ impl Plan {
             // a single path.
             Strategy::ParallelVerifiedCandidates
         } else if self.verify_schema
-            || self.task_profile.math_expected().is_some()
+            || self.task_profile.has_deterministic_verifier()
             || self.mode == Mode::Deep
             || self.complexity >= 3
         {
@@ -529,7 +529,7 @@ struct CandidateQuality {
     http_success: bool,
     parseable: bool,
     schema_valid: Option<bool>,
-    math_valid: Option<bool>,
+    task_valid: Option<bool>,
     complete: bool,
     non_empty: bool,
     agreement: usize,
@@ -543,13 +543,13 @@ impl CandidateQuality {
 
     fn has_majority(self) -> bool {
         self.candidates <= 1
-            || self.math_valid == Some(true)
+            || self.task_valid == Some(true)
             || self.agreement.saturating_mul(2) > self.candidates
     }
 
     fn rank(self) -> (u8, u8, u8, u8, u8, usize, u8, u8) {
         let schema_ok = u8::from(self.schema_valid != Some(false));
-        let math_ok = u8::from(self.math_valid != Some(false));
+        let math_ok = u8::from(self.task_valid != Some(false));
         (
             u8::from(self.http_success),
             schema_ok + math_ok,
@@ -570,7 +570,7 @@ impl CandidateQuality {
         self.http_success
             && self.parseable
             && self.schema_valid != Some(false)
-            && self.math_valid != Some(false)
+            && self.task_valid != Some(false)
             && self.complete
             && self.non_empty
             && self.has_majority()
@@ -579,7 +579,7 @@ impl CandidateQuality {
     fn needs_revision(self) -> bool {
         self.http_success
             && (self.schema_valid == Some(false)
-                || self.math_valid == Some(false)
+                || self.task_valid == Some(false)
                 || !self.complete
                 || !self.non_empty
                 || !self.has_majority())
@@ -600,7 +600,7 @@ fn assess_candidate(
         None
     };
     let content = response_content(body).unwrap_or_default();
-    let math_valid = plan.task_profile.math_valid(content);
+    let task_valid = plan.task_profile.task_valid(content);
     let finish_reason = body
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str);
@@ -609,7 +609,7 @@ fn assess_candidate(
         http_success: status.is_success(),
         parseable: true,
         schema_valid,
-        math_valid,
+        task_valid,
         complete,
         non_empty: !content.trim().is_empty(),
         agreement: summary.agreement_for(body),
@@ -623,7 +623,7 @@ fn reasoning_receipt(
     summary: &CandidateSummary,
     body: &Value,
 ) -> String {
-    let judge = if plan.task_profile.math_expected().is_some() {
+    let judge = if plan.task_profile.has_deterministic_verifier() {
         "math_exact"
     } else if plan.verify_schema {
         "json_schema+answer_consensus"
@@ -642,10 +642,10 @@ fn reasoning_receipt(
 fn revision_feedback(
     quality: CandidateQuality,
     schema_feedback: Option<&str>,
-    math_feedback: Option<&str>,
+    task_feedback: Option<&str>,
 ) -> Option<String> {
-    if quality.math_valid == Some(false) {
-        return math_feedback.map(str::to_string).or_else(|| {
+    if quality.task_valid == Some(false) {
+        return task_feedback.map(str::to_string).or_else(|| {
             Some("The deterministic arithmetic verifier rejected the answer. Recompute and return the corrected result.".into())
         });
     }
@@ -938,7 +938,7 @@ async fn run_local_chat_inner(
             let feedback = revision_feedback(
                 best_quality,
                 schema_detail.as_deref(),
-                plan.task_profile.math_feedback().as_deref(),
+                plan.task_profile.task_feedback().as_deref(),
             );
             let Some(feedback) = feedback else {
                 stop_reason = "quality_gate_pass".into();
@@ -1363,7 +1363,7 @@ async fn run_remote_chat_inner(
             let feedback = revision_feedback(
                 best_quality,
                 schema_detail.as_deref(),
-                plan.task_profile.math_feedback().as_deref(),
+                plan.task_profile.task_feedback().as_deref(),
             );
             let Some(feedback) = feedback else {
                 stop_reason = "quality_gate_pass".into();
@@ -1821,14 +1821,14 @@ mod tests {
             http_success: true,
             parseable: true,
             schema_valid: None,
-            math_valid: Some(false),
+            task_valid: Some(false),
             complete: true,
             non_empty: true,
             agreement: 3,
             candidates: 3,
         };
         let verified_answer = CandidateQuality {
-            math_valid: Some(true),
+            task_valid: Some(true),
             agreement: 1,
             ..wrong_consensus
         };
