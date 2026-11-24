@@ -200,7 +200,7 @@ For newly released GGUF architectures, Blazar can build a matching active curate
 
 Three native API dialects: OpenAI, Ollama and Anthropic. Request-path features include thinking-effort mapping, `<think>` leak suppression, structured-output receipts, forced-tool-choice handling, Anthropic cache accounting and Batch API, Responses API conversation chains and background jobs, plus engine passthrough utilities such as tokenize, detokenize, apply-template and infill.
 
-Buffered chat requests also support gateway-wide adaptive inference through `X-Blazar-Adaptive: auto|deep`. One shared controller allocates bounded refinement and schema verification across local model backends and the OpenAI-compatible remote lane; MCP is optional. See the adaptive runtime contract in [the API specification](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md).
+Buffered chat requests also support gateway-wide adaptive inference through `X-Blazar-Adaptive: auto|deep`. One shared controller allocates bounded refinement and schema verification across local model backends and the OpenAI-compatible remote lane; MCP is optional. See the adaptive runtime contract in [the API specification](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md). The longer-term integration design is documented in [the unified adaptive analysis loop](https://github.com/santanu20/blazar/blob/main/docs/research/2026-11-24-unified-adaptive-analysis-loop.md); it distinguishes current request-time behavior from planned evidence-driven policy learning.
 
 Reference: [`docs/4.API_SPEC.md`](https://github.com/santanu20/blazar/blob/main/docs/4.API_SPEC.md).
 
