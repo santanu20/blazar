@@ -290,7 +290,10 @@ fn arithmetic_oracle_from_text(text: &str) -> Option<ArithmeticOracle> {
             continue;
         };
         let expression = expression_tail[..end].trim().trim_end_matches('.').trim();
-        if !expression.chars().any(|ch| matches!(ch, '+' | '-' | '*' | '/' | '^')) {
+        if !expression
+            .chars()
+            .any(|ch| matches!(ch, '+' | '-' | '*' | '/' | '^'))
+        {
             continue;
         }
         let Some(expected) = parse_expression(expression) else {
@@ -329,7 +332,10 @@ fn format_number(value: f64) -> String {
     if value.fract().abs() < 1.0e-10 {
         format!("{value:.0}")
     } else {
-        format!("{value:.10}").trim_end_matches('0').trim_end_matches('.').to_string()
+        format!("{value:.10}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     }
 }
 
@@ -498,7 +504,10 @@ mod tests {
 
     #[test]
     fn unit__answer_hash__normalizes_equivalent_numeric_answers() {
-        assert_eq!(answer_hash("Final answer: 267."), answer_hash("\\boxed{267}"));
+        assert_eq!(
+            answer_hash("Final answer: 267."),
+            answer_hash("\\boxed{267}")
+        );
     }
 
     #[test]
@@ -511,9 +520,18 @@ mod tests {
             }]
         });
         let candidates = vec![
-            (200, json!({"choices":[{"message":{"content":"268"},"finish_reason":"stop"}]})),
-            (200, json!({"choices":[{"message":{"content":"268"},"finish_reason":"stop"}]})),
-            (200, json!({"choices":[{"message":{"content":"267"},"finish_reason":"stop"}]})),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"268"},"finish_reason":"stop"}]}),
+            ),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"268"},"finish_reason":"stop"}]}),
+            ),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"267"},"finish_reason":"stop"}]}),
+            ),
         ];
         let decision = pick_candidate(&sentinel, &candidates, None, &request);
         assert_eq!(decision.winner_index, 2);
@@ -526,9 +544,18 @@ mod tests {
         let sentinel = crate::sentinel::Sentinel::new(false, 0, None);
         let request = json!({"messages":[{"role":"user","content":"What is the capital?"}]});
         let candidates = vec![
-            (200, json!({"choices":[{"message":{"content":"Final answer: Paris"},"finish_reason":"stop"}]})),
-            (200, json!({"choices":[{"message":{"content":"Final answer: Rome"},"finish_reason":"stop"}]})),
-            (200, json!({"choices":[{"message":{"content":"Final answer: Paris"},"finish_reason":"stop"}]})),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Final answer: Paris"},"finish_reason":"stop"}]}),
+            ),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Final answer: Rome"},"finish_reason":"stop"}]}),
+            ),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Final answer: Paris"},"finish_reason":"stop"}]}),
+            ),
         ];
         let decision = pick_candidate(&sentinel, &candidates, None, &request);
         assert_eq!(decision.winner_index, 0);
