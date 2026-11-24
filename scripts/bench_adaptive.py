@@ -133,6 +133,7 @@ def request_once(endpoint: str, model: str, case: dict[str, Any],
     status = 0
     receipt = None
     candidate_receipt = None
+    search_receipt = None
     response: dict[str, Any] = {}
     error = None
     try:
@@ -140,11 +141,13 @@ def request_once(endpoint: str, model: str, case: dict[str, Any],
             status = result.status
             receipt = result.headers.get("x-blazar-adaptive-result")
             candidate_receipt = result.headers.get("x-blazar-adaptive-candidates")
+            search_receipt = result.headers.get("x-blazar-adaptive-search")
             response = json.loads(result.read())
     except urllib.error.HTTPError as exc:
         status = exc.code
         receipt = exc.headers.get("x-blazar-adaptive-result")
         candidate_receipt = exc.headers.get("x-blazar-adaptive-candidates")
+        search_receipt = exc.headers.get("x-blazar-adaptive-search")
         try:
             response = json.loads(exc.read())
         except (json.JSONDecodeError, OSError):
@@ -166,6 +169,7 @@ def request_once(endpoint: str, model: str, case: dict[str, Any],
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
         "adaptive_receipt": receipt,
         "candidate_receipt": candidate_receipt,
+        "search_receipt": search_receipt,
         "error": error,
     }
 
@@ -188,6 +192,9 @@ def summarise(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "candidate_receipts": sorted(
             {row["candidate_receipt"] for row in rows if row["candidate_receipt"]}
+        ),
+        "search_receipts": sorted(
+            {row["search_receipt"] for row in rows if row["search_receipt"]}
         ),
     }
 
