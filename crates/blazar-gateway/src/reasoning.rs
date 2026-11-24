@@ -60,13 +60,9 @@ impl TaskProfile {
         self.table.as_ref().map(|oracle| oracle.value)
     }
 
-
     pub(crate) fn math_valid(&self, content: &str) -> Option<bool> {
         let expected = self.math_expected()?;
-        Some(
-            numeric_answer(content)
-                .is_some_and(|actual| numbers_equal(actual, expected))
-        )
+        Some(numeric_answer(content).is_some_and(|actual| numbers_equal(actual, expected)))
     }
 
     pub(crate) fn math_feedback(&self) -> Option<String> {
@@ -98,8 +94,8 @@ impl TaskProfile {
             && answer_tokens
                 .windows(label_tokens.len())
                 .any(|window| window == label_tokens.as_slice());
-        let value_matches = numeric_answer(&answer)
-            .is_some_and(|value| numbers_equal(value, oracle.value));
+        let value_matches =
+            numeric_answer(&answer).is_some_and(|value| numbers_equal(value, oracle.value));
         Some(label_matches && value_matches)
     }
 
@@ -413,9 +409,7 @@ fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
     let mut entries = Vec::<(String, f64)>::new();
     for segment in text.split([',', ';', '\n']) {
         let segment = segment.trim();
-        let Some((label, raw_value)) = segment
-            .split_once('=')
-            .or_else(|| segment.split_once(':'))
+        let Some((label, raw_value)) = segment.split_once('=').or_else(|| segment.split_once(':'))
         else {
             continue;
         };
@@ -423,7 +417,9 @@ fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
         let raw_value = raw_value.trim().trim_end_matches('.');
         if label.is_empty()
             || label.len() > 64
-            || !label.chars().all(|ch| ch.is_ascii_alphabetic() || ch.is_ascii_whitespace() || ch == '_' || ch == '-')
+            || !label.chars().all(|ch| {
+                ch.is_ascii_alphabetic() || ch.is_ascii_whitespace() || ch == '_' || ch == '-'
+            })
         {
             continue;
         }
@@ -450,7 +446,10 @@ fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
     }
     entries.sort_by(|left, right| left.1.total_cmp(&right.1));
     let (label, value) = entries.pop()?;
-    if entries.last().is_some_and(|(_, second)| numbers_equal(*second, value)) {
+    if entries
+        .last()
+        .is_some_and(|(_, second)| numbers_equal(*second, value))
+    {
         // A tied maximum is not a unique oracle.
         return None;
     }
@@ -712,9 +711,18 @@ mod tests {
             }]
         });
         let candidates = vec![
-            (200, json!({"choices":[{"message":{"content":"Pine=19"},"finish_reason":"stop"}]})),
-            (200, json!({"choices":[{"message":{"content":"Pine=19"},"finish_reason":"stop"}]})),
-            (200, json!({"choices":[{"message":{"content":"Birch=26"},"finish_reason":"stop"}]})),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Pine=19"},"finish_reason":"stop"}]}),
+            ),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Pine=19"},"finish_reason":"stop"}]}),
+            ),
+            (
+                200,
+                json!({"choices":[{"message":{"content":"Birch=26"},"finish_reason":"stop"}]}),
+            ),
         ];
         let decision = pick_candidate(&sentinel, &candidates, None, &request);
         assert_eq!(decision.winner_index, 2);
