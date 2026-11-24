@@ -181,7 +181,7 @@ pub struct SearchStats {
 pub struct SearchTree {
     config: SearchConfig,
     nodes: Vec<SearchNode>,
-    transpositions: HashMap<u64, usize>,
+    transpositions: HashMap<String, usize>,
     expansions: usize,
     tokens: usize,
     max_depth_reached: usize,
@@ -194,7 +194,7 @@ impl SearchTree {
     pub fn new(root_state: impl Into<String>, config: SearchConfig) -> Self {
         let root_state = root_state.into();
         let mut transpositions = HashMap::new();
-        transpositions.insert(state_hash(&root_state), 0);
+        transpositions.insert(normalize_state(&root_state), 0);
         Self {
             config: SearchConfig {
                 max_nodes: config.max_nodes.max(1),
@@ -366,8 +366,8 @@ impl SearchTree {
                 self.stop_reason = Some(StopReason::TokenBudget);
                 break;
             }
-            let hash = state_hash(&proposal.state);
-            if self.transpositions.contains_key(&hash) {
+            let normalized_state = normalize_state(&proposal.state);
+            if self.transpositions.contains_key(&normalized_state) {
                 self.transposition_hits = self.transposition_hits.saturating_add(1);
                 continue;
             }
@@ -398,7 +398,7 @@ impl SearchTree {
                 estimated_state_tokens: proposal.estimated_state_tokens,
                 value_sum: value.mean,
             });
-            self.transpositions.insert(hash, id);
+            self.transpositions.insert(normalized_state, id);
             self.nodes[parent_id].children.push(id);
             self.max_depth_reached = self.max_depth_reached.max(depth);
             if status == NodeStatus::Terminal && proposal.verification == Verification::Passed {
@@ -581,19 +581,14 @@ fn finite_unit(value: f64, fallback: f64) -> f64 {
     }
 }
 
-fn state_hash(state: &str) -> u64 {
-    // FNV-1a fingerprint for in-request transposition detection; not
-    // a cryptographic integrity primitive. Normalize whitespace and case.
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in state
+fn normalize_state(state: &str) -> String {
+    state
         .split_whitespace()
-        .flat_map(|part| part.to_ascii_lowercase().into_bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+        .flat_map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
+
 
 #[cfg(test)]
 mod tests {
