@@ -963,8 +963,7 @@ mod tests {
             Plan::for_request(Mode::Deep, &multiple_choices).strategy(&multiple_choices),
             Strategy::Direct
         );
-        let mut complex_messages =
-            vec![json!({"role": "user", "content": "x".repeat(13_000)})];
+        let mut complex_messages = vec![json!({"role": "user", "content": "x".repeat(13_000)})];
         complex_messages.extend((1..8).map(|_| json!({"role": "user", "content": "context"})));
         let complex = json!({"messages": complex_messages});
         assert_eq!(
