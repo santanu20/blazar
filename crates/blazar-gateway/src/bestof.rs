@@ -8,9 +8,9 @@
 //! - non-streaming only (`stream: true` + best-of is rejected 400 - a
 //!   winner cannot be picked before completion, and streaming N
 //!   candidates to the client is a different feature);
-//! - the winner is chosen by a deterministic ladder: schema-valid (when
-//!   the request carries a schema) > `finish_reason: stop` > candidate
-//!   index (arrival order);
+//! - adaptive fan-out uses Blazar's task-aware evaluator: schema and
+//!   recognized arithmetic oracles are hard signals, while normalized
+//!   final-answer agreement is a self-consistency signal (not proof);
 //! - usage is the SUM across candidates (every candidate generated and
 //!   is billed; the response extension itemizes the split);
 //! - the fan-out never queues behind live traffic: candidates are
@@ -248,6 +248,15 @@ pub(crate) async fn fan_out(
         Ok(v) => v,
         Err(_) => return FanOut::Skip,
     };
+    // Repeated deterministic requests cannot create useful search breadth.
+    // Respect an explicit seed and temperature=0 rather than billing duplicate
+    // candidates as if they were independent reasoning trajectories.
+    if parsed.get("seed").is_some()
+        || parsed.get("temperature").and_then(Value::as_f64) == Some(0.0)
+    {
+        FANOUT_DEGRADED.fetch_add(1, Ordering::Relaxed);
+        return FanOut::Degraded(format!("asked={want} used=1 reason=deterministic_sampling"));
+    }
     let schema = request_schema(&parsed);
     FANOUT_ACTIVE.fetch_add(1, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
@@ -308,7 +317,9 @@ pub(crate) async fn fan_out(
     }
     let used = u64::try_from(cands.len()).unwrap_or(u64::MAX);
     let judged: Vec<(u16, Value)> = cands.iter().map(|c| (c.0, c.1.clone())).collect();
-    let winner = pick_winner(&state.sentinel, &judged, schema.as_ref());
+    let decision =
+        crate::reasoning::pick_candidate(&state.sentinel, &judged, schema.as_ref(), &parsed);
+    let winner = decision.winner_index;
     let others: Vec<Value> = judged
         .iter()
         .enumerate()
@@ -316,7 +327,14 @@ pub(crate) async fn fan_out(
         .map(|(_, c)| c.1.clone())
         .collect();
     let (status, winner_val, raw) = &mut cands[winner];
-    let hdr = patch_winner(winner_val, &others, n, used);
+    let mut hdr = patch_winner(winner_val, &others, n, used);
+    hdr.push_str(&format!(
+        " judge={} agreement={}/{}",
+        decision.verifier, decision.agreement, decision.candidates
+    ));
+    if let Some(answer_hash) = decision.answer_hash {
+        hdr.push_str(&format!(" vote_key={answer_hash:016x}"));
+    }
     let status = *status;
     let raw = raw.clone();
     // A non-JSON winner body (degenerate case - the ladder ranks those
