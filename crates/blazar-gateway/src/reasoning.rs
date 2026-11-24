@@ -495,6 +495,18 @@ mod tests {
     }
 
     #[test]
+    fn unit__task_profile__uses_latest_user_turn_not_old_math_context() {
+        let request = json!({
+            "messages": [
+                {"role": "user", "content": "Calculate 12 * 12. Return only the number."},
+                {"role": "assistant", "content": "144"},
+                {"role": "user", "content": "What is the capital of France?"}
+            ]
+        });
+        assert_eq!(TaskProfile::from_request(&request).math_expected(), None);
+    }
+
+    #[test]
     fn unit__arithmetic_parser__precedence_parentheses_and_divide_by_zero() {
         assert_eq!(parse_expression("2 + 3 * (8 - 4)"), Some(14.0));
         assert_eq!(parse_expression("2^3 + 1"), Some(9.0));
@@ -571,5 +583,10 @@ mod tests {
         assert_eq!(decision.agreement, 2);
         assert_eq!(decision.candidates, 3);
         assert_eq!(decision.verifier, "answer_consensus");
+        assert_eq!(decision.vote_tallies.len(), 2);
+        assert_eq!(
+            decision.vote_tallies.iter().map(|(_, votes)| votes).sum::<usize>(),
+            3
+        );
     }
 }
