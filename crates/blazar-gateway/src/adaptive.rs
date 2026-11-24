@@ -488,10 +488,7 @@ async fn local_proxy_round(
     })
 }
 
-fn candidate_usage(
-    headers: &reqwest::header::HeaderMap,
-    asked: usize,
-) -> (usize, Option<String>) {
+fn candidate_usage(headers: &reqwest::header::HeaderMap, asked: usize) -> (usize, Option<String>) {
     let Some(receipt) = headers
         .get("x-blazar-adaptive-candidates")
         .and_then(|value| value.to_str().ok())
@@ -621,17 +618,10 @@ async fn run_local_chat_inner(
 
     // Every local model call goes through proxy_request, preserving the
     // normal admission, key-budget, usage, Sentinel and service-time path.
-    let asked_candidates = (strategy == Strategy::ParallelVerifiedCandidates)
-        .then(|| Plan::max_candidates(strategy));
-    let mut current = local_proxy_round(
-        state,
-        engine,
-        &request,
-        headers,
-        key,
-        asked_candidates,
-    )
-    .await?;
+    let asked_candidates =
+        (strategy == Strategy::ParallelVerifiedCandidates).then(|| Plan::max_candidates(strategy));
+    let mut current =
+        local_proxy_round(state, engine, &request, headers, key, asked_candidates).await?;
     if let Some(asked) = asked_candidates {
         let (used, reason) = candidate_usage(&current.headers, usize::try_from(asked).unwrap_or(1));
         candidates = used;
