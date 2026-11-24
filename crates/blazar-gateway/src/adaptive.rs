@@ -1064,9 +1064,8 @@ async fn run_remote_chat_inner(
         }
     };
     merge_usage(&mut usage_total, &current_body);
-    let mut best_quality = assess_candidate(
-        state, &plan, schema.as_ref(), current.status, &current_body,
-    );
+    let mut best_quality =
+        assess_candidate(state, &plan, schema.as_ref(), current.status, &current_body);
     schema_verified = best_quality.schema_valid;
 
     if message_has_tool_calls(&current_body) {
@@ -1487,8 +1486,11 @@ mod tests {
     #[test]
     fn unit__candidate_quality__empty_and_failed_candidates_need_repair() {
         let empty = CandidateQuality {
-            http_success: true, parseable: true, schema_valid: None,
-            complete: true, non_empty: false,
+            http_success: true,
+            parseable: true,
+            schema_valid: None,
+            complete: true,
+            non_empty: false,
         };
         let failed = CandidateQuality {
             http_success: false,
