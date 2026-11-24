@@ -1094,9 +1094,14 @@ async fn remote_round(
         })?;
     let status = reqwest::StatusCode::from_u16(parts.status.as_u16())
         .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+    // Never trust provider-supplied Blazar control-plane receipts. The
+    // gateway creates its own candidate receipt after judging this response.
+    let mut response_headers = parts.headers;
+    response_headers.remove("x-blazar-adaptive-candidates");
+    response_headers.remove("x-blazar-adaptive-result");
     Ok(BufferedResponse {
         status,
-        headers: parts.headers,
+        headers: response_headers,
         body: bytes,
     })
 }
