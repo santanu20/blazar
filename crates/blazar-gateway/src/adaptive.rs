@@ -270,19 +270,25 @@ async fn read_child_response(response: reqwest::Response) -> Result<BufferedResp
             "adaptive response exceeded the {MAX_ADAPTIVE_RESPONSE_BYTES}-byte response cap"
         ));
     }
-    let body = response
-        .bytes()
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| format!("child response body read failed: {error}"))?;
-    if body.len() > MAX_ADAPTIVE_RESPONSE_BYTES {
-        return Err(format!(
-            "adaptive response exceeded the {MAX_ADAPTIVE_RESPONSE_BYTES}-byte response cap"
-        ));
+        .map_err(|error| format!("child response body read failed: {error}"))?
+    {
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len > MAX_ADAPTIVE_RESPONSE_BYTES {
+            return Err(format!(
+                "adaptive response exceeded the {MAX_ADAPTIVE_RESPONSE_BYTES}-byte response cap"
+            ));
+        }
+        body.extend_from_slice(&chunk);
     }
     Ok(BufferedResponse {
         status,
         headers,
-        body,
+        body: axum::body::Bytes::from(body),
     })
 }
 
@@ -973,32 +979,75 @@ mod tests {
     }
 
     #[test]
-    fn unit__strategy__selects_direct_revision_and_parallel() {
-        let simple = json!({
-            "messages": [{"role": "user", "content": "What is 2 + 2?"}]
+    fn unit__usage_merge__adds_nested_token_counters() {
+        let mut total = Some(json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": {"cached_tokens": 2}
+        }));
+        let next = json!({
+            "prompt_tokens": 20,
+            "completion_tokens": 7,
+            "total_tokens": 27,
+            "prompt_tokens_details": {"cached_tokens": 3}
         });
-        assert_eq!(
-            Plan::for_request(Mode::Auto, &simple).strategy(&simple),
-            Strategy::Direct
-        );
-        let complex = json!({
-            "messages": [{"role": "user", "content": "x".repeat(4_000)}]
+        merge_usage(&mut total, &json!({"usage": next}));
+        let usage = total.expect("usage counters should be present");
+        assert_eq!(usage["prompt_tokens"], 30);
+        assert_eq!(usage["completion_tokens"], 12);
+        assert_eq!(usage["total_tokens"], 42);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 5);
+    }
+
+    #[test]
+    fn unit__tool_handoff__recognizes_calls_and_finish_reasons() {
+        assert!(message_has_tool_calls(&json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{"id": "call_1", "type": "function"}]
+                }
+            }]
+        })));
+        assert!(message_has_tool_calls(&json!({
+            "choices": [{
+                "message": {"content": null},
+                "finish_reason": "tool_calls"
+            }]
+        })));
+        assert!(message_has_tool_calls(&json!({
+            "choices": [{
+                "message": {"function_call": {"name": "lookup"}},
+                "finish_reason": "function_call"
+            }]
+        })));
+        assert!(!message_has_tool_calls(&json!({
+            "choices": [{
+                "message": {"content": "finished"},
+                "finish_reason": "stop"
+            }]
+        })));
+    }
+
+    #[test]
+    fn unit__revision_context__stays_in_the_working_copy() {
+        let mut working = json!({
+            "messages": [{"role": "user", "content": "Return valid JSON."}]
         });
-        assert_eq!(
-            Plan::for_request(Mode::Auto, &complex).strategy(&complex),
-            Strategy::SequentialRevision
-        );
-        let structured = json!({
-            "messages": [{"role": "user", "content": "Return a JSON object."}],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"schema": {"type": "object"}}
-            }
-        });
-        assert_eq!(
-            Plan::for_request(Mode::Deep, &structured).strategy(&structured),
-            Strategy::ParallelVerifiedCandidates
-        );
+        let assistant = json!({"role": "assistant", "content": "not json"});
+        append_revision_prompt(
+            &mut working,
+            &assistant,
+            Some("response content is not valid JSON"),
+        )
+        .expect("working context should accept a repair turn");
+        assert_eq!(working["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(working["messages"][1]["role"], "assistant");
+        assert_eq!(working["messages"][2]["role"], "user");
+        assert!(working["messages"][2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Validation feedback"));
     }
 
     #[test]
