@@ -138,65 +138,39 @@ KV-cache quality receipts:
 
 ## Adaptive reasoning A/B harness
 
-Blazar's adaptive controller performs **test-time inference orchestration**:
-independent candidate generation, task-aware evaluation, bounded revision,
-incumbent preservation, and explicit stopping when a response contract is
-satisfied or its compute budget is exhausted. It does not change model weights.
+Blazar's adaptive inference controller has two policies:
+
+- **Auto:** conservative request-shape planning, deterministic task/JSON-Schema checks, bounded repair and incumbent-preserving selection.
+- **Deep:** budgeted PUCT search over partial reasoning states on local engines and OpenAI-compatible remote Chat Completions. The generator proposes compact next-state summaries, the tree selects which branch to expand, and independent hard verifiers can accept or reject terminal answers.
 
 Run the same fixed task set against the same model in each mode:
 
     python3 scripts/bench_adaptive.py --base-url http://127.0.0.1:11435 --model MODEL --runs 20 --warmup 2 --seed 20261124 --output /tmp/adaptive.json
 
-The harness compares off, auto, and deep. It includes three exact arithmetic
-expressions, a keyed table lookup, and a strict JSON-schema extraction task.
-Mode order is randomized and interleaved within each case/run. The report
-records the seed and execution order, exact-match pass rates by case, p50/p95
-latency, prompt/completion/total tokens, errors, adaptive receipts, candidate
-judge receipts, and paired accuracy/latency deltas with bootstrap confidence
-intervals versus off.
+The harness compares off, auto and deep. It includes three exact arithmetic expressions, a keyed numeric table lookup and a strict JSON-Schema extraction task. Mode order is randomized/interleaved within each case/run. Reports contain per-case pass rates, p50/p95 latency, measured prompt/completion/total provider tokens, errors, adaptive/candidate/search receipts, and paired accuracy/latency deltas with bootstrap intervals versus off.
 
-**Controller signals and their meaning:**
+**Deep search contract:**
 
-- **Hard response-contract gates:** HTTP success, parseable response envelope,
-  non-empty content, normal completion, and caller-requested JSON Schema.
-- **Deterministic arithmetic verifier:** recognizes a deliberately narrow
-  arithmetic-expression grammar in user messages (parentheses, decimals,
-  unary signs, addition, subtraction, multiplication, division and powers).
-  It independently evaluates only that extracted expression; it does not
-  execute arbitrary prompt text or general code.
-- **Answer self-consistency:** normalizes final-answer spans and compares
-  candidate votes. This is a confidence/consistency signal, not factual proof.
-  A majority cannot override a failed schema or deterministic arithmetic
-  check. A tie can consume another bounded sample while preserving the
-  incumbent.
-- **Budget policy:** Auto keeps a conservative single repair path. Deep uses
-  three parallel candidates and at most four further verifier-guided calls
-  (seven calls total); the request wall-clock deadline, per-call admission,
-  slot/queue saturation and key token budgets remain hard limits. Seeded or
-  temperature-zero requests avoid pretending deterministic repeats are
-  independent samples.
+- **Partial-state representation:** each branch stores its parent, cumulative state, depth, prior, value estimate, uncertainty, optional terminal answer and verifier state. The tree deduplicates normalized states (transpositions), rejects hard-verifier failures, tracks visits and backpropagates values.
+- **Selection:** PUCT balances branch value and proposal prior, with an uncertainty bonus. Branch width and exploration coefficient narrow as the estimated state-token budget is consumed.
+- **Expansion:** each expansion asks for up to three concise, checkable next-state summaries. The generated expansion is constrained to JSON and capped at 512 output tokens. It is not a request to expose private chain-of-thought.
+- **Hard stopping budgets:** up to six expansion calls plus one reserved conventional-answer fallback (seven model calls maximum), 40 nodes, depth 8, branch factor 3, 120-second request deadline, and a bounded estimated state-token budget. Existing admission/queue/key-budget constraints remain authoritative. Search-state token estimates are **not** substituted for provider-reported usage.
+- **Hard verification:** requested JSON Schema and narrowly recognized deterministic arithmetic/table tasks can independently pass/fail terminal answers. If more than one deterministic verifier applies, all applicable hard checks must pass.
+- **Unverified generation:** when no independent verifier applies, a terminal answer remains marked Unknown; the search receipt does not claim it is verified. The PUCT policy is a search controller, not a correctness oracle.
 
-The benchmark is a **diagnostic smoke suite**, not a held-out reasoning
-leaderboard. Five hand-authored tasks are useful for regression-testing
-routing, arithmetic verification, schema handling, receipts and the cost
-curve; they do not establish general reasoning ability. For quality claims,
-run paired, held-out domain suites with independent checkers (for example,
-GSM8K/MATH/AIME for math, GPQA for science, code tasks executed in a
-resource-limited sandbox, and multi-hop QA with evidence-backed scoring).
-Freeze model revisions and prompts, stratify tasks by difficulty, report
-per-task accuracy and uncertainty, and compare quality at equal token or
-latency budgets. Avoid relying on a model-as-judge as the sole verifier.
+**Process-reward status:** the tree consumes the ProcessRewardModel interface. The current default UncalibratedValueModel returns neutral value with maximal uncertainty, and the receipt labels the value source as self-reported/uncalibrated and records the calibrated-node count. There is **no configured trained/calibrated PRM adapter** in this PR yet. It would be incorrect to describe the current execution path as learned PRM-guided search. A calibrated PRM can be added as an adapter only after an independently trained evaluator, calibration data, timeout/budget policy and held-out validation are supplied.
 
-**Architecture boundary:** this controller only sees request/response
-payloads. It does not re-apply Transformer blocks to hidden states, preserve
-per-layer KV caches, or implement recurrent depth inside a model. That is a
-separate engine-level capability; the current generic Engine trait exposes
-process lifecycle and health, not hidden-state forward-pass access. A true
-looped-Transformer backend needs model-specific forward-pass integration,
-a selected layer window, cache-correct recurrence, stable damping/halting,
-and architecture-aware handling (especially for MoE models). Repeated API
-calls are not a substitute.
+**Benchmark interpretation:** this five-task suite is a diagnostic smoke test, not a held-out reasoning leaderboard. It validates the task verifiers, branch search, request receipts and cost accounting; it cannot establish general reasoning ability or SOTA. Quality claims require frozen model revisions, held-out domain suites with independent checkers, matched token/FLOP/latency budgets, per-domain ablations, calibration/error analysis and confidence intervals. Compare at least greedy, self-consistency, Best-of-N, beam search, PUCT without value model and calibrated PRM-guided PUCT.
 
-Do not describe the gateway as state-of-the-art until broad held-out
-benchmarks demonstrate a repeatable, statistically defensible improvement
-over the same model's non-adaptive baseline at comparable compute.
+**Latent recurrent Transformer boundary:** PUCT search still operates over request/response-visible partial states. It does not loop hidden representations through internal Transformer blocks. The generic Blazar Engine interface exposes process lifecycle/health, not the model forward pass or per-layer KV-cache state. True latent recurrence needs a model-specific engine capability, recurrent layer-window execution, loop-aware cache semantics, stable damping/halting and architecture-aware MoE behavior. Recent work on variable-depth Looped Transformers and loop-aware KV caches is a separate runtime/model project; repeated API calls are not a substitute.
+
+Research directions informing the next phase:
+
+- [PRM-guided adaptive trajectory search (ICML 2026)](https://proceedings.mlr.press/v306/bilal26a.html)
+- [Budget-guided MCTS for test-time scaling (2026)](https://proceedings.mlr.press/v306/miyamoto26a.html)
+- [MCTS over partial reasoning states (2026)](https://arxiv.org/abs/2608.30395)
+- [Uncertainty-aware PRM tree search (ICLR 2026)](https://openreview.net/forum?id=)
+- [T-LoopFormer variable-depth recurrence (2026)](https://arxiv.org/abs/2609.15160)
+- [LoopCache for recurrent KV state (2026)](https://arxiv.org/abs/2611.24301)
+
+Do not describe Blazar as state-of-the-art until broad, reproducible held-out benchmarks demonstrate a statistically defensible improvement over appropriate baselines at comparable compute.
