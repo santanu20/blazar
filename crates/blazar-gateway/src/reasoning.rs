@@ -15,20 +15,32 @@ struct ArithmeticOracle {
     expected: f64,
 }
 
-/// Request-local verification profile. It contains only a narrowly
-/// recognized arithmetic oracle; general prompts are never executed.
+#[derive(Clone, Debug)]
+struct TableOracle {
+    label: String,
+    value: f64,
+}
+
+/// Request-local deterministic verification profile. Only the latest user
+/// turn is inspected; general prompt text is never executed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TaskProfile {
     arithmetic: Option<ArithmeticOracle>,
+    table: Option<TableOracle>,
 }
 
 impl TaskProfile {
     pub(crate) fn from_request(request: &Value) -> Self {
-        let arithmetic = user_texts(request)
-            .into_iter()
+        let latest_user_texts = latest_user_texts(request);
+        let arithmetic = latest_user_texts
+            .iter()
             .rev()
-            .find_map(arithmetic_oracle_from_text);
-        Self { arithmetic }
+            .find_map(|text| arithmetic_oracle_from_text(text));
+        let table = latest_user_texts
+            .iter()
+            .rev()
+            .find_map(|text| table_oracle_from_text(text));
+        Self { arithmetic, table }
     }
 
     pub(crate) fn math_expected(&self) -> Option<f64> {
@@ -43,8 +55,10 @@ impl TaskProfile {
 
     pub(crate) fn math_valid(&self, content: &str) -> Option<bool> {
         let expected = self.math_expected()?;
-        let actual = numeric_answer(content)?;
-        Some(numbers_equal(actual, expected))
+        Some(
+            numeric_answer(content)
+                .is_some_and(|actual| numbers_equal(actual, expected))
+        )
     }
 
     pub(crate) fn math_feedback(&self) -> Option<String> {
@@ -54,6 +68,53 @@ impl TaskProfile {
             oracle.expression,
             format_number(oracle.expected)
         ))
+    }
+
+    pub(crate) fn table_valid(&self, content: &str) -> Option<bool> {
+        let oracle = self.table.as_ref()?;
+        let answer = answer_text(content).unwrap_or_default();
+        let label_tokens: Vec<String> = oracle
+            .label
+            .to_ascii_lowercase()
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect();
+        let answer_tokens: Vec<String> = answer
+            .to_ascii_lowercase()
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect();
+        let label_matches = !label_tokens.is_empty()
+            && answer_tokens
+                .windows(label_tokens.len())
+                .any(|window| window == label_tokens.as_slice());
+        let value_matches = numeric_answer(&answer)
+            .is_some_and(|value| numbers_equal(value, oracle.value));
+        Some(label_matches && value_matches)
+    }
+
+    pub(crate) fn table_feedback(&self) -> Option<String> {
+        let oracle = self.table.as_ref()?;
+        Some(format!(
+            "A deterministic table check found that {} has the maximum value {}. Return that label and value.",
+            oracle.label,
+            format_number(oracle.value)
+        ))
+    }
+
+    pub(crate) fn task_valid(&self, content: &str) -> Option<bool> {
+        self.math_valid(content)
+            .or_else(|| self.table_valid(content))
+    }
+
+    pub(crate) fn task_feedback(&self) -> Option<String> {
+        self.math_feedback().or_else(|| self.table_feedback())
+    }
+
+    pub(crate) fn has_deterministic_verifier(&self) -> bool {
+        self.arithmetic.is_some() || self.table.is_some()
     }
 }
 
@@ -251,15 +312,18 @@ fn stable_hash(text: &str) -> u64 {
     hash
 }
 
-fn user_texts(request: &Value) -> Vec<&str> {
+fn latest_user_texts(request: &Value) -> Vec<&str> {
     let Some(messages) = request.get("messages").and_then(Value::as_array) else {
         return Vec::new();
     };
-    messages
+    let Some(message) = messages
         .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .flat_map(|message| text_parts(message.get("content")))
-        .collect()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return Vec::new();
+    };
+    text_parts(message.get("content"))
 }
 
 fn text_parts(value: Option<&Value>) -> Vec<&str> {
@@ -316,6 +380,55 @@ fn arithmetic_oracle_from_text(text: &str) -> Option<ArithmeticOracle> {
         });
     }
     None
+}
+
+fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
+    let lower = text.to_ascii_lowercase();
+    if !["highest", "largest", "maximum", "greatest"]
+        .iter()
+        .any(|cue| lower.contains(cue))
+    {
+        return None;
+    }
+
+    let mut entries = Vec::<(String, f64)>::new();
+    for segment in text.split([',', ';', '\\n']) {
+        let segment = segment.trim();
+        let Some((label, raw_value)) = segment
+            .split_once('=')
+            .or_else(|| segment.split_once(':'))
+        else {
+            continue;
+        };
+        let label = label.trim();
+        let raw_value = raw_value.trim().trim_end_matches('.');
+        if label.is_empty()
+            || label.len() > 64
+            || !label.chars().all(|ch| ch.is_ascii_alphabetic() || ch.is_ascii_whitespace() || ch == '_' || ch == '-')
+        {
+            continue;
+        }
+        let Ok(value) = raw_value.parse::<f64>() else {
+            continue;
+        };
+        if !value.is_finite() {
+            continue;
+        }
+        entries.push((label.to_string(), value));
+        if entries.len() > 32 {
+            return None;
+        }
+    }
+    if entries.len() < 2 {
+        return None;
+    }
+    entries.sort_by(|left, right| left.1.total_cmp(&right.1));
+    let (label, value) = entries.pop()?;
+    if entries.last().is_some_and(|(_, second)| numbers_equal(*second, value)) {
+        // A tied maximum is not a unique oracle.
+        return None;
+    }
+    Some(TableOracle { label, value })
 }
 
 fn numeric_answer(content: &str) -> Option<f64> {
@@ -506,6 +619,32 @@ mod tests {
             ]
         });
         assert_eq!(TaskProfile::from_request(&request).math_expected(), None);
+    }
+
+    #[test]
+    fn unit__table_oracle__extracts_unique_maximum_and_checks_label_value_pair() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Oak=12, Pine=19, Birch=16. Return the highest label and value."
+            }]
+        });
+        let profile = TaskProfile::from_request(&request);
+        assert_eq!(profile.table_valid("Pine=19"), Some(true));
+        assert_eq!(profile.table_valid("Birch=19"), Some(false));
+        assert_eq!(profile.table_valid("Pine=18"), Some(false));
+        assert!(profile.table_feedback().is_some());
+    }
+
+    #[test]
+    fn unit__table_oracle__rejects_tied_maximum() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Oak=12, Pine=19, Birch=19. Return the highest label and value."
+            }]
+        });
+        assert_eq!(TaskProfile::from_request(&request).table, None);
     }
 
     #[test]
