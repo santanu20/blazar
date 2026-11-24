@@ -1058,12 +1058,31 @@ pub async fn openai_proxy(
         return *resp;
     }
 
+    // Adaptive tool execution is explicit and scoped to the buffered MCP chat lane.
+    // Validate before early-return lanes so the header is never silently ignored.
+    let adaptive_mode = match crate::adaptive::mode_from_headers(&headers) {
+        Ok(mode) => mode,
+        Err(msg) => return openai_error(400, &msg),
+    };
+    if adaptive_mode.is_some() && !uri.path().ends_with("/chat/completions") {
+        return openai_error(
+            400,
+            "X-Blazar-Adaptive is supported only on /v1/chat/completions with MCP mediation",
+        );
+    }
+
     // PD disaggregation pair: chat traffic for models that asked for
     // sglang.disagg_pair routes through the two role children (prefill
     // warmup + decode forward) instead of the single-lane path. All
     // body rewrites and per-key admission above already ran; the pair
     // lane bypasses queue/single-flight in v1 (documented boundary).
     if uri.path().ends_with("/chat/completions") && crate::pd::pd_pair_requested(&state, &model) {
+        if adaptive_mode.is_some() {
+            return openai_error(
+                400,
+                "X-Blazar-Adaptive is not available on the PD disaggregation lane; clear the header or disable disagg_pair",
+            );
+        }
         // Boxed: handlers are inlined into their callers' futures (the
         // realtime voice lane reuses this proxy fn), and the two-phase
         // dispatch carries enough state to push those past the size lint.
@@ -1208,8 +1227,15 @@ pub async fn openai_proxy(
                 );
             }
             v["stream"] = serde_json::Value::Bool(false);
-            return match crate::mcp::chat_via_mcp(&state, &engine, v, &sel, key_ext.as_deref())
-                .await
+            return match crate::mcp::chat_via_mcp(
+                &state,
+                &engine,
+                v,
+                &sel,
+                key_ext.as_deref(),
+                adaptive_mode,
+            )
+            .await
             {
                 Ok(child) => {
                     let status = axum::http::StatusCode::from_u16(child.status().as_u16())
@@ -1245,6 +1271,13 @@ pub async fn openai_proxy(
                 Err(resp) => resp,
             };
         }
+    }
+
+    if adaptive_mode.is_some() {
+        return openai_error(
+            400,
+            "X-Blazar-Adaptive requires an active MCP selector (mcp body field, X-Blazar-Mcp, or mcp_default); adaptive execution never gains tool access implicitly",
+        );
     }
 
     // Single-flight BEFORE slot admission (chat lane): the bounded
