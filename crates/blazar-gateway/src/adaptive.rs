@@ -819,7 +819,7 @@ async fn run_local_chat_inner(
             current = revised;
             current_body = revised_body;
             best_quality = revised_quality;
-            let mut schema_verified = best_quality.schema_valid;
+            schema_verified = best_quality.schema_valid;
             accepted += 1;
 
             if message_has_tool_calls(&current_body) {
