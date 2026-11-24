@@ -944,9 +944,9 @@ async fn run_local_chat_inner(
                 // When candidate voting is still inconclusive, a rejected
                 // sample contributes evidence and the incumbent is retained.
                 if model_calls < plan.max_model_calls(strategy)
-                    && !best_quality.has_majority()
-                    && best_quality.math_valid != Some(true)
-                    && best_quality.schema_valid != Some(false)
+                    && best_quality.needs_revision()
+                    && (best_quality.schema_valid != Some(false)
+                        || schema_repair_attempts < plan.max_schema_retries)
                 {
                     continue;
                 }
@@ -1338,9 +1338,9 @@ async fn run_remote_chat_inner(
                 rejected += 1;
                 stop_reason = "no_objective_improvement".into();
                 if model_calls < plan.max_model_calls(strategy)
-                    && !best_quality.has_majority()
-                    && best_quality.math_valid != Some(true)
-                    && best_quality.schema_valid != Some(false)
+                    && best_quality.needs_revision()
+                    && (best_quality.schema_valid != Some(false)
+                        || schema_repair_attempts < plan.max_schema_retries)
                 {
                     continue;
                 }
