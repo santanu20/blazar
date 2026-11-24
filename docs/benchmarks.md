@@ -162,3 +162,27 @@ HotpotQA, FEVER or software-engineering task sets. Report the full per-case
 results and confidence intervals before describing the adaptive policy as
 quality-improving.
 
+The current adaptive controller uses a **deterministic response-contract
+evaluator**, not a general semantic judge. It can score transport success,
+parseable response envelopes, requested JSON Schema validity, non-empty
+content and normal completion (`finish_reason`). It only accepts a revision
+when that observable score strictly improves; ties and regressions retain the
+incumbent. Auto gets one schema-repair opportunity; Deep gets a larger bounded
+repair ceiling and stops when the contract gates pass or no measurable
+improvement is available. Receipts expose `accepted`, `rejected`, and a
+low-cardinality `stop` reason.
+
+This is a test-time inference/refinement loop. It does **not** alter the
+weights or internal recurrence of a model's Transformer blocks, and it does
+not claim to prove factual or semantic correctness for unconstrained prose.
+That requires task-specific independent verifiers (for example, unit tests,
+evidence checks or calibrated judges) and held-out experiments. Do not call
+the loop state-of-the-art without those measurements.
+
+The harness now runs randomized, interleaved mode orders within each
+case/run (recorded with `randomization_seed` and `execution_order`). The
+arithmetic checker requires an exact numeric answer, the table checker
+requires the correct label/value association, and JSON remains parsed and
+compared structurally. The default is ten repetitions per case; increase it
+for stable tail-latency and quality estimates.
+
