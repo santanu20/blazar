@@ -146,7 +146,7 @@ pub struct SearchNode {
     pub status: NodeStatus,
     pub verification: Verification,
     pub children: Vec<usize>,
-    pub tokens_charged: usize,
+    pub estimated_state_tokens: usize,
     value_sum: f64,
 }
 
@@ -165,7 +165,7 @@ impl SearchNode {
 pub struct SearchStats {
     pub nodes: usize,
     pub expansions: usize,
-    pub tokens: usize,
+    pub estimated_state_tokens: usize,
     pub max_depth_reached: usize,
     pub verified_terminals: usize,
     pub rejected_nodes: usize,
@@ -218,7 +218,7 @@ impl SearchTree {
                 status: NodeStatus::Open,
                 verification: Verification::Unknown,
                 children: Vec::new(),
-                tokens_charged: 0,
+                estimated_state_tokens: 0,
                 value_sum: 0.5,
             }],
             transpositions,
@@ -344,7 +344,7 @@ impl SearchTree {
                 self.stop_reason = Some(StopReason::NodeBudget);
                 break;
             }
-            if proposal.tokens > self.remaining_tokens() {
+            if proposal.estimated_state_tokens > self.remaining_tokens() {
                 self.stop_reason = Some(StopReason::TokenBudget);
                 break;
             }
@@ -377,7 +377,7 @@ impl SearchTree {
                 status,
                 verification: proposal.verification,
                 children: Vec::new(),
-                tokens_charged: proposal.tokens,
+                estimated_state_tokens: proposal.estimated_state_tokens,
                 value_sum: value.mean,
             });
             self.transpositions.insert(hash, id);
@@ -465,7 +465,7 @@ impl SearchTree {
         SearchStats {
             nodes: self.nodes.len(),
             expansions: self.expansions,
-            tokens: self.tokens,
+            estimated_state_tokens: self.tokens,
             max_depth_reached: self.max_depth_reached,
             verified_terminals,
             rejected_nodes,
@@ -589,7 +589,7 @@ mod tests {
             prior,
             value: ValueEstimate::new(value, uncertainty, true),
             verification: Verification::Unknown,
-            estimated_state_tokens: 4,
+            estimated_state_estimated_state_tokens: 4,
         }
     }
 
@@ -649,7 +649,7 @@ mod tests {
                     prior: 1.0,
                     value: ValueEstimate::new(0.99, 0.05, true),
                     verification: Verification::Unknown,
-                    tokens: 4,
+                    estimated_state_tokens: 4,
                 },
                 SearchProposal {
                     state: "verified branch".into(),
@@ -657,7 +657,7 @@ mod tests {
                     prior: 0.5,
                     value: ValueEstimate::new(0.5, 0.2, true),
                     verification: Verification::Passed,
-                    tokens: 4,
+                    estimated_state_tokens: 4,
                 },
             ],
         )
