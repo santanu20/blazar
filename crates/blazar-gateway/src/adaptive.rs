@@ -20,6 +20,7 @@ pub(crate) const HEADER: &str = "x-blazar-adaptive";
 const MAX_TOOL_ROUNDS: usize = 6;
 const MAX_TOOL_CALLS: usize = 20;
 const MAX_SCHEMA_RETRIES: usize = 1;
+const MAX_DEEP_SCHEMA_RETRIES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
@@ -87,7 +88,7 @@ impl Plan {
             max_tool_rounds,
             max_tool_calls,
             max_schema_retries: if verify_schema {
-                if mode == Mode::Deep { 3 } else { MAX_SCHEMA_RETRIES }
+                if mode == Mode::Deep { MAX_DEEP_SCHEMA_RETRIES } else { MAX_SCHEMA_RETRIES }
             } else {
                 0
             },
@@ -429,7 +430,6 @@ struct CandidateSummary {
     candidates: usize,
     fanout: bool,
     votes: HashMap<u64, usize>,
-    judge: Option<String>,
 }
 
 impl CandidateSummary {
@@ -461,7 +461,6 @@ impl CandidateSummary {
             if let Some(key) = key {
                 summary.votes.insert(key, count);
             }
-            summary.judge = field("judge=").map(str::to_string);
         } else if let Some(key) =
             crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
         {
@@ -497,7 +496,7 @@ impl CandidateSummary {
 /// recognized arithmetic) from answer agreement, which is only a consistency
 /// signal and never proof of factual correctness.
 #[allow(clippy::struct_excessive_bools)] // Independent response-contract gates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CandidateQuality {
     http_success: bool,
     parseable: bool,
@@ -1644,7 +1643,7 @@ mod tests {
         let plan = Plan::for_request(Mode::Deep, &request);
         assert_eq!(plan.max_tool_rounds, MAX_TOOL_ROUNDS);
         assert_eq!(plan.max_tool_calls, MAX_TOOL_CALLS);
-        assert!(plan.max_schema_retries <= MAX_SCHEMA_RETRIES);
+        assert!(plan.max_schema_retries <= MAX_DEEP_SCHEMA_RETRIES);
     }
 
     #[test]
@@ -1655,6 +1654,7 @@ mod tests {
             schema_valid: Some(false),
             complete: true,
             non_empty: true,
+            ..CandidateQuality::default()
         };
         let valid_but_truncated = CandidateQuality {
             http_success: true,
@@ -1662,6 +1662,7 @@ mod tests {
             schema_valid: Some(true),
             complete: false,
             non_empty: true,
+            ..CandidateQuality::default()
         };
         assert!(valid_but_truncated.is_better_than(invalid_but_complete));
     }
@@ -1674,6 +1675,7 @@ mod tests {
             schema_valid: None,
             complete: false,
             non_empty: true,
+            ..CandidateQuality::default()
         };
         let complete = CandidateQuality {
             complete: true,
@@ -1691,6 +1693,7 @@ mod tests {
             schema_valid: None,
             complete: true,
             non_empty: true,
+            ..CandidateQuality::default()
         };
         assert!(!incumbent.is_better_than(incumbent));
     }
@@ -1703,6 +1706,7 @@ mod tests {
             schema_valid: None,
             complete: true,
             non_empty: false,
+            ..CandidateQuality::default()
         };
         let failed = CandidateQuality {
             http_success: false,
@@ -1710,6 +1714,63 @@ mod tests {
         };
         assert!(empty.needs_revision());
         assert!(!failed.needs_revision());
+    }
+
+    #[test]
+    fn unit__candidate_quality__exact_math_overrides_wrong_answer_consensus() {
+        let wrong_consensus = CandidateQuality {
+            http_success: true,
+            parseable: true,
+            schema_valid: None,
+            math_valid: Some(false),
+            complete: true,
+            non_empty: true,
+            agreement: 3,
+            candidates: 3,
+        };
+        let verified_answer = CandidateQuality {
+            math_valid: Some(true),
+            agreement: 1,
+            ..wrong_consensus
+        };
+        assert!(verified_answer.is_better_than(wrong_consensus));
+        assert!(verified_answer.is_satisfied());
+    }
+
+    #[test]
+    fn unit__candidate_summary__revisions_accumulate_votes() {
+        let first = json!({"choices":[{"message":{"content":"Paris"},"finish_reason":"stop"}]});
+        let mut summary = CandidateSummary {
+            candidates: 3,
+            fanout: true,
+            votes: HashMap::from([(crate::reasoning::answer_hash("Paris").unwrap(), 1)]),
+        };
+        summary.add_revision(&first);
+        assert_eq!(summary.candidates, 4);
+        assert_eq!(summary.agreement_for(&first), 2);
+        summary.add_revision(&first);
+        assert_eq!(summary.candidates, 5);
+        assert_eq!(summary.agreement_for(&first), 3);
+        assert!(summary.agreement_for(&first).saturating_mul(2) > summary.candidates);
+    }
+
+    #[test]
+    fn unit__deep_mode__parallelizes_general_chat_but_respects_seed() {
+        let ordinary = json!({
+            "messages": [{"role": "user", "content": "Explain the difference between a mutex and a semaphore."}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Deep, &ordinary).strategy(&ordinary),
+            Strategy::ParallelVerifiedCandidates
+        );
+        let seeded = json!({
+            "seed": 7,
+            "messages": [{"role": "user", "content": "Explain the difference between a mutex and a semaphore."}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Deep, &seeded).strategy(&seeded),
+            Strategy::SequentialRevision
+        );
     }
 
     #[test]
@@ -1737,11 +1798,11 @@ mod tests {
             }
         });
         let plan = Plan::for_request(Mode::Deep, &request);
-        assert_eq!(plan.max_schema_retries, 2);
+        assert_eq!(plan.max_schema_retries, MAX_DEEP_SCHEMA_RETRIES);
         assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 3);
         assert_eq!(
             plan.max_model_calls(Strategy::ParallelVerifiedCandidates),
-            4
+            6
         );
     }
 
