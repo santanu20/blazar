@@ -709,7 +709,7 @@ async fn run_local_chat_inner(
     let mut rejected = 0usize;
     let mut schema_repair_attempts = 0usize;
     let mut usage_total = None;
-    let mut stop_reason = "quality_gate_pass".to_string();
+    let mut stop_reason: String;
 
     // All local calls stay on the normal proxy/accounting path.
     let asked_candidates =
@@ -793,13 +793,12 @@ async fn run_local_chat_inner(
             let revised = match local_proxy_round(state, engine, &request, headers, key, None).await
             {
                 Ok(response) => response,
-                Err(error) => {
+                Err(_error) => {
                     stop_reason = "revision_error".into();
                     if degraded.is_none() {
                         degraded = Some("revision_error".into());
                     }
                     tracing::warn!(model = %model, "adaptive revision failed; retaining the best prior candidate");
-                    let _ = error;
                     break;
                 }
             };
