@@ -152,6 +152,7 @@ pub(crate) fn degrade(tried: &[String], failed_idx: usize, reason: &str, msg: &s
     resp
 }
 
+#[allow(clippy::too_many_lines)] // One bounded cascade attempt ladder, kept together for review.
 pub(crate) async fn run(
     state: &Arc<AppState>,
     trace_ext: Option<Extension<TraceId>>,

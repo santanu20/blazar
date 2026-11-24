@@ -195,7 +195,7 @@ impl Plan {
         }
     }
 
-    pub(crate) fn max_model_calls(&self, strategy: Strategy) -> usize {
+    pub(crate) const fn max_model_calls(strategy: Strategy) -> usize {
         match strategy {
             Strategy::Direct => 1,
             Strategy::SequentialRevision => 2,
@@ -203,7 +203,7 @@ impl Plan {
         }
     }
 
-    pub(crate) fn max_candidates(&self, strategy: Strategy) -> u64 {
+    pub(crate) const fn max_candidates(strategy: Strategy) -> u64 {
         match strategy {
             Strategy::ParallelVerifiedCandidates => 2,
             Strategy::Direct | Strategy::SequentialRevision => 1,
@@ -424,6 +424,7 @@ fn schema_violation(
 /// evaluator prompts and tool transcripts are never committed to the
 /// caller's conversation store. Caller-owned tool calls remain handoffs;
 /// only an authorized MCP selector can enable gateway-side tool execution.
+#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 pub(crate) async fn run_local_chat(
     state: &std::sync::Arc<crate::state::AppState>,
     engine: &blazar_runtime::EngineRef,
@@ -444,6 +445,7 @@ pub(crate) async fn run_local_chat(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 async fn run_local_chat_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     engine: &blazar_runtime::EngineRef,
@@ -479,7 +481,7 @@ async fn run_local_chat_inner(
     // Parallel sampling is restricted to requests with a deterministic schema
     // verifier. Best-of-N owns queue, slot-headroom and body-size degradation.
     if strategy == Strategy::ParallelVerifiedCandidates {
-        match crate::bestof::fan_out(state, engine, &url, &body, plan.max_candidates(strategy))
+        match crate::bestof::fan_out(state, engine, &url, &body, Plan::max_candidates(strategy))
             .await
         {
             crate::bestof::FanOut::Ran(outcome) => {
@@ -542,21 +544,18 @@ async fn run_local_chat_inner(
             ),
         ));
     }
-    let parsed = match serde_json::from_slice::<Value>(&current.body) {
-        Ok(value) => value,
-        Err(_) => {
-            return Ok(rebuild_response(
-                current,
-                &plan.execution_receipt(
-                    strategy,
-                    model_calls,
-                    candidates,
-                    verified,
-                    revisions,
-                    degraded.as_deref(),
-                ),
-            ));
-        }
+    let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) else {
+        return Ok(rebuild_response(
+            current,
+            &plan.execution_receipt(
+                strategy,
+                model_calls,
+                candidates,
+                verified,
+                revisions,
+                degraded.as_deref(),
+            ),
+        ));
     };
     if message_has_tool_calls(&parsed) {
         return Ok(rebuild_response(
@@ -574,7 +573,7 @@ async fn run_local_chat_inner(
 
     let schema_feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
     let should_revise = (schema_feedback.is_some() || strategy == Strategy::SequentialRevision)
-        && model_calls < plan.max_model_calls(strategy);
+        && model_calls < Plan::max_model_calls(strategy);
     if should_revise {
         let assistant = parsed
             .pointer("/choices/0/message")
@@ -627,10 +626,10 @@ async fn run_local_chat_inner(
             &current.body,
         );
     }
-    if let Some(kind) = so_kind {
-        if let Ok(value) = axum::http::HeaderValue::from_str(kind) {
-            current.headers.insert("x-blazar-structured-output", value);
-        }
+    if let Some(kind) = so_kind
+        && let Ok(value) = axum::http::HeaderValue::from_str(kind)
+    {
+        current.headers.insert("x-blazar-structured-output", value);
     }
     Ok(rebuild_response(
         current,
@@ -645,6 +644,7 @@ async fn run_local_chat_inner(
     ))
 }
 
+#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 async fn remote_round(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -734,7 +734,7 @@ pub(crate) async fn run_remote_chat(
             "gateway MCP execution is available on local engine lanes; adaptive inference itself supports OpenAI-compatible remotes",
         );
     }
-    let mut request = selector_body;
+    let request = selector_body;
     let budget = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
     match tokio::time::timeout(
         budget,
@@ -742,8 +742,7 @@ pub(crate) async fn run_remote_chat(
     )
     .await
     {
-        Ok(Ok(response)) => response,
-        Ok(Err(response)) => response,
+        Ok(Ok(response)) | Ok(Err(response)) => response,
         Err(_) => crate::mcp::teaching_error(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
             &format!(
@@ -753,6 +752,7 @@ pub(crate) async fn run_remote_chat(
     }
 }
 
+#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 async fn run_remote_chat_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -794,14 +794,11 @@ async fn run_remote_chat_inner(
             &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
         ));
     }
-    let parsed = match serde_json::from_slice::<Value>(&current.body) {
-        Ok(value) => value,
-        Err(_) => {
-            return Ok(rebuild_axum_response(
-                current,
-                &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
-            ));
-        }
+    let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) else {
+        return Ok(rebuild_axum_response(
+            current,
+            &plan.execution_receipt(strategy, model_calls, 1, verified, revisions, None),
+        ));
     };
     merge_usage(&mut usage_total, &parsed);
     if message_has_tool_calls(&parsed) {
@@ -854,6 +851,7 @@ async fn run_remote_chat_inner(
 
 /// Shared protocol-adapter entry point. MCP is an optional tool provider;
 /// ordinary inference uses the same controller without requiring MCP.
+#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 pub(crate) async fn execute_chat(
     state: &std::sync::Arc<crate::state::AppState>,
     engine: &blazar_runtime::EngineRef,
