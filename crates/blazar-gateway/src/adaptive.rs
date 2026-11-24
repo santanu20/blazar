@@ -1222,7 +1222,8 @@ async fn run_local_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        budget.max_model_calls,
         budget.max_expansions,
         budget.max_nodes,
         budget.max_depth,
@@ -1851,7 +1852,8 @@ async fn run_remote_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        budget.max_model_calls,
         budget.max_expansions,
         budget.max_nodes,
         budget.max_depth,
