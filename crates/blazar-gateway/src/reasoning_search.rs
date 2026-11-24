@@ -274,40 +274,58 @@ impl SearchTree {
         }
         let mut current = 0usize;
         loop {
-            let node = self.nodes.get(current)?;
-            if node.status == NodeStatus::Rejected || node.status == NodeStatus::Terminal {
-                return None;
-            }
-            if node.status == NodeStatus::Open {
-                if node.depth >= self.config.max_depth {
-                    self.nodes[current].status = NodeStatus::Terminal;
-                    self.stop_reason = Some(StopReason::DepthLimit);
-                    return None;
+            let status = self.nodes.get(current)?.status;
+            match status {
+                NodeStatus::Rejected | NodeStatus::Terminal => {
+                    if current == 0 {
+                        return None;
+                    }
+                    current = self.nodes[current].parent?;
                 }
-                self.nodes[current].visits = self.nodes[current].visits.saturating_add(1);
-                return Some(current);
+                NodeStatus::Open => {
+                    if self.nodes[current].depth >= self.config.max_depth {
+                        self.nodes[current].status = NodeStatus::Terminal;
+                        self.stop_reason = Some(StopReason::DepthLimit);
+                        if current == 0 {
+                            return None;
+                        }
+                        current = self.nodes[current].parent?;
+                        continue;
+                    }
+                    self.nodes[current].visits = self.nodes[current].visits.saturating_add(1);
+                    return Some(current);
+                }
+                NodeStatus::Expanded => {
+                    let parent_visits = f64::from(self.nodes[current].visits.max(1)).sqrt();
+                    let eligible: Vec<usize> = self.nodes[current]
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            self.nodes.get(*id).is_some_and(|child| {
+                                matches!(child.status, NodeStatus::Open | NodeStatus::Expanded)
+                            })
+                        })
+                        .collect();
+                    if eligible.is_empty() {
+                        // This subtree is exhausted. Close it and backtrack so
+                        // PUCT can still select a viable sibling at an ancestor.
+                        self.nodes[current].status = NodeStatus::Terminal;
+                        if current == 0 {
+                            return None;
+                        }
+                        current = self.nodes[current].parent?;
+                        continue;
+                    }
+                    let exploration = self.current_exploration();
+                    let selected = eligible.into_iter().max_by(|left, right| {
+                        let left_score = self.puct_score(*left, parent_visits, exploration);
+                        let right_score = self.puct_score(*right, parent_visits, exploration);
+                        left_score.total_cmp(&right_score)
+                    })?;
+                    current = selected;
+                }
             }
-            let parent_visits = f64::from(node.visits.max(1)).sqrt();
-            let eligible: Vec<usize> = node
-                .children
-                .iter()
-                .copied()
-                .filter(|id| {
-                    self.nodes.get(*id).is_some_and(|child| {
-                        matches!(child.status, NodeStatus::Open | NodeStatus::Expanded)
-                    })
-                })
-                .collect();
-            if eligible.is_empty() {
-                return None;
-            }
-            let exploration = self.current_exploration();
-            let selected = eligible.into_iter().max_by(|left, right| {
-                let left_score = self.puct_score(*left, parent_visits, exploration);
-                let right_score = self.puct_score(*right, parent_visits, exploration);
-                left_score.total_cmp(&right_score)
-            })?;
-            current = selected;
         }
     }
 
