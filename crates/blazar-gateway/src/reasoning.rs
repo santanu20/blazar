@@ -232,6 +232,9 @@ pub(crate) fn pick_candidate(
 /// text as an answer. If no explicit marker is present, the last non-empty
 /// line is the bounded fallback.
 pub(crate) fn answer_text(content: &str) -> Option<String> {
+    if content.len() > 16_384 {
+        return None;
+    }
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
@@ -349,6 +352,9 @@ fn text_parts(value: Option<&Value>) -> Vec<&str> {
 }
 
 fn arithmetic_oracle_from_text(text: &str) -> Option<ArithmeticOracle> {
+    if text.len() > 16_384 {
+        return None;
+    }
     let lower = text.to_ascii_lowercase();
     let cues = ["calculate ", "compute ", "evaluate ", "what is "];
     for cue in cues {
@@ -393,6 +399,9 @@ fn arithmetic_oracle_from_text(text: &str) -> Option<ArithmeticOracle> {
 }
 
 fn table_oracle_from_text(text: &str) -> Option<TableOracle> {
+    if text.len() > 16_384 {
+        return None;
+    }
     let lower = text.to_ascii_lowercase();
     if !["highest", "largest", "maximum", "greatest"]
         .iter()
@@ -481,6 +490,31 @@ fn format_number(value: f64) -> String {
 }
 
 fn parse_expression(input: &str) -> Option<f64> {
+    // The deterministic oracle is intentionally small. Bound bytes, nesting
+    // and operator count before entering recursive descent so user-controlled
+    // prompts cannot cause pathological parser recursion.
+    if input.len() > 512 {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    let mut operators = 0usize;
+    for byte in input.bytes() {
+        match byte {
+            b'(' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            b')' => {
+                depth = depth.checked_sub(1)?;
+            }
+            b'+' | b'-' | b'*' | b'/' | b'^' => operators += 1,
+            _ => {}
+        }
+    }
+    if depth != 0 || max_depth > 32 || operators > 64 {
+        return None;
+    }
     let mut parser = ArithmeticParser {
         bytes: input.as_bytes(),
         position: 0,
@@ -705,6 +739,14 @@ mod tests {
         assert_eq!(parse_expression("2^3 + 1"), Some(9.0));
         assert_eq!(parse_expression("8 / 0"), None);
         assert_eq!(parse_expression("2 + unknown"), None);
+    }
+
+    #[test]
+    fn unit__arithmetic_parser__rejects_unbounded_depth_and_length() {
+        let nested = format!("{}1{}", "(".repeat(33), ")".repeat(33));
+        assert_eq!(parse_expression(&nested), None);
+        assert_eq!(parse_expression(&format!("{}1", "1+".repeat(257))), None);
+        assert_eq!(parse_expression(&"1".repeat(513)), None);
     }
 
     #[test]
