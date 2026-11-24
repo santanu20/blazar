@@ -350,7 +350,8 @@ fn message_has_tool_calls(body: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|calls| !calls.is_empty())
         || body.pointer("/choices/0/message/function_call").is_some()
-        || body.pointer("/choices/0/finish_reason")
+        || body
+            .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| reason == "tool_calls" || reason == "function_call")
 }
