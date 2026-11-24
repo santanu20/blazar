@@ -623,8 +623,10 @@ fn reasoning_receipt(
     summary: &CandidateSummary,
     body: &Value,
 ) -> String {
-    let judge = if plan.task_profile.has_deterministic_verifier() {
+    let judge = if plan.task_profile.math_expected().is_some() {
         "math_exact"
+    } else if plan.task_profile.table_label().is_some() {
+        "table_lookup_exact"
     } else if plan.verify_schema {
         "json_schema+answer_consensus"
     } else if summary.fanout {
@@ -646,7 +648,7 @@ fn revision_feedback(
 ) -> Option<String> {
     if quality.task_valid == Some(false) {
         return task_feedback.map(str::to_string).or_else(|| {
-            Some("The deterministic arithmetic verifier rejected the answer. Recompute and return the corrected result.".into())
+            Some("The deterministic task verifier rejected the answer. Re-evaluate the original task and return the verified result.".into())
         });
     }
     if let Some(feedback) = schema_feedback {
@@ -1741,6 +1743,20 @@ mod tests {
         });
         let plan = Plan::for_request(Mode::Auto, &request);
         assert_eq!(plan.task_profile.math_expected(), Some(267.0));
+        assert_eq!(plan.strategy(&request), Strategy::SequentialRevision);
+        assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 2);
+    }
+
+    #[test]
+    fn unit__auto_table__gets_a_bounded_verifier_repair() {
+        let request = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Oak=12, Pine=19, Birch=26. Return the highest label and value."
+            }]
+        });
+        let plan = Plan::for_request(Mode::Auto, &request);
+        assert_eq!(plan.task_profile.table_label(), Some("Birch"));
         assert_eq!(plan.strategy(&request), Strategy::SequentialRevision);
         assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 2);
     }
