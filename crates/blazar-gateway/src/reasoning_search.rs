@@ -728,8 +728,7 @@ fn answer_priority(node: &SearchNode) -> f64 {
         Verification::Unknown => 0.0,
         Verification::Failed => -2.0,
     };
-    hard + node.mean_value() + finite_unit(node.prior, 0.0) * 0.15
-        - node.value.uncertainty * 0.1
+    hard + node.mean_value() + finite_unit(node.prior, 0.0) * 0.15 - node.value.uncertainty * 0.1
 }
 
 fn sanitize_estimate(estimate: ValueEstimate) -> ValueEstimate {
