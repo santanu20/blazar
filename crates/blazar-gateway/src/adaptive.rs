@@ -742,7 +742,7 @@ pub(crate) async fn run_remote_chat(
     )
     .await
     {
-        Ok(Ok(response)) | Ok(Err(response)) => response,
+        Ok(result) => result.unwrap_or_else(std::convert::identity),
         Err(_) => crate::mcp::teaching_error(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
             &format!(
