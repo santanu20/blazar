@@ -1067,6 +1067,77 @@ fn rebuild_axum_response(response: BufferedResponse, receipt: &str) -> axum::res
         .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
 }
 
+/// Run bounded remote candidates concurrently. Partial transport failures
+/// reduce the sample count; a complete failure returns the first upstream error.
+#[allow(clippy::too_many_lines, clippy::result_large_err)]
+async fn remote_candidate_rounds(
+    state: &std::sync::Arc<crate::state::AppState>,
+    model: &str,
+    method: &axum::http::Method,
+    path_query: &str,
+    headers: &axum::http::HeaderMap,
+    request: &Value,
+    want: u64,
+) -> Result<BufferedResponse, axum::response::Response> {
+    let sends = (0..want)
+        .map(|_| remote_round(state, model, method, path_query, headers, request));
+    let results = futures::future::join_all(sends).await;
+    let mut responses = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(response) => responses.push(response),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if responses.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            crate::mcp::teaching_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "all adaptive remote candidates failed",
+            )
+        }));
+    }
+
+    let mut parsed = Vec::with_capacity(responses.len());
+    let mut usage_total = None;
+    for response in &responses {
+        let value = serde_json::from_slice::<Value>(&response.body).unwrap_or(Value::Null);
+        merge_usage(&mut usage_total, &value);
+        parsed.push((response.status.as_u16(), value));
+    }
+    let schema = request
+        .pointer("/response_format/json_schema/schema")
+        .filter(|value| value.is_object());
+    let decision =
+        crate::reasoning::pick_candidate(&state.sentinel, &parsed, schema, request);
+    let mut winner = responses.swap_remove(decision.winner_index);
+    if let Ok(mut body) = serde_json::from_slice::<Value>(&winner.body) {
+        patch_usage(&mut body, usage_total);
+        winner.body = axum::body::Bytes::from(
+            serde_json::to_vec(&body).unwrap_or_else(|_| winner.body.to_vec()),
+        );
+        let mut receipt = format!(
+            "asked={want} used={} judge={} agreement={}/{}",
+            parsed.len(),
+            decision.verifier,
+            decision.agreement,
+            decision.candidates
+        );
+        if let Some(hash) = decision.answer_hash {
+            receipt.push_str(&format!(" vote_key={hash:016x}"));
+        }
+        if let Ok(value) = axum::http::HeaderValue::from_str(&receipt) {
+            winner.headers.insert("x-blazar-adaptive-candidates", value);
+        }
+    }
+    Ok(winner)
+}
+
 /// Adaptive execution for an explicitly configured OpenAI-compatible remote.
 /// Local engines and remotes therefore share the same request profiler,
 /// verification and revision policy; remote selection/health/affinity remain
@@ -1126,14 +1197,7 @@ async fn run_remote_chat_inner(
 ) -> Result<axum::response::Response, axum::response::Response> {
     let original_request = request.clone();
     let plan = Plan::for_request(mode, &request);
-    // Remote fan-out is not exposed by the current remote admission contract.
-    // Keep candidate evaluation and repair semantics identical, using serial calls.
-    let proposed = plan.strategy(&request);
-    let strategy = if proposed == Strategy::ParallelVerifiedCandidates {
-        Strategy::SequentialRevision
-    } else {
-        proposed
-    };
+    let strategy = plan.strategy(&request);
     let schema = request
         .pointer("/response_format/json_schema/schema")
         .filter(|schema| schema.is_object())
@@ -1151,9 +1215,19 @@ async fn run_remote_chat_inner(
     let mut usage_total = None;
     let stop_reason: String;
 
-    let first = remote_round(state, model, method, path_query, headers, &request).await?;
-    model_calls += 1;
-    let mut current = first;
+    let asked_candidates =
+        (strategy == Strategy::ParallelVerifiedCandidates).then(|| plan.max_candidates(strategy));
+    let mut current = if let Some(want) = asked_candidates {
+        remote_candidate_rounds(state, model, method, path_query, headers, &request, want).await?
+    } else {
+        remote_round(state, model, method, path_query, headers, &request).await?
+    };
+    model_calls = current.headers
+        .get("x-blazar-adaptive-candidates")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|receipt| receipt.split_whitespace().find_map(|part| part.strip_prefix("used=")))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
     if !current.status.is_success() {
         stop_reason = "upstream_error".into();
         return Ok(rebuild_axum_response(
@@ -1191,8 +1265,10 @@ async fn run_remote_chat_inner(
         ));
     };
     merge_usage(&mut usage_total, &current_body);
-    let mut best_quality =
-        assess_candidate(state, &plan, schema.as_ref(), current.status, &current_body);
+    let mut candidate_summary = CandidateSummary::from_response(&current.headers, &current_body);
+    let mut best_quality = assess_candidate(
+        state, &plan, schema.as_ref(), current.status, &current_body, &candidate_summary,
+    );
     let mut schema_verified = best_quality.schema_valid;
 
     if message_has_tool_calls(&current_body) {
@@ -1204,7 +1280,11 @@ async fn run_remote_chat_inner(
             } else {
                 None
             };
-            let feedback = revision_feedback(best_quality, schema_detail.as_deref());
+            let feedback = revision_feedback(
+                best_quality,
+                schema_detail.as_deref(),
+                plan.task_profile.math_feedback().as_deref(),
+            );
             let Some(feedback) = feedback else {
                 stop_reason = "quality_gate_pass".into();
                 break;
@@ -1250,11 +1330,20 @@ async fn run_remote_chat_inner(
                 break;
             };
             merge_usage(&mut usage_total, &revised_body);
-            let revised_quality =
-                assess_candidate(state, &plan, schema.as_ref(), revised.status, &revised_body);
+            candidate_summary.add_revision(&revised_body);
+            let revised_quality = assess_candidate(
+                state, &plan, schema.as_ref(), revised.status, &revised_body, &candidate_summary,
+            );
             if !revised_quality.is_better_than(best_quality) {
                 rejected += 1;
                 stop_reason = "no_objective_improvement".into();
+                if model_calls < plan.max_model_calls(strategy)
+                    && !best_quality.has_majority()
+                    && best_quality.math_valid != Some(true)
+                    && best_quality.schema_valid != Some(false)
+                {
+                    continue;
+                }
                 break;
             }
             current = revised;
