@@ -26,6 +26,7 @@ impl TaskProfile {
     pub(crate) fn from_request(request: &Value) -> Self {
         let arithmetic = user_texts(request)
             .into_iter()
+            .rev()
             .find_map(arithmetic_oracle_from_text);
         Self { arithmetic }
     }
@@ -62,6 +63,7 @@ pub(crate) struct CandidateDecision {
     pub(crate) agreement: usize,
     pub(crate) candidates: usize,
     pub(crate) answer_hash: Option<u64>,
+    pub(crate) vote_tallies: Vec<(u64, usize)>,
     pub(crate) verifier: &'static str,
 }
 
@@ -137,11 +139,18 @@ pub(crate) fn pick_candidate(
         "answer_consensus"
     };
 
+    let mut vote_tallies: Vec<(u64, usize)> = counts
+        .iter()
+        .map(|(answer, count)| (stable_hash(answer), *count))
+        .collect();
+    vote_tallies.sort_unstable_by_key(|(hash, _)| *hash);
+
     CandidateDecision {
         winner_index,
         agreement,
         candidates: candidates.len(),
         answer_hash: winning_key.map(|key| stable_hash(key)),
+        vote_tallies,
         verifier,
     }
 }
