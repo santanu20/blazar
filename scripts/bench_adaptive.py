@@ -68,14 +68,14 @@ def check(case: dict[str, Any], content: str) -> bool:
     if case["id"] == "arithmetic":
         # This task explicitly requests only the number. Substring matching
         # would incorrectly pass explanations containing a wrong result too.
-        return re.fullmatch(r"\\s*267\\s*[.!]?\\s*", content) is not None
+        return re.fullmatch(r"\s*267\s*[.!]?\s*", content) is not None
     if isinstance(expected, tuple):
         # Require the correct label/value pair, not merely both tokens
         # appearing somewhere in an unrelated answer.
         lowered = content.lower()
         return re.search(
-            r"\\bpine\\b(?:\\s+|\\s*[:=|,–—-]\\s*)19\\b|"
-            r"\\b19\\b(?:\\s+|\\s*[:=|,–—-]\\s*)\\bpine\\b",
+            r"\bpine\b(?:\s+|\s*[:=|,-]\s*)19\b|"
+            r"\b19\b(?:\s+|\s*[:=|,-]\s*)\bpine\b",
             lowered,
         ) is not None
     candidate = content.strip()
@@ -87,7 +87,7 @@ def check(case: dict[str, Any], content: str) -> bool:
         if lines and lines[0].strip().lower() == "json":
             lines = lines[1:]
     try:
-        return json.loads("\\n".join(lines).strip()) == expected
+        return json.loads("\n".join(lines).strip()) == expected
     except json.JSONDecodeError:
         return False
 
