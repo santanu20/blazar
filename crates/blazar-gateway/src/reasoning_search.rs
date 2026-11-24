@@ -173,9 +173,10 @@ impl ProcessRewardModel for HttpProcessRewardModel {
         {
             return ValueEstimate::uncalibrated();
         }
-        let calibrated = self.expected_calibration_id.as_deref().is_some_and(|expected| {
-            result.calibration_id.as_deref() == Some(expected)
-        });
+        let calibrated = self
+            .expected_calibration_id
+            .as_deref()
+            .is_some_and(|expected| result.calibration_id.as_deref() == Some(expected));
         ValueEstimate::new(result.score, result.uncertainty, calibrated)
     }
 
