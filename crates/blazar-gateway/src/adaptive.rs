@@ -1189,7 +1189,7 @@ async fn run_local_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
@@ -1813,7 +1813,7 @@ async fn run_remote_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
