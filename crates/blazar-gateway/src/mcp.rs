@@ -1542,10 +1542,12 @@ async fn chat_via_mcp_inner(
                 body_bytes,
                 rounds,
                 so_kind,
-                adaptive_plan.as_ref(),
-                tool_calls_total,
-                schema_verified,
-                verification_retries,
+                RebuildMeta {
+                    adaptive_plan: adaptive_plan.as_ref(),
+                    tool_calls: tool_calls_total,
+                    schema_verified,
+                    schema_retries: verification_retries,
+                },
             ));
         }
         rounds += 1;
@@ -1706,7 +1708,12 @@ fn rebuild(
     if let Some(plan) = meta.adaptive_plan {
         builder = builder.header(
             "x-blazar-adaptive-result",
-            plan.receipt(rounds, meta.tool_calls, meta.schema_verified, meta.schema_retries),
+            plan.receipt(
+                rounds,
+                meta.tool_calls,
+                meta.schema_verified,
+                meta.schema_retries,
+            ),
         );
     }
     // The mediated path never passes through the proxy response builder,

@@ -184,7 +184,7 @@ impl Plan {
             .is_some_and(|tools| !tools.is_empty());
         if has_caller_tools {
             Strategy::Direct
-        } else if self.mode == Mode::Deep && self.verify_schema && self.complexity >= 3 {
+        } else if self.mode == Mode::Deep && self.verify_schema {
             Strategy::ParallelVerifiedCandidates
         } else if self.mode == Mode::Deep || self.complexity >= 3 {
             Strategy::SequentialRevision
@@ -276,7 +276,11 @@ async fn read_child_response(response: reqwest::Response) -> Result<BufferedResp
             "adaptive response exceeded the {MAX_ADAPTIVE_RESPONSE_BYTES}-byte response cap"
         ));
     }
-    Ok(BufferedResponse { status, headers, body })
+    Ok(BufferedResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn rebuild_response(response: BufferedResponse, receipt: &str) -> reqwest::Response {
@@ -306,23 +310,21 @@ fn usage_from_body(body: &Value) -> Option<Value> {
 }
 
 fn merge_json_counters(total: &mut Value, next: &Value) {
-    match (total, next) {
-        (Value::Object(total), Value::Object(next)) => {
-            for (key, value) in next {
-                match total.get_mut(key) {
-                    Some(existing) => merge_json_counters(existing, value),
-                    None => {
-                        total.insert(key.clone(), value.clone());
-                    }
+    if let (Some(left), Some(right)) = (total.as_u64(), next.as_u64()) {
+        *total = Value::from(left.saturating_add(right));
+        return;
+    }
+    if let (Some(total_fields), Some(next_fields)) =
+        (total.as_object_mut(), next.as_object())
+    {
+        for (key, value) in next_fields {
+            match total_fields.get_mut(key) {
+                Some(existing) => merge_json_counters(existing, value),
+                None => {
+                    total_fields.insert(key.clone(), value.clone());
                 }
             }
         }
-        (Value::Number(left), Value::Number(right)) => {
-            if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
-                *total = Value::from(left.saturating_add(right));
-            }
-        }
-        _ => {}
     }
 }
 
@@ -348,10 +350,7 @@ fn message_has_tool_calls(body: &Value) -> bool {
         .is_some_and(|calls| !calls.is_empty())
 }
 
-pub(crate) fn stamp(
-    response: &mut axum::response::Response,
-    receipt: Option<&str>,
-) {
+pub(crate) fn stamp(response: &mut axum::response::Response, receipt: Option<&str>) {
     if let Some(value) = receipt.and_then(|v| axum::http::HeaderValue::from_str(v).ok()) {
         response
             .headers_mut()
@@ -474,14 +473,8 @@ async fn run_local_chat_inner(
     // Parallel sampling is restricted to requests with a deterministic schema
     // verifier. Best-of-N owns queue, slot-headroom and body-size degradation.
     if strategy == Strategy::ParallelVerifiedCandidates {
-        match crate::bestof::fan_out(
-            state,
-            engine,
-            &url,
-            &body,
-            plan.max_candidates(strategy),
-        )
-        .await
+        match crate::bestof::fan_out(state, engine, &url, &body, plan.max_candidates(strategy))
+            .await
         {
             crate::bestof::FanOut::Ran(outcome) => {
                 candidates = 2;
@@ -491,7 +484,8 @@ async fn run_local_chat_inner(
                 })?;
                 if let Ok(parsed) = serde_json::from_slice::<Value>(&buffered.body) {
                     merge_usage(&mut usage_total, &parsed);
-                    verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
+                    verified =
+                        Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
                 }
                 response = Some(buffered);
             }
@@ -532,7 +526,14 @@ async fn run_local_chat_inner(
     if !current.status.is_success() {
         return Ok(rebuild_response(
             current,
-            &plan.execution_receipt(strategy, model_calls, candidates, verified, revisions, degraded.as_deref()),
+            &plan.execution_receipt(
+                strategy,
+                model_calls,
+                candidates,
+                verified,
+                revisions,
+                degraded.as_deref(),
+            ),
         ));
     }
     let parsed = match serde_json::from_slice::<Value>(&current.body) {
@@ -540,7 +541,14 @@ async fn run_local_chat_inner(
         Err(_) => {
             return Ok(rebuild_response(
                 current,
-                &plan.execution_receipt(strategy, model_calls, candidates, verified, revisions, degraded.as_deref()),
+                &plan.execution_receipt(
+                strategy,
+                model_calls,
+                candidates,
+                verified,
+                revisions,
+                degraded.as_deref(),
+            ),
             ));
         }
     };
@@ -553,7 +561,8 @@ async fn run_local_chat_inner(
 
     let schema_feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
     let should_revise = schema_feedback.is_some()
-        || (strategy == Strategy::SequentialRevision && model_calls < plan.max_model_calls(strategy));
+        || (strategy == Strategy::SequentialRevision
+            && model_calls < plan.max_model_calls(strategy));
     if should_revise {
         let assistant = parsed
             .pointer("/choices/0/message")
@@ -617,8 +626,6 @@ async fn run_local_chat_inner(
     ))
 }
 
-
-
 async fn remote_round(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -658,10 +665,7 @@ async fn remote_round(
     })
 }
 
-fn rebuild_axum_response(
-    response: BufferedResponse,
-    receipt: &str,
-) -> axum::response::Response {
+fn rebuild_axum_response(response: BufferedResponse, receipt: &str) -> axum::response::Response {
     let mut builder = axum::http::Response::builder().status(
         axum::http::StatusCode::from_u16(response.status.as_u16())
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
@@ -695,9 +699,10 @@ pub(crate) async fn run_remote_chat(
     openai_body: &Value,
     mode: Mode,
 ) -> axum::response::Response {
+    let mut selector_body = openai_body.clone();
     let selector = match state
         .mcp
-        .resolve(crate::mcp::selector_from(headers, Some(openai_body)))
+        .resolve(crate::mcp::selector_from(headers, Some(&mut selector_body)))
     {
         Ok(selector) => selector,
         Err(message) => {
@@ -710,10 +715,7 @@ pub(crate) async fn run_remote_chat(
             "gateway MCP execution is available on local engine lanes; adaptive inference itself supports OpenAI-compatible remotes",
         );
     }
-    let mut request = openai_body.clone();
-    if let Some(object) = request.as_object_mut() {
-        object.remove("mcp");
-    }
+    let mut request = selector_body;
     let budget = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
     match tokio::time::timeout(
         budget,
@@ -791,7 +793,8 @@ async fn run_remote_chat_inner(
     }
     let feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
     if feedback.is_some()
-        || (strategy == Strategy::SequentialRevision && model_calls < plan.max_model_calls(strategy))
+        || (strategy == Strategy::SequentialRevision
+            && model_calls < plan.max_model_calls(strategy))
     {
         let assistant = parsed
             .pointer("/choices/0/message")
@@ -899,6 +902,35 @@ mod tests {
         assert_eq!(plan.max_tool_calls, 12);
         assert_eq!(plan.max_schema_retries, 1);
         assert!(plan.verify_schema);
+    }
+
+    #[test]
+    fn unit__strategy__direct_revision_and_parallel_candidates() {
+        let simple = json!({
+            "messages": [{"role": "user", "content": "What is 2 + 2?"}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Auto, &simple).strategy(&simple),
+            Strategy::Direct
+        );
+        let complex = json!({
+            "messages": [{"role": "user", "content": "x".repeat(4_000)}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Auto, &complex).strategy(&complex),
+            Strategy::SequentialRevision
+        );
+        let structured = json!({
+            "messages": [{"role": "user", "content": "Return a JSON object."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Deep, &structured).strategy(&structured),
+            Strategy::ParallelVerifiedCandidates
+        );
     }
 
     #[test]

@@ -567,7 +567,10 @@ pub async fn messages(
         let mut r = anthropic_error(status.as_u16(), "api_error", &msg);
         crate::bestof::stamp(&mut r, bestof_hdr.as_deref());
         crate::mcp::stamp(&mut r, mcp_hdr.as_deref());
-        if let Some(value) = adaptive_hdr.as_deref().and_then(|v| axum::http::HeaderValue::from_str(v).ok()) {
+        if let Some(value) = adaptive_hdr
+            .as_deref()
+            .and_then(|v| axum::http::HeaderValue::from_str(v).ok())
+        {
             r.headers_mut().insert("x-blazar-adaptive-result", value);
         }
         return r;
@@ -596,7 +599,10 @@ pub async fn messages(
     let mut resp = (StatusCode::OK, axum::Json(translated)).into_response();
     crate::bestof::stamp(&mut resp, bestof_hdr.as_deref());
     crate::mcp::stamp(&mut resp, mcp_hdr.as_deref());
-    if let Some(value) = adaptive_hdr.as_deref().and_then(|v| axum::http::HeaderValue::from_str(v).ok()) {
+    if let Some(value) = adaptive_hdr
+        .as_deref()
+        .and_then(|v| axum::http::HeaderValue::from_str(v).ok())
+    {
         resp.headers_mut().insert("x-blazar-adaptive-result", value);
     }
     if let Some(member) = &pool_member

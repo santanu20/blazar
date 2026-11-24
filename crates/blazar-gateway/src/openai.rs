@@ -893,9 +893,10 @@ pub async fn openai_proxy(
             let Some(request) = parsed_body.as_ref() else {
                 return openai_error(400, "adaptive remote request body must be JSON");
             };
+            let mut selector_body = request.clone();
             match state
                 .mcp
-                .resolve(crate::mcp::selector_from(&headers, Some(request)))
+                .resolve(crate::mcp::selector_from(&headers, Some(&mut selector_body)))
             {
                 Err(msg) => return openai_error(400, &msg),
                 Ok(Some(_)) => {
@@ -1280,15 +1281,8 @@ pub async fn openai_proxy(
                 )
                 .await
             } else if let Some(selector) = sel.as_deref() {
-                crate::mcp::chat_via_mcp(
-                    &state,
-                    &engine,
-                    v,
-                    selector,
-                    key_ext.as_deref(),
-                    None,
-                )
-                .await
+                crate::mcp::chat_via_mcp(&state, &engine, v, selector, key_ext.as_deref(), None)
+                    .await
             } else {
                 unreachable!("adaptive or MCP selector entered the dispatch branch")
             };
@@ -1312,9 +1306,14 @@ pub async fn openai_proxy(
                             builder = builder.header(name, value);
                         }
                     }
-                    builder.body(axum::body::Body::from(bytes)).unwrap_or_else(|error| {
-                        openai_error(502, &format!("adaptive/MCP response rebuild failed: {error}"))
-                    })
+                    builder
+                        .body(axum::body::Body::from(bytes))
+                        .unwrap_or_else(|error| {
+                            openai_error(
+                                502,
+                                &format!("adaptive/MCP response rebuild failed: {error}"),
+                            )
+                        })
                 }
                 Err(response) => response,
             };

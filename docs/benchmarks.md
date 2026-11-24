@@ -135,3 +135,30 @@ KV-cache quality receipts:
 - FP8 (`f8_e4m3`) vs f16 KV on qwen2.5-0.5b: perplexity parity at 2048 ctx, +0.141 at 16384 (~2x err bars) - pin-only, the fit ladder never auto-selects it. [bench-artifacts/20261111-fp8-kv-quality/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261111-fp8-kv-quality/README.md)
 - TTFT: `chunked_prefill_size 2048` = -24.7% uncached-prefill TTFT on a 10K-token prompt (35.1s -> 26.4s), zero quality loss (scheduling knob); warm radix-cache hits ~0.04s regardless; includes an arXiv-verified survey of modern TTFT algorithms. [bench-artifacts/20261112-ttft-chunked-prefill/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-ttft-chunked-prefill/README.md)
 - PD disaggregation overhead on a single GPU: direct lane vs `disagg_pair` + sgl-router = +27-44% steady-state e2e (router hop + mooncake transfer; ~2.5x cold from the 3-process spawn) - PD here is the topology/wiring tier, not a single-box perf win. [bench-artifacts/20261112-pd-overhead/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-pd-overhead/README.md)
+
+## Adaptive inference A/B harness
+
+The gateway adaptive runtime can spend additional model calls to improve
+structured-output validity or revise a complex answer. Those calls are a
+quality/latency/token trade-off, not a free optimization. Do not quote a
+quality or performance gain until it has been measured on a held-out workload.
+
+Run the same fixed task set against the same model in each mode:
+
+    python3 scripts/bench_adaptive.py --base-url http://127.0.0.1:11435 --model MODEL --runs 10 --warmup 2 --output /tmp/adaptive.json
+
+The harness compares off, auto, and deep, using deterministic checks for
+arithmetic, table lookup, and a JSON-schema extraction task. It records task
+pass rate, p50/p95 latency, prompt/completion/total token usage, error counts,
+and the gateway's adaptive execution receipts. Use the same machine, model
+revision, sampling settings, concurrency, cache warmth, and request order for
+every arm. Rotate or randomize arm order for longer campaigns to reduce
+thermal/cache order effects.
+
+This smoke suite is intentionally small. It is useful for validating routing,
+receipts, token accounting and obvious cost/latency shifts; it is not a
+substitute for broad held-out reasoning benchmarks such as GPQA, GSM8K,
+HotpotQA, FEVER or software-engineering task sets. Report the full per-case
+results and confidence intervals before describing the adaptive policy as
+quality-improving.
+

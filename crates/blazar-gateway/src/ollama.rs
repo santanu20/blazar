@@ -1351,9 +1351,7 @@ pub async fn chat(
         Ok(mode) => mode,
         Err(msg) => return api_error(400, &msg),
     };
-    if adaptive_mode.is_some()
-        && req.get("stream").and_then(Value::as_bool).unwrap_or(true)
-    {
+    if adaptive_mode.is_some() && req.get("stream").and_then(Value::as_bool).unwrap_or(true) {
         return api_error(
             400,
             "X-Blazar-Adaptive requires stream:false; the adaptive runtime uses buffered execution",
