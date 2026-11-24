@@ -642,12 +642,44 @@ mod tests {
                 0,
                 vec![
                     proposal("same  partial state", 0.6, 0.2, 0.5),
-                    proposal("same partial state", 0.7, 0.1, 0.7),
+                    proposal("SAME partial STATE", 0.7, 0.1, 0.7),
                 ],
             )
             .unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(tree.stats().transpositions, 1);
+    }
+
+    #[test]
+    fn unit__puct__backtracks_from_exhausted_subtree_to_open_sibling() {
+        let mut tree = SearchTree::new("root", SearchConfig::default());
+        let branches = tree
+            .expand(
+                0,
+                vec![
+                    proposal("promising branch", 0.95, 0.1, 0.95),
+                    proposal("alternative branch", 0.45, 0.2, 0.45),
+                ],
+            )
+            .unwrap();
+        let promising = branches[0];
+        let alternative = branches[1];
+        tree.expand(
+            promising,
+            vec![SearchProposal {
+                state: "closed final answer".into(),
+                answer: Some("done".into()),
+                prior: 1.0,
+                value: ValueEstimate::new(0.5, 1.0, false),
+                verification: Verification::Unknown,
+                estimated_state_tokens: 4,
+            }],
+        )
+        .unwrap();
+
+        // The higher-priority subtree is terminal; selection must backtrack
+        // to the still-open sibling instead of terminating the whole search.
+        assert_eq!(tree.select_leaf(), Some(alternative));
     }
 
     #[test]
