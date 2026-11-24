@@ -973,8 +973,7 @@ async fn parse_search_expansion(
         let mut state_text = String::with_capacity(parent_state.len() + step.len() + 8);
         if !parent_state.is_empty() {
             state_text.push_str(parent_state);
-            state_text.push_str("
-");
+            state_text.push('\n');
         }
         state_text.push_str(step);
         if state_text.len() > 16_384 {
@@ -990,7 +989,13 @@ async fn parse_search_expansion(
             .saturating_add(answer.as_ref().map_or(0, String::len))
             .div_ceil(4)
             .max(1);
-        prepared.push((state_text, answer, prior, verification, estimated_state_tokens));
+        prepared.push((
+            state_text,
+            answer,
+            prior,
+            verification,
+            estimated_state_tokens,
+        ));
     }
 
     // Process-reward calls for one expansion are concurrent but bounded by
@@ -1072,7 +1077,6 @@ fn configured_process_reward_model(
         }
     }
 }
-
 
 fn has_chat_response_envelope(body: &Value) -> bool {
     body.pointer("/choices/0/message")
