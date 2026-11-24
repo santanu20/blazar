@@ -871,7 +871,7 @@ fn append_search_expansion_prompt(
     messages.push(serde_json::json!({
         "role": "user",
         "content": format!(
-            "Continue solving the original task by expanding this partial solution state:\n\n{state}\n\n             Return a JSON object with a branches array containing at most {branch_limit} distinct next states.              Each branch must have: step (a concise, checkable progress summary, not private chain-of-thought),              prior (0..1), value (0..1 self-assessment only), uncertainty (0..1 self-assessed uncertainty),              and final_answer (a complete final answer string only when this branch is ready, otherwise null).              Explore meaningfully different approaches when possible. Do not repeat an existing state.              Never claim that self-assessment is independent verification. If no valid continuation exists, return              an empty branches array. JSON only."
+            "Continue solving the original task by expanding this partial solution state:\n\n{state}\n\n             Return a JSON object with a branches array containing at most {branch_limit} distinct next states.              Each branch must have: step (a concise, checkable progress summary, not private chain-of-thought),              prior (0..1 estimate of how promising this branch is), and final_answer (a complete final answer string              only when this branch is ready, otherwise null). Explore meaningfully different approaches when possible.              Do not repeat an existing state. If no valid continuation exists, return an empty branches array. JSON only."
         )
     }));
     request["response_format"] = serde_json::json!({"type": "json_object"});
@@ -917,6 +917,7 @@ fn parse_search_expansion(
     state: &crate::state::AppState,
     plan: &Plan,
     schema: Option<&Value>,
+    value_model: &dyn crate::reasoning_search::ProcessRewardModel,
     parent_state: &str,
     response: &Value,
     branch_limit: usize,
@@ -966,12 +967,11 @@ fn parse_search_expansion(
                 crate::reasoning_search::Verification::Unknown,
                 |final_answer| verify_search_answer(state, plan, schema, final_answer),
             );
+            // Score the partial prefix through the independent value-model
+            // interface. The default adapter is explicitly uncalibrated; it
+            // never treats the generator's own confidence as a PRM score.
             let prior = branch.get("prior").and_then(Value::as_f64).unwrap_or(0.5);
-            let value = branch.get("value").and_then(Value::as_f64).unwrap_or(0.5);
-            let uncertainty = branch
-                .get("uncertainty")
-                .and_then(Value::as_f64)
-                .unwrap_or(1.0);
+            let value = value_model.evaluate(&state_text);
             let tokens = step
                 .len()
                 .saturating_add(answer.as_ref().map_or(0, String::len))
@@ -981,7 +981,7 @@ fn parse_search_expansion(
                 state: state_text.clone(),
                 answer,
                 prior,
-                value: crate::reasoning_search::ValueEstimate::new(value, uncertainty, false),
+                value,
                 verification,
                 tokens,
             })
@@ -1044,6 +1044,7 @@ async fn run_local_search_inner(
             uncertainty_bonus: 0.45,
         },
     );
+    let value_model = crate::reasoning_search::UncalibratedValueModel;
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
     let mut current: Option<BufferedResponse> = None;
@@ -1090,6 +1091,7 @@ async fn run_local_search_inner(
             state,
             &plan,
             schema.as_ref(),
+            &value_model,
             &parent_state,
             &expansion_body,
             branch_limit,
@@ -1658,6 +1660,7 @@ async fn run_remote_search_inner(
             uncertainty_bonus: 0.45,
         },
     );
+    let value_model = crate::reasoning_search::UncalibratedValueModel;
     let started = std::time::Instant::now();
     let deadline = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
     let mut current: Option<BufferedResponse> = None;
@@ -1712,6 +1715,7 @@ async fn run_remote_search_inner(
             state,
             &plan,
             schema.as_ref(),
+            &value_model,
             &parent_state,
             &expansion_body,
             branch_limit,
