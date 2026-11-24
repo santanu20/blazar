@@ -197,7 +197,9 @@ impl Plan {
             Strategy::Direct
         } else if self.mode == Mode::Deep && self.verify_schema {
             Strategy::ParallelVerifiedCandidates
-        } else if self.mode == Mode::Deep || self.complexity >= 3 {
+        } else if self.verify_schema || self.mode == Mode::Deep || self.complexity >= 3 {
+            // Auto must retain one repair call for invalid structured output,
+            // even when the request is otherwise classified as simple.
             Strategy::SequentialRevision
         } else {
             Strategy::Direct
@@ -1430,6 +1432,21 @@ mod tests {
         let failed = CandidateQuality { http_success: false, ..empty };
         assert!(empty.needs_revision());
         assert!(!failed.needs_revision());
+    }
+
+    #[test]
+    fn unit__auto_schema__gets_one_repair_opportunity() {
+        let request = json!({
+            "messages": [{"role": "user", "content": "Extract one field."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        let plan = Plan::for_request(Mode::Auto, &request);
+        assert_eq!(plan.strategy(&request), Strategy::SequentialRevision);
+        assert_eq!(plan.max_schema_retries, 1);
+        assert_eq!(plan.max_model_calls(Strategy::SequentialRevision), 2);
     }
 
     #[test]
