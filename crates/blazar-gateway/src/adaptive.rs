@@ -1044,10 +1044,12 @@ mod tests {
         assert_eq!(working["messages"].as_array().unwrap().len(), 3);
         assert_eq!(working["messages"][1]["role"], "assistant");
         assert_eq!(working["messages"][2]["role"], "user");
-        assert!(working["messages"][2]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Validation feedback"));
+        assert!(
+            working["messages"][2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Validation feedback")
+        );
     }
 
     #[test]
