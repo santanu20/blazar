@@ -603,7 +603,12 @@ impl SearchTree {
         self.nodes
             .iter()
             .filter(|node| node.answer.is_some() && node.status != NodeStatus::Rejected)
-            .max_by(|left, right| answer_priority(left).total_cmp(&answer_priority(right)))
+            .max_by(|left, right| {
+                answer_priority(left)
+                    .total_cmp(&answer_priority(right))
+                    // Stable ties retain the earliest generated candidate.
+                    .then_with(|| right.id.cmp(&left.id))
+            })
             .and_then(|node| {
                 node.answer
                     .as_deref()
@@ -911,6 +916,34 @@ mod tests {
         // The higher-priority subtree is terminal; selection must backtrack
         // to the still-open sibling instead of terminating the whole search.
         assert_eq!(tree.select_leaf(), Some(alternative));
+    }
+
+    #[test]
+    fn unit__candidate_ties__retain_first_candidate_deterministically() {
+        let mut tree = SearchTree::new("root", SearchConfig::default());
+        tree.expand(
+            0,
+            vec![
+                SearchProposal {
+                    state: "first candidate".into(),
+                    answer: Some("first".into()),
+                    prior: 0.5,
+                    value: ValueEstimate::uncalibrated(),
+                    verification: Verification::Unknown,
+                    estimated_state_tokens: 4,
+                },
+                SearchProposal {
+                    state: "second candidate".into(),
+                    answer: Some("second".into()),
+                    prior: 0.5,
+                    value: ValueEstimate::uncalibrated(),
+                    verification: Verification::Unknown,
+                    estimated_state_tokens: 4,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(tree.best_answer().unwrap().1, "first");
     }
 
     #[test]
