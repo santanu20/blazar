@@ -262,7 +262,8 @@ impl SearchTree {
             .saturating_sub(1)
             .saturating_mul(remaining)
             .div_ceil(total);
-        1_usize.saturating_add(extra)
+        1_usize
+            .saturating_add(extra)
             .clamp(1, self.config.branch_factor)
     }
 
@@ -287,9 +288,9 @@ impl SearchTree {
     /// visits or otherwise perturb the search policy.
     #[must_use]
     pub fn has_open_frontier(&self) -> bool {
-        self.nodes.iter().any(|node| {
-            node.status == NodeStatus::Open && node.depth < self.config.max_depth
-        })
+        self.nodes
+            .iter()
+            .any(|node| node.status == NodeStatus::Open && node.depth < self.config.max_depth)
     }
 
     /// Select an expandable leaf with PUCT and an uncertainty bonus.
@@ -615,7 +616,6 @@ fn normalize_state(state: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-
 
 #[cfg(test)]
 mod tests {
