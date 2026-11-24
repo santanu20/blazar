@@ -1325,7 +1325,7 @@ async fn run_local_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source={} prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_evaluated_nodes={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source={} prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} duplicate_states={} prm_evaluated_nodes={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         value_model.source(),
         budget.max_model_calls,
         budget.max_expansions,
@@ -1336,7 +1336,7 @@ async fn run_local_search_inner(
         stats.expansions,
         stats.max_depth_reached,
         stats.estimated_state_tokens,
-        stats.transpositions,
+        stats.duplicate_states,
         stats.prm_evaluated_nodes,
         stats.prm_calibrated_nodes,
         stats.best_value,
@@ -1971,7 +1971,7 @@ async fn run_remote_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source={} prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_evaluated_nodes={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source={} prior_source=generator_proposal_heuristic verified={verified} allocated_model_calls={} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} duplicate_states={} prm_evaluated_nodes={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         value_model.source(),
         budget.max_model_calls,
         budget.max_expansions,
@@ -1982,7 +1982,7 @@ async fn run_remote_search_inner(
         stats.expansions,
         stats.max_depth_reached,
         stats.estimated_state_tokens,
-        stats.transpositions,
+        stats.duplicate_states,
         stats.prm_evaluated_nodes,
         stats.prm_calibrated_nodes,
         stats.best_value,
