@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
+import re
 import statistics
 import time
 import urllib.error
@@ -63,19 +65,29 @@ def percentile(values: list[float], q: float) -> float | None:
 
 def check(case: dict[str, Any], content: str) -> bool:
     expected = case["expected"]
-    if isinstance(expected, str):
-        return expected in content
+    if case["id"] == "arithmetic":
+        # This task explicitly requests only the number. Substring matching
+        # would incorrectly pass explanations containing a wrong result too.
+        return re.fullmatch(r"\\s*267\\s*[.!]?\\s*", content) is not None
     if isinstance(expected, tuple):
+        # Require the correct label/value pair, not merely both tokens
+        # appearing somewhere in an unrelated answer.
         lowered = content.lower()
-        return all(item in lowered for item in expected)
+        return re.search(
+            r"\\bpine\\b(?:\\s+|\\s*[:=|,–—-]\\s*)19\\b|"
+            r"\\b19\\b(?:\\s+|\\s*[:=|,–—-]\\s*)\\bpine\\b",
+            lowered,
+        ) is not None
     candidate = content.strip()
-    fence = chr(96) * 3
-    if candidate.startswith(fence):
-        candidate = candidate.strip(chr(96))
-        if candidate.lower().startswith("json"):
-            candidate = candidate[4:].strip()
+    lines = candidate.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        if lines and lines[0].strip().lower() == "json":
+            lines = lines[1:]
     try:
-        return json.loads(candidate) == expected
+        return json.loads("\\n".join(lines).strip()) == expected
     except json.JSONDecodeError:
         return False
 
@@ -163,10 +175,11 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:11435")
     parser.add_argument("--model", required=True)
     parser.add_argument("--api-key")
-    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--modes", default="off,auto,deep")
+    parser.add_argument("--seed", type=int, default=20261124)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.runs < 1 or args.warmup < 0 or args.timeout <= 0:
@@ -188,16 +201,35 @@ def main() -> int:
             "host, concurrency, cache state and request set fixed for comparisons."
         ),
     }
-    for mode in modes:
-        rows = []
-        for case in CASES:
-            for _ in range(args.warmup):
+    rng = random.Random(args.seed)
+    samples: dict[str, list[dict[str, Any]]] = {mode: [] for mode in modes}
+    execution_order: list[dict[str, Any]] = []
+    # Interleave and randomize mode order within each case/run so thermal,
+    # cache-warmth and time-of-run effects do not systematically favor one arm.
+    for case in CASES:
+        for _ in range(args.warmup):
+            warmup_modes = list(modes)
+            rng.shuffle(warmup_modes)
+            for mode in warmup_modes:
                 request_once(endpoint, args.model, case, mode, args.api_key, args.timeout)
-            for run_index in range(args.runs):
+        for run_index in range(args.runs):
+            run_modes = list(modes)
+            rng.shuffle(run_modes)
+            execution_order.append({
+                "case": case["id"],
+                "run": run_index + 1,
+                "mode_order": run_modes,
+            })
+            for mode in run_modes:
                 result = request_once(
                     endpoint, args.model, case, mode, args.api_key, args.timeout
                 )
-                rows.append({"run": run_index + 1, **result})
+                samples[mode].append({"run": run_index + 1, **result})
+
+    report["randomization_seed"] = args.seed
+    report["execution_order"] = execution_order
+    for mode in modes:
+        rows = samples[mode]
         report["results"][mode] = {"summary": summarise(rows), "samples": rows}
 
     rendered = json.dumps(report, indent=2, sort_keys=True)
