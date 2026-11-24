@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fmt::Write as _;
 
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -491,7 +492,7 @@ impl CandidateSummary {
                 summary.votes.insert(key, count);
             }
         } else if let Some(key) =
-            crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
+            crate::reasoning::answer_hash(response_content(body).unwrap_or_default())
         {
             summary.votes.insert(key, 1);
         }
@@ -1474,7 +1475,7 @@ async fn run_remote_chat_inner(
         rejected,
         &stop_reason,
     );
-    let receipt = reasoning_receipt(receipt, &plan, &candidate_summary, &current_body);
+    let receipt = reasoning_receipt(&receipt, &plan, &candidate_summary, &current_body);
     Ok(rebuild_axum_response(current, &receipt))
 }
 
