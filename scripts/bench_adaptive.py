@@ -186,6 +186,9 @@ def summarise(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "receipts": sorted(
             {row["adaptive_receipt"] for row in rows if row["adaptive_receipt"]}
         ),
+        "candidate_receipts": sorted(
+            {row["candidate_receipt"] for row in rows if row["candidate_receipt"]}
+        ),
     }
 
 
