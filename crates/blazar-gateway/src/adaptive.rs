@@ -1054,7 +1054,7 @@ async fn run_remote_chat_inner(
     merge_usage(&mut usage_total, &current_body);
     let mut best_quality =
         assess_candidate(state, &plan, schema.as_ref(), current.status, &current_body);
-    schema_verified = best_quality.schema_valid;
+    let mut schema_verified = best_quality.schema_valid;
 
     if message_has_tool_calls(&current_body) {
         stop_reason = "tool_handoff".into();
