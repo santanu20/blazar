@@ -88,7 +88,11 @@ impl Plan {
             max_tool_rounds,
             max_tool_calls,
             max_schema_retries: if verify_schema {
-                if mode == Mode::Deep { MAX_DEEP_SCHEMA_RETRIES } else { MAX_SCHEMA_RETRIES }
+                if mode == Mode::Deep {
+                    MAX_DEEP_SCHEMA_RETRIES
+                } else {
+                    MAX_SCHEMA_RETRIES
+                }
             } else {
                 0
             },
@@ -456,8 +460,11 @@ impl CandidateSummary {
                 .unwrap_or(1)
                 .clamp(1, crate::bestof::MAX_BEST_OF as usize);
             summary.fanout = summary.candidates > 1;
-            let key = field("vote_key").and_then(|value| u64::from_str_radix(value, 16).ok())
-                .or_else(|| crate::reasoning::answer_hash(&response_content(body).unwrap_or_default()));
+            let key = field("vote_key")
+                .and_then(|value| u64::from_str_radix(value, 16).ok())
+                .or_else(|| {
+                    crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
+                });
             let count = field("agreement=")
                 .and_then(|value| value.split('/').next())
                 .and_then(|value| value.parse::<usize>().ok())
@@ -887,7 +894,12 @@ async fn run_local_chat_inner(
     merge_usage(&mut usage_total, &current_body);
     let mut candidate_summary = CandidateSummary::from_response(&current.headers, &current_body);
     let mut best_quality = assess_candidate(
-        state, &plan, schema.as_ref(), current.status, &current_body, &candidate_summary,
+        state,
+        &plan,
+        schema.as_ref(),
+        current.status,
+        &current_body,
+        &candidate_summary,
     );
     let mut schema_verified = best_quality.schema_valid;
 
@@ -959,7 +971,12 @@ async fn run_local_chat_inner(
             merge_usage(&mut usage_total, &revised_body);
             candidate_summary.add_revision(&revised_body);
             let revised_quality = assess_candidate(
-                state, &plan, schema.as_ref(), revised.status, &revised_body, &candidate_summary,
+                state,
+                &plan,
+                schema.as_ref(),
+                revised.status,
+                &revised_body,
+                &candidate_summary,
             );
             if !revised_quality.is_better_than(best_quality) {
                 rejected += 1;
@@ -1101,8 +1118,7 @@ async fn remote_candidate_rounds(
     request: &Value,
     want: u64,
 ) -> Result<BufferedResponse, axum::response::Response> {
-    let sends = (0..want)
-        .map(|_| remote_round(state, model, method, path_query, headers, request));
+    let sends = (0..want).map(|_| remote_round(state, model, method, path_query, headers, request));
     let results = futures::future::join_all(sends).await;
     let mut responses = Vec::new();
     let mut first_error = None;
@@ -1135,8 +1151,7 @@ async fn remote_candidate_rounds(
     let schema = request
         .pointer("/response_format/json_schema/schema")
         .filter(|value| value.is_object());
-    let decision =
-        crate::reasoning::pick_candidate(&state.sentinel, &parsed, schema, request);
+    let decision = crate::reasoning::pick_candidate(&state.sentinel, &parsed, schema, request);
     let mut winner = responses.swap_remove(decision.winner_index);
     if let Ok(mut body) = serde_json::from_slice::<Value>(&winner.body) {
         patch_usage(&mut body, usage_total);
@@ -1244,10 +1259,15 @@ async fn run_remote_chat_inner(
     } else {
         remote_round(state, model, method, path_query, headers, &request).await?
     };
-    model_calls = current.headers
+    model_calls = current
+        .headers
         .get("x-blazar-adaptive-candidates")
         .and_then(|value| value.to_str().ok())
-        .and_then(|receipt| receipt.split_whitespace().find_map(|part| part.strip_prefix("used=")))
+        .and_then(|receipt| {
+            receipt
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix("used="))
+        })
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
     if !current.status.is_success() {
@@ -1289,7 +1309,12 @@ async fn run_remote_chat_inner(
     merge_usage(&mut usage_total, &current_body);
     let mut candidate_summary = CandidateSummary::from_response(&current.headers, &current_body);
     let mut best_quality = assess_candidate(
-        state, &plan, schema.as_ref(), current.status, &current_body, &candidate_summary,
+        state,
+        &plan,
+        schema.as_ref(),
+        current.status,
+        &current_body,
+        &candidate_summary,
     );
     let mut schema_verified = best_quality.schema_valid;
 
@@ -1354,7 +1379,12 @@ async fn run_remote_chat_inner(
             merge_usage(&mut usage_total, &revised_body);
             candidate_summary.add_revision(&revised_body);
             let revised_quality = assess_candidate(
-                state, &plan, schema.as_ref(), revised.status, &revised_body, &candidate_summary,
+                state,
+                &plan,
+                schema.as_ref(),
+                revised.status,
+                &revised_body,
+                &candidate_summary,
             );
             if !revised_quality.is_better_than(best_quality) {
                 rejected += 1;
