@@ -333,9 +333,8 @@ impl SearchTree {
         }
 
         proposals.retain(|proposal| !proposal.state.trim().is_empty());
-        proposals.sort_by(|left, right| {
-            proposal_priority(right).total_cmp(&proposal_priority(left))
-        });
+        proposals
+            .sort_by(|left, right| proposal_priority(right).total_cmp(&proposal_priority(left)));
         proposals.truncate(self.current_branch_limit());
 
         let parent_depth = parent.depth;
@@ -395,7 +394,8 @@ impl SearchTree {
         self.expansions = self.expansions.saturating_add(1);
         if created.is_empty() && self.nodes[parent_id].children.is_empty() {
             self.nodes[parent_id].status = NodeStatus::Rejected;
-            self.stop_reason.get_or_insert(StopReason::NoExpandableState);
+            self.stop_reason
+                .get_or_insert(StopReason::NoExpandableState);
         }
         Ok(created)
     }
@@ -691,10 +691,7 @@ mod tests {
         let leaf = tree.select_leaf().unwrap();
         tree.expand(
             leaf,
-            vec![
-                proposal("a1", 0.7, 0.1, 0.5),
-                proposal("a2", 0.6, 0.1, 0.3),
-            ],
+            vec![proposal("a1", 0.7, 0.1, 0.5), proposal("a2", 0.6, 0.1, 0.3)],
         )
         .unwrap();
         assert!(tree.remaining_tokens() < 100);
