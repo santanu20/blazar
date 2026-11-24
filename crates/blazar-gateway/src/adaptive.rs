@@ -216,8 +216,8 @@ impl Plan {
         match (strategy, self.mode) {
             (Strategy::Direct, _) => 1,
             (Strategy::SequentialRevision, Mode::Auto) => 2,
-            (Strategy::SequentialRevision, Mode::Deep) => 3,
-            (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 3,
+            (Strategy::SequentialRevision, Mode::Deep)
+            | (Strategy::ParallelVerifiedCandidates, Mode::Auto) => 3,
             (Strategy::ParallelVerifiedCandidates, Mode::Deep) => 4,
         }
     }
@@ -418,6 +418,7 @@ fn schema_violation(
 /// does not claim factual or semantic correctness: without a task-specific
 /// independent verifier, Blazar can prove transport, response-envelope,
 /// completion and requested-schema properties only.
+#[allow(clippy::struct_excessive_bools)] // Each field is an independent response-contract gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CandidateQuality {
     http_success: bool,
@@ -471,11 +472,7 @@ fn assess_candidate(
     let finish_reason = body
         .pointer("/choices/0/finish_reason")
         .and_then(Value::as_str);
-    let complete = match finish_reason {
-        Some("length") => false,
-        Some("stop" | "content_filter") | None => true,
-        Some(_) => false,
-    };
+    let complete = matches!(finish_reason, Some("stop" | "content_filter") | None);
     CandidateQuality {
         http_success: status.is_success(),
         parseable: true,
@@ -503,6 +500,7 @@ fn revision_feedback(quality: CandidateQuality, schema_feedback: Option<&str>) -
     None
 }
 
+#[allow(clippy::too_many_arguments)] // Arguments map directly to the compact machine-readable receipt.
 fn loop_receipt(
     plan: &Plan,
     strategy: Strategy,
@@ -709,7 +707,7 @@ async fn run_local_chat_inner(
     let mut rejected = 0usize;
     let mut schema_repair_attempts = 0usize;
     let mut usage_total = None;
-    let mut stop_reason: String;
+    let stop_reason: String;
 
     // All local calls stay on the normal proxy/accounting path.
     let asked_candidates =
@@ -723,26 +721,23 @@ async fn run_local_chat_inner(
         (1, None, 1)
     };
 
-    let mut current_body = match serde_json::from_slice::<Value>(&current.body) {
-        Ok(body) => body,
-        Err(_) => {
-            stop_reason = "unparseable_initial_response".into();
-            return Ok(rebuild_response(
-                current,
-                &loop_receipt(
-                    &plan,
-                    strategy,
-                    model_calls,
-                    candidates,
-                    None,
-                    revisions,
-                    degraded.as_deref(),
-                    accepted,
-                    rejected,
-                    &stop_reason,
-                ),
-            ));
-        }
+    let Ok(mut current_body) = serde_json::from_slice::<Value>(&current.body) else {
+        stop_reason = "unparseable_initial_response".into();
+        return Ok(rebuild_response(
+            current,
+            &loop_receipt(
+                &plan,
+                strategy,
+                model_calls,
+                candidates,
+                None,
+                revisions,
+                degraded.as_deref(),
+                accepted,
+                rejected,
+                &stop_reason,
+            ),
+        ));
     };
     merge_usage(&mut usage_total, &current_body);
     let mut best_quality =
@@ -805,13 +800,10 @@ async fn run_local_chat_inner(
             model_calls += 1;
             revisions += 1;
 
-            let revised_body = match serde_json::from_slice::<Value>(&revised.body) {
-                Ok(body) => body,
-                Err(_) => {
-                    rejected += 1;
-                    stop_reason = "unparseable_revision".into();
-                    break;
-                }
+            let Ok(revised_body) = serde_json::from_slice::<Value>(&revised.body) else {
+                rejected += 1;
+                stop_reason = "unparseable_revision".into();
+                break;
             };
             merge_usage(&mut usage_total, &revised_body);
             let revised_quality =
@@ -827,7 +819,7 @@ async fn run_local_chat_inner(
             current = revised;
             current_body = revised_body;
             best_quality = revised_quality;
-            schema_verified = best_quality.schema_valid;
+            let mut schema_verified = best_quality.schema_valid;
             accepted += 1;
 
             if message_has_tool_calls(&current_body) {
@@ -875,6 +867,7 @@ async fn run_local_chat_inner(
     ))
 }
 
+#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
 async fn remote_round(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -982,7 +975,7 @@ pub(crate) async fn run_remote_chat(
     }
 }
 
-#[allow(clippy::result_large_err)] // Axum Response is the gateway handler's error currency.
+#[allow(clippy::result_large_err, clippy::too_many_lines)] // One bounded remote evaluate/revise/accept state machine.
 async fn run_remote_chat_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     model: &str,
@@ -1016,9 +1009,8 @@ async fn run_remote_chat_inner(
     let mut accepted = 0usize;
     let mut rejected = 0usize;
     let mut schema_repair_attempts = 0usize;
-    let mut schema_verified = None;
     let mut usage_total = None;
-    let mut stop_reason = "quality_gate_pass".to_string();
+    let stop_reason: String;
 
     let first = remote_round(state, model, method, path_query, headers, &request).await?;
     model_calls += 1;
@@ -1041,26 +1033,23 @@ async fn run_remote_chat_inner(
             ),
         ));
     }
-    let mut current_body = match serde_json::from_slice::<Value>(&current.body) {
-        Ok(body) => body,
-        Err(_) => {
-            stop_reason = "unparseable_initial_response".into();
-            return Ok(rebuild_axum_response(
-                current,
-                &loop_receipt(
-                    &plan,
-                    strategy,
-                    model_calls,
-                    1,
-                    None,
-                    revisions,
-                    None,
-                    accepted,
-                    rejected,
-                    &stop_reason,
-                ),
-            ));
-        }
+    let Ok(mut current_body) = serde_json::from_slice::<Value>(&current.body) else {
+        stop_reason = "unparseable_initial_response".into();
+        return Ok(rebuild_axum_response(
+            current,
+            &loop_receipt(
+                &plan,
+                strategy,
+                model_calls,
+                1,
+                None,
+                revisions,
+                None,
+                accepted,
+                rejected,
+                &stop_reason,
+            ),
+        ));
     };
     merge_usage(&mut usage_total, &current_body);
     let mut best_quality =
@@ -1108,22 +1097,18 @@ async fn run_remote_chat_inner(
                 .await
             {
                 Ok(response) => response,
-                Err(error) => {
+                Err(_error) => {
                     stop_reason = "revision_error".into();
                     tracing::warn!(model = %model_name, "adaptive remote revision failed; retaining the best prior candidate");
-                    let _ = error;
                     break;
                 }
             };
             model_calls += 1;
             revisions += 1;
-            let revised_body = match serde_json::from_slice::<Value>(&revised.body) {
-                Ok(body) => body,
-                Err(_) => {
-                    rejected += 1;
-                    stop_reason = "unparseable_revision".into();
-                    break;
-                }
+            let Ok(revised_body) = serde_json::from_slice::<Value>(&revised.body) else {
+                rejected += 1;
+                stop_reason = "unparseable_revision".into();
+                break;
             };
             merge_usage(&mut usage_total, &revised_body);
             let revised_quality =
