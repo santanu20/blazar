@@ -1011,6 +1011,38 @@ fn install_search_answer(body: &mut Value, answer: &str) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReasoningSearchBudget {
+    max_model_calls: usize,
+    max_expansions: usize,
+    max_nodes: usize,
+    max_depth: usize,
+    max_estimated_state_tokens: usize,
+}
+
+/// Request-shape-aware compute allocation. This is intentionally a scheduling
+/// heuristic, not a learned difficulty predictor. The model-call ceiling from
+/// Plan remains the hard limit; deeper/longer requests receive more expansion
+/// opportunities, while easy tasks retain a minimum useful search width.
+fn reasoning_search_budget(plan: &Plan, strategy: Strategy) -> ReasoningSearchBudget {
+    let max_model_calls = plan.max_model_calls(strategy).max(1);
+    let has_hard_verifier = plan.verify_schema || plan.task_profile.has_deterministic_verifier();
+    let requested_expansions = match (plan.complexity, has_hard_verifier) {
+        (0..=1, true) => 3,
+        (0..=1, false) => 4,
+        (2..=3, _) => 5,
+        _ => 6,
+    };
+    let max_expansions = requested_expansions.min(max_model_calls.saturating_sub(1));
+    ReasoningSearchBudget {
+        max_model_calls,
+        max_expansions,
+        max_nodes: (1 + max_expansions * 3).clamp(4, 40),
+        max_depth: (4 + usize::from(plan.complexity)).clamp(4, 8),
+        max_estimated_state_tokens: max_expansions.saturating_mul(768),
+    }
+}
+
 /// Deep mode expands partial reasoning states with budgeted PUCT search.
 /// Model-provided value hints are explicitly uncalibrated; only exact task
 /// verifiers and requested schemas can mark an answer as independently verified.
@@ -1035,15 +1067,16 @@ async fn run_local_search_inner(
         .and_then(Value::as_str)
         .unwrap_or(&engine.name)
         .to_string();
-    let max_calls = plan.max_model_calls(strategy);
-    let expansion_budget = max_calls.saturating_sub(1).max(1);
+    let budget = reasoning_search_budget(&plan, strategy);
+    let max_calls = budget.max_model_calls;
+    let expansion_budget = budget.max_expansions;
     let mut tree = crate::reasoning_search::SearchTree::new(
         "root",
         crate::reasoning_search::SearchConfig {
-            max_nodes: 40,
-            max_depth: 8,
+            max_nodes: budget.max_nodes,
+            max_depth: budget.max_depth,
             max_expansions: expansion_budget,
-            max_tokens: expansion_budget.saturating_mul(768),
+            max_tokens: budget.max_estimated_state_tokens,
             branch_factor: 3,
             exploration: 1.6,
             uncertainty_bonus: 0.45,
@@ -1189,7 +1222,11 @@ async fn run_local_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        budget.max_expansions,
+        budget.max_nodes,
+        budget.max_depth,
+        budget.max_estimated_state_tokens,
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
@@ -1651,15 +1688,16 @@ async fn run_remote_search_inner(
         .filter(|schema| schema.is_object())
         .cloned();
     let original_request = request.clone();
-    let max_calls = plan.max_model_calls(strategy);
-    let expansion_budget = max_calls.saturating_sub(1).max(1);
+    let budget = reasoning_search_budget(&plan, strategy);
+    let max_calls = budget.max_model_calls;
+    let expansion_budget = budget.max_expansions;
     let mut tree = crate::reasoning_search::SearchTree::new(
         "root",
         crate::reasoning_search::SearchConfig {
-            max_nodes: 40,
-            max_depth: 8,
+            max_nodes: budget.max_nodes,
+            max_depth: budget.max_depth,
             max_expansions: expansion_budget,
-            max_tokens: expansion_budget.saturating_mul(768),
+            max_tokens: budget.max_estimated_state_tokens,
             branch_factor: 3,
             exploration: 1.6,
             uncertainty_bonus: 0.45,
@@ -1813,7 +1851,11 @@ async fn run_remote_search_inner(
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=uncalibrated_process_reward_fallback prior_source=generator_proposal_heuristic verified={verified} allocated_expansions={} allocated_nodes={} allocated_depth={} allocated_state_tokens={} nodes={} expansions={} depth={} estimated_state_tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
+        budget.max_expansions,
+        budget.max_nodes,
+        budget.max_depth,
+        budget.max_estimated_state_tokens,
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
@@ -2321,6 +2363,25 @@ mod tests {
         assert_eq!(plan.max_tool_rounds, MAX_TOOL_ROUNDS);
         assert_eq!(plan.max_tool_calls, MAX_TOOL_CALLS);
         assert!(plan.max_schema_retries <= MAX_DEEP_SCHEMA_RETRIES);
+    }
+
+    #[test]
+    fn unit__reasoning_search_budget__scales_with_request_shape() {
+        let easy = json!({
+            "messages": [{"role": "user", "content": "Explain a mutex in one sentence."}]
+        });
+        let long = json!({
+            "messages": [{"role": "user", "content": "Reason about this system: ".to_string() + &"context ".repeat(2_000)}]
+        });
+        let easy_plan = Plan::for_request(Mode::Deep, &easy);
+        let long_plan = Plan::for_request(Mode::Deep, &long);
+        let easy_budget = reasoning_search_budget(&easy_plan, Strategy::ParallelVerifiedCandidates);
+        let long_budget = reasoning_search_budget(&long_plan, Strategy::ParallelVerifiedCandidates);
+        assert!(easy_budget.max_expansions < long_budget.max_expansions);
+        assert!(long_budget.max_expansions <= 6);
+        assert!(long_budget.max_model_calls <= 7);
+        assert!(long_budget.max_nodes <= 40);
+        assert!(long_budget.max_depth <= 8);
     }
 
     #[test]
