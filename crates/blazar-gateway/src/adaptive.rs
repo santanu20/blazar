@@ -79,11 +79,7 @@ impl Plan {
             complexity,
             max_tool_rounds,
             max_tool_calls,
-            max_schema_retries: if verify_schema {
-                MAX_SCHEMA_RETRIES
-            } else {
-                0
-            },
+            max_schema_retries: if verify_schema { MAX_SCHEMA_RETRIES } else { 0 },
             verify_schema,
         }
     }
@@ -120,9 +116,7 @@ impl Plan {
 fn complexity_score(request: &Value) -> u8 {
     let messages = request.get("messages").and_then(Value::as_array);
     let message_count = messages.map_or(0, Vec::len);
-    let message_chars = messages.map_or(0, |rows| {
-        rows.iter().map(recursive_text_len).sum()
-    });
+    let message_chars = messages.map_or(0, |rows| rows.iter().map(recursive_text_len).sum());
     let text_chars = message_chars
         + request.get("input").map_or(0, recursive_text_len)
         + request.get("instructions").map_or(0, recursive_text_len);
@@ -233,9 +227,12 @@ mod tests {
 
     #[test]
     fn unit__receipt__contains_no_request_content() {
-        let plan = Plan::for_request(Mode::Auto, &json!({
-            "messages": [{"role": "user", "content": "private prompt"}]
-        }));
+        let plan = Plan::for_request(
+            Mode::Auto,
+            &json!({
+                "messages": [{"role": "user", "content": "private prompt"}]
+            }),
+        );
         let receipt = plan.receipt(1, 2, None, 0);
         assert!(receipt.contains("mode=auto"));
         assert!(!receipt.contains("private prompt"));

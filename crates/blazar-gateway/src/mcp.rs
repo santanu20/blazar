@@ -1282,6 +1282,7 @@ async fn chat_via_mcp_inner(
     openai_body: &mut Value,
     sel: &str,
     key: Option<&crate::keys::KeyCtx>,
+    adaptive_mode: Option<crate::adaptive::Mode>,
 ) -> Result<reqwest::Response, Response> {
     // Hard posture first: a key with mcp_access = "off" never engages
     // MCP at all - any selector (including the config default) is
@@ -1386,11 +1387,16 @@ async fn chat_via_mcp_inner(
 
     // Compute the plan only after the authorized MCP catalog has been
     // injected. Tool definitions affect complexity, but never authority.
-    let adaptive_plan = adaptive_mode.map(|mode| crate::adaptive::Plan::for_request(mode, openai_body));
+    let adaptive_plan =
+        adaptive_mode.map(|mode| crate::adaptive::Plan::for_request(mode, openai_body));
     let response_schema = adaptive_plan
         .as_ref()
         .filter(|plan| plan.verify_schema)
-        .and_then(|_| openai_body.pointer("/response_format/json_schema/schema").cloned());
+        .and_then(|_| {
+            openai_body
+                .pointer("/response_format/json_schema/schema")
+                .cloned()
+        });
 
     let url = format!(
         "{}/v1/chat/completions",
@@ -1483,7 +1489,10 @@ async fn chat_via_mcp_inner(
                         Ok(candidate) => state.sentinel.schema_check(schema, &candidate),
                         Err(error) => Some(format!("response content is not valid JSON: {error}")),
                     },
-                    None => Some("response did not contain JSON text at choices[0].message.content".to_string()),
+                    None => Some(
+                        "response did not contain JSON text at choices[0].message.content"
+                            .to_string(),
+                    ),
                 };
                 if let Some(why) = violation {
                     if verification_retries < plan.max_schema_retries {
@@ -1496,11 +1505,17 @@ async fn chat_via_mcp_inner(
                             assistant["role"] = json!("assistant");
                             messages.push(assistant);
                             let detail = why.chars().take(512).collect::<String>();
+                            let feedback = format!("Validation feedback: {detail}");
+                            let repair_prompt = [
+                                "The previous response did not satisfy the requested JSON schema.",
+                                &feedback,
+                                "Return only a corrected JSON object that satisfies the schema.",
+                                "Do not include commentary.",
+                            ]
+                            .join(" ");
                             messages.push(json!({
                                 "role": "user",
-                                "content": format!(
-                                    "The previous response did not satisfy the requested JSON schema.                                      Validation feedback: {detail}. Return only a corrected JSON object                                      that satisfies the schema. Do not include commentary."
-                                )
+                                "content": repair_prompt
                             }));
                             continue;
                         }
@@ -2080,6 +2095,36 @@ mod tests {
             0,
         );
         assert!(bare.headers().get("x-blazar-structured-output").is_none());
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn unit__rebuild__adaptive_receipt_is_sanitized() {
+        let plan = crate::adaptive::Plan::for_request(
+            crate::adaptive::Mode::Auto,
+            &json!({"messages": [{"role": "user", "content": "private prompt"}]}),
+        );
+        let resp = rebuild(
+            reqwest::StatusCode::OK,
+            &reqwest::header::HeaderMap::new(),
+            axum::body::Bytes::new(),
+            1,
+            None,
+            Some(&plan),
+            2,
+            Some(true),
+            1,
+        );
+        let receipt = resp
+            .headers()
+            .get("x-blazar-adaptive-result")
+            .and_then(|v| v.to_str().ok())
+            .expect("adaptive receipt is present");
+        assert!(receipt.contains("mode=auto"));
+        assert!(receipt.contains("rounds=1"));
+        assert!(receipt.contains("calls=2"));
+        assert!(receipt.contains("schema=pass"));
+        assert!(!receipt.contains("private prompt"));
     }
 
     #[allow(non_snake_case)]
