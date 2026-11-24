@@ -888,11 +888,12 @@ pub async fn openai_proxy(
                     let proposed = plan.strategy(v);
                     // Remote candidate fan-out is currently serialized into
                     // the sequential strategy by run_remote_chat.
-                    let effective = if proposed == crate::adaptive::Strategy::ParallelVerifiedCandidates {
-                        crate::adaptive::Strategy::SequentialRevision
-                    } else {
-                        proposed
-                    };
+                    let effective =
+                        if proposed == crate::adaptive::Strategy::ParallelVerifiedCandidates {
+                            crate::adaptive::Strategy::SequentialRevision
+                        } else {
+                            proposed
+                        };
                     u64::try_from(plan.max_model_calls(effective)).unwrap_or(1)
                 });
                 per_call.saturating_mul(call_multiplier)
