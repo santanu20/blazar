@@ -136,53 +136,67 @@ KV-cache quality receipts:
 - TTFT: `chunked_prefill_size 2048` = -24.7% uncached-prefill TTFT on a 10K-token prompt (35.1s -> 26.4s), zero quality loss (scheduling knob); warm radix-cache hits ~0.04s regardless; includes an arXiv-verified survey of modern TTFT algorithms. [bench-artifacts/20261112-ttft-chunked-prefill/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-ttft-chunked-prefill/README.md)
 - PD disaggregation overhead on a single GPU: direct lane vs `disagg_pair` + sgl-router = +27-44% steady-state e2e (router hop + mooncake transfer; ~2.5x cold from the 3-process spawn) - PD here is the topology/wiring tier, not a single-box perf win. [bench-artifacts/20261112-pd-overhead/](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261112-pd-overhead/README.md)
 
-## Adaptive inference A/B harness
+## Adaptive reasoning A/B harness
 
-The gateway adaptive runtime can spend additional model calls to improve
-structured-output validity or revise a complex answer. Those calls are a
-quality/latency/token trade-off, not a free optimization. Do not quote a
-quality or performance gain until it has been measured on a held-out workload.
+Blazar's adaptive controller performs **test-time inference orchestration**:
+independent candidate generation, task-aware evaluation, bounded revision,
+incumbent preservation, and explicit stopping when a response contract is
+satisfied or its compute budget is exhausted. It does not change model weights.
 
 Run the same fixed task set against the same model in each mode:
 
-    python3 scripts/bench_adaptive.py --base-url http://127.0.0.1:11435 --model MODEL --runs 10 --warmup 2 --output /tmp/adaptive.json
+    python3 scripts/bench_adaptive.py --base-url http://127.0.0.1:11435 --model MODEL --runs 20 --warmup 2 --seed 20261124 --output /tmp/adaptive.json
 
-The harness compares off, auto, and deep, using deterministic checks for
-arithmetic, table lookup, and a JSON-schema extraction task. It records task
-pass rate, p50/p95 latency, prompt/completion/total token usage, error counts,
-and the gateway's adaptive execution receipts. Use the same machine, model
-revision, sampling settings, concurrency, cache warmth, and request order for
-every arm. Rotate or randomize arm order for longer campaigns to reduce
-thermal/cache order effects.
+The harness compares off, auto, and deep. It includes three exact arithmetic
+expressions, a keyed table lookup, and a strict JSON-schema extraction task.
+Mode order is randomized and interleaved within each case/run. The report
+records the seed and execution order, exact-match pass rates by case, p50/p95
+latency, prompt/completion/total tokens, errors, adaptive receipts, candidate
+judge receipts, and paired accuracy/latency deltas with bootstrap confidence
+intervals versus off.
 
-This smoke suite is intentionally small. It is useful for validating routing,
-receipts, token accounting and obvious cost/latency shifts; it is not a
-substitute for broad held-out reasoning benchmarks such as GPQA, GSM8K,
-HotpotQA, FEVER or software-engineering task sets. Report the full per-case
-results and confidence intervals before describing the adaptive policy as
-quality-improving.
+**Controller signals and their meaning:**
 
-The current adaptive controller uses a **deterministic response-contract
-evaluator**, not a general semantic judge. It can score transport success,
-parseable response envelopes, requested JSON Schema validity, non-empty
-content and normal completion (`finish_reason`). It only accepts a revision
-when that observable score strictly improves; ties and regressions retain the
-incumbent. Auto gets one schema-repair opportunity; Deep gets a larger bounded
-repair ceiling and stops when the contract gates pass or no measurable
-improvement is available. Receipts expose `accepted`, `rejected`, and a
-low-cardinality `stop` reason.
+- **Hard response-contract gates:** HTTP success, parseable response envelope,
+  non-empty content, normal completion, and caller-requested JSON Schema.
+- **Deterministic arithmetic verifier:** recognizes a deliberately narrow
+  arithmetic-expression grammar in user messages (parentheses, decimals,
+  unary signs, addition, subtraction, multiplication, division and powers).
+  It independently evaluates only that extracted expression; it does not
+  execute arbitrary prompt text or general code.
+- **Answer self-consistency:** normalizes final-answer spans and compares
+  candidate votes. This is a confidence/consistency signal, not factual proof.
+  A majority cannot override a failed schema or deterministic arithmetic
+  check. A tie can consume another bounded sample while preserving the
+  incumbent.
+- **Budget policy:** Auto keeps a conservative single repair path. Deep uses
+  three parallel candidates and at most four further verifier-guided calls
+  (seven calls total); the request wall-clock deadline, per-call admission,
+  slot/queue saturation and key token budgets remain hard limits. Seeded or
+  temperature-zero requests avoid pretending deterministic repeats are
+  independent samples.
 
-This is a test-time inference/refinement loop. It does **not** alter the
-weights or internal recurrence of a model's Transformer blocks, and it does
-not claim to prove factual or semantic correctness for unconstrained prose.
-That requires task-specific independent verifiers (for example, unit tests,
-evidence checks or calibrated judges) and held-out experiments. Do not call
-the loop state-of-the-art without those measurements.
+The benchmark is a **diagnostic smoke suite**, not a held-out reasoning
+leaderboard. Five hand-authored tasks are useful for regression-testing
+routing, arithmetic verification, schema handling, receipts and the cost
+curve; they do not establish general reasoning ability. For quality claims,
+run paired, held-out domain suites with independent checkers (for example,
+GSM8K/MATH/AIME for math, GPQA for science, code tasks executed in a
+resource-limited sandbox, and multi-hop QA with evidence-backed scoring).
+Freeze model revisions and prompts, stratify tasks by difficulty, report
+per-task accuracy and uncertainty, and compare quality at equal token or
+latency budgets. Avoid relying on a model-as-judge as the sole verifier.
 
-The harness now runs randomized, interleaved mode orders within each
-case/run (recorded with `randomization_seed` and `execution_order`). The
-arithmetic checker requires an exact numeric answer, the table checker
-requires the correct label/value association, and JSON remains parsed and
-compared structurally. The default is ten repetitions per case; increase it
-for stable tail-latency and quality estimates.
+**Architecture boundary:** this controller only sees request/response
+payloads. It does not re-apply Transformer blocks to hidden states, preserve
+per-layer KV caches, or implement recurrent depth inside a model. That is a
+separate engine-level capability; the current generic Engine trait exposes
+process lifecycle and health, not hidden-state forward-pass access. A true
+looped-Transformer backend needs model-specific forward-pass integration,
+a selected layer window, cache-correct recurrence, stable damping/halting,
+and architecture-aware handling (especially for MoE models). Repeated API
+calls are not a substitute.
 
+Do not describe the gateway as state-of-the-art until broad held-out
+benchmarks demonstrate a repeatable, statistically defensible improvement
+over the same model's non-adaptive baseline at comparable compute.
