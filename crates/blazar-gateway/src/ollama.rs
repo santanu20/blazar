@@ -1484,6 +1484,12 @@ pub async fn chat(
     // POOL-aware (C4): select among same-named remotes with prefix
     // stickiness + circuit health, not just the first configured entry.
     if crate::remotes::split_remote(&model_field, &state.cfg()).is_some() {
+        if adaptive_mode.is_some() {
+            return api_error(
+                400,
+                "X-Blazar-Adaptive for remote models is currently supported through OpenAI-compatible /v1/chat/completions; the Ollama remote lane preserves its existing byte/dialect contract",
+            );
+        }
         // F11: remote lanes pay key admission against the full
         // `remote:model` string (same semantics as the OpenAI lane's
         // split: a scope entry like `my-remote:*` admits, anything
