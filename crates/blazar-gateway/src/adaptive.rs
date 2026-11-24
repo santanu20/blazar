@@ -1148,7 +1148,7 @@ async fn run_local_search_inner(
             stop_reason = "verified_answer".to_string();
             break;
         }
-        if added.is_empty() && tree.select_leaf().is_none() {
+        if added.is_empty() && !tree.has_open_frontier() {
             stop_reason = "no_expandable_state".to_string();
             break;
         }
@@ -1778,7 +1778,7 @@ async fn run_remote_search_inner(
             stop_reason = "verified_answer".to_string();
             break;
         }
-        if added.is_empty() && tree.select_leaf().is_none() {
+        if added.is_empty() && !tree.has_open_frontier() {
             stop_reason = "no_expandable_state".to_string();
             break;
         }
