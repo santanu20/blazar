@@ -881,6 +881,36 @@ fn append_search_expansion_prompt(
     Ok(())
 }
 
+fn verify_search_answer(
+    state: &crate::state::AppState,
+    plan: &Plan,
+    schema: Option<&Value>,
+    answer: &str,
+) -> crate::reasoning_search::Verification {
+    if let Some(valid) = plan.task_profile.task_valid(answer) {
+        return if valid {
+            crate::reasoning_search::Verification::Passed
+        } else {
+            crate::reasoning_search::Verification::Failed
+        };
+    }
+    if plan.verify_schema {
+        let schema_valid = schema
+            .and_then(|schema| {
+                serde_json::from_str::<Value>(answer)
+                    .ok()
+                    .map(|value| state.sentinel.schema_check(schema, &value).is_none())
+            })
+            .unwrap_or(false);
+        return if schema_valid {
+            crate::reasoning_search::Verification::Passed
+        } else {
+            crate::reasoning_search::Verification::Failed
+        };
+    }
+    crate::reasoning_search::Verification::Unknown
+}
+
 fn parse_search_expansion(
     state: &crate::state::AppState,
     plan: &Plan,
@@ -932,32 +962,7 @@ fn parse_search_expansion(
 
             let verification = answer.as_deref().map_or(
                 crate::reasoning_search::Verification::Unknown,
-                |final_answer| {
-                    if let Some(valid) = plan.task_profile.task_valid(final_answer) {
-                        return if valid {
-                            crate::reasoning_search::Verification::Passed
-                        } else {
-                            crate::reasoning_search::Verification::Failed
-                        };
-                    }
-                    if plan.verify_schema {
-                        let schema_valid = schema
-                            .and_then(|schema| {
-                                serde_json::from_str::<Value>(final_answer)
-                                    .ok()
-                                    .map(|value| {
-                                        state.sentinel.schema_check(schema, &value).is_none()
-                                    })
-                            })
-                            .unwrap_or(false);
-                        return if schema_valid {
-                            crate::reasoning_search::Verification::Passed
-                        } else {
-                            crate::reasoning_search::Verification::Failed
-                        };
-                    }
-                    crate::reasoning_search::Verification::Unknown
-                },
+                |final_answer| verify_search_answer(state, plan, schema, final_answer),
             );
             let prior = branch.get("prior").and_then(Value::as_f64).unwrap_or(0.5);
             let value = branch.get("value").and_then(Value::as_f64).unwrap_or(0.5);
@@ -1126,15 +1131,18 @@ async fn run_local_search_inner(
                 merge_usage(&mut usage_total, &body);
             }
             stop_reason = "search_fallback".to_string();
-            (response, None, None)
+            let verification = serde_json::from_slice::<Value>(&response.body)
+                .ok()
+                .and_then(|body| response_content(&body).map(|answer| {
+                    verify_search_answer(state, &plan, schema.as_ref(), answer)
+                }))
+                .unwrap_or(crate::reasoning_search::Verification::Unknown);
+            (response, None, Some(verification))
         } else {
-            let Some(response) = current else {
-                return Err(crate::mcp::teaching_error(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    "reasoning search could not produce an answer within its compute budget",
-                ));
-            };
-            (response, None, None)
+            return Err(crate::mcp::teaching_error(
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+                "reasoning search exhausted its compute deadline before producing a user-facing answer",
+            ));
         }
     };
 
