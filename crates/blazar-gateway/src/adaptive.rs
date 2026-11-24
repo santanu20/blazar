@@ -12,6 +12,7 @@
 //! held-out workloads before any quality-optimality claim is justified.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use axum::http::HeaderMap;
 use serde_json::Value;
@@ -463,7 +464,7 @@ impl CandidateSummary {
             let key = field("vote_key")
                 .and_then(|value| u64::from_str_radix(value, 16).ok())
                 .or_else(|| {
-                    crate::reasoning::answer_hash(&response_content(body).unwrap_or_default())
+                    crate::reasoning::answer_hash(response_content(body).unwrap_or_default())
                 });
             if let Some(tallies) = field("vote_tallies=") {
                 for entry in tallies.split(',') {
@@ -618,7 +619,7 @@ fn assess_candidate(
 }
 
 fn reasoning_receipt(
-    receipt: String,
+    receipt: &str,
     plan: &Plan,
     summary: &CandidateSummary,
     body: &Value,
@@ -1062,7 +1063,7 @@ async fn run_local_chat_inner(
         rejected,
         &stop_reason,
     );
-    let receipt = reasoning_receipt(receipt, &plan, &candidate_summary, &current_body);
+    let receipt = reasoning_receipt(&receipt, &plan, &candidate_summary, &current_body);
     Ok(rebuild_response(current, &receipt))
 }
 
@@ -1192,7 +1193,7 @@ async fn remote_candidate_rounds(
             decision.candidates
         );
         if let Some(hash) = decision.answer_hash {
-            receipt.push_str(&format!(" vote_key={hash:016x}"));
+            let _ = write!(receipt, " vote_key={hash:016x}");
         }
         let vote_tallies = decision
             .vote_tallies
@@ -1201,7 +1202,7 @@ async fn remote_candidate_rounds(
             .collect::<Vec<_>>()
             .join(",");
         if !vote_tallies.is_empty() {
-            receipt.push_str(&format!(" vote_tallies={vote_tallies}"));
+            let _ = write!(receipt, " vote_tallies={vote_tallies}");
         }
         if let Ok(value) = axum::http::HeaderValue::from_str(&receipt) {
             winner.headers.insert("x-blazar-adaptive-candidates", value);
@@ -1279,7 +1280,7 @@ async fn run_remote_chat_inner(
         .and_then(Value::as_str)
         .unwrap_or(model)
         .to_string();
-    let mut model_calls = 0usize;
+    let mut model_calls;
     let mut revisions = 0usize;
     let mut accepted = 0usize;
     let mut rejected = 0usize;
