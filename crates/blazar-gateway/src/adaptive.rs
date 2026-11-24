@@ -433,6 +433,128 @@ fn schema_violation(
     }
 }
 
+/// Execute one internal local model round through Blazar's normal proxy
+/// pipeline. Every revision/candidate therefore participates in key budget
+/// reservation, usage sniffing, Sentinel and local service telemetry.
+#[allow(clippy::result_large_err)]
+async fn local_proxy_round(
+    state: &std::sync::Arc<crate::state::AppState>,
+    engine: &blazar_runtime::EngineRef,
+    request: &Value,
+    headers: &HeaderMap,
+    key: Option<&crate::keys::KeyCtx>,
+    candidates: Option<u64>,
+) -> Result<BufferedResponse, axum::response::Response> {
+    let mut child_headers = headers.clone();
+    child_headers.remove(HEADER);
+    child_headers.remove("x-blazar-mcp");
+    child_headers.remove("x-blazar-adaptive-result");
+    let body = axum::body::Bytes::from(serde_json::to_vec(request).unwrap_or_default());
+    let sf_gate = candidates
+        .map(crate::proxy::SfGate::AdaptiveCandidates)
+        .unwrap_or(crate::proxy::SfGate::AdaptiveDirect);
+    let response = crate::proxy::proxy_request(
+        state,
+        engine,
+        &engine.name,
+        &axum::http::Method::POST,
+        "/v1/chat/completions",
+        &child_headers,
+        body,
+        0,
+        None,
+        None,
+        key.cloned(),
+        None, // Intermediate drafts must not create completion metadata cards.
+        sf_gate,
+        None,
+    )
+    .await;
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, MAX_ADAPTIVE_RESPONSE_BYTES)
+        .await
+        .map_err(|error| {
+            crate::mcp::teaching_error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                &format!("adaptive proxy response body failed: {error}"),
+            )
+        })?;
+    let status = reqwest::StatusCode::from_u16(parts.status.as_u16())
+        .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+    Ok(BufferedResponse {
+        status,
+        headers: parts.headers,
+        body: bytes,
+    })
+}
+
+fn candidate_usage(
+    headers: &reqwest::header::HeaderMap,
+    asked: usize,
+) -> (usize, Option<String>) {
+    let Some(receipt) = headers
+        .get("x-blazar-adaptive-candidates")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (1, None);
+    };
+    let used = receipt
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("used="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, asked.max(1));
+    let reason = receipt
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("reason="))
+        .map(str::to_string);
+    (used, reason)
+}
+
+async fn adaptive_admission_guard(
+    state: &std::sync::Arc<crate::state::AppState>,
+    engine: &blazar_runtime::EngineRef,
+    request: &Value,
+    headers: &HeaderMap,
+    key: Option<&crate::keys::KeyCtx>,
+) -> Result<crate::proxy::InFlightGuard, axum::response::Response> {
+    let body = serde_json::to_vec(request).unwrap_or_default();
+    let has_tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let class = crate::workload::classify_for(
+        state,
+        &engine.name,
+        crate::workload::WorkloadSurface::Chat,
+        has_tools,
+        false,
+    );
+    let priority = crate::queue::Priority::from_header(
+        headers
+            .get("x-blazar-priority")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let deadline_ms = headers
+        .get("x-blazar-deadline-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let wfq = key.map(|key| (key.name.as_str(), key.weight));
+    let exclusive = crate::proxy::exclusive_intent_bytes(state, &engine.name, &body);
+    crate::proxy::admission_gate_slo(
+        state,
+        &engine.name,
+        priority,
+        class,
+        deadline_ms,
+        body.len(),
+        wfq,
+        exclusive,
+    )
+    .await
+    .map_err(|response| *response)
+}
+
 /// Run an adaptive chat task on any locally resolved Blazar engine. All
 /// local engines use the same OpenAI-compatible child chat endpoint.
 ///
@@ -446,10 +568,17 @@ pub(crate) async fn run_local_chat(
     engine: &blazar_runtime::EngineRef,
     openai_body: &Value,
     mode: Mode,
+    headers: &HeaderMap,
+    key: Option<&crate::keys::KeyCtx>,
 ) -> Result<reqwest::Response, axum::response::Response> {
     let request = openai_body.clone();
     let budget = std::time::Duration::from_secs(ADAPTIVE_MAX_REQUEST_SECS);
-    match tokio::time::timeout(budget, run_local_chat_inner(state, engine, request, mode)).await {
+    match tokio::time::timeout(
+        budget,
+        run_local_chat_inner(state, engine, request, mode, headers, key),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(crate::mcp::teaching_error(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
@@ -467,6 +596,8 @@ async fn run_local_chat_inner(
     engine: &blazar_runtime::EngineRef,
     mut request: Value,
     mode: Mode,
+    headers: &HeaderMap,
+    key: Option<&crate::keys::KeyCtx>,
 ) -> Result<reqwest::Response, axum::response::Response> {
     let original_request = request.clone();
     let plan = Plan::for_request(mode, &request);
@@ -481,72 +612,38 @@ async fn run_local_chat_inner(
         .and_then(Value::as_str)
         .unwrap_or(&engine.name)
         .to_string();
-    let url = format!(
-        "{}/v1/chat/completions",
-        crate::proxy::child_base(&engine.endpoint)
-    );
-    let body = serde_json::to_vec(&request).unwrap_or_default();
     let mut degraded = None;
     let mut candidates = 1usize;
     let mut model_calls = 0usize;
     let mut revisions = 0usize;
     let mut verified = None;
     let mut usage_total = None;
-    let mut response: Option<BufferedResponse> = None;
 
-    // Parallel sampling is restricted to requests with a deterministic schema
-    // verifier. Best-of-N owns queue, slot-headroom and body-size degradation.
-    if strategy == Strategy::ParallelVerifiedCandidates {
-        match crate::bestof::fan_out(state, engine, &url, &body, Plan::max_candidates(strategy))
-            .await
-        {
-            crate::bestof::FanOut::Ran(outcome) => {
-                candidates = 2;
-                model_calls = candidates;
-                let buffered = read_child_response(outcome.resp).await.map_err(|error| {
-                    crate::mcp::teaching_error(axum::http::StatusCode::BAD_GATEWAY, &error)
-                })?;
-                if let Ok(parsed) = serde_json::from_slice::<Value>(&buffered.body) {
-                    merge_usage(&mut usage_total, &parsed);
-                    verified =
-                        Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
-                }
-                response = Some(buffered);
-            }
-            crate::bestof::FanOut::Degraded(reason) => degraded = Some(reason),
-            crate::bestof::FanOut::Skip => {}
-        }
+    // Every local model call goes through proxy_request, preserving the
+    // normal admission, key-budget, usage, Sentinel and service-time path.
+    let asked_candidates = (strategy == Strategy::ParallelVerifiedCandidates)
+        .then(|| Plan::max_candidates(strategy));
+    let mut current = local_proxy_round(
+        state,
+        engine,
+        &request,
+        headers,
+        key,
+        asked_candidates,
+    )
+    .await?;
+    if let Some(asked) = asked_candidates {
+        let (used, reason) = candidate_usage(&current.headers, usize::try_from(asked).unwrap_or(1));
+        candidates = used;
+        model_calls = used;
+        degraded = reason;
+    } else {
+        model_calls = 1;
     }
-
-    if response.is_none() {
-        let client = crate::state::child_client(state, &engine.endpoint);
-        let send = crate::proxy::child_auth(
-            client
-                .post(&url)
-                .header("content-type", "application/json")
-                .body(body),
-            engine,
-        );
-        let child = crate::proxy::child_send(state, engine, send.send())
-            .await
-            .map_err(|error| {
-                crate::mcp::teaching_error(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    &format!("adaptive engine request failed: {error}"),
-                )
-            })?;
-        model_calls += 1;
-        let buffered = read_child_response(child).await.map_err(|error| {
-            crate::mcp::teaching_error(axum::http::StatusCode::BAD_GATEWAY, &error)
-        })?;
-        if let Ok(parsed) = serde_json::from_slice::<Value>(&buffered.body) {
-            merge_usage(&mut usage_total, &parsed);
-            verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
-        }
-        response = Some(buffered);
+    if let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) {
+        merge_usage(&mut usage_total, &parsed);
+        verified = Some(schema_violation(state, &plan, schema.as_ref(), &parsed).is_none());
     }
-
-    let mut current = response.expect("direct or fan-out path always sets a response");
     if !current.status.is_success() {
         return Ok(rebuild_response(
             current,
@@ -601,27 +698,9 @@ async fn run_local_chat_inner(
         append_revision_prompt(&mut request, &assistant, feedback.as_deref()).map_err(|error| {
             crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
         })?;
-        let client = crate::state::child_client(state, &engine.endpoint);
-        let send = crate::proxy::child_auth(
-            client
-                .post(&url)
-                .header("content-type", "application/json")
-                .body(serde_json::to_vec(&request).unwrap_or_default()),
-            engine,
-        );
-        let child = crate::proxy::child_send(state, engine, send.send())
-            .await
-            .map_err(|error| {
-                crate::mcp::teaching_error(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    &format!("adaptive revision request failed: {error}"),
-                )
-            })?;
         model_calls += 1;
         revisions += 1;
-        current = read_child_response(child).await.map_err(|error| {
-            crate::mcp::teaching_error(axum::http::StatusCode::BAD_GATEWAY, &error)
-        })?;
+        current = local_proxy_round(state, engine, &request, headers, key, None).await?;
         if let Ok(parsed) = serde_json::from_slice::<Value>(&current.body) {
             merge_usage(&mut usage_total, &parsed);
             if plan.verify_schema {
@@ -878,11 +957,20 @@ pub(crate) async fn execute_chat(
     mode: Mode,
     mcp_selector: Option<&str>,
     key: Option<&crate::keys::KeyCtx>,
+    headers: &HeaderMap,
+    acquire_slo_guard: bool,
 ) -> Result<reqwest::Response, axum::response::Response> {
+    // OpenAI enters before the usual SLO gate. Anthropic and Ollama already
+    // hold a guard at their protocol translation boundary.
+    let _inflight = if acquire_slo_guard {
+        Some(adaptive_admission_guard(state, engine, openai_body, headers, key).await?)
+    } else {
+        None
+    };
     if let Some(selector) = mcp_selector {
         crate::mcp::chat_via_mcp(state, engine, openai_body, selector, key, Some(mode)).await
     } else {
-        run_local_chat(state, engine, openai_body, mode).await
+        run_local_chat(state, engine, openai_body, mode, headers, key).await
     }
 }
 

@@ -467,6 +467,8 @@ pub async fn messages(
             mode,
             mcp_sel.as_deref(),
             key_ext.as_deref(),
+            &headers,
+            false,
         )
         .await
         {

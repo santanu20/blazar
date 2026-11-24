@@ -2009,6 +2009,7 @@ pub async fn chat(
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
                 adaptive_mode,
+                headers.clone(),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint #12),
@@ -2580,6 +2581,7 @@ async fn proxy_core_chat(
     // authorization-checked.
     mcp_key: Option<crate::keys::KeyCtx>,
     adaptive_mode: Option<crate::adaptive::Mode>,
+    adaptive_headers: axum::http::HeaderMap,
 ) -> Response {
     let base = child_base(&engine.endpoint);
     // Pre-render recipe lane: the gateway owns the prompt (chatml wrap
@@ -2696,6 +2698,8 @@ async fn proxy_core_chat(
                 mode,
                 mcp_sel.as_deref(),
                 mcp_key.as_ref(),
+                &adaptive_headers,
+                false,
             )
             .await
             {
@@ -4300,6 +4304,7 @@ pub async fn generate(
                 None,
                 key_ext.as_ref().map(|Extension(k)| k.clone()),
                 None,
+                headers.clone(),
             )
             .await;
             // keep_alive=0: evict right after this response (complaint

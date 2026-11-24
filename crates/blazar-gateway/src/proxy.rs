@@ -1451,7 +1451,11 @@ pub async fn proxy_request(
     // the twin proceeds uncoalesced (long generations never serialize
     // their duplicates indefinitely).
     let mut sf: Option<SingleFlight> = None;
+    let mut adaptive_candidate_want = None;
+    let mut adaptive_candidate_receipt: Option<String> = None;
     match sf_gate {
+        SfGate::AdaptiveDirect => {}
+        SfGate::AdaptiveCandidates(want) => adaptive_candidate_want = Some(want),
         SfGate::Held(g) => sf = Some(g),
         // The bounded wait already ran pre-admission; proceeding
         // uncoalesced matches the legacy timeout outcome.
@@ -1516,13 +1520,16 @@ pub async fn proxy_request(
         // parsed=None only on cold callers; parse the snapshot for the
         // estimate then (the strict lane is opt-in, so the parse rides
         // it rather than taxing every request).
-        let estimate = match parsed.as_ref() {
+        let per_call_estimate = match parsed.as_ref() {
             Some(v) => crate::keys::completion_ceiling(v, state.cfg().reserve_default_tokens),
             None => match serde_json::from_slice::<serde_json::Value>(&body_snapshot) {
                 Ok(v) => crate::keys::completion_ceiling(&v, state.cfg().reserve_default_tokens),
                 Err(_) => state.cfg().reserve_default_tokens,
             },
         };
+        // Candidate fan-out consumes N independent generations. Reserve the
+        // aggregate completion ceiling before the first candidate starts.
+        let estimate = per_call_estimate.saturating_mul(adaptive_candidate_want.unwrap_or(1));
         match state.keys.reserve(&entry, estimate) {
             Ok(l) => budget_lease = l,
             Err(rej) => {
@@ -1536,7 +1543,25 @@ pub async fn proxy_request(
         // below carries it to stream/buffered completion.
         crate::keys::LocalServiceStamp::new(std::sync::Arc::clone(&state.service_ewma_local), model)
     });
-    let upstream = forward_once(state, engine, method, &url, headers, body).await;
+    let upstream = if let Some(want) = adaptive_candidate_want {
+        match crate::bestof::fan_out(state, engine, &url, &body_snapshot, want).await {
+            crate::bestof::FanOut::Ran(outcome) => {
+                state.ttft.observe_secs(outcome.elapsed.as_secs_f64());
+                adaptive_candidate_receipt = Some(outcome.hdr);
+                Ok(outcome.resp)
+            }
+            crate::bestof::FanOut::Degraded(receipt) => {
+                adaptive_candidate_receipt = Some(receipt);
+                forward_once(state, engine, method, &url, headers, body.clone()).await
+            }
+            crate::bestof::FanOut::Skip => {
+                adaptive_candidate_receipt = Some(format!("asked={want} used=1 reason=skip"));
+                forward_once(state, engine, method, &url, headers, body).await
+            }
+        }
+    } else {
+        forward_once(state, engine, method, &url, headers, body).await
+    };
     let mut resp = match upstream {
         Ok(r) => r,
         Err(e) => {
@@ -1693,6 +1718,9 @@ pub async fn proxy_request(
         if !STRIP_RESPONSE.contains(&name.as_str()) {
             builder = builder.header(name, value);
         }
+    }
+    if let Some(receipt) = adaptive_candidate_receipt.as_deref() {
+        builder = builder.header("x-blazar-adaptive-candidates", receipt);
     }
     // Loading transparency (complaint #10): requests that waited on a
     // cold load say so.
@@ -2316,6 +2344,12 @@ pub enum SfGate {
     /// Not eligible (config off / non-chat route / stream / oversized
     /// body): `proxy_request`'s legacy internal block stays the owner.
     Ineligible,
+    /// Adaptive direct round: the adaptive controller owns admission and
+    /// deliberately does not coalesce its distinct internal model calls.
+    AdaptiveDirect,
+    /// Adaptive verified-candidate request: proxy owns candidate fan-out
+    /// while retaining the normal buffered accounting pipeline.
+    AdaptiveCandidates(u64),
     /// Waited (bounded) and now holding the single-flight: the caller
     /// may proceed to slot admission; duplicates coalesce behind this.
     Held(SingleFlight),

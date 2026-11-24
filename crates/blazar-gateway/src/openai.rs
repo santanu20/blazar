@@ -1278,6 +1278,8 @@ pub async fn openai_proxy(
                     mode,
                     sel.as_deref(),
                     key_ext.as_deref(),
+                    &headers,
+                    true,
                 )
                 .await
             } else if let Some(selector) = sel.as_deref() {
