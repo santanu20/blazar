@@ -547,11 +547,14 @@ impl CandidateQuality {
             || self.agreement.saturating_mul(2) > self.candidates
     }
 
-    fn rank(self) -> (u8, u8, u8, u8, usize, u8, u8) {
+    fn rank(self) -> (u8, u8, u8, u8, u8, usize, u8, u8) {
+        let schema_ok = u8::from(self.schema_valid != Some(false));
+        let math_ok = u8::from(self.math_valid != Some(false));
         (
             u8::from(self.http_success),
-            u8::from(self.schema_valid != Some(false)),
-            u8::from(self.math_valid != Some(false)),
+            schema_ok + math_ok,
+            schema_ok,
+            math_ok,
             u8::from(self.complete),
             self.consensus_score(),
             u8::from(self.non_empty),
