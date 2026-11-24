@@ -887,14 +887,14 @@ fn verify_search_answer(
     schema: Option<&Value>,
     answer: &str,
 ) -> crate::reasoning_search::Verification {
-    if let Some(valid) = plan.task_profile.task_valid(answer) {
-        return if valid {
-            crate::reasoning_search::Verification::Passed
-        } else {
-            crate::reasoning_search::Verification::Failed
-        };
+    let mut applicable = false;
+    let mut valid = true;
+    if let Some(task_valid) = plan.task_profile.task_valid(answer) {
+        applicable = true;
+        valid &= task_valid;
     }
     if plan.verify_schema {
+        applicable = true;
         let schema_valid = schema
             .and_then(|schema| {
                 serde_json::from_str::<Value>(answer)
@@ -902,13 +902,15 @@ fn verify_search_answer(
                     .map(|value| state.sentinel.schema_check(schema, &value).is_none())
             })
             .unwrap_or(false);
-        return if schema_valid {
-            crate::reasoning_search::Verification::Passed
-        } else {
-            crate::reasoning_search::Verification::Failed
-        };
+        valid &= schema_valid;
     }
-    crate::reasoning_search::Verification::Unknown
+    if !applicable {
+        crate::reasoning_search::Verification::Unknown
+    } else if valid {
+        crate::reasoning_search::Verification::Passed
+    } else {
+        crate::reasoning_search::Verification::Failed
+    }
 }
 
 fn parse_search_expansion(
@@ -1094,7 +1096,13 @@ async fn run_local_search_inner(
             branch_limit,
         );
         let added = tree.expand(leaf, proposals).unwrap_or_default();
-        accepted = accepted.saturating_add(added.len());
+        let added_accepted = added
+            .iter()
+            .filter(|id| tree.nodes()[**id].status != crate::reasoning_search::NodeStatus::Rejected)
+            .count();
+        let added_rejected = added.len().saturating_sub(added_accepted);
+        accepted = accepted.saturating_add(added_accepted);
+        rejected = rejected.saturating_add(added_rejected);
         current = Some(response);
 
         if tree.stats().verified_terminals > 0 {
@@ -1164,22 +1172,21 @@ async fn run_local_search_inner(
     current.body = axum::body::Bytes::from(
         serde_json::to_vec(&final_body).unwrap_or_else(|_| current.body.to_vec()),
     );
-    let schema_verified = if plan.verify_schema {
-        Some(schema_violation(state, &plan, schema.as_ref(), &final_body).is_none())
-    } else {
-        selected_verification
-            .map(|verification| verification == crate::reasoning_search::Verification::Passed)
-    };
+    let schema_verified = plan
+        .verify_schema
+        .then(|| schema_violation(state, &plan, schema.as_ref(), &final_body).is_none());
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
         stats.tokens,
         stats.transpositions,
         stats.prm_calibrated_nodes,
+        stats.best_value,
+        stats.best_uncertainty,
     );
     if let Ok(value) = axum::http::HeaderValue::from_str(&search_receipt) {
         current.headers.insert("x-blazar-adaptive-search", value);
@@ -1699,7 +1706,13 @@ async fn run_remote_search_inner(
             branch_limit,
         );
         let added = tree.expand(leaf, proposals).unwrap_or_default();
-        accepted = accepted.saturating_add(added.len());
+        let added_accepted = added
+            .iter()
+            .filter(|id| tree.nodes()[**id].status != crate::reasoning_search::NodeStatus::Rejected)
+            .count();
+        let added_rejected = added.len().saturating_sub(added_accepted);
+        accepted = accepted.saturating_add(added_accepted);
+        rejected = rejected.saturating_add(added_rejected);
         current = Some(response);
 
         if tree.stats().verified_terminals > 0 {
@@ -1769,22 +1782,21 @@ async fn run_remote_search_inner(
     current.body = axum::body::Bytes::from(
         serde_json::to_vec(&final_body).unwrap_or_else(|_| current.body.to_vec()),
     );
-    let schema_verified = if plan.verify_schema {
-        Some(schema_violation(state, &plan, schema.as_ref(), &final_body).is_none())
-    } else {
-        selected_verification
-            .map(|verification| verification == crate::reasoning_search::Verification::Passed)
-    };
+    let schema_verified = plan
+        .verify_schema
+        .then(|| schema_violation(state, &plan, schema.as_ref(), &final_body).is_none());
     let stats = tree.stats();
     let verified = selected_verification == Some(crate::reasoning_search::Verification::Passed);
     let search_receipt = format!(
-        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} stop={stop_reason}",
+        "algorithm=prefix_puct value_source=self_reported_uncalibrated verified={verified} nodes={} expansions={} depth={} tokens={} transpositions={} prm_calibrated_nodes={} best_value={:.3} uncertainty={:.3} stop={stop_reason}",
         stats.nodes,
         stats.expansions,
         stats.max_depth_reached,
         stats.tokens,
         stats.transpositions,
         stats.prm_calibrated_nodes,
+        stats.best_value,
+        stats.best_uncertainty,
     );
     if let Ok(value) = axum::http::HeaderValue::from_str(&search_receipt) {
         current.headers.insert("x-blazar-adaptive-search", value);
