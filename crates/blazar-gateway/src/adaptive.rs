@@ -156,8 +156,6 @@ fn recursive_text_len(value: &Value) -> usize {
     }
 }
 
-
-
 /// Execution strategy selected by the gateway controller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Strategy {
@@ -196,7 +194,8 @@ impl Plan {
     pub(crate) fn max_model_calls(&self, strategy: Strategy) -> usize {
         match strategy {
             Strategy::Direct => 1,
-            Strategy::SequentialRevision | Strategy::ParallelVerifiedCandidates => 2,
+            Strategy::SequentialRevision => 2,
+            Strategy::ParallelVerifiedCandidates => 3,
         }
     }
 
@@ -314,9 +313,7 @@ fn merge_json_counters(total: &mut Value, next: &Value) {
         *total = Value::from(left.saturating_add(right));
         return;
     }
-    if let (Some(total_fields), Some(next_fields)) =
-        (total.as_object_mut(), next.as_object())
-    {
+    if let (Some(total_fields), Some(next_fields)) = (total.as_object_mut(), next.as_object()) {
         for (key, value) in next_fields {
             match total_fields.get_mut(key) {
                 Some(existing) => merge_json_counters(existing, value),
@@ -542,6 +539,20 @@ async fn run_local_chat_inner(
             return Ok(rebuild_response(
                 current,
                 &plan.execution_receipt(
+                    strategy,
+                    model_calls,
+                    candidates,
+                    verified,
+                    revisions,
+                    degraded.as_deref(),
+                ),
+            ));
+        }
+    };
+    if message_has_tool_calls(&parsed) {
+        return Ok(rebuild_response(
+            current,
+            &plan.execution_receipt(
                 strategy,
                 model_calls,
                 candidates,
@@ -549,20 +560,13 @@ async fn run_local_chat_inner(
                 revisions,
                 degraded.as_deref(),
             ),
-            ));
-        }
-    };
-    if message_has_tool_calls(&parsed) {
-        return Ok(rebuild_response(
-            current,
-            &plan.execution_receipt(strategy, model_calls, candidates, verified, revisions, degraded.as_deref()),
         ));
     }
 
     let schema_feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
-    let should_revise = schema_feedback.is_some()
-        || (strategy == Strategy::SequentialRevision
-            && model_calls < plan.max_model_calls(strategy));
+    let should_revise = (schema_feedback.is_some()
+        || strategy == Strategy::SequentialRevision)
+        && model_calls < plan.max_model_calls(strategy);
     if should_revise {
         let assistant = parsed
             .pointer("/choices/0/message")
@@ -792,9 +796,8 @@ async fn run_remote_chat_inner(
         ));
     }
     let feedback = schema_violation(state, &plan, schema.as_ref(), &parsed);
-    if feedback.is_some()
-        || (strategy == Strategy::SequentialRevision
-            && model_calls < plan.max_model_calls(strategy))
+    if (feedback.is_some() || strategy == Strategy::SequentialRevision)
+        && model_calls < plan.max_model_calls(strategy)
     {
         let assistant = parsed
             .pointer("/choices/0/message")
@@ -906,6 +909,35 @@ mod tests {
 
     #[test]
     fn unit__strategy__direct_revision_and_parallel_candidates() {
+        let simple = json!({
+            "messages": [{"role": "user", "content": "What is 2 + 2?"}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Auto, &simple).strategy(&simple),
+            Strategy::Direct
+        );
+        let complex = json!({
+            "messages": [{"role": "user", "content": "x".repeat(4_000)}]
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Auto, &complex).strategy(&complex),
+            Strategy::SequentialRevision
+        );
+        let structured = json!({
+            "messages": [{"role": "user", "content": "Return a JSON object."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}}
+            }
+        });
+        assert_eq!(
+            Plan::for_request(Mode::Deep, &structured).strategy(&structured),
+            Strategy::ParallelVerifiedCandidates
+        );
+    }
+
+    #[test]
+    fn unit__strategy__selects_direct_revision_and_parallel() {
         let simple = json!({
             "messages": [{"role": "user", "content": "What is 2 + 2?"}]
         });

@@ -894,10 +894,10 @@ pub async fn openai_proxy(
                 return openai_error(400, "adaptive remote request body must be JSON");
             };
             let mut selector_body = request.clone();
-            match state
-                .mcp
-                .resolve(crate::mcp::selector_from(&headers, Some(&mut selector_body)))
-            {
+            match state.mcp.resolve(crate::mcp::selector_from(
+                &headers,
+                Some(&mut selector_body),
+            )) {
                 Err(msg) => return openai_error(400, &msg),
                 Ok(Some(_)) => {
                     return openai_error(

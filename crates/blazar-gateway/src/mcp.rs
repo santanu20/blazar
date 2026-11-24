@@ -2118,10 +2118,12 @@ mod tests {
             axum::body::Bytes::new(),
             1,
             None,
-            Some(&plan),
-            2,
-            Some(true),
-            1,
+            RebuildMeta {
+                adaptive_plan: Some(&plan),
+                tool_calls: 2,
+                schema_verified: Some(true),
+                schema_retries: 1,
+            },
         );
         let receipt = resp
             .headers()
