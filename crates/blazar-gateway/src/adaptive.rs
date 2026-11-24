@@ -1,10 +1,15 @@
-//! Adaptive control for the gateway-mediated MCP execution path.
+//! Gateway-wide adaptive inference control for normalized chat requests.
 //!
-//! This module deliberately contains a cheap, deterministic policy: it
-//! profiles request shape once, then allocates bounded tool rounds/calls.
-//! It does not ask a second model to decide whether another model call is
-//! worthwhile. The configured MCP request deadline remains the wall-clock
-//! hard stop, and existing API-key MCP scopes remain authoritative.
+//! The shared controller runs after protocol normalization and before the
+//! resolved model backend. It can allocate bounded inference revisions,
+//! deterministic schema verification, and (on supported local lanes) parallel
+//! candidates. MCP is optional: when selected, its independent tool-round,
+//! server-timeout, and per-key authorization limits remain authoritative.
+//!
+//! The initial policy is deterministic and request-shape driven. It does not
+//! inspect hidden reasoning or spend an extra model call deciding whether to
+//! spend another model call. Its thresholds require calibration against
+//! held-out workloads before any quality-optimality claim is justified.
 
 use axum::http::HeaderMap;
 use serde_json::Value;
