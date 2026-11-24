@@ -75,6 +75,7 @@ def main() -> int:
     # The doc tracks one table per config.rs struct (section == struct).
     tracked = {
         "Config": "Config",
+        "ReasoningPrmConfig": "ReasoningPrmConfig",
         "MistralrsTuning": "MistralrsTuning",
         "SglangTuning": "SglangTuning",
         "ModelOverride": "ModelOverride",
