@@ -1105,6 +1105,8 @@ async fn run_local_search_inner(
             .map_err(|error| {
                 crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
             })?;
+        model_calls = model_calls.saturating_add(1);
+        revisions = revisions.saturating_add(1);
         let response =
             match local_proxy_round(state, engine, &expansion_request, headers, key, None).await {
                 Ok(response) => response,
@@ -1115,8 +1117,6 @@ async fn run_local_search_inner(
                     continue;
                 }
             };
-        model_calls = model_calls.saturating_add(1);
-        revisions = revisions.saturating_add(1);
         let Ok(expansion_body) = serde_json::from_slice::<Value>(&response.body) else {
             let _ = tree.expand(leaf, Vec::new());
             rejected = rejected.saturating_add(1);
@@ -1727,6 +1727,8 @@ async fn run_remote_search_inner(
             .map_err(|error| {
                 crate::mcp::teaching_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &error)
             })?;
+        model_calls = model_calls.saturating_add(1);
+        revisions = revisions.saturating_add(1);
         let response = match remote_round(
             state,
             model,
@@ -1745,8 +1747,6 @@ async fn run_remote_search_inner(
                 continue;
             }
         };
-        model_calls = model_calls.saturating_add(1);
-        revisions = revisions.saturating_add(1);
         let Ok(expansion_body) = serde_json::from_slice::<Value>(&response.body) else {
             let _ = tree.expand(leaf, Vec::new());
             rejected = rejected.saturating_add(1);
