@@ -458,7 +458,7 @@ impl CandidateSummary {
             summary.candidates = field("used=")
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(1)
-                .clamp(1, crate::bestof::MAX_BEST_OF as usize);
+                .clamp(1, 4);
             summary.fanout = summary.candidates > 1;
             let key = field("vote_key")
                 .and_then(|value| u64::from_str_radix(value, 16).ok())
