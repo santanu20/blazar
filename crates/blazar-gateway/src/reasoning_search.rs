@@ -589,7 +589,7 @@ mod tests {
             prior,
             value: ValueEstimate::new(value, uncertainty, true),
             verification: Verification::Unknown,
-            estimated_state_estimated_state_tokens: 4,
+            estimated_state_tokens: 4,
         }
     }
 
