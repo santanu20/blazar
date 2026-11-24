@@ -169,7 +169,7 @@ Research directions informing the next phase:
 - [PRM-guided adaptive trajectory search (ICML 2026)](https://proceedings.mlr.press/v306/bilal26a.html)
 - [Budget-guided MCTS for test-time scaling (2026)](https://proceedings.mlr.press/v306/miyamoto26a.html)
 - [MCTS over partial reasoning states (2026)](https://arxiv.org/abs/2608.30395)
-- [Uncertainty-aware PRM tree search (ICLR 2026)](https://openreview.net/forum?id=)
+- [Uncertainty-Aware Tree Search (ICLR 2026)](https://openreview.net/forum?id=tOSQtPmfGE). Its reported negative/neutral downstream results under search-induced distribution shift are a reason to validate PRM/PUM reliability on generated search states, not to assume uncertainty bonuses improve accuracy.
 - [T-LoopFormer variable-depth recurrence (2026)](https://arxiv.org/abs/2609.15160)
 - [LoopCache for recurrent KV state (2026)](https://arxiv.org/abs/2611.24301)
 
