@@ -400,6 +400,7 @@ is closed except the two upstream-bound verdicts:
 - W3 (P2): DONE - G5 engine ASR lane (CLOSED) + G6 config-driven CLIP
   lane (CLOSED) + G8 voice frontier verdict (UPSTREAM-BOUND, modern
   voices reachable via G1) + G4 glmocr/ggmlc verdict (UPSTREAM-BOUND,
+  _Corrections (2026-11-23): G4 was closed 2026-11-03 by pull-side steering (see the G4 heading above) and the G8 verdict was superseded by the kokoro-onnx lane (CHANGELOG 0.31.0); this summary line predates both. The G8 section is printed twice in this file (a duplicate)._
   filings tracked, fail-fast + teaching at every layer today).
 
 ## 6. Reproduction

@@ -77,6 +77,7 @@ def main() -> int:
         "Config": "Config",
         "MistralrsTuning": "MistralrsTuning",
         "SglangTuning": "SglangTuning",
+        "VllmTuning": "VllmTuning",
         "ModelOverride": "ModelOverride",
         "SamplerDefaults": "SamplerDefaults",
         "Remote": "Remote",

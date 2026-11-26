@@ -2,6 +2,8 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Retry budget for spawn-class transients. 4 attempts / 250 ms flat
@@ -137,11 +139,31 @@ pub fn parent_death_tie(cmd: &mut Command) {
 /// is retried by [`with_spawn_retry`]; what survives is logged with the
 /// error so it stays distinguishable from a missing binary).
 pub fn probe_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output> {
+    run_probe(cmd, secs, false)
+}
+
+/// [`probe_output`] for a tool that is optional on the box: `nvidia-smi`
+/// on an AMD or Intel machine is simply not installed, and every census
+/// would otherwise log a warning for it. A missing binary is named at
+/// debug; every other failure keeps the warning of [`probe_output`].
+pub(crate) fn optional_tool_output(cmd: &mut Command, secs: u64) -> Option<std::process::Output> {
+    run_probe(cmd, secs, true)
+}
+
+fn run_probe(
+    cmd: &mut Command,
+    secs: u64,
+    missing_tool_is_quiet: bool,
+) -> Option<std::process::Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = match with_spawn_retry(|| cmd.spawn()) {
         Ok(c) => c,
+        Err(e) if missing_tool_is_quiet && e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!("optional probe tool not installed: {:?}", cmd.get_program());
+            return None;
+        }
         Err(e) => {
             tracing::warn!("probe spawn failed ({e}): {:?}", cmd.get_program());
             return None;
@@ -317,18 +339,96 @@ pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
         // manifest's device list empty too - a GPU the daemon cannot see
         // silently starves every capacity decision on that lane (measured:
         // "0 GPUs" banner on a 4070 box, paged-attn auto-fallback blind,
-        // 502 loads). Fall back to a system-side NVIDIA census; non-NVIDIA
-        // boxes without a census keep the empty list, same as before.
+        // 502 loads). Fall back to a system-side census: nvidia-smi when
+        // the tool is installed, else the vendor-neutral sources in
+        // `gpu_census`. An NVML row carries the same name as the
+        // nvidia-smi row for that card, so a cache keyed by GPU name sees
+        // one shape either way.
         //
         // A census that names devices but reports total_mib == 0 on every
         // row (sd-server's --list-devices prints NAME<TAB>description only,
         // no memory) is not a capacity census either: it fed the pool
         // Vulkan-namespace names with zero free bytes - placement tied at
         // 0 and picked nonsense for llama spawns. Treat it exactly like
-        // the empty census and let nvidia-smi speak when it can.
-        gpus = nvidia_smi_gpus();
+        // the empty census and let the system census speak when it can.
+        gpus = system_gpu_pool();
+    }
+    if gpus.is_empty() {
+        warn_missing_gpu_once();
     }
     hardware_with(gpus)
+}
+
+/// The system-side GPU pool behind [`probe_hardware`]: `nvidia-smi` rows
+/// when the tool answers, else the vendor-neutral census (NVML, DRM
+/// sysfs, Vulkan, macOS displays). Every row carries a memory total.
+fn system_gpu_pool() -> Vec<GpuInfo> {
+    let smi_rows = nvidia_smi_gpus();
+    if !smi_rows.is_empty() {
+        return smi_rows;
+    }
+    let started = Instant::now();
+    let census = crate::gpu_census::system_gpus();
+    tracing::info!(
+        nvml = census.nvml,
+        sysfs = census.sysfs,
+        vulkan = census.vulkan,
+        displays = census.displays,
+        gpus = census.gpus.len(),
+        elapsed_ms = elapsed_millis(started),
+        "GPU census: nvidia-smi is not installed, system sources used"
+    );
+    census.gpus
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Says once per process why no GPU is visible, when the PCI bus shows
+/// one. Measured on a 4070 laptop with `nvidia-smi` off PATH: the empty
+/// pool read as "no GPU" and the model decoded at 47 t/s on CPU instead
+/// of ~340 t/s, without a single line explaining it.
+fn warn_missing_gpu_once() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let Some(hint) = missing_gpu_census_hint() else {
+        return;
+    };
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("no GPU visible to blazar: {hint}");
+    }
+}
+
+/// Remedy hint for a box whose PCI bus lists an accelerator no census
+/// source could read; `None` when the bus holds no such accelerator.
+/// The PCI bus does not change under a running daemon, so the answer is
+/// read once per process.
+#[must_use]
+pub fn missing_gpu_census_hint() -> Option<String> {
+    static HINT: OnceLock<Option<String>> = OnceLock::new();
+    HINT.get_or_init(|| missing_gpu_census_hint_for(&pci_gpu_vendors()))
+        .clone()
+}
+
+/// Vendors blazar can place work on, in the order the hint names them.
+const ACCELERATOR_VENDORS: [(&str, &str); 3] =
+    [("10de", "NVIDIA"), ("1002", "AMD"), ("8086", "Intel")];
+
+/// A BMC VGA controller on a headless server (ASPEED, Matrox) is display
+/// hardware, not compute hardware: it raises no hint.
+fn missing_gpu_census_hint_for(vendors: &[String]) -> Option<String> {
+    let found: Vec<&str> = ACCELERATOR_VENDORS
+        .iter()
+        .filter(|(id, _)| vendors.iter().any(|v| v == id))
+        .map(|(_, name)| *name)
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the PCI bus lists a GPU from {} but no source reports its memory, so models will run CPU-only; install the vendor user-space (NVIDIA: nvidia-smi or the driver's NVML library; AMD or Intel: a Vulkan runtime with the vendor ICD) or pin `devices` to a name from `blazar doctor`",
+        found.join(", ")
+    ))
 }
 
 /// Census precedence shared by the daemon's live path and daemon-less
@@ -368,8 +468,9 @@ pub fn live_census_hardware(server_path: &std::path::Path, manifest: &Manifest) 
 /// `spanning_spawn_env` pairs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 pub(crate) fn nvidia_smi_gpus() -> Vec<GpuInfo> {
     // F85: best-effort census - a hung nvidia-smi yields an empty list,
-    // never a wedged caller.
-    let Some(out) = probe_output(
+    // never a wedged caller. The tool is optional: its absence is the
+    // normal state of an AMD, Intel or Apple box.
+    let Some(out) = optional_tool_output(
         std::process::Command::new("nvidia-smi").args([
             "--query-gpu=name,memory.total,memory.free",
             "--format=csv,noheader,nounits",
@@ -447,7 +548,7 @@ pub fn parse_gpu_tenants(csv: &str) -> Vec<GpuTenant> {
 /// never kills another product's process.
 #[must_use]
 pub fn gpu_compute_tenants() -> Option<Vec<GpuTenant>> {
-    let out = probe_output(
+    let out = optional_tool_output(
         std::process::Command::new("nvidia-smi").args([
             "--query-compute-apps=pid,process_name,used_memory",
             "--format=csv,noheader,nounits",
@@ -478,7 +579,7 @@ fn sum_free_mib_csv(text: &str) -> Option<u64> {
 /// callers treat that as "no gate data", never as zero headroom.
 #[must_use]
 pub fn nvidia_free_vram_mib() -> Option<u64> {
-    let out = probe_output(
+    let out = optional_tool_output(
         std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]),
         5,
@@ -497,7 +598,7 @@ pub fn nvidia_free_vram_mib() -> Option<u64> {
 /// ineligible instead of guessing zero.
 #[must_use]
 pub fn nvidia_used_vram_mib() -> Option<u64> {
-    let out = probe_output(
+    let out = optional_tool_output(
         std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"]),
         5,
@@ -1003,6 +1104,90 @@ mod tests {
         assert!(probe_output(&mut cmd, 5).is_none());
     }
 
+    /// Formatted log lines written into a buffer the test can read.
+    #[derive(Clone)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink poisoned").write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Log lines one probe call emits, captured for this thread only.
+    fn captured_probe_logs(run: impl FnOnce()) -> String {
+        use tracing_subscriber::filter::LevelFilter;
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(LevelFilter::TRACE)
+            .with_writer(LogSink(buffer.clone()))
+            .finish();
+        let _scope = tracing::subscriber::set_default(subscriber);
+        run();
+        let bytes = buffer.lock().expect("log sink poisoned").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__probe_output__missing_binary_still_warns() {
+        let logs = captured_probe_logs(|| {
+            let mut cmd = std::process::Command::new("/nonexistent/blazar-probe-binary");
+            assert!(probe_output(&mut cmd, 5).is_none());
+        });
+        assert!(
+            logs.contains("WARN"),
+            "a required probe binary that is missing must stay loud: {logs}"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__optional_tool_output__missing_tool_is_not_a_warning() {
+        let logs = captured_probe_logs(|| {
+            let mut cmd = std::process::Command::new("/nonexistent/blazar-optional-tool");
+            assert!(optional_tool_output(&mut cmd, 5).is_none());
+        });
+        assert!(
+            logs.contains("blazar-optional-tool"),
+            "the absence is still named: {logs}"
+        );
+        assert!(
+            !logs.contains("WARN"),
+            "a tool that is not installed is an expected state on that box, not a probe failure: {logs}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__optional_tool_output__other_spawn_errors_still_warn() {
+        let plain_file = tempfile::NamedTempFile::new().expect("temp file");
+        let logs = captured_probe_logs(|| {
+            let mut cmd = std::process::Command::new(plain_file.path());
+            assert!(optional_tool_output(&mut cmd, 5).is_none());
+        });
+        assert!(
+            logs.contains("WARN"),
+            "only a missing binary is quiet: {logs}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unit__is_transient_spawn_err__classifies_pressure_vs_permanent() {
@@ -1113,5 +1298,45 @@ mod tests {
             None,
             "without procfs the group is not measurable"
         );
+    }
+
+    fn vendor_ids(text: &[&str]) -> Vec<String> {
+        text.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn unit__missing_gpu_census_hint__names_accelerator_vendors_only() {
+        let hint = missing_gpu_census_hint_for(&vendor_ids(&["1a03", "10de"]))
+            .expect("an NVIDIA card on the PCI bus raises a hint");
+        assert!(
+            hint.starts_with(
+                "the PCI bus lists a GPU from NVIDIA but no source reports its memory"
+            ),
+            "{hint}"
+        );
+        assert!(hint.is_ascii(), "{hint}");
+        assert!(
+            hint.contains("nvidia-smi") && hint.contains("`devices`"),
+            "the hint names the remedy: {hint}"
+        );
+    }
+
+    #[test]
+    fn unit__missing_gpu_census_hint__lists_all_three_vendors_in_order() {
+        let hint = missing_gpu_census_hint_for(&vendor_ids(&["8086", "10de", "1002"]))
+            .expect("three accelerator vendors raise a hint");
+        assert!(
+            hint.starts_with("the PCI bus lists a GPU from NVIDIA, AMD, Intel but"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn unit__missing_gpu_census_hint__display_only_or_empty_bus_is_silent() {
+        assert_eq!(
+            missing_gpu_census_hint_for(&vendor_ids(&["1a03", "102b"])),
+            None
+        );
+        assert_eq!(missing_gpu_census_hint_for(&[]), None);
     }
 }

@@ -613,8 +613,7 @@ pub fn request_ctx(
         None
     } else {
         state
-            .with_store(|s| s.get_model(model).ok().flatten())
-            .flatten()
+            .read_store_or_absent("models.get", |s| s.get_model(model))
             .and_then(|row| {
                 state
                     .sentinel
@@ -643,15 +642,16 @@ pub fn request_ctx(
         tool_schemas,
         response_format,
         stream: stream || sse,
+        // The window a prompt may fill is the KV pool the child serves
+        // from (`prompt_ctx`), not one slot's share of it: under unified
+        // KV a single prompt may span the whole pool.
+        // ctx == 0 marks lanes that manage their own window (mlx:
+        // compile_mlx reports 0 by design) - that is "unknown", never a
+        // zero-token ceiling.
         ctx: state
             .sup
-            .ps()
-            .into_iter()
-            .find(|p| p.name == model)
-            // ctx == 0 marks lanes that manage their own window (mlx:
-            // compile_mlx reports 0 by design) - that is "unknown",
-            // never a zero-token ceiling.
-            .and_then(|p| (p.ctx > 0).then_some(p.ctx)),
+            .prompt_ctx(model)
+            .and_then(|c| (c > 0).then_some(c)),
         template,
         child_degrade,
     };
@@ -799,6 +799,10 @@ pub struct Sentinel {
     /// ring stays the source of truth for record content.
     records_total: AtomicU64,
     detections_total: [AtomicU64; Code::COUNT],
+    /// Issue 012: lines appended to `sentinel.jsonl` and appends that
+    /// failed; `/metrics` pairs them with the tracing sink counters.
+    persist_lines: AtomicU64,
+    persist_failures: AtomicU64,
 }
 
 /// Wrapper so the struct stays Clone-cheap and Debug-clean.
@@ -860,6 +864,8 @@ impl Sentinel {
             evict_hook: Mutex::new(None),
             records_total: AtomicU64::new(0),
             detections_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            persist_lines: AtomicU64::new(0),
+            persist_failures: AtomicU64::new(0),
         })
     }
 
@@ -918,6 +924,16 @@ impl Sentinel {
             })
             .collect();
         (records, detections)
+    }
+
+    /// Issue 012 counters: `sentinel.jsonl` lines appended and appends
+    /// that failed.
+    #[must_use]
+    pub fn persist_counts(&self) -> (u64, u64) {
+        (
+            self.persist_lines.load(Ordering::Relaxed),
+            self.persist_failures.load(Ordering::Relaxed),
+        )
     }
 
     /// Begin observing a request: spawns the analyzer and returns the
@@ -1206,8 +1222,10 @@ impl Sentinel {
             }
         }
         if let Err(e) = writeln!(p.file, "{line}") {
+            self.persist_failures.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(target: "blazar::sentinel", "persist append: {e}");
         } else {
+            self.persist_lines.fetch_add(1, Ordering::Relaxed);
             p.written = p.written.saturating_add(line_len + 1);
         }
     }

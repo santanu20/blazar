@@ -99,13 +99,9 @@ fn benchmarks_rows(benches: &[BenchResultRow], profiles: &[ProfileRow]) -> Vec<V
 pub async fn benchmarks(State(state): State<Arc<AppState>>) -> Json<Value> {
     // Flat, short store borrows (never nested inside another with_store).
     let benches = state
-        .with_store(blazar_core::Store::list_bench_results)
-        .and_then(std::result::Result::ok)
-        .unwrap_or_default();
-    let profiles = state
-        .with_store(blazar_core::Store::list_profiles)
-        .and_then(std::result::Result::ok)
-        .unwrap_or_default();
+        .read_store_list_or_empty("benchmarks.results", blazar_core::Store::list_bench_results);
+    let profiles =
+        state.read_store_list_or_empty("benchmarks.profiles", blazar_core::Store::list_profiles);
     Json(json!({
         "object": "blazar.benchmarks",
         "rows": benchmarks_rows(&benches, &profiles),

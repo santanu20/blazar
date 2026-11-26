@@ -136,6 +136,8 @@ fn model_row(path: &str, arch: Option<&str>, mmproj: Option<&str>) -> ModelRow {
         ctx_train: Some(40_960),
         pulled_at: 0,
         last_used_at: 0,
+
+        license: None,
     }
 }
 

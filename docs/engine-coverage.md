@@ -345,9 +345,9 @@ Registry lane `mlx` pins 18 first-class flags (compile + spawn-time emission).
 
 ## sglang-0.5.23 (sglang) - 604 flags probed
 
-**certified: 3 | first-class: 68 | passthrough: 531 | intentionally-unsupported: 2 | not-applicable: 0 | unverified: 0**
+**certified: 3 | first-class: 70 | passthrough: 529 | intentionally-unsupported: 2 | not-applicable: 0 | unverified: 0**
 
-Registry lane `sglang` pins 71 first-class flags (compile + spawn-time emission).
+Registry lane `sglang` pins 73 first-class flags (compile + spawn-time emission).
 
 ### Capability matrix
 
@@ -372,7 +372,7 @@ Registry lane `sglang` pins 71 first-class flags (compile + spawn-time emission)
 
 ### Passthrough families
 
-- **uncategorized long-tail** (253): --abort-on-priority-when-disabled, --api-, --bf16-gemm-backend, --boundary-reduction, --c128-page-size, --chat-template (+247 more)
+- **uncategorized long-tail** (251): --abort-on-priority-when-disabled, --api-, --bf16-gemm-backend, --boundary-reduction, --c128-page-size, --chat-template (+245 more)
 - **scheduler/memory detail** (129): --attention-, --attention-context-parallel-size, --attention-data-parallel-size, --cuda-graph-, --cuda-graph-backend-decode, --cuda-graph-config (+123 more)
 - **per-request/gateway-owned** (28): --admin-api-key, --allow-auto-truncate, --constrained-json-disable-any-whitespace, --constrained-json-max-whitespace-cnt, --constrained-json-whitespace-pattern, --enable-http-worker-reuseport (+22 more)
 - **observability** (27): --bucket-e2e-request-latency, --bucket-inter-token-latency, --bucket-time-to-first-token, --decode-log-interval, --enable-forward-pass-metrics, --enable-metrics-for-all-schedulers (+21 more)
@@ -424,9 +424,9 @@ Registry lane `mistralrs` pins 39 first-class flags (compile + spawn-time emissi
 
 ## vllm-0.34.0 (vllm) - 428 flags probed
 
-**certified: 4 | first-class: 6 | passthrough: 418 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
+**certified: 6 | first-class: 6 | passthrough: 416 | intentionally-unsupported: 0 | not-applicable: 0 | unverified: 0**
 
-Registry lane `vllm` pins 10 first-class flags (compile + spawn-time emission).
+Registry lane `vllm` pins 12 first-class flags (compile + spawn-time emission).
 
 ### Capability matrix
 
@@ -449,10 +449,12 @@ Registry lane `vllm` pins 10 first-class flags (compile + spawn-time emission).
 - `--gpu-memory-utilization` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): default 0.85 in child argv; 8 GB lane served + idle reaped to 16 MiB
 - `--max-model-len` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): clamped 32768->16384 per ctx policy, child argv observed
 - `--served-model-name` [`bench-artifacts/20261120-kokoro-vllm-cert/README.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/20261120-kokoro-vllm-cert/README.md) - E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): child argv observed with sanitized name; request model string resolved
+- `--spec-method` [`bench-artifacts/2026-11-23-sota-roadmap/vllm-suffix-decoding-receipt.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-23-sota-roadmap/vllm-suffix-decoding-receipt.md) - E2 spec cert 2026-11-26 (sandbox daemon, qwen2.5-coder-0.5b BF16, spec_method=suffix): child argv observed with --spec-method suffix; steady decode 190.5->884.4 tok/s median on a suffix-heavy prompt, temp-0 outputs byte-identical
+- `--spec-tokens` [`bench-artifacts/2026-11-23-sota-roadmap/vllm-suffix-decoding-receipt.md`](https://github.com/santanu20/blazar/blob/main/bench-artifacts/2026-11-23-sota-roadmap/vllm-suffix-decoding-receipt.md) - E2 spec cert 2026-11-26 (sandbox daemon, qwen2.5-coder-0.5b BF16, spec_num_tokens=4): child argv observed with --spec-tokens 4; planned-fact line in /api/ps; bound below compiled ctx at config time
 
 ### Passthrough families
 
-- **uncategorized long-tail** (418): --additional-config, --aggregate-engine-logging, --all2all-backend, --allow-credentials, --allow-deprecated-quantization, --allowed-headers (+412 more)
+- **uncategorized long-tail** (416): --additional-config, --aggregate-engine-logging, --all2all-backend, --allow-credentials, --allow-deprecated-quantization, --allowed-headers (+410 more)
 
 ## Cross-engine KV interoperability
 

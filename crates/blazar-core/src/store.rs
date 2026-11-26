@@ -64,7 +64,10 @@ pub struct Store {
 /// time; session-bank identity binds the adapter set by (path, sha),
 /// so a swapped adapter file under an unchanged path can never silently
 /// ride a bank restored for the bytes that actually produced it).
-const SCHEMA_VERSION: i32 = 24;
+/// v25 adds `models.license` (licence text captured at pull time from
+/// the registry licence layer or the HF model card; NULL = no licence
+/// on record - imported/adopted models have no upstream licence).
+const SCHEMA_VERSION: i32 = 25;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS engines (
@@ -90,7 +93,8 @@ CREATE TABLE IF NOT EXISTS models (
     params     REAL,
     ctx_train  INTEGER,
     pulled_at  INTEGER NOT NULL,
-    last_used_at INTEGER NOT NULL DEFAULT 0
+    last_used_at INTEGER NOT NULL DEFAULT 0,
+    license     TEXT
 );
 CREATE TABLE IF NOT EXISTS profiles (
     model_name     TEXT NOT NULL,
@@ -398,6 +402,11 @@ pub struct ModelRow {
     /// Backfilled from `pulled_at` at v9 migration.
     #[serde(default)]
     pub last_used_at: i64,
+    /// Licence text captured from the pull source (ollama-registry licence
+    /// layer or HF cardData.license); None = no licence on record -
+    /// imported and adopted models carry no upstream licence to store.
+    #[serde(default)]
+    pub license: Option<String>,
 }
 
 /// One diffusion component: the sd-server flag it rides and the local
@@ -830,6 +839,45 @@ pub struct StoredResponseRow {
 }
 
 #[must_use]
+/// Reads a store row for callers that only decorate output with it. An
+/// honest absence stays `None`; a failed read is logged and also reads as
+/// absent, so a broken store is never mistaken for missing data.
+pub fn row_or_warn<T, E: std::fmt::Display>(op: &'static str, outcome: Result<T, E>) -> Option<T> {
+    match outcome {
+        Ok(row) => Some(row),
+        Err(error) => {
+            tracing::warn!("store read failed ({op}) - treated as absent: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_or_warn_tests {
+    #![allow(non_snake_case)]
+    use super::row_or_warn;
+
+    #[test]
+    fn unit__row_or_warn__keeps_value_and_reads_failed_query_as_absent() {
+        assert_eq!(
+            row_or_warn::<Option<i32>, std::fmt::Error>("ok", Ok(Some(7))).flatten(),
+            Some(7),
+            "a present row passes through"
+        );
+        assert_eq!(
+            row_or_warn::<Option<i32>, std::fmt::Error>("absent", Ok(None)),
+            Some(None),
+            "an honest absence stays an honest absence"
+        );
+        assert_eq!(
+            row_or_warn::<i32, _>("failed", Err("table missing")),
+            None,
+            "a failed read reads as absent (after warning)"
+        );
+    }
+}
+
+#[must_use]
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -845,6 +893,9 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        // Every request path reads several rows before dispatch; without a statement
+        // cache SQLite re-parses and re-plans the same SQL on each of those reads.
+        conn.set_prepared_statement_cache_capacity(64);
         let store = Self { conn };
         store.migrate()?;
         Ok(store)
@@ -863,7 +914,9 @@ impl Store {
     /// Column names of `table` - the source of truth for additive
     /// migrations deciding whether an ALTER is still owed.
     fn table_columns(&self, table: &str) -> CoreResult<Vec<String>> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("PRAGMA table_info({table})"))?;
         let mut cols = stmt.query([])?;
         let mut names = Vec::new();
         while let Some(r) = cols.next()? {
@@ -909,7 +962,7 @@ impl Store {
                 type LegacyComponentCols = (String, Option<String>, Option<String>, Option<String>);
                 let legacy: Vec<LegacyComponentCols> = self
                     .conn
-                    .prepare("SELECT name, vae_path, llm_path, llm_vision_path FROM models")?
+                    .prepare_cached("SELECT name, vae_path, llm_path, llm_vision_path FROM models")?
                     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                     .collect::<Result<Vec<_>, _>>()?;
                 for (name, vae, llm, vision) in legacy {
@@ -1045,6 +1098,19 @@ impl Store {
                 self.conn
                     .execute("ALTER TABLE loras ADD COLUMN sha256 TEXT", [])?;
             }
+            // v24->v25: `models.license` (licence text captured at pull
+            // time from the registry licence layer or HF cardData.license).
+            // Same replay-safe guarded-ALTER shape as the steps above:
+            // fresh stores get the column from SCHEMA_SQL, upgrade stores
+            // take the ALTER, and legacy rows keep NULL - an honest
+            // "no licence on record", never a guessed upstream licence.
+            if !self
+                .table_columns("models")?
+                .contains(&"license".to_string())
+            {
+                self.conn
+                    .execute("ALTER TABLE models ADD COLUMN license TEXT", [])?;
+            }
         }
         // v15->v16: `model_modalities` (engine-advertised output
         // modalities, e.g. llama-server's architecture object marking
@@ -1136,7 +1202,7 @@ impl Store {
                 _ => 0,
             };
             let actives: Vec<(String, String, i64)> = v14
-                .prepare("SELECT tag, kind, installed_at FROM engines WHERE active = 1")?
+                .prepare_cached("SELECT tag, kind, installed_at FROM engines WHERE active = 1")?
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             // max_by with (rank, installed_at) mirrors
@@ -1364,7 +1430,7 @@ impl Store {
         // cast total instead of `as` truncation.
         let limit_i = i64::try_from(limit).unwrap_or(1000);
         binds.push(rusqlite::types::Value::Integer(limit_i));
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(binds), |r| {
             Ok(JobRow {
                 id: r.get(0)?,
@@ -1386,7 +1452,7 @@ impl Store {
     /// Job events, oldest-first (the story reads in order).
     pub fn job_events(&self, job_id: &str, limit: u64) -> CoreResult<Vec<JobEventRow>> {
         let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT seq, job_id, ts, kind, data_json FROM (
                 SELECT * FROM job_events WHERE job_id = ?1 ORDER BY seq DESC LIMIT ?2
             ) ORDER BY seq ASC",
@@ -1416,7 +1482,7 @@ impl Store {
     /// Returns the swept ids (for the boot log).
     pub fn sweep_jobs_updated_before(&self, cutoff_unix: i64) -> CoreResult<Vec<String>> {
         let swept: Vec<String> = {
-            let mut stmt = self.conn.prepare(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT id FROM jobs WHERE state IN ('queued','running') AND updated_at < ?1",
             )?;
             let rows = stmt.query_map(params![cutoff_unix], |r| r.get::<_, String>(0))?;
@@ -1447,7 +1513,7 @@ impl Store {
         // Collected before the delete in the same transaction: after it,
         // the paths would be unrecoverable (and unlinkable).
         let artifacts = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT artifact_path FROM jobs WHERE state IN ('completed','failed','cancelled','abandoned') \
                  AND updated_at < ?1 AND artifact_path IS NOT NULL",
             )?;
@@ -1557,7 +1623,7 @@ impl Store {
             sql.push_str(" AND (owner IS NULL OR owner = ?2)");
         }
         sql.push_str(" ORDER BY ts ASC, id ASC");
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = match owner {
             Some(o) => stmt.query_map(params![conversation, o], Self::map_response_row)?,
             None => stmt.query_map(params![conversation], Self::map_response_row)?,
@@ -1905,7 +1971,7 @@ impl Store {
     /// Every plain-bench payload on record - one query for the console's
     /// Benchmarks view instead of a per-model lookup per row.
     pub fn list_bench_results(&self) -> CoreResult<Vec<BenchResultRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT model, engine_tag, payload_json, updated_at, quant, hw_fingerprint, workload, profile_hash
              FROM bench_results
              ORDER BY model, engine_tag",
@@ -1930,7 +1996,7 @@ impl Store {
     /// Every tuned launch profile on record - pairs with
     /// `list_bench_results` to show measured vs tuned per model + lane.
     pub fn list_profiles(&self) -> CoreResult<Vec<ProfileRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT model_name, engine_tag, args_hash, args_json, benchmark_json, updated_at
              FROM profiles ORDER BY model_name, engine_tag",
         )?;
@@ -2125,7 +2191,7 @@ impl Store {
     pub fn engine_kind_of_tag(&self, tag: &str) -> CoreResult<Option<EngineKind>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT kind FROM engines WHERE tag = ?")?;
+            .prepare_cached("SELECT kind FROM engines WHERE tag = ?")?;
         let mut rows = stmt.query([tag])?;
         if let Some(r) = rows.next()? {
             let raw: String = r.get(0)?;
@@ -2146,7 +2212,7 @@ impl Store {
     /// Engine updates prune old `engines` rows, so retired tags survive only
     /// here; calibration falls back to this when the active lane is empty.
     pub fn bench_history_all(&self) -> CoreResult<Vec<BenchHistoryLaneRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT model, tg_tokens_per_sec FROM bench_history \
              WHERE tg_tokens_per_sec IS NOT NULL ORDER BY ts ASC",
         )?;
@@ -2160,7 +2226,7 @@ impl Store {
     }
 
     pub fn bench_history_for_lane(&self, engine_tag: &str) -> CoreResult<Vec<BenchHistoryLaneRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT model, tg_tokens_per_sec FROM bench_history \
              WHERE engine_tag = ?1 AND tg_tokens_per_sec IS NOT NULL \
              ORDER BY ts ASC",
@@ -2175,7 +2241,7 @@ impl Store {
     }
 
     pub fn active_engine(&self) -> CoreResult<Option<EngineRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines WHERE active = 1",
         )?;
         let mut rows = stmt.query([])?;
@@ -2198,7 +2264,7 @@ impl Store {
     }
 
     pub fn list_engines(&self) -> CoreResult<Vec<EngineRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines ORDER BY installed_at DESC, rowid DESC",
         )?;
         let mut rows = stmt.query([])?;
@@ -2221,7 +2287,7 @@ impl Store {
     /// The rows stay untouched in the store and parse again under a
     /// newer binary - quarantine is read-side only.
     pub fn unknown_kind_engine_rows(&self) -> CoreResult<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT tag, asset, sha256, installed_at, active, manifest, kind FROM engines ORDER BY installed_at DESC, rowid DESC",
         )?;
         let mut rows = stmt.query([])?;
@@ -2276,7 +2342,7 @@ impl Store {
     /// for listing surfaces.
     pub fn all_model_modalities(&self) -> CoreResult<Vec<(String, Vec<String>)>> {
         self.conn
-            .prepare("SELECT model, modalities FROM model_modalities")?
+            .prepare_cached("SELECT model, modalities FROM model_modalities")?
             .query_map([], |r| {
                 let model: String = r.get(0)?;
                 let json: String = r.get(1)?;
@@ -2313,8 +2379,8 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO models (name, repo, quant, path, bytes, sha256, mmproj_path, components,
-                                 shards, arch, params, ctx_train, pulled_at, last_used_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                                 shards, arch, params, ctx_train, pulled_at, last_used_at, license)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
              ON CONFLICT(name) DO UPDATE SET
                repo = excluded.repo, quant = excluded.quant, path = excluded.path,
                bytes = excluded.bytes, sha256 = excluded.sha256,
@@ -2322,7 +2388,7 @@ impl Store {
                shards = excluded.shards,
                arch = excluded.arch, params = excluded.params,
                ctx_train = excluded.ctx_train, pulled_at = excluded.pulled_at,
-               last_used_at = excluded.last_used_at",
+               last_used_at = excluded.last_used_at, license = excluded.license",
             params![
                 m.name,
                 m.repo,
@@ -2338,16 +2404,17 @@ impl Store {
                 m.params,
                 m.ctx_train,
                 m.pulled_at,
-                last_used_at
+                last_used_at,
+                m.license
             ],
         )?;
         Ok(())
     }
 
     pub fn get_model(&self, name: &str) -> CoreResult<Option<ModelRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
-                    params, ctx_train, pulled_at, last_used_at
+                    params, ctx_train, pulled_at, last_used_at, license
              FROM models WHERE name = ?1",
         )?;
         let mut rows = stmt.query(params![name])?;
@@ -2358,9 +2425,9 @@ impl Store {
     }
 
     pub fn list_models(&self) -> CoreResult<Vec<ModelRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT name, repo, quant, path, bytes, sha256, mmproj_path, components, shards, arch,
-                    params, ctx_train, pulled_at, last_used_at
+                    params, ctx_train, pulled_at, last_used_at, license
              FROM models ORDER BY name",
         )?;
         let rows = stmt.query_map([], model_from_row)?;
@@ -2440,7 +2507,7 @@ impl Store {
     }
 
     pub fn get_profile(&self, model: &str, engine_tag: &str) -> CoreResult<Option<ProfileRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT model_name, engine_tag, args_hash, args_json, benchmark_json, updated_at
              FROM profiles WHERE model_name = ?1 AND engine_tag = ?2",
         )?;
@@ -2514,7 +2581,7 @@ impl Store {
     pub fn load_pool_ops(&self) -> CoreResult<Vec<(String, bool, Option<i64>, bool)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT key, drained, drained_until, pinned FROM pools_ops")?;
+            .prepare_cached("SELECT key, drained, drained_until, pinned FROM pools_ops")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2555,7 +2622,7 @@ impl Store {
     pub fn load_pool_affinity(&self) -> CoreResult<Vec<(String, String, i64)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT key, effective, at_unix FROM pools_affinity")?;
+            .prepare_cached("SELECT key, effective, at_unix FROM pools_affinity")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2578,7 +2645,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM pools_window_events", [])?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO pools_window_events (pool, kind, member, at_unix)
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
@@ -2597,7 +2664,7 @@ impl Store {
     /// window maps are rebuilt gateway-side from these rows.
     #[allow(clippy::type_complexity)]
     pub fn load_pool_windows(&self) -> CoreResult<Vec<(String, String, Option<String>, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT pool, kind, member, at_unix FROM pools_window_events
              ORDER BY at_unix ASC",
         )?;
@@ -2663,7 +2730,7 @@ impl Store {
         model: &str,
         engine_tag: &str,
     ) -> CoreResult<Vec<SpecReceiptRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT model, engine_tag, mode, tok_per_s, dense_tps, ratio, measured_at,
                     hw_fingerprint, spec_params, tuned, reps
              FROM spec_receipts WHERE model = ?1 AND engine_tag = ?2
@@ -2727,7 +2794,7 @@ impl Store {
 
     /// Usage rollups for the last `days` days, oldest first.
     pub fn list_usage_days(&self, days: i64) -> CoreResult<Vec<UsageDayRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT day, model, in_tokens, out_tokens, cached_tokens, requests, gen_secs, ttft_count, ttft_ms_total
              FROM usage_daily WHERE day >= strftime('%Y%m%d', 'now', ?1)
              ORDER BY day, model",
@@ -2758,7 +2825,7 @@ impl Store {
     ) -> CoreResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "INSERT INTO usage_workload (day, model, kind, requests)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(day, model, kind) DO UPDATE SET
@@ -2776,7 +2843,7 @@ impl Store {
     /// first. The routing derivation's evidence base (thin evidence =
     /// no derivation, never a guessed mix).
     pub fn list_usage_workload(&self, days: i64) -> CoreResult<Vec<UsageWorkloadRow>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT day, model, kind, requests
              FROM usage_workload WHERE day >= strftime('%Y%m%d', 'now', ?1)
              ORDER BY day, model, kind",
@@ -2825,7 +2892,7 @@ impl Store {
                 vec![],
             ),
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |r| {
             Ok(LoraRow {
                 id: r.get(0)?,
@@ -2842,7 +2909,7 @@ impl Store {
     pub fn key_usage(&self, day: &str) -> CoreResult<Vec<KeyUsageRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT day, name, requests, tokens FROM key_usage WHERE day = ?1")?;
+            .prepare_cached("SELECT day, name, requests, tokens FROM key_usage WHERE day = ?1")?;
         let rows = stmt.query_map(rusqlite::params![day], |r| {
             Ok(KeyUsageRow {
                 day: r.get(0)?,
@@ -2924,14 +2991,14 @@ impl Store {
     pub fn latest_bench_by_time(&self) -> CoreResult<Option<(String, f64, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT engine_tag, tg_tokens_per_sec, model FROM bench_history ORDER BY id DESC LIMIT 1")?;
+            .prepare_cached("SELECT engine_tag, tg_tokens_per_sec, model FROM bench_history ORDER BY id DESC LIMIT 1")?;
         let mut rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.next().transpose()?)
     }
 
     /// Most recent bench row per model: `engine_tag`, `tg` t/s, `model`.
     pub fn latest_benches(&self) -> CoreResult<Vec<(String, f64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT engine_tag, tg_tokens_per_sec, model FROM bench_history b \
              WHERE id = (SELECT MAX(id) FROM bench_history b2 WHERE b2.model = b.model) \
              ORDER BY model",
@@ -3162,7 +3229,7 @@ impl Store {
         &self,
         experiment_id: i64,
     ) -> CoreResult<Vec<(i64, String, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT ts, kind, reason FROM optimization_events
              WHERE experiment_id = ?1 ORDER BY id ASC",
         )?;
@@ -3269,6 +3336,7 @@ fn model_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         ctx_train: r.get(11)?,
         pulled_at: r.get(12)?,
         last_used_at: r.get(13)?,
+        license: r.get(14)?,
     })
 }
 
@@ -5241,6 +5309,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -5475,6 +5545,8 @@ mod tests {
             ctx_train: Some(32_768),
             pulled_at: 42,
             last_used_at: 42,
+
+            license: None,
         };
         s.upsert_model(&m).unwrap();
         let got = s.get_model("qwen3-0.6b").unwrap().unwrap();
@@ -5483,6 +5555,54 @@ mod tests {
         assert!(s.delete_model("qwen3-0.6b").unwrap());
         assert!(!s.delete_model("qwen3-0.6b").unwrap());
         assert!(s.get_model("qwen3-0.6b").unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__model_roundtrip__license_round_trips_and_replaces() {
+        let (_t, s) = tmp_store();
+        let m = ModelRow {
+            name: "qwen3-0.6b".into(),
+            repo: "ggml-org/Qwen3-0.6B-GGUF".into(),
+            quant: "Q4_K_M".into(),
+            path: "/models/qwen3-0.6b-q4_k_m.gguf".into(),
+            bytes: 500_000_000,
+            sha256: Some("abc".into()),
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: Some("qwen3".into()),
+            params: Some(0.6),
+            ctx_train: Some(32_768),
+            pulled_at: 42,
+            last_used_at: 42,
+            license: Some("apache-2.0".into()),
+        };
+        s.upsert_model(&m).unwrap();
+        assert_eq!(
+            s.get_model("qwen3-0.6b")
+                .unwrap()
+                .unwrap()
+                .license
+                .as_deref(),
+            Some("apache-2.0")
+        );
+        assert_eq!(
+            s.list_models().unwrap()[0].license.as_deref(),
+            Some("apache-2.0")
+        );
+        // A re-pull replaces the licence (excluded.license wins on
+        // conflict, same as every other captured fact).
+        let mut re = m.clone();
+        re.license = Some("mit".into());
+        s.upsert_model(&re).unwrap();
+        assert_eq!(
+            s.get_model("qwen3-0.6b")
+                .unwrap()
+                .unwrap()
+                .license
+                .as_deref(),
+            Some("mit")
+        );
     }
 
     #[test]
@@ -5569,6 +5689,62 @@ mod tests {
         assert_eq!(rows[1].sha256.as_deref(), Some("bbb222"));
     }
 
+    #[test]
+    fn unit__migrate_v25__adds_models_license_to_legacy_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        // Hand-build a v24 store: models WITHOUT the license column and
+        // one legacy row, exactly the shape pre-v25 databases had.
+        std::fs::create_dir_all(&dirs.data_dir).unwrap();
+        {
+            let raw = rusqlite::Connection::open(dirs.data_dir.join("blazar.db")).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE models (
+                    name        TEXT PRIMARY KEY,
+                    repo        TEXT NOT NULL,
+                    quant       TEXT NOT NULL,
+                    path        TEXT NOT NULL,
+                    bytes       INTEGER NOT NULL,
+                    sha256      TEXT,
+                    mmproj_path TEXT,
+                    components  TEXT NOT NULL DEFAULT '[]',
+                    shards      INTEGER NOT NULL DEFAULT 1,
+                    arch        TEXT,
+                    params      REAL,
+                    ctx_train   INTEGER,
+                    pulled_at   INTEGER NOT NULL,
+                    last_used_at INTEGER NOT NULL DEFAULT 0
+                );
+                 INSERT INTO models (name, repo, quant, path, bytes, pulled_at)
+                 VALUES ('legacy', 'o/m', 'Q4_K_M', '/models/legacy.gguf', 10, 1);
+                 PRAGMA user_version = 24;",
+            )
+            .unwrap();
+        }
+        // Opening runs the migration ladder: the guarded ALTER adds the
+        // column, the ladder stamps the CURRENT schema version, and the
+        // legacy row survives with its honest NULL. New writes persist.
+        let s = Store::open(&dirs).unwrap();
+        let version: i32 = s
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let legacy = s.get_model("legacy").unwrap().unwrap();
+        assert_eq!(legacy.license, None);
+        let mut fresh = legacy.clone();
+        fresh.name = "fresh".into();
+        fresh.license = Some("apache-2.0".into());
+        s.upsert_model(&fresh).unwrap();
+        assert_eq!(
+            s.get_model("fresh").unwrap().unwrap().license.as_deref(),
+            Some("apache-2.0")
+        );
+    }
+
     /// The quantized-safetensors routing signal: pull-convention dir
     /// names carry the quant-method token; `quant` column values never
     /// enter it (awq rows pull as `4BIT`, fp8-dynamic as `BF16`).
@@ -5589,6 +5765,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         // The live incident rows: awq/gptq/fp8 dirs quantize true.
         assert!(
@@ -5710,6 +5888,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
         }
@@ -5759,7 +5939,10 @@ mod tests {
             .unwrap();
         }
         let s = Store::open(&dirs).unwrap();
-        let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
+        let mut cols = s
+            .conn()
+            .prepare_cached("PRAGMA table_info(models)")
+            .unwrap();
         let mut rows = cols.query([]).unwrap();
         let mut names: Vec<String> = Vec::new();
         while let Some(r) = rows.next().unwrap() {
@@ -5793,6 +5976,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 2,
             last_used_at: 2,
+
+            license: None,
         })
         .unwrap();
         let set = s.get_model("qwen-image-2.1").unwrap().unwrap();
@@ -5857,7 +6042,10 @@ mod tests {
         assert!(qwen.serves_image_edits());
         let text = s.get_model("text-m").unwrap().unwrap();
         assert_eq!(text.components.len(), 0);
-        let mut cols = s.conn().prepare("PRAGMA table_info(models)").unwrap();
+        let mut cols = s
+            .conn()
+            .prepare_cached("PRAGMA table_info(models)")
+            .unwrap();
         let mut rows = cols.query([]).unwrap();
         while let Some(r) = rows.next().unwrap() {
             let name: String = r.get(1).unwrap();

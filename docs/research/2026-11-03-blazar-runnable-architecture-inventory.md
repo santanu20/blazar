@@ -149,6 +149,8 @@ LTX-2.3, LTX-2.5 (video + stereo audio), HunyuanVideo 1.5, Lingbot Video
 | tiny-SD class | offline diffusers prep needed | concedo sdxs GGUFs = exact-file pullable |
 | kokoro TTS | no engine builds the arch (piper1-gpl rejected: VITS-only, pip distribution) | G1 lane picks it up free if upstream adds it |
 
+_Superseded (2026-11-23): kokoro ships through the kokoro-onnx lane (CHANGELOG 0.31.0; `bench_media.py speech --lane-speech kokoro`), so the "no engine builds the arch" row is history._
+
 Resolved after the engine update + G2b gateway fix (2026-11-03, receipts
 `bench-artifacts/20261102-universal-coverage/g2b-live-receipts.json`):
 

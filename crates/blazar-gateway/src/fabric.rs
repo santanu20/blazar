@@ -6,9 +6,9 @@
 //!
 //! - CPU: sysinfo physical cores + total RAM (`probe_hardware`).
 //! - GPUs: live `nvidia-smi` census when present (the same bounded
-//!   spawn `capacity.rs` uses), falling back to the engine manifest's
-//!   device list, falling back to an empty list plus a note. Never a
-//!   guess, never an error.
+//!   spawn `capacity.rs` uses), falling back to the runtime's system
+//!   census (NVML, DRM sysfs, Vulkan, macOS displays), falling back to an
+//!   empty list plus a note. Never a guess, never an error.
 //! - Residents: supervisor live rows joined onto their device by the
 //!   census key (`CUDA0` and `cuda:0` are the same card to the join),
 //!   with per-process VRAM from compute-apps where the driver reports
@@ -30,7 +30,10 @@ use blazar_core::Hardware;
 use blazar_core::store::EngineRow;
 use blazar_runtime::supervisor::PsRow;
 
-use crate::capacity::{DeviceRow, bounded_output, parse_compute_apps, parse_devices};
+use crate::capacity::{
+    DeviceRow, NO_CENSUS_NOTE, SYSTEM_CENSUS_NOTE, bounded_output, device_id, parse_compute_apps,
+    parse_devices, system_device_rows,
+};
 use crate::remotes::PeerCapacity;
 use crate::state::AppState;
 
@@ -67,56 +70,77 @@ pub(crate) fn fabric_snapshot(
         "total_ram_bytes": hardware.total_ram_mib * 1024 * 1024,
     });
 
-    // GPU block: live census > manifest devices > honest absence.
+    // GPU block: live census > system census > honest absence.
     let apps = census.map(|(_, apps)| apps);
-    let (devices, backend) = match census {
+    let (devices, backend, from_system) = match census {
         Some((rows, _)) if !rows.is_empty() => {
             let n = rows.len();
-            (rows.to_vec(), format!("nvidia-smi census ({n} device(s))"))
+            (
+                rows.to_vec(),
+                format!("nvidia-smi census ({n} device(s))"),
+                false,
+            )
         }
         _ => {
-            let gpus: Vec<DeviceRow> = hardware
-                .gpus
-                .iter()
-                .enumerate()
-                .map(|(i, g)| DeviceRow {
-                    index: u32::try_from(i).expect("device index fits u32"),
-                    name: g.name.clone(),
-                    total_mib: g.total_mib,
-                    free_mib: g.free_mib,
-                    // Manifest censuses carry no utilization signal.
-                    util_pct: 0,
-                })
-                .collect();
+            let gpus = system_device_rows(&hardware.gpus);
             if gpus.is_empty() {
-                notes.push(
-                    "no GPU census available - non-NVIDIA boxes without an engine manifest \
-                     census report an empty device list; residents below still come from \
-                     the supervisor",
-                );
-                (Vec::new(), "none".to_string())
+                notes.push(NO_CENSUS_NOTE);
+                notes.push("residents below still come from the supervisor");
+                (Vec::new(), "none".to_string(), true)
             } else {
-                notes.push(
-                    "nvidia-smi unavailable - device list comes from the active engine \
-                     manifest census (no utilization, no per-process VRAM)",
-                );
-                (gpus, "engine manifest census".to_string())
+                notes.push(SYSTEM_CENSUS_NOTE);
+                (gpus, "system census".to_string(), true)
             }
         }
     };
 
+    // The system census numbers cards in its own namespace (`gpu:0`)
+    // while the supervisor keeps the engine's device id (`CUDA0`). One
+    // card leaves nothing to tell apart, so every non-CPU resident joins
+    // it. Several cards would need a mapping nobody reports - say so
+    // instead of guessing; the resident stays listed under assignments.
+    let single_system_gpu = from_system && devices.len() == 1;
+    if from_system && devices.len() > 1 {
+        notes.push("the system census cannot map device ids to cards: residents are listed under assignments only");
+    }
+    // A lane without a device census (sglang, vllm as the active engine)
+    // leaves the supervisor no backend id to report for an unpinned
+    // single-card spawn: the resident then carries the census row's own
+    // card name. That name is a key only while exactly one row holds it.
+    let mut card_names: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for d in &devices {
+        *card_names.entry(d.name.as_str()).or_default() += 1;
+    }
+    let name_is_ambiguous = |name: &str| card_names.get(name).is_some_and(|count| *count > 1);
+    if ps_rows
+        .iter()
+        .any(|p| p.device_id.as_deref().is_some_and(name_is_ambiguous))
+    {
+        notes.push("two census rows share the name of a resident's card: that resident is listed under assignments only");
+    }
+
     let devices: Vec<serde_json::Value> = devices
         .iter()
         .map(|d| {
-            let id = format!("cuda:{}", d.index);
+            let id = device_id(from_system, d.index);
+            let utilization = if from_system {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(d.util_pct)
+            };
             let key = join_key(&id);
+            let name_is_unique = card_names.get(d.name.as_str()) == Some(&1);
+            let name_key = join_key(&d.name);
             let mut residents = Vec::new();
             let mut external = Vec::new();
             for p in ps_rows {
-                if p.device_id
-                    .as_deref()
-                    .is_some_and(|pid| join_key(pid) == key)
-                {
+                let sits_on_device = p.device_id.as_deref().is_some_and(|resident| {
+                    let resident = join_key(resident);
+                    resident == key
+                        || (name_is_unique && resident == name_key)
+                        || (single_system_gpu && resident != "cpu")
+                });
+                if sits_on_device {
                     let vram = apps.and_then(|a| {
                         a.iter()
                             .find(|(pid, _)| *pid == p.pid)
@@ -148,10 +172,10 @@ pub(crate) fn fabric_snapshot(
             serde_json::json!({
                 "id": id,
                 "name": d.name,
-                "backend": "cuda",
+                "backend": if from_system { "gpu" } else { "cuda" },
                 "total_vram_bytes": d.total_mib * 1024 * 1024,
                 "free_vram_bytes": d.free_mib * 1024 * 1024,
-                "utilization_percent": d.util_pct,
+                "utilization_percent": utilization,
                 "residents": residents,
                 "external": external,
             })
@@ -228,9 +252,10 @@ pub(crate) fn fabric_snapshot(
 
 /// `GET /api/fabric` - the `ComputeFabric` read-model.
 pub async fn fabric(State(state): State<Arc<AppState>>) -> Response {
-    // Same two bounded nvidia-smi spawns as /api/capacity (~30-60 ms):
+    // Same two bounded nvidia-smi spawns as /api/capacity (~30-60 ms),
+    // plus the hardware probe that answers when nvidia-smi is silent:
     // blocking work, off the async runtime threads.
-    let census = tokio::task::spawn_blocking(|| {
+    let (census, hardware) = tokio::task::spawn_blocking(|| {
         let devices = bounded_output(
             std::process::Command::new("nvidia-smi").args([
                 "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
@@ -251,19 +276,17 @@ pub async fn fabric(State(state): State<Arc<AppState>>) -> Response {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .map(|t| parse_compute_apps(&t));
-        devices.map(|d| (d, apps.unwrap_or_default()))
+        // The hardware probe spawns census subprocesses (and loads vendor
+        // libraries when nvidia-smi is silent): same blocking section.
+        let hardware = blazar_runtime::probe_hardware(None);
+        (devices.map(|d| (d, apps.unwrap_or_default())), hardware)
     })
     .await
-    .ok()
-    .flatten();
+    .unwrap_or_else(|join| std::panic::resume_unwind(join.into_panic()));
 
-    let hardware = blazar_runtime::probe_hardware(None);
     let ps_rows = state.sup.ps();
     // Flat, short store borrow (never nested inside another with_store).
-    let engines = state
-        .with_store(blazar_core::Store::list_engines)
-        .and_then(std::result::Result::ok)
-        .unwrap_or_default();
+    let engines = state.read_store_list_or_empty("engines.list", blazar_core::Store::list_engines);
     // Peers: snapshot the capacity cache once, name entries by their
     // configured remote (an unprobed remote is simply absent).
     let caps = state
@@ -377,24 +400,31 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
-    fn unit__fabric_snapshot__manifest_fallback_and_honest_absence() {
+    fn unit__fabric_snapshot__system_census_fallback_and_honest_absence() {
         let gpus = vec![blazar_core::GpuInfo {
             name: "RTX 4070".to_string(),
             description: "vulkan".to_string(),
             total_mib: 8192,
             free_mib: 8192,
         }];
-        // Census absent, manifest present: devices render from the
-        // manifest, the note names the degraded source.
+        // Census absent, system census present: devices render from the
+        // system rows under their own namespace, the note names the
+        // degraded source.
         let v = fabric_snapshot(&hardware(gpus), None, &[], &[], &[]);
-        assert_eq!(v["backend"], "engine manifest census");
+        assert_eq!(v["backend"], "system census");
         assert_eq!(v["devices"][0]["name"], "RTX 4070");
+        assert_eq!(v["devices"][0]["id"], "gpu:0");
+        assert_eq!(v["devices"][0]["backend"], "gpu");
+        assert_eq!(
+            v["devices"][0]["utilization_percent"],
+            serde_json::Value::Null
+        );
         assert_eq!(
             v["devices"][0]["residents"].as_array().map(Vec::len),
             Some(0)
         );
         assert!(
-            v["notes"].to_string().contains("manifest"),
+            v["notes"].to_string().contains("system census"),
             "degraded source must be named: {}",
             v["notes"]
         );
@@ -405,6 +435,121 @@ mod tests {
         assert!(empty["notes"].to_string().contains("no GPU census"));
         assert_eq!(empty["cpu"]["physical_cores"], 8);
         assert_eq!(empty["cpu"]["total_ram_bytes"], 32768u64 * 1024 * 1024);
+    }
+
+    fn system_gpu(index: usize) -> blazar_core::GpuInfo {
+        blazar_core::GpuInfo {
+            name: format!("sys:nvml:{index}"),
+            description: format!("NVIDIA card {index}"),
+            total_mib: 8188,
+            free_mib: 6842,
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__fabric_snapshot__single_system_gpu_takes_every_device_id() {
+        let rows = [
+            ps_row("qwen3", Some("CUDA0"), 4242),
+            ps_row("cpu-model", None, 5555),
+        ];
+        let v = fabric_snapshot(&hardware(vec![system_gpu(0)]), None, &rows, &[], &[]);
+        // The system census names cards in its own namespace; with one
+        // card there is nothing to tell apart, so the GPU resident joins
+        // it and the CPU row stays out of the device.
+        assert_eq!(v["devices"][0]["residents"][0]["model"], "qwen3");
+        assert_eq!(v["assignments"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__fabric_snapshot__multi_gpu_system_census_does_not_guess_the_card() {
+        let rows = [ps_row("qwen3", Some("CUDA1"), 4242)];
+        let v = fabric_snapshot(
+            &hardware(vec![system_gpu(0), system_gpu(1)]),
+            None,
+            &rows,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            v["devices"][0]["residents"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            v["devices"][1]["residents"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert!(
+            v["notes"].to_string().contains("cannot map device ids"),
+            "unmapped residents must be announced: {}",
+            v["notes"]
+        );
+        // The resident stays visible where its device id is known.
+        assert_eq!(v["assignments"][0]["device_id"], "CUDA1");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__fabric_snapshot__resident_named_by_the_card_joins_the_vendor_census() {
+        // An active lane without a device census (sglang, vllm) leaves the
+        // supervisor no backend id to report: the resident carries the
+        // census row's own card name instead.
+        let card = "NVIDIA GeForce RTX 4070";
+        let rows = [ps_row("qwen3", Some(card), 4242)];
+        let (dev, apps) = census();
+        let v = fabric_snapshot(&hardware(Vec::new()), Some((&dev, &apps)), &rows, &[], &[]);
+        assert_eq!(v["devices"][0]["residents"][0]["model"], "qwen3");
+        assert_eq!(
+            v["devices"][0]["residents"][0]["vram_bytes"],
+            2048u64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // pin names read as scenario sentences (house pattern)
+    fn unit__fabric_snapshot__duplicate_card_names_do_not_double_count_a_resident() {
+        let (dev, apps) = census();
+        let twin = DeviceRow {
+            index: 1,
+            ..dev[0].clone()
+        };
+        let pair = [dev[0].clone(), twin];
+        let rows = [ps_row("qwen3", Some(&dev[0].name), 4242)];
+        let v = fabric_snapshot(&hardware(Vec::new()), Some((&pair, &apps)), &rows, &[], &[]);
+        // Two rows answer to the same name: the card is unknown, so the
+        // resident joins neither and the snapshot says why.
+        assert_eq!(
+            v["devices"][0]["residents"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            v["devices"][1]["residents"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(v["assignments"][0]["device_id"], dev[0].name);
+        assert!(
+            v["notes"].to_string().contains("share the name"),
+            "an ambiguous card name must be announced: {}",
+            v["notes"]
+        );
+
+        // Two identical cards with residents on backend ids: nothing is
+        // ambiguous, so the box gets no note.
+        let by_backend = [ps_row("qwen3", Some("CUDA1"), 4242)];
+        let quiet = fabric_snapshot(
+            &hardware(Vec::new()),
+            Some((&pair, &apps)),
+            &by_backend,
+            &[],
+            &[],
+        );
+        assert!(
+            !quiet["notes"].to_string().contains("share the name"),
+            "a clean join must not carry the ambiguity note: {}",
+            quiet["notes"]
+        );
+        assert_eq!(quiet["devices"][1]["residents"][0]["model"], "qwen3");
     }
 
     #[test]

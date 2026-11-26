@@ -15,6 +15,7 @@ pub mod feature_policy;
 pub mod fs_safety;
 pub mod gguf;
 pub mod hardware;
+pub mod hardware_receipts;
 pub mod hfmeta;
 pub mod knob_registry;
 pub mod kv;

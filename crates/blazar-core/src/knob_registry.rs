@@ -425,6 +425,7 @@ const SGLANG_SUPPORTED: &[&str] = &[
     "--enable-memory-saver",
     "--enable-metrics",
     "--enable-mixed-chunk",
+    "--enable-paged-experts",
     "--enable-priority-scheduling",
     "--enable-session-radix-cache",
     "--enable-tf32-matmul",
@@ -448,6 +449,7 @@ const SGLANG_SUPPORTED: &[&str] = &[
     "--mmproj",
     "--no-kv-offload",
     "--page-size",
+    "--paged-experts-num-resident",
     "--pp-size",
     "--quantization",
     "--radix-eviction-policy",
@@ -503,6 +505,8 @@ const VLLM_SUPPORTED: &[&str] = &[
     "--kv-transfer-config",
     "--enable-auto-tool-choice",
     "--tool-call-parser",
+    "--spec-method",
+    "--spec-tokens",
 ];
 
 /// First-class flag tokens per lane, in sorted order, as compiled from the
@@ -643,6 +647,7 @@ fn hf_meta() -> HfMeta {
         dtype: Some("bfloat16".into()),
         quant_bits: None,
         quant_method: None,
+        quant_gptq_marlin_convertible: false,
         vision_tower: false,
         rope_fingerprint: None,
         kv: KvGeom {
@@ -775,6 +780,50 @@ fn draft_file() -> String {
     let p = std::env::temp_dir().join(format!("blazar-registry-draft-{}.gguf", std::process::id()));
     std::fs::write(&p, b"gguf").expect("draft fixture");
     p.to_string_lossy().into_owned()
+}
+
+/// Real `MoE` repo fixture (config.json + header-only safetensors): the
+/// paged-experts ladder reads routed-expert geometry from the model
+/// dir, so the registry needs a parseable expert shape on disk.
+fn moe_repo_fixture() -> String {
+    use std::io::Write as _;
+    let dir = std::env::temp_dir().join(format!("blazar-registry-moe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("moe repo fixture dir");
+    let cfg = r#"{"architectures":["OlmoeForCausalLM"],"model_type":"olmoe","num_experts":40,"num_experts_per_tok":4,"quantization_config":{"quant_method":"gptq","bits":4}}"#;
+    std::fs::write(dir.join("config.json"), cfg).expect("moe repo config");
+
+    // 2 layers x 40 routed experts x 75 MiB of F16: per-expert bytes
+    // derive from the declared tensor shapes (header is the contract).
+    let per_tensor_numel: u64 = 75 * MIB / 2;
+    let mut names: Vec<String> = Vec::new();
+    for l in 0..2 {
+        for e in 0..40 {
+            names.push(format!("model.layers.{l}.experts.{e}.down_proj.weight"));
+        }
+    }
+    names.push("model.layers.0.self_attn.q_proj.weight".into());
+    let entries: Vec<String> = names
+        .iter()
+        .map(|n| {
+            format!(
+                "\"{n}\":{{\"dtype\":\"F16\",\"shape\":[{per_tensor_numel}],\"data_offsets\":[0,0]}}"
+            )
+        })
+        .collect();
+    let header = format!("{{{}}}", entries.join(","));
+    let header_bytes = header.as_bytes();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dir.join("model.safetensors"))
+        .expect("moe repo safetensors");
+    let pad = (8 - (header_bytes.len() % 8)) % 8;
+    file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+        .and_then(|()| file.write_all(header_bytes))
+        .and_then(|()| file.write_all(&vec![b' '; pad]))
+        .expect("moe repo safetensors header");
+    dir.to_string_lossy().into_owned()
 }
 
 fn llamacpp_lane() -> Vec<String> {
@@ -1251,6 +1300,29 @@ fn sglang_profiles() -> Vec<Profile> {
     knob_inp.loras = &loras;
     absorb(&mut profiles, &knob_inp, &TuningOverrides::default());
 
+    // Paged-experts posture: manual engagement over a real MoE repo
+    // (geometry comes from the model dir), resident K pinned.
+    let paged = Config {
+        sglang: SglangTuning {
+            paged_experts: Some(true),
+            paged_experts_num_resident: Some(8),
+            ..SglangTuning::default()
+        },
+        ..Config::default()
+    };
+    let moe_repo = moe_repo_fixture();
+    let mut moe_inp = base_input(
+        EngineKind::Sglang,
+        ModelMeta::Hf(&hf),
+        8_000 * MIB,
+        &hw,
+        &paged,
+        &plain,
+        &flags,
+    );
+    moe_inp.model_path = &moe_repo;
+    absorb(&mut profiles, &moe_inp, &TuningOverrides::default());
+
     // Draft-free NGRAM speculation posture.
     let ngram = Config {
         sglang: SglangTuning {
@@ -1650,6 +1722,8 @@ fn vllm_profiles() -> Vec<Profile> {
                 connector: KvConnectorChoice::default(),
             },
             tool_call_parser: None,
+            spec_method: None,
+            spec_num_tokens: None,
         },
         ..Config::default()
     };
@@ -1662,6 +1736,31 @@ fn vllm_profiles() -> Vec<Profile> {
             &hw,
             &knobs,
             &plain,
+            &flags,
+        ),
+        &TuningOverrides::default(),
+    );
+
+    // Speculative-decoding posture: the draft-free suffix speculator
+    // with an explicit proposal window. The pair rides every spawn
+    // the knobs engage (no draft model, plain flag set).
+    let spec = ModelOverride {
+        vllm: Some(VllmTuning {
+            spec_method: Some("suffix".into()),
+            spec_num_tokens: Some(4),
+            ..VllmTuning::default()
+        }),
+        ..ModelOverride::default()
+    };
+    absorb(
+        &mut profiles,
+        &base_input(
+            EngineKind::Vllm,
+            ModelMeta::Hf(&hf),
+            988 * MIB,
+            &hw,
+            &base,
+            &spec,
             &flags,
         ),
         &TuningOverrides::default(),

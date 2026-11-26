@@ -26,6 +26,7 @@ pub mod engine;
 pub mod engine_impl;
 pub mod events;
 pub mod fleet;
+pub mod gpu_census;
 pub mod hf;
 pub mod hf_parallel;
 pub mod knob_registry;
@@ -62,9 +63,10 @@ pub use daemon::{
 };
 pub use engine::gh::GhClient;
 pub use engine::manifest::{
-    Manifest, Vendor, lane_only_capability_card, predicted_rescue_lane, probe as probe_manifest,
+    EngineView, Manifest, Vendor, lane_only_capability_card, predicted_rescue_lane,
+    probe as probe_manifest,
 };
-pub use engine::{EngineManager, LOCAL_TAG, system_vendor_hint};
+pub use engine::{EngineManager, EngineVerifyReport, LOCAL_TAG, system_vendor_hint};
 pub use engine_impl::{
     ChildHandle, Engine, LlamaCppEngine, MistralRsEngine, MlxEngine, OpenAiHostEngine, SdCppEngine,
     SglangEngine, VllmEngine,

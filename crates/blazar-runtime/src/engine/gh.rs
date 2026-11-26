@@ -501,6 +501,12 @@ impl GhClient {
         self
     }
 
+    /// The configured download-cache root, if any - shared with the
+    /// engine verifier so it can re-hash cached install archives.
+    pub(crate) fn downloads_cache_root(&self) -> Option<std::path::PathBuf> {
+        self.downloads_cache.clone()
+    }
+
     /// Advisory cross-process lock over a NAMED shared resource in the
     /// downloads cache root - used for blob downloads (inside
     /// [`Self::download_asset_file`]) and per-tag engine installs
@@ -1821,11 +1827,18 @@ pub enum Candidate {
 /// Ordered asset preference for this machine. `Cpu` entries are
 /// last-resort: they resolve only when every GPU variant is absent and
 /// the caller warns loudly (never a silent CPU fallback).
+///
+/// `vulkan_device` says whether Vulkan enumerates a discrete GPU on this
+/// host. It only matters when `vendor` names no runtime: an AMD or Intel
+/// card with neither `ROCm` nor oneAPI installed has no vendor build to
+/// run, and the Vulkan build serves it instead of the CPU build. An
+/// integrated-only host keeps the CPU build.
 #[must_use]
 pub fn pick_asset(
     os: &str,
     arch: &str,
     vendor: Option<crate::engine::manifest::Vendor>,
+    vulkan_device: bool,
 ) -> Vec<Candidate> {
     use crate::engine::manifest::Vendor;
     use Candidate::{Cpu, Exact, Versioned};
@@ -1845,6 +1858,7 @@ pub fn pick_asset(
                 Exact("ubuntu-vulkan-x64"),
                 Cpu("ubuntu-x64"),
             ],
+            _ if vulkan_device => vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")],
             _ => vec![Cpu("ubuntu-x64")],
         },
         ("linux", "aarch64" | "arm64") => vec![Exact("ubuntu-vulkan-arm64"), Cpu("ubuntu-arm64")],
@@ -1891,6 +1905,11 @@ pub struct AssetPick {
 /// above the cap are skipped - when at least one exists - and the
 /// lane falls through to Vulkan with a warning instead of a
 /// guaranteed probe failure. `None` = cap unknown, pick the newest.
+///
+/// `vulkan_device` reaches [`pick_asset`]: a host whose discrete GPU only
+/// Vulkan can drive prefers the Vulkan build, and a release without it
+/// resolves the CPU build as a flagged fallback (the host does have a
+/// GPU).
 #[must_use]
 pub fn resolve_asset(
     release: &GhRelease,
@@ -1898,8 +1917,9 @@ pub fn resolve_asset(
     arch: &str,
     vendor: Option<crate::engine::manifest::Vendor>,
     driver_cuda: Option<(u32, u32)>,
+    vulkan_device: bool,
 ) -> Option<AssetPick> {
-    let candidates = pick_asset(os, arch, vendor);
+    let candidates = pick_asset(os, arch, vendor, vulkan_device);
     let wants_gpu = candidates.iter().any(|c| !matches!(c, Candidate::Cpu(_)));
     let tag = &release.tag_name;
     for candidate in &candidates {
@@ -3484,7 +3504,7 @@ mod tests {
     #[test]
     fn unit__asset_matrix__linux_nvidia__vulkan_then_cpu_resort() {
         assert_eq!(
-            pick_asset("linux", "x86_64", Some(Vendor::Nvidia)),
+            pick_asset("linux", "x86_64", Some(Vendor::Nvidia), false),
             vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")]
         );
     }
@@ -3492,7 +3512,7 @@ mod tests {
     #[test]
     fn unit__asset_matrix__linux_amd__rocm_glob_then_vulkan_then_cpu() {
         assert_eq!(
-            pick_asset("linux", "x86_64", Some(Vendor::Amd)),
+            pick_asset("linux", "x86_64", Some(Vendor::Amd), false),
             vec![
                 Versioned {
                     prefix: "ubuntu-rocm-",
@@ -3507,7 +3527,7 @@ mod tests {
     #[test]
     fn unit__asset_matrix__linux_intel__sycl_then_vulkan_then_cpu() {
         assert_eq!(
-            pick_asset("linux", "x86_64", Some(Vendor::Intel)),
+            pick_asset("linux", "x86_64", Some(Vendor::Intel), false),
             vec![
                 Exact("ubuntu-sycl-fp16-x64"),
                 Exact("ubuntu-vulkan-x64"),
@@ -3518,17 +3538,33 @@ mod tests {
 
     #[test]
     fn unit__asset_matrix__linux_cpu__plain() {
-        assert_eq!(pick_asset("linux", "x86_64", None), vec![Cpu("ubuntu-x64")]);
         assert_eq!(
-            pick_asset("linux", "x86_64", Some(Vendor::Other)),
+            pick_asset("linux", "x86_64", None, false),
             vec![Cpu("ubuntu-x64")]
         );
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Other), false),
+            vec![Cpu("ubuntu-x64")]
+        );
+    }
+
+    /// An AMD or Intel card without its vendor runtime (no `ROCm`, no
+    /// oneAPI) is still a GPU: the Vulkan build serves it. The runtime
+    /// hint reads `Other` on such a host, which used to mean CPU-only.
+    #[test]
+    fn unit__asset_matrix__gpu_without_its_vendor_runtime__vulkan_then_cpu() {
+        let expected = vec![Exact("ubuntu-vulkan-x64"), Cpu("ubuntu-x64")];
+        assert_eq!(
+            pick_asset("linux", "x86_64", Some(Vendor::Other), true),
+            expected
+        );
+        assert_eq!(pick_asset("linux", "x86_64", None, true), expected);
     }
 
     #[test]
     fn unit__asset_matrix__linux_arm__vulkan_then_cpu() {
         assert_eq!(
-            pick_asset("linux", "aarch64", None),
+            pick_asset("linux", "aarch64", None, false),
             vec![Exact("ubuntu-vulkan-arm64"), Cpu("ubuntu-arm64")]
         );
     }
@@ -3536,7 +3572,7 @@ mod tests {
     #[test]
     fn unit__asset_matrix__macos_arm_first() {
         assert_eq!(
-            pick_asset("macos", "arm64", None),
+            pick_asset("macos", "arm64", None, false),
             vec![Exact("macos-arm64"), Exact("macos-x64")]
         );
     }
@@ -3544,7 +3580,7 @@ mod tests {
     #[test]
     fn unit__asset_matrix__windows_variants() {
         assert_eq!(
-            pick_asset("windows", "x64", Some(Vendor::Nvidia)),
+            pick_asset("windows", "x64", Some(Vendor::Nvidia), false),
             vec![
                 Versioned {
                     prefix: "win-cuda-",
@@ -3555,7 +3591,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            pick_asset("windows", "x64", Some(Vendor::Amd)),
+            pick_asset("windows", "x64", Some(Vendor::Amd), false),
             vec![
                 Versioned {
                     prefix: "win-rocm-",
@@ -3566,11 +3602,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            pick_asset("windows", "x64", None),
+            pick_asset("windows", "x64", None, false),
             vec![Exact("win-vulkan-x64"), Cpu("win-cpu-x64")]
         );
         assert_eq!(
-            pick_asset("windows", "arm64", None),
+            pick_asset("windows", "arm64", None, false),
             vec![Cpu("win-cpu-arm64")]
         );
     }
@@ -3596,7 +3632,7 @@ mod tests {
                 "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz",
             ],
         );
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), None).unwrap();
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), None, false).unwrap();
         assert_eq!(p.name, "llama-b10833-bin-ubuntu-rocm-11.2-x64.tar.gz");
         assert_eq!(p.label, "ubuntu-rocm-11.2-x64");
         assert!(!p.cpu_fallback);
@@ -3612,7 +3648,7 @@ mod tests {
                 "llama-b1-bin-win-cuda-10.0-x64.zip",
             ],
         );
-        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None).unwrap();
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None, false).unwrap();
         assert_eq!(p.label, "win-cuda-10.0-x64");
     }
 
@@ -3621,7 +3657,7 @@ mod tests {
         // The exact live b10833 scenario: nvidia box, vulkan asset not
         // uploaded yet, CPU asset visible.
         let r = rel("b10833", &["llama-b10833-bin-ubuntu-x64.tar.gz"]);
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None).unwrap();
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None, false).unwrap();
         assert_eq!(p.label, "ubuntu-x64");
         assert!(p.cpu_fallback, "must be flagged, never silent");
     }
@@ -3629,7 +3665,7 @@ mod tests {
     #[test]
     fn unit__resolve__no_assets__none() {
         let r = rel("b10833", &[]);
-        assert!(resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None).is_none());
+        assert!(resolve_asset(&r, "linux", "x86_64", Some(Vendor::Nvidia), None, false).is_none());
     }
 
     #[test]
@@ -3642,8 +3678,43 @@ mod tests {
             ],
         );
         // Intel: fp16 exact miss -> vulkan (sycl-fp32 is not a candidate).
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Intel), None).unwrap();
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Intel), None, false).unwrap();
         assert_eq!(p.label, "ubuntu-vulkan-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    #[test]
+    fn unit__resolve__gpu_without_its_vendor_runtime__vulkan_build_resolves() {
+        let r = rel(
+            "b1",
+            &[
+                "llama-b1-bin-ubuntu-vulkan-x64.tar.gz",
+                "llama-b1-bin-ubuntu-x64.tar.gz",
+            ],
+        );
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Other), None, true).unwrap();
+        assert_eq!(p.label, "ubuntu-vulkan-x64");
+        assert!(!p.cpu_fallback);
+    }
+
+    /// The Vulkan build is not up yet: the CPU build answers, and the
+    /// caller must say so, because this host does have a GPU.
+    #[test]
+    fn unit__resolve__gpu_without_its_vendor_runtime__missing_vulkan_build_is_a_flagged_cpu_fallback()
+     {
+        let r = rel("b1", &["llama-b1-bin-ubuntu-x64.tar.gz"]);
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Other), None, true).unwrap();
+        assert_eq!(p.label, "ubuntu-x64");
+        assert!(p.cpu_fallback, "a GPU host must never land on CPU silently");
+    }
+
+    /// A host where Vulkan enumerates no device keeps the quiet CPU-only
+    /// list: nothing is missing when only the CPU asset resolves.
+    #[test]
+    fn unit__resolve__no_gpu_host__cpu_build_resolves_unflagged() {
+        let r = rel("b1", &["llama-b1-bin-ubuntu-x64.tar.gz"]);
+        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Other), None, false).unwrap();
+        assert_eq!(p.label, "ubuntu-x64");
         assert!(!p.cpu_fallback);
     }
 
@@ -3656,7 +3727,7 @@ mod tests {
                 "llama-b1-bin-win-vulkan-x64.zip",
             ],
         );
-        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None).unwrap();
+        let p = resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), None, false).unwrap();
         assert_eq!(p.label, "win-vulkan-x64");
     }
 
@@ -3673,7 +3744,7 @@ mod tests {
             ],
         );
         let pick = |cap: Option<(u32, u32)>| {
-            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), cap).unwrap()
+            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), cap, false).unwrap()
         };
         assert_eq!(pick(Some((12, 6))).label, "win-cuda-12.4-x64");
         assert_eq!(pick(Some((13, 9))).label, "win-cuda-13.4-x64");
@@ -3692,8 +3763,15 @@ mod tests {
                 "llama-b11011-bin-win-vulkan-x64.zip",
             ],
         );
-        let p =
-            resolve_asset(&r, "windows", "x86_64", Some(Vendor::Nvidia), Some((12, 4))).unwrap();
+        let p = resolve_asset(
+            &r,
+            "windows",
+            "x86_64",
+            Some(Vendor::Nvidia),
+            Some((12, 4)),
+            false,
+        )
+        .unwrap();
         assert_eq!(p.label, "win-vulkan-x64");
         assert!(!p.cpu_fallback);
     }
@@ -3709,7 +3787,15 @@ mod tests {
                 "llama-b11011-bin-ubuntu-x64.tar.gz",
             ],
         );
-        let p = resolve_asset(&r, "linux", "x86_64", Some(Vendor::Amd), Some((12, 0))).unwrap();
+        let p = resolve_asset(
+            &r,
+            "linux",
+            "x86_64",
+            Some(Vendor::Amd),
+            Some((12, 0)),
+            false,
+        )
+        .unwrap();
         assert_eq!(p.label, "ubuntu-rocm-10.0-x64");
     }
 

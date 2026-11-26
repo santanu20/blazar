@@ -114,7 +114,7 @@ async fn verify_row(row: ModelRow) -> Result<VerifyReport> {
 }
 
 /// Stream a file through sha256; returns (file size hashed, hex digest).
-fn sha256_file(path: &Path) -> std::io::Result<(u64, String)> {
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<(u64, String)> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_BUF_BYTES];
@@ -161,6 +161,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         }
     }
 

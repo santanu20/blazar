@@ -49,6 +49,14 @@ pub struct HfMeta {
     /// are, not which loader must read them; a lane without the quantizer
     /// dies at weight load.
     pub quant_method: Option<String>,
+    /// GPTQ configs carrying the full `bits` / `group_size` / `sym` /
+    /// `desc_act` property set convert to the Marlin loader at engine
+    /// load (upstream `GPTQMarlinConfig.override_quantization_method`),
+    /// so the declared `gptq` format is loadable by any lane whose
+    /// registry lists `gptq_marlin`. Absent or partial properties leave
+    /// the format unconvertible - the engine itself dies on the plain
+    /// `gptq` loader lookup there.
+    pub quant_gptq_marlin_convertible: bool,
     /// Config declares a vision/image tower (top-level `vision_config` or
     /// `image_config` object - the multimodal-wrapper class). Tower models
     /// need their processor artifact (`preprocessor_config.json`) at engine
@@ -228,6 +236,15 @@ pub fn read_hf_config(dir: &Path) -> CoreResult<HfMeta> {
             .and_then(Value::as_str)
             .filter(|m| !m.is_empty())
             .map(str::to_owned),
+        // Upstream converts a GPTQ config to the Marlin loader only when
+        // the property set is complete (is_gptq_marlin_compatible checks
+        // bits, group_size, sym and desc_act for presence, not values).
+        quant_gptq_marlin_convertible: v.get("quantization_config").is_some_and(|q| {
+            q.get("quant_method").and_then(Value::as_str) == Some("gptq")
+                && ["bits", "group_size", "sym", "desc_act"]
+                    .iter()
+                    .all(|key| q.get(*key).is_some_and(|p| !p.is_null()))
+        }),
         vision_tower: ["vision_config", "image_config"]
             .iter()
             .any(|k| v.get(*k).is_some_and(Value::is_object)),
@@ -350,21 +367,32 @@ impl SglangLaneFacts {
 /// dirs and dense text models pass untouched.
 #[must_use]
 pub fn sglang_lane_teach(meta: &HfMeta, dir: &Path, facts: &SglangLaneFacts) -> Option<String> {
-    if let Some(method) = meta.quant_method.as_deref().filter(|m| !m.is_empty())
-        && !facts.effective_quant_methods().contains(&method)
-    {
-        let version = if facts.version.is_empty() {
-            "version unknown"
+    if let Some(method) = meta.quant_method.as_deref().filter(|m| !m.is_empty()) {
+        // The registry lists loader names, the config declares format
+        // names. A complete GPTQ config converts to the Marlin loader at
+        // engine load, so the gate asks the registry for the loader the
+        // engine will actually pick; the declared name stays acceptable
+        // for a lane that registers it directly.
+        let engine_loader = if method == "gptq" && meta.quant_gptq_marlin_convertible {
+            "gptq_marlin"
         } else {
-            facts.version.as_str()
+            method
         };
-        return Some(format!(
-            "quant_method '{method}' is not loadable by this sglang lane ({version}; \
-             supported: {}). Serve it on a lane that reads the format \
-             (blazar engine use <tag>), or pull a quant this lane reads \
-             (blazar fit <repo> previews the repo's variants)",
-            facts.effective_quant_methods().join(", ")
-        ));
+        let loadable = facts.effective_quant_methods();
+        if !loadable.contains(&method) && !loadable.contains(&engine_loader) {
+            let version = if facts.version.is_empty() {
+                "version unknown"
+            } else {
+                facts.version.as_str()
+            };
+            return Some(format!(
+                "quant_method '{method}' is not loadable by this sglang lane ({version}; \
+                 supported: {}). Serve it on a lane that reads the format \
+                 (blazar engine use <tag>), or pull a quant this lane reads \
+                 (blazar fit <repo> previews the repo's variants)",
+                loadable.join(", ")
+            ));
+        }
     }
     if meta.vision_tower && !dir.join("preprocessor_config.json").is_file() {
         // Weight evidence splits the remedy. Visual tensors in the
@@ -487,6 +515,180 @@ pub fn root_safetensors_bytes(dir: &Path) -> Option<u64> {
             .map(|m| m.len())
             .sum(),
     )
+}
+
+/// Routed-MoE geometry the sglang paged-experts plan needs: how many
+/// experts exist per layer, how many the router activates per token,
+/// and the byte weight of the expert tensors. Expert weights are the
+/// only pageable slice of a `MoE` checkpoint (attention, embeddings and
+/// shared experts are dense), so the split math lives on exactly these
+/// numbers. Bytes come from the safetensors headers themselves (shape
+/// x itemsize per tensor) - the stored truth, not a file-size
+/// approximation; GPTQ/AWQ packed tensors (`qweight` I32) count at
+/// their packed itemsize, which is exactly what the host store pins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoeGeometry {
+    /// Routed experts per `MoE` layer (`E`). From config keys when
+    /// present, else the max expert index seen in the tensors + 1.
+    pub experts: u64,
+    /// Router top-k (`num_experts_per_tok`): the floor for any
+    /// resident-expert count - upstream refuses `K < top_k`.
+    pub top_k: u64,
+    /// Summed bytes of ALL routed-expert tensors (every layer).
+    pub expert_weights_bytes: u64,
+    /// `expert_weights_bytes / experts`: the per-expert share the
+    /// GPU residency table and the host pinned store are sized in.
+    pub per_expert_bytes: u64,
+    /// `quantization_config.quant_method` when declared - the
+    /// paged-experts runner support gate reads it (triton and Marlin
+    /// `MoE` runners cover distinct quant families).
+    pub quant_method: Option<String>,
+}
+
+/// A tensor is a routed-expert weight when its name walks
+/// `layers.<n> ... experts.<e>`: qwen2-moe (`mlp.experts`),
+/// OLMoE/gpt-oss (`experts`), granite (`block_sparse_moe.experts`) all
+/// fit the walk. `shared_experts` never matches - it is one segment,
+/// and shared experts are dense FFN weights no paged store owns.
+fn is_routed_expert_tensor(name: &str) -> bool {
+    let segs: Vec<&str> = name.split('.').collect();
+    (0..segs.len().saturating_sub(1)).any(|i| {
+        segs[i] == "layers"
+            && segs[i + 1].parse::<u64>().is_ok()
+            && segs[i + 2..]
+                .iter()
+                .position(|s| *s == "experts")
+                .is_some_and(|j| {
+                    segs.get(i + 2 + j + 1)
+                        .is_some_and(|s| s.parse::<u64>().is_ok())
+                })
+    })
+}
+
+/// The expert index of a routed-expert tensor name (the numeric
+/// segment directly after `experts`), for the tensor-derived expert
+/// count.
+fn expert_index_of(name: &str) -> Option<u64> {
+    let segs: Vec<&str> = name.split('.').collect();
+    segs.iter()
+        .position(|s| *s == "experts")
+        .and_then(|j| segs.get(j + 1).and_then(|s| s.parse().ok()))
+}
+
+/// Safetensors itemsize per dtype string. Packed GPTQ/AWQ tensors
+/// ride I32/U32 rows; FP8 blocks ride U8/I8 - all counted at what the
+/// file actually stores.
+fn safetensors_itemsize(dtype: &str) -> Option<u64> {
+    Some(match dtype {
+        "F64" | "I64" | "U64" => 8,
+        "F32" | "I32" | "U32" => 4,
+        "F16" | "BF16" | "I16" | "U16" => 2,
+        "I8" | "U8" | "BOOL" | "F8_E4M3" | "F8_E5M2" => 1,
+        _ => return None,
+    })
+}
+
+/// (tensor name, byte size) pairs from one safetensors file header:
+/// 8-byte LE header length + JSON header of dtype/shape. `None` on
+/// anything unreadable - a half-written shard must read as "no facts",
+/// never as zero-byte experts.
+fn safetensors_header_tensors(path: &Path) -> Option<Vec<(String, u64)>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf).ok()?;
+    let header_len = usize::try_from(u64::from_le_bytes(len_buf)).ok()?;
+    // A real safetensors header of a served model is a few MB at most;
+    // anything past this bound is not a safetensors file.
+    if header_len == 0 || header_len > 64 * 1024 * 1024 {
+        return None;
+    }
+    let mut header = vec![0u8; header_len];
+    file.read_exact(&mut header).ok()?;
+    let parsed: Value = serde_json::from_slice(&header).ok()?;
+    let mut out = Vec::new();
+    for (name, meta) in parsed.as_object()? {
+        if name == "__metadata__" {
+            continue;
+        }
+        // An unknown dtype fails the WHOLE file, not one tensor:
+        // silently skipping expert tensors would undercount the
+        // pinned store the plan charges host RAM for.
+        let dtype = meta.get("dtype").and_then(Value::as_str)?;
+        let itemsize = safetensors_itemsize(dtype)?;
+        let numel = meta
+            .get("shape")
+            .and_then(Value::as_array)
+            .map_or(1, |shape| {
+                shape.iter().filter_map(Value::as_u64).product::<u64>()
+            });
+        out.push((name.clone(), numel.saturating_mul(itemsize)));
+    }
+    Some(out)
+}
+
+/// Routed-MoE geometry of an HF safetensors model dir, or `None` for
+/// dense models, incomplete pulls (expert tensors but no top-k
+/// anywhere), zero-expert hybrids (granite mamba-attention FFN), and
+/// unreadable dirs. Downstream paged-experts decisions skip-with-
+/// teaching on `None` - same contract as every other fact here: never
+/// estimate what the checkpoint does not declare.
+#[must_use]
+pub fn moe_geometry(dir: &Path) -> Option<MoeGeometry> {
+    let raw = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let config: Value = serde_json::from_str(&raw).ok()?;
+    let u64_key = |key: &str| -> Option<u64> {
+        let at = |v: &Value| v.get(key).and_then(Value::as_u64);
+        at(&config).or_else(|| config.get("text_config").and_then(at))
+    };
+    // Expert-count keys across the MoE families: qwen2/3-moe and
+    // granite declare num_local_experts, OLMoE/gpt-oss num_experts,
+    // deepseek n_routed_experts, older qwen1-moe moe_num_experts.
+    let experts = [
+        "num_local_experts",
+        "num_experts",
+        "n_routed_experts",
+        "moe_num_experts",
+    ]
+    .iter()
+    .find_map(|k| u64_key(k).filter(|e| *e > 0));
+    let top_k = ["num_experts_per_tok", "num_experts_topk", "moe_topk"]
+        .iter()
+        .find_map(|k| u64_key(k));
+
+    // Scan the real tensor headers: routed-expert names only, real
+    // dtype x shape bytes. Sharded repos all carry root safetensors
+    // files; a repo without any is not a loadable model dir.
+    let mut expert_bytes = 0u64;
+    let mut max_expert_index: Option<u64> = None;
+    for shard in root_safetensors(dir) {
+        for (name, bytes) in safetensors_header_tensors(&shard).into_iter().flatten() {
+            if is_routed_expert_tensor(&name) {
+                expert_bytes = expert_bytes.saturating_add(bytes);
+                max_expert_index = max_expert_index.max(expert_index_of(&name));
+            }
+        }
+    }
+    if expert_bytes == 0 {
+        return None; // dense (or a tower repo without text experts)
+    }
+    // top-k is the K floor upstream enforces; without it the geometry
+    // cannot bound a plan, so it stays incomplete, not guessed.
+    let top_k = top_k?;
+    let experts = experts.or(max_expert_index.map(|max| max + 1))?;
+    let per_expert = expert_bytes.checked_div(experts).filter(|p| *p > 0)?;
+    Some(MoeGeometry {
+        experts,
+        top_k,
+        expert_weights_bytes: expert_bytes,
+        per_expert_bytes: per_expert,
+        quant_method: config
+            .get("quantization_config")
+            .and_then(|q| q.get("quant_method"))
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+            .map(str::to_owned),
+    })
 }
 
 #[cfg(test)]
@@ -674,6 +876,53 @@ mod tests {
                 "num_hidden_layers": 28, "num_attention_heads": 14}"#,
         )]);
         assert_eq!(read_hf_config(dir.path()).unwrap().quant_bits, Some(4));
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__hf_config_gptq_props__marlin_conversion_flag() {
+        // Live shape of shuyuej/OLMoE-1B-7B-0924-GPTQ (and every genuine
+        // GPTQ export, e.g. Qwen/Qwen3-30B-A3B-GPTQ-Int4): the full
+        // bits/group_size/sym/desc_act property set is what upstream
+        // `GPTQMarlinConfig.is_gptq_marlin_compatible` requires before it
+        // converts the format to the Marlin loader at runtime.
+        let full = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["OlmoeForCausalLM"],
+                "quantization_config": {"quant_method": "gptq", "bits": 4,
+                    "group_size": 128, "sym": true, "desc_act": false}}"#,
+        )]);
+        assert!(
+            read_hf_config(full.path())
+                .unwrap()
+                .quant_gptq_marlin_convertible
+        );
+        // A partial property set (sym missing) cannot convert - the
+        // engine would die looking up the plain gptq loader.
+        let partial = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["OlmoeForCausalLM"],
+                "quantization_config": {"quant_method": "gptq", "bits": 4,
+                    "group_size": 128, "desc_act": false}}"#,
+        )]);
+        assert!(
+            !read_hf_config(partial.path())
+                .unwrap()
+                .quant_gptq_marlin_convertible
+        );
+        // The mapping is GPTQ-only: an AWQ config with the same keys
+        // never routes through the Marlin conversion.
+        let awq = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen2ForCausalLM"],
+                "quantization_config": {"quant_method": "awq", "bits": 4,
+                    "group_size": 128, "sym": true, "desc_act": false}}"#,
+        )]);
+        assert!(
+            !read_hf_config(awq.path())
+                .unwrap()
+                .quant_gptq_marlin_convertible
+        );
     }
 
     #[test]
@@ -900,6 +1149,51 @@ mod tests {
 
     #[test]
     #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__sglang_lane_teach__gptq_converts_to_the_marlin_loader() {
+        let dir = write_dir(&[]);
+        // Live shape: a genuine GPTQ export declares `quant_method: gptq`
+        // while the engine's loader registry (what the probe reads) lists
+        // only `gptq_marlin` - upstream converts the format at load time
+        // (`GPTQMarlinConfig.override_quantization_method`). The gate must
+        // ask the registry for the loader the engine will actually pick.
+        let gptq_convertible = HfMeta {
+            quant_method: Some("gptq".into()),
+            quant_gptq_marlin_convertible: true,
+            ..Default::default()
+        };
+        let marlin_lane = SglangLaneFacts {
+            version: "0.5.23".into(),
+            quant_methods: Some(vec!["awq".into(), "gptq_marlin".into()]),
+        };
+        assert_eq!(
+            sglang_lane_teach(&gptq_convertible, dir.path(), &marlin_lane),
+            None,
+            "a complete GPTQ config is loadable wherever the Marlin loader is registered"
+        );
+        // A lane without the Marlin loader still refuses, naming the
+        // declared format (the model's own config vocabulary).
+        let fp8_only = SglangLaneFacts {
+            version: "0.5.23".into(),
+            quant_methods: Some(vec!["fp8".into()]),
+        };
+        let teach = sglang_lane_teach(&gptq_convertible, dir.path(), &fp8_only)
+            .expect("no marlin loader registered means the format has no reader");
+        assert!(teach.contains("quant_method 'gptq'"), "{teach}");
+        // Partial GPTQ properties cannot convert - the engine dies on the
+        // plain gptq loader lookup, so the refusal is honest.
+        let gptq_partial = HfMeta {
+            quant_method: Some("gptq".into()),
+            quant_gptq_marlin_convertible: false,
+            ..Default::default()
+        };
+        assert!(
+            sglang_lane_teach(&gptq_partial, dir.path(), &marlin_lane).is_some(),
+            "an incomplete GPTQ config has no conversion path and must refuse"
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__sglang_lane_teach__vision_tower_without_processor_refuses() {
         let tower = HfMeta {
             vision_tower: true,
@@ -1031,5 +1325,166 @@ mod tests {
             .expect("incomplete multimodal refuses");
         assert!(teach.contains("Re-pull"), "{teach}");
         assert!(teach.contains("blazar pull"), "{teach}");
+    }
+
+    // --- paged-experts geometry (E1) fixtures -----------------------------
+
+    /// Minimal real safetensors file: 8-byte LE header length, JSON header
+    /// (dtype/shape/`data_offsets`), zero data. Enough truth for the tensor
+    /// scanner: names, dtypes, shapes.
+    fn write_safetensors(dir: &Path, name: &str, tensors: &[(&str, &str, &[u64])]) {
+        let mut offset = 0u64;
+        let mut entries = String::new();
+        for (tname, dtype, shape) in tensors {
+            let numel: u64 = shape.iter().product();
+            let item = match *dtype {
+                "I64" | "F64" | "U64" => 8,
+                "I32" | "F32" | "U32" => 4,
+                "I16" | "F16" | "BF16" | "U16" => 2,
+                _ => 1,
+            };
+            let bytes = numel * item;
+            let dims = shape
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let entry = format!(
+                "\"{tname}\":{{\"dtype\":\"{dtype}\",\"shape\":[{dims}],\"data_offsets\":[{offset},{}]}}",
+                offset + bytes
+            );
+            if !entries.is_empty() {
+                entries.push(',');
+            }
+            entries.push_str(&entry);
+            offset += bytes;
+        }
+        let header = format!("{{{entries}}}");
+        let mut body = header.into_bytes();
+        let mut out = (body.len() as u64).to_le_bytes().to_vec();
+        out.append(&mut body);
+        out.extend(std::iter::repeat_n(
+            0u8,
+            usize::try_from(offset).expect("test fixture offset fits usize"),
+        ));
+        fs::write(dir.join(name), out).unwrap();
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__moe_geometry__olmoe_like_config_and_tensors() {
+        let dir = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["OlmoeForCausalLM"],
+                "num_experts": 64, "num_experts_per_tok": 8,
+                "quantization_config": {"quant_method": "gptq", "bits": 4}}"#,
+        )]);
+        write_safetensors(
+            dir.path(),
+            "model.safetensors",
+            &[
+                ("model.layers.0.experts.63.gate_proj", "I32", &[64, 8]),
+                ("model.layers.1.experts.5.up_proj", "I32", &[64, 8]),
+                ("model.layers.0.self_attn.q_proj", "F32", &[100, 100]),
+            ],
+        );
+        let geom = moe_geometry(dir.path()).expect("olmoe-like geometry");
+        assert_eq!(geom.experts, 64, "E from config");
+        assert_eq!(geom.top_k, 8);
+        // 2 expert tensors x 64*8 I32 elements = 4096 bytes total.
+        assert_eq!(geom.expert_weights_bytes, 4096);
+        assert_eq!(geom.per_expert_bytes, 64, "4096 / 64 experts");
+        assert_eq!(geom.quant_method.as_deref(), Some("gptq"));
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__moe_geometry__qwen2_moe_names_and_shared_experts_excluded() {
+        let dir = write_dir(&[("config.json", r#"{"num_local_experts": 4, "moe_topk": 2}"#)]);
+        write_safetensors(
+            dir.path(),
+            "model.safetensors",
+            &[
+                ("model.layers.2.mlp.experts.7.down_proj", "BF16", &[16, 8]),
+                ("model.layers.2.mlp.experts.1.gate_proj", "BF16", &[16, 8]),
+                // shared experts are dense FFN weights, never routed or
+                // paged: the scanner must skip them.
+                (
+                    "model.layers.2.mlp.shared_experts.gate_proj",
+                    "BF16",
+                    &[16, 8],
+                ),
+            ],
+        );
+        let geom = moe_geometry(dir.path()).expect("qwen2-moe geometry");
+        assert_eq!(geom.experts, 4, "E from num_local_experts");
+        assert_eq!(geom.top_k, 2, "top_k from moe_topk");
+        assert_eq!(geom.expert_weights_bytes, 2 * 16 * 8 * 2);
+        assert_eq!(geom.quant_method, None, "unquantized repo");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__moe_geometry__expert_count_falls_back_to_tensors() {
+        let dir = write_dir(&[("config.json", r#"{"num_experts_per_tok": 2}"#)]);
+        write_safetensors(
+            dir.path(),
+            "model.safetensors",
+            &[
+                ("model.layers.0.experts.0.gate_proj", "F16", &[8]),
+                ("model.layers.0.experts.3.up_proj", "F16", &[8]),
+            ],
+        );
+        let geom = moe_geometry(dir.path()).expect("tensor-derived E");
+        assert_eq!(geom.experts, 4, "max expert index 3 -> E = 4");
+        assert_eq!(geom.per_expert_bytes, 8, "16 bytes over 4 experts");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__moe_geometry__dense_and_incomplete_dirs_are_none() {
+        // Dense: attention tensors only, no MoE keys.
+        let dense = write_dir(&[("config.json", r#"{"num_hidden_layers": 2}"#)]);
+        write_safetensors(
+            dense.path(),
+            "model.safetensors",
+            &[("model.layers.0.self_attn.q_proj", "F32", &[4, 4])],
+        );
+        assert_eq!(moe_geometry(dense.path()), None);
+        // Expert tensors but no top_k anywhere: paged needs the K floor,
+        // an incomplete geometry is not a guess.
+        let no_topk = write_dir(&[("config.json", r#"{"num_experts": 8}"#)]);
+        write_safetensors(
+            no_topk.path(),
+            "model.safetensors",
+            &[("model.layers.0.experts.1.gate_proj", "F16", &[8])],
+        );
+        assert_eq!(moe_geometry(no_topk.path()), None);
+        // Granite-hybrid shape: num_local_experts = 0 means a dense FFN.
+        let hybrid = write_dir(&[(
+            "config.json",
+            r#"{"num_local_experts": 0, "num_experts_per_tok": 0}"#,
+        )]);
+        assert_eq!(moe_geometry(hybrid.path()), None);
+        // No config at all / no weights: not a readable model dir.
+        assert_eq!(moe_geometry(write_dir(&[]).path()), None);
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
+    fn unit__moe_geometry__nested_text_config_keys_descend() {
+        let dir = write_dir(&[(
+            "config.json",
+            r#"{"architectures": ["Qwen3MoeForCausalLM"],
+                "text_config": {"num_experts": 32, "num_experts_per_tok": 4}}"#,
+        )]);
+        write_safetensors(
+            dir.path(),
+            "model.safetensors",
+            &[("model.layers.0.experts.31.gate_proj", "F16", &[16])],
+        );
+        let geom = moe_geometry(dir.path()).expect("nested geometry");
+        assert_eq!(geom.experts, 32);
+        assert_eq!(geom.top_k, 4);
     }
 }

@@ -82,12 +82,17 @@ impl JobRuntime {
     pub fn boot_sweep(&self, state: &Arc<AppState>) {
         let boot_unix = blazar_core::store::unix_now();
         let swept = state
-            .with_store(|s| {
-                let cutoff = blazar_core::store::unix_now() - BOOT_GRACE_SECS;
-                let abandoned = s.sweep_jobs_updated_before(cutoff).unwrap_or_default();
-                let pruned = s.prune_jobs(TERMINAL_PRUNE_SECS).unwrap_or((0, Vec::new()));
-                (abandoned, pruned)
-            })
+            .read_store(
+                "jobs.boot_sweep",
+                |s| -> blazar_core::CoreResult<Option<_>> {
+                    let cutoff = blazar_core::store::unix_now() - BOOT_GRACE_SECS;
+                    let abandoned = s.sweep_jobs_updated_before(cutoff)?;
+                    let pruned = s.prune_jobs(TERMINAL_PRUNE_SECS)?;
+                    Ok(Some((abandoned, pruned)))
+                },
+            )
+            .ok()
+            .flatten()
             .unwrap_or((Vec::new(), (0, Vec::new())));
         if !swept.0.is_empty() {
             tracing::info!(
@@ -114,12 +119,9 @@ impl JobRuntime {
                 (BOOT_GRACE_SECS + GRACE_MARGIN_SECS) as u64,
             ))
             .await;
-            let late = st
-                .with_store(|s| {
-                    s.sweep_jobs_updated_before(boot_unix - 1)
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
+            let late = st.read_store_list_or_empty("jobs.late_sweep", |s| {
+                s.sweep_jobs_updated_before(boot_unix - 1)
+            });
             if !late.is_empty() {
                 tracing::info!(
                     target: "blazar::jobs",
@@ -314,13 +316,21 @@ impl JobRuntime {
         error: Option<&str>,
         event_kind: &str,
     ) {
-        let outcome = state.with_store(|s| {
-            let flipped = s.set_job_state(id, to, result_json, error).unwrap_or(false);
-            if flipped && let Err(err) = s.append_job_event(id, event_kind, None) {
-                tracing::warn!(target: "blazar::jobs", job = %id, %err, "job event append failed");
-            }
-            flipped
-        });
+        let outcome = state
+            .with_store(|s| -> blazar_core::CoreResult<bool> {
+                let flipped = s.set_job_state(id, to, result_json, error)?;
+                if flipped && let Err(err) = s.append_job_event(id, event_kind, None) {
+                    tracing::warn!(target: "blazar::jobs", job = %id, %err, "job event append failed");
+                }
+                Ok(flipped)
+            })
+            .and_then(|result| match result {
+                Ok(flipped) => Some(flipped),
+                Err(err) => {
+                    tracing::warn!(target: "blazar::jobs", job = %id, %err, "job state transition could not be persisted");
+                    None
+                }
+            });
         match outcome {
             Some(true) => {}
             // Unknown row (lane created it before this release, or the
@@ -377,6 +387,35 @@ pub fn row_payload(row: &JobRow) -> serde_json::Value {
     payload
 }
 
+/// The job row behind `id` with the two misses kept apart: `Ok(None)` is
+/// an honest absence the caller turns into its own 404 (lanes attach
+/// teaching text to it), `Err` is the 503 to return when the store
+/// cannot answer - a 404 there would claim the job never existed while
+/// only the store is broken.
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+pub(crate) fn job_row_or_503(state: &AppState, job_id: &str) -> Result<Option<JobRow>, Response> {
+    state
+        .read_store("jobs.lookup", |s| s.get_job(job_id))
+        .map_err(|message| {
+            crate::proxy::openai_error(
+                503,
+                &format!(
+                    "store could not read job {job_id} ({message}) - retry once the store recovers"
+                ),
+            )
+        })
+}
+
+/// [`job_row_or_503`] with the plain job-surface 404 folded in.
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+pub(crate) fn load_job(state: &AppState, job_id: &str) -> Result<JobRow, Response> {
+    match job_row_or_503(state, job_id) {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(not_found(job_id)),
+        Err(response) => Err(response),
+    }
+}
+
 fn not_found(id: &str) -> Response {
     crate::proxy::openai_error(
         404,
@@ -416,17 +455,22 @@ pub async fn jobs_list(
     key_ext: Option<Extension<crate::keys::KeyCtx>>,
 ) -> Response {
     let owner = key_ext.as_deref().map(|k| k.name.as_str());
-    let rows = state
-        .with_store(|s| {
-            s.list_jobs(
-                q.state.as_deref(),
-                q.kind.as_deref(),
-                q.limit.unwrap_or(50),
-                owner,
-            )
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let rows = match state.read_store_list("jobs.list", |s| {
+        s.list_jobs(
+            q.state.as_deref(),
+            q.kind.as_deref(),
+            q.limit.unwrap_or(50),
+            owner,
+        )
+    }) {
+        Ok(rows) => rows,
+        Err(message) => {
+            return crate::proxy::openai_error(
+                503,
+                &format!("store could not list jobs ({message}) - retry once the store recovers"),
+            );
+        }
+    };
     let data: Vec<serde_json::Value> = rows.iter().map(row_payload).collect();
     axum::Json(serde_json::json!({
         "object": "blazar.job.list",
@@ -451,11 +495,9 @@ pub async fn jobs_get(
     {
         return crate::proxy::openai_error(400, "invalid job id");
     }
-    let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
-    else {
-        return not_found(&job_id);
+    let row = match load_job(&state, &job_id) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     // Foreign-owned rows answer as if they never existed - a 404 leaks
     // neither the id nor the fact that another key owns it (BLZ-1).
@@ -500,12 +542,9 @@ pub async fn jobs_get(
                 let msg = "job's engine child is gone (eviction, crash or restart) - \
                            resubmit the generation";
                 state.jobs.record_failed(&state, &job_id, msg);
-                let closed = state
-                    .with_store(|s| s.get_job(&job_id).ok().flatten())
-                    .flatten();
-                match closed {
-                    Some(row) => axum::Json(row_payload(&row)).into_response(),
-                    None => not_found(&job_id),
+                match load_job(&state, &job_id) {
+                    Ok(row) => axum::Json(row_payload(&row)).into_response(),
+                    Err(response) => response,
                 }
             }
         },
@@ -555,11 +594,9 @@ pub async fn jobs_cancel(
     {
         return crate::proxy::openai_error(400, "invalid job id");
     }
-    let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
-    else {
-        return not_found(&job_id);
+    let row = match load_job(&state, &job_id) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     // Only the owning key may cancel (BLZ-1); 404 for anyone else.
     if !crate::keys::owner_allows(
@@ -604,12 +641,9 @@ pub async fn jobs_cancel(
             );
         }
     }
-    let closed = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten();
-    match closed {
-        Some(row) => axum::Json(row_payload(&row)).into_response(),
-        None => not_found(&job_id),
+    match load_job(&state, &job_id) {
+        Ok(row) => axum::Json(row_payload(&row)).into_response(),
+        Err(response) => response,
     }
 }
 
@@ -629,11 +663,9 @@ pub async fn jobs_events(
     }
     // The row is the authorization anchor; events always imply one
     // (insert_job stamps 'created' in the same transaction).
-    let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
-    else {
-        return not_found(&job_id);
+    let row = match load_job(&state, &job_id) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     if !crate::keys::owner_allows(
         row.owner.as_deref(),
@@ -642,9 +674,17 @@ pub async fn jobs_events(
     ) {
         return not_found(&job_id);
     }
-    let events = state
-        .with_store(|s| s.job_events(&job_id, 1000).ok().unwrap_or_default())
-        .unwrap_or_default();
+    let events = match state.read_store_list("jobs.events", |s| s.job_events(&job_id, 1000)) {
+        Ok(events) => events,
+        Err(message) => {
+            return crate::proxy::openai_error(
+                503,
+                &format!(
+                    "store could not read events for job {job_id} ({message}) - retry once the store recovers"
+                ),
+            );
+        }
+    };
     let data: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
@@ -685,11 +725,9 @@ pub async fn jobs_artifact(
     {
         return crate::proxy::openai_error(400, "invalid job id");
     }
-    let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
-    else {
-        return not_found(&job_id);
+    let row = match load_job(&state, &job_id) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     // Spilled results are caller-visible output - same owner gate as the
     // row itself (BLZ-1).

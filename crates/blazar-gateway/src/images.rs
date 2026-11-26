@@ -37,7 +37,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::proxy::{child_auth, child_base, ensure_with_admission, openai_error, resolve_model};
+use crate::proxy::{
+    ModelResolution, child_auth, child_base, ensure_with_admission, openai_error,
+    resolve_model_checked, resolve_model_or_503,
+};
 use crate::queue::Priority;
 use crate::state::AppState;
 
@@ -1130,9 +1133,10 @@ pub async fn generations(
     if let Err(msg) = parse_ref_media(&parsed, false) {
         return openai_error(400, &msg);
     }
-    let row = state
-        .with_store(|s| resolve_model(s, &model).ok())
-        .flatten();
+    let row = match resolve_model_or_503(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
     // Federation fallback: a diffusion model no local row owns serves
     // from a live peer that lists it - byte-forward the generation
     // request, the peer's own gate owns capability checks. Local-only
@@ -1434,9 +1438,10 @@ pub async fn video_generations(
     // family request (image set on the video route) must hear the lane
     // teaching first - complying with VRAM levers (fewer frames, smaller
     // size) could never fix a family mismatch, so that error order lied.
-    let row = state
-        .with_store(|s| resolve_model(s, &model).ok())
-        .flatten();
+    let row = match resolve_model_or_503(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
     match images_gate(row.as_ref(), Surface::VidGen) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
@@ -1533,9 +1538,10 @@ pub async fn edits(
     if let Err(resp) = state.admit_or_respond(key_ext.as_ref(), &model) {
         return *resp;
     }
-    let row = state
-        .with_store(|s| resolve_model(s, &model).ok())
-        .flatten();
+    let row = match resolve_model_or_503(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
     match images_gate(row.as_ref(), Surface::ImgEdits) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
@@ -1714,9 +1720,10 @@ pub async fn variations(
         Ok(v) => v,
         Err(msg) => return openai_error(400, &msg),
     };
-    let row = state
-        .with_store(|s| resolve_model(s, &model).ok())
-        .flatten();
+    let row = match resolve_model_or_503(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
     match images_gate(row.as_ref(), Surface::ImgGen) {
         ImagesGate::Serve => {}
         ImagesGate::Reject(msg) => return openai_error(400, &msg),
@@ -1786,8 +1793,9 @@ fn child_matches_model(query: &str, canonical: Option<&str>, child: &str) -> boo
 fn live_sdcpp_children(state: &AppState, model: Option<&str>) -> Vec<blazar_runtime::EngineRef> {
     let canonical = model.and_then(|m| {
         state
-            .with_store(|s| resolve_model(s, m).ok())
-            .flatten()
+            .read_store_or_absent("models.resolve", |s| {
+                resolve_model_checked(s, m).map(ModelResolution::found)
+            })
             .map(|row| row.name)
     });
     state
@@ -2236,9 +2244,10 @@ pub async fn jobs_get(
     // crash took the owner: the ledger is the afterlife either way. A
     // non-terminal row means the child died mid-render - close it
     // honestly instead of leaving a forever-running zombie row.
-    let row = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten();
+    let row = match crate::jobs::job_row_or_503(&state, &job_id) {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
     if let Some(row) = row {
         if matches!(row.state.as_str(), "queued" | "running") {
             state.jobs.record_failed(
@@ -2248,9 +2257,10 @@ pub async fn jobs_get(
                  resubmit the generation",
             );
         }
-        let fresh = state
-            .with_store(|s| s.get_job(&job_id).ok().flatten())
-            .flatten();
+        let fresh = match crate::jobs::job_row_or_503(&state, &job_id) {
+            Ok(fresh) => fresh,
+            Err(response) => return response,
+        };
         if let Some(fresh) = fresh {
             return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
         }
@@ -2298,16 +2308,18 @@ pub async fn jobs_cancel(
         // No live child owns it: the durable ledger decides. A terminal
         // row answers as-is; an in-flight row belongs to a dead child,
         // so the cancel intent is satisfied by closing it.
-        let row = state
-            .with_store(|s| s.get_job(&job_id).ok().flatten())
-            .flatten();
+        let row = match crate::jobs::job_row_or_503(&state, &job_id) {
+            Ok(row) => row,
+            Err(response) => return response,
+        };
         if let Some(row) = row {
             if matches!(row.state.as_str(), "queued" | "running") {
                 state.jobs.record_cancelled(&state, &job_id);
             }
-            let fresh = state
-                .with_store(|s| s.get_job(&job_id).ok().flatten())
-                .flatten();
+            let fresh = match crate::jobs::job_row_or_503(&state, &job_id) {
+                Ok(fresh) => fresh,
+                Err(response) => return response,
+            };
             if let Some(fresh) = fresh {
                 return axum::Json(crate::jobs::row_payload(&fresh)).into_response();
             }
@@ -2631,11 +2643,9 @@ async fn freshen_video_row(
     Some(fresh)
 }
 
-fn video_row(state: &AppState, id: &str) -> Option<blazar_core::store::JobRow> {
-    state
-        .with_store(|s| s.get_job(id).ok().flatten())
-        .flatten()
-        .filter(|row| row.kind == "video")
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+fn video_row(state: &AppState, id: &str) -> Result<Option<blazar_core::store::JobRow>, Response> {
+    crate::jobs::job_row_or_503(state, id).map(|row| row.filter(|row| row.kind == "video"))
 }
 
 /// GET /v1/videos - Sora's list verb over the durable video rows,
@@ -2649,19 +2659,22 @@ pub async fn videos_list(
     // Owner-scoped listing: a keyed caller sees their videos plus legacy
     // NULL-owner rows (BLZ-1).
     let owner = key_ext.as_deref().map(|k| k.name.as_str());
-    let rows = state
-        .with_store(|s| {
-            s.list_jobs(None, Some("video"), limit + 1, owner)
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let rows = match state.read_store_list("jobs.list_videos", |s| {
+        s.list_jobs(None, Some("video"), limit + 1, owner)
+    }) {
+        Ok(rows) => rows,
+        Err(message) => {
+            return openai_error(
+                503,
+                &format!("store could not list videos ({message}) - retry once the store recovers"),
+            );
+        }
+    };
     let has_more = rows.len() as u64 > limit;
     let mut data: Vec<serde_json::Value> = Vec::new();
     for row in rows.iter().take(limit as usize) {
         let fresh = freshen_video_row(&state, row).await;
-        let refetched = state
-            .with_store(|s| s.get_job(&row.id).ok().flatten())
-            .unwrap_or_default();
+        let refetched = state.read_store_or_absent("jobs.lookup", |s| s.get_job(&row.id));
         let current = refetched.as_ref().unwrap_or(row);
         data.push(sora_video_object(current, fresh.as_ref()));
     }
@@ -2697,8 +2710,10 @@ pub async fn video_get(
     {
         return openai_error(400, "invalid video id");
     }
-    let Some(row) = video_row(&state, &id) else {
-        return openai_error(404, &format!("video {id} not found"));
+    let row = match video_row(&state, &id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return openai_error(404, &format!("video {id} not found")),
+        Err(response) => return response,
     };
     if !crate::keys::owner_allows(
         row.owner.as_deref(),
@@ -2708,9 +2723,7 @@ pub async fn video_get(
         return openai_error(404, &format!("video {id} not found"));
     }
     let fresh = freshen_video_row(&state, &row).await;
-    let refetched = state
-        .with_store(|s| s.get_job(&id).ok().flatten())
-        .unwrap_or_default();
+    let refetched = state.read_store_or_absent("jobs.lookup", |s| s.get_job(&id));
     let current = refetched.as_ref().unwrap_or(&row);
     axum::Json(sora_video_object(current, fresh.as_ref())).into_response()
 }
@@ -2729,8 +2742,10 @@ pub async fn video_content(
     {
         return openai_error(400, "invalid video id");
     }
-    let Some(row) = video_row(&state, &id) else {
-        return openai_error(404, &format!("video {id} not found"));
+    let row = match video_row(&state, &id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return openai_error(404, &format!("video {id} not found")),
+        Err(response) => return response,
     };
     // Rendered bytes are the caller's output - owner gate before the
     // download (BLZ-1).
@@ -2795,8 +2810,10 @@ pub async fn video_delete(
     {
         return openai_error(400, "invalid video id");
     }
-    let Some(row) = video_row(&state, &id) else {
-        return openai_error(404, &format!("video {id} not found"));
+    let row = match video_row(&state, &id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return openai_error(404, &format!("video {id} not found")),
+        Err(response) => return response,
     };
     // Only the owning key may cancel or purge (BLZ-1).
     if !crate::keys::owner_allows(
@@ -2869,24 +2886,16 @@ pub async fn upscale(
     // older engine the child would answer a confusing 404 - teach
     // instead. Deliberately fails OPEN on an unreadable store or
     // unparseable manifest (audited F1, posture kept): the upscale
-    // child's own response is self-describing, store-open failures
-    // already warn once via with_store, and doctor surfaces store
-    // errors loudly - so blocking this lane on a meta-read failure
-    // would trade availability for nothing.
+    // child's own response is self-describing, the failed read warns
+    // once and counts in blazar_store_read_errors_total, and doctor
+    // surfaces store errors loudly - so blocking this lane on a
+    // meta-read failure would trade availability for nothing.
     let too_old = state
-        .with_store(|s| {
-            s.list_engines()
-                .ok()
-                .and_then(|rows| {
-                    rows.into_iter()
-                        .find(|r| r.kind == blazar_core::engine_kind::EngineKind::SdCpp && r.active)
-                        .and_then(|r| {
-                            serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest).ok()
-                        })
-                })
-                .is_some_and(|m| m.build_number < 929)
-        })
-        .unwrap_or(false);
+        .read_store_list_or_empty("engines.list", blazar_core::Store::list_engines)
+        .into_iter()
+        .find(|r| r.kind == blazar_core::engine_kind::EngineKind::SdCpp && r.active)
+        .and_then(|r| serde_json::from_str::<blazar_runtime::Manifest>(&r.manifest).ok())
+        .is_some_and(|m| m.build_number < 929);
     if too_old {
         return openai_error(
             400,
@@ -3034,6 +3043,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         }
     }
 

@@ -3,6 +3,7 @@
 //! auth, `keep_alive` eviction, `num_ctx` restart, and cancellation.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -103,6 +104,35 @@ async fn start(config: Config) -> TestServer {
 }
 
 async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestServer {
+    start_with_manifest(config, child_env, |_| {}).await
+}
+
+/// `start` with a child whose compiled argv carries `--kv-unified` (the
+/// default KV layout of a current llama.cpp build): the stub binary's own
+/// help does not advertise the flag, so the manifest is taught it here.
+async fn start_unified_kv(config: Config) -> TestServer {
+    start_with_manifest(config, Vec::new(), |manifest| {
+        manifest.flags.insert("--kv-unified".to_string());
+    })
+    .await
+}
+
+/// Boxes the server start-up: its future is large, and nesting it
+/// through the `start*` wrappers grew every caller's future past
+/// clippy's `large_futures` budget.
+fn start_with_manifest(
+    config: Config,
+    child_env: Vec<(String, String)>,
+    tune_manifest: impl FnOnce(&mut blazar_runtime::Manifest) + Send + 'static,
+) -> Pin<Box<dyn std::future::Future<Output = TestServer> + Send>> {
+    Box::pin(start_with_manifest_inner(config, child_env, tune_manifest))
+}
+
+async fn start_with_manifest_inner(
+    config: Config,
+    child_env: Vec<(String, String)>,
+    tune_manifest: impl FnOnce(&mut blazar_runtime::Manifest),
+) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let dirs = BlazarDirs {
         config_dir: tmp.path().join("c"),
@@ -128,6 +158,8 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             ctx_train: Some(40_960),
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         })
         .unwrap();
     // Second model for router-mode tests (unused by single-model tests).
@@ -149,11 +181,14 @@ async fn start_with(config: Config, child_env: Vec<(String, String)>) -> TestSer
             ctx_train: Some(40_960),
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         })
         .unwrap();
 
-    let mut engine =
-        LlamaCppEngine::new(blazar_runtime::probe_manifest(&stub_bin(), "stub").unwrap());
+    let mut manifest = blazar_runtime::probe_manifest(&stub_bin(), "stub").unwrap();
+    tune_manifest(&mut manifest);
+    let mut engine = LlamaCppEngine::new(manifest);
     engine.child_env = child_env;
     // One bus, shared by supervisor and gateway state exactly like the
     // serve path builds it - separate instances would silently detach
@@ -2549,6 +2584,159 @@ async fn e2e__tls_serves_https_and_cors_headers() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+/// Serve the test state over TLS on an ephemeral port; `start()` covers
+/// plain HTTP only. Returns the base URL and the shutdown trigger.
+async fn start_tls(state: Arc<AppState>) -> (String, tokio::sync::oneshot::Sender<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        blazar_gateway::serve(
+            state,
+            "127.0.0.1",
+            port,
+            Box::pin(async move {
+                let _ = rx.await;
+            }),
+        )
+        .await
+        .unwrap();
+    });
+    blazar_core::tls::ensure_tls_provider();
+    let base = format!("https://127.0.0.1:{port}");
+    let probe = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let mut ok = false;
+    for _ in 0..50 {
+        if probe
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status() == 200)
+        {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "TLS server never became ready");
+    (base, tx)
+}
+
+/// Read one stub SSE stream to its end. Returns the negotiated HTTP
+/// version, the first-chunk latency, the total elapsed time and the
+/// number of body frames. The stub paces its chunks through
+/// `STUB_DELAY_CHUNK_MS`, so a first chunk that lands long before the last
+/// one proves the stream was relayed incrementally.
+async fn timed_sse(
+    client: reqwest::Client,
+    base: &str,
+) -> (reqwest::Version, Duration, Duration, usize) {
+    use futures::StreamExt;
+    let body = serde_json::json!({
+        "model": "m1", "stream": true,
+        "messages": [{"role": "user", "content": "count the chunks"}],
+    });
+    let started = std::time::Instant::now();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let version = resp.version();
+    let mut stream = resp.bytes_stream();
+    let mut first_chunk = None;
+    let mut frames = 0usize;
+    while let Some(item) = stream.next().await {
+        item.unwrap();
+        if first_chunk.is_none() {
+            first_chunk = Some(started.elapsed());
+        }
+        frames += 1;
+    }
+    (
+        version,
+        first_chunk.expect("stream delivered at least one frame"),
+        started.elapsed(),
+        frames,
+    )
+}
+
+fn assert_incremental(first: Duration, total: Duration, frames: usize) {
+    assert!(
+        first < Duration::from_millis(1200),
+        "first chunk landed at {first:?}: the stream was buffered"
+    );
+    assert!(
+        total.saturating_sub(first) >= Duration::from_millis(1200),
+        "stream span {total:?} with first chunk at {first:?}: chunks arrived in one burst"
+    );
+    assert!(frames >= 4, "body frames: {frames}");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__tls_negotiates_http2_and_streams_sse() {
+    set_env("STUB_DELAY_CHUNK_MS", "300");
+    let cfg = Config {
+        tls_cert: "tests/fixtures/tls-cert.pem".into(),
+        tls_key: "tests/fixtures/tls-key.pem".into(),
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let (base, tx) = start_tls(Arc::clone(&ts.state)).await;
+    // The default client offers h2 then http/1.1 through ALPN.
+    let c = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let health = c.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(
+        health.version(),
+        reqwest::Version::HTTP_2,
+        "ALPN must select h2 when the client offers it"
+    );
+    assert_eq!(health.status(), 200);
+    let (version, first, total, frames) = timed_sse(c, &base).await;
+    assert_eq!(version, reqwest::Version::HTTP_2);
+    assert_incremental(first, total, frames);
+    let _ = tx.send(());
+    ts.state.sup.shutdown_all().await.unwrap();
+    remove_env("STUB_DELAY_CHUNK_MS");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__tls_http1_client_streams_sse_incrementally() {
+    set_env("STUB_DELAY_CHUNK_MS", "300");
+    let cfg = Config {
+        tls_cert: "tests/fixtures/tls-cert.pem".into(),
+        tls_key: "tests/fixtures/tls-key.pem".into(),
+        ..Config::default()
+    };
+    let ts = start(cfg).await;
+    let (base, tx) = start_tls(Arc::clone(&ts.state)).await;
+    // HTTP/1.1-only client: what non-ALPN stacks and plain curl send.
+    let c = reqwest::Client::builder()
+        .http1_only()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let (version, first, total, frames) = timed_sse(c, &base).await;
+    assert_eq!(version, reqwest::Version::HTTP_11);
+    assert_incremental(first, total, frames);
+    let _ = tx.send(());
+    ts.state.sup.shutdown_all().await.unwrap();
+    remove_env("STUB_DELAY_CHUNK_MS");
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__responses_chaining_and_store() {
@@ -3182,6 +3370,71 @@ async fn e2e__ps_and_show() {
     assert!(caps.iter().any(|c| c == "completion"), "{s}");
     assert!(caps.iter().any(|c| c == "thinking"), "{s}");
     assert!(!caps.iter().any(|c| c == "vision"), "{s}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// E5 licence notices: `/api/show` must surface the licence captured at
+/// pull time (ollama registry licence layer or HF card `cardData`),
+/// and keep the honest upstream pointer for rows with none on record -
+/// never a placeholder posing as the licence text.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__show_licence_surfaces_row_text_and_honest_fallback() {
+    let ts = start(Config::default()).await;
+    // A second row with a captured licence - same fixture GGUF so the
+    // metadata read stays real for it too.
+    let store = blazar_core::Store::open(&ts.dirs).unwrap();
+    store
+        .upsert_model(&blazar_core::ModelRow {
+            name: "lic1".into(),
+            repo: "registry.ollama.ai/library/lic1".into(),
+            quant: "Q4_K_M".into(),
+            path: ts
+                .dirs
+                .models_dir()
+                .join("m1-q4_k_m.gguf")
+                .display()
+                .to_string(),
+            bytes: 500,
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: Some("qwen3".into()),
+            params: Some(0.5),
+            ctx_train: Some(40_960),
+            pulled_at: 2,
+            last_used_at: 2,
+            license: Some("Apache-2.0\nCopyright (c) 2026 fixture".into()),
+        })
+        .unwrap();
+    drop(store);
+    let c = client();
+    let licensed: serde_json::Value = c
+        .post(format!("{}/api/show", ts.base))
+        .json(&serde_json::json!({"model": "lic1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        licensed["license"], "Apache-2.0\nCopyright (c) 2026 fixture",
+        "captured licence text must reach the client verbatim: {licensed}"
+    );
+    // No licence on record (imported/adopted rows): the honest pointer,
+    // byte-identical to the pre-E5 behaviour.
+    let bare: serde_json::Value = c
+        .post(format!("{}/api/show", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bare["license"], "see upstream model card");
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
@@ -5299,6 +5552,225 @@ async fn e2e__anthropic_messages_translate_tool_use() {
     ts.state.sup.shutdown_all().await.unwrap();
 }
 
+// ---- E4 Gemini /v1beta generateContent translate lane ----
+
+/// Non-stream: Gemini-dialect request in (contents, systemInstruction,
+/// `generationConfig`) -> `GenerateContentResponse` shape out. The route is
+/// the catch-all `:verb` form - matchit refuses a parameter plus a
+/// literal suffix in one segment (see gemini.rs module doc).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__gemini_generate_content_non_stream() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let v: serde_json::Value = c
+        .post(format!("{}/v1beta/models/m1:generateContent", ts.base))
+        .json(&serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi there"}]}],
+            "systemInstruction": {"parts": [{"text": "be terse"}]},
+            "generationConfig": {"temperature": 0.5, "maxOutputTokens": 64},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["candidates"][0]["content"]["role"], "model", "body: {v}");
+    assert_eq!(
+        v["candidates"][0]["content"]["parts"][0]["text"],
+        "stub:m1:hi there"
+    );
+    assert_eq!(v["candidates"][0]["finishReason"], "STOP");
+    assert!(v["usageMetadata"]["promptTokenCount"].as_i64().unwrap() > 0);
+    assert!(v["usageMetadata"]["candidatesTokenCount"].as_i64().unwrap() > 0);
+    assert!(
+        v["usageMetadata"]["totalTokenCount"].as_i64().unwrap()
+            >= v["usageMetadata"]["promptTokenCount"].as_i64().unwrap()
+    );
+
+    // Unknown verb -> Gemini error envelope with NOT_FOUND, not axum's
+    // empty 404 (the lane owns the whole model:verb segment).
+    let e: serde_json::Value = c
+        .post(format!("{}/v1beta/models/m1:countTokens", ts.base))
+        .json(&serde_json::json!({
+            "contents": [{"parts": [{"text": "hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(e["error"]["status"], "NOT_FOUND");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Stream: the `:streamGenerateContent` verb drives child SSE ->
+/// Gemini data-only frames (no `event:` lines - the Gemini wire has no
+/// event names).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__gemini_generate_content_stream() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let body = c
+        .post(format!(
+            "{}/v1beta/models/m1:streamGenerateContent",
+            ts.base
+        ))
+        .json(&serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+            "generationConfig": {"maxOutputTokens": 32},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("data: "), "frames present: {body}");
+    assert!(
+        !body.contains("event: "),
+        "gemini wire carries data-only frames: {body}"
+    );
+    assert!(body.contains("\"parts\""));
+    assert!(body.contains("\"finishReason\""));
+    assert!(body.contains("\"usageMetadata\""));
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Tool round trip: functionDeclarations in, functionCall part out
+/// (broken JSON args settle to `{}`); a follow-up functionResponse turn
+/// rides the same route (the name-as-id convention links the pair).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__gemini_function_call_round_trip() {
+    let ts = start_with(
+        Config::default(),
+        vec![("STUB_BAD_TOOL_ARGS".to_string(), "1".to_string())],
+    )
+    .await;
+    let c = client();
+    let v: serde_json::Value = c
+        .post(format!("{}/v1beta/models/m1:generateContent", ts.base))
+        .json(&serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "call the tool"}]}],
+            "tools": [{"functionDeclarations": [
+                {"name": "echo", "description": "echoes",
+                 "parameters": {"type": "object", "properties": {}}}
+            ]}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let parts = v["candidates"][0]["content"]["parts"]
+        .as_array()
+        .unwrap_or(&empty);
+    let fc = parts
+        .iter()
+        .find(|p| p.get("functionCall").is_some())
+        .expect("functionCall part present: {parts:?}");
+    assert_eq!(fc["functionCall"]["name"], "echo");
+    assert_eq!(fc["functionCall"]["args"], serde_json::json!({}));
+
+    // Tool result turn: functionResponse parts must translate into the
+    // OpenAI tool message the child contract requires.
+    let back: serde_json::Value = c
+        .post(format!("{}/v1beta/models/m1:generateContent", ts.base))
+        .json(&serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "call the tool"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "echo", "args": {}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "echo", "response": {"ok": true}}}
+                ]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The stub re-emits a tool call for this prompt (the turn text
+    // contains "tool"), so either a text echo or another functionCall
+    // part proves the tool-result turn was translated and served -
+    // the follow-up path is what this arm pins.
+    let back_parts = back["candidates"][0]["content"]["parts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !back_parts.is_empty()
+            && (back_parts.iter().any(|p| p.get("text").is_some())
+                || back_parts.iter().any(|p| p.get("functionCall").is_some())),
+        "tool-result turn served: {back}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// candidateCount > 1 refuses with teaching: the translate lane serves
+/// one candidate per request (engines differ on `n`; the `OpenAI` surface
+/// carries n natively).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__gemini_candidate_count_refused() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let e: serde_json::Value = c
+        .post(format!("{}/v1beta/models/m1:generateContent", ts.base))
+        .json(&serde_json::json!({
+            "contents": [{"parts": [{"text": "hi"}]}],
+            "generationConfig": {"candidateCount": 3},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(e["error"]["code"], 400);
+    assert_eq!(e["error"]["status"], "INVALID_ARGUMENT");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("candidateCount"),
+        "teaching names the knob: {e}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Kill switch: `gemini_translate = false` leaves the route unmounted
+/// (plain 404 - the flag is the documented opt-out).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__gemini_flag_off_unmounts_the_route() {
+    let ts = start(Config {
+        gemini_translate: false,
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1beta/models/m1:generateContent", ts.base))
+        .json(&serde_json::json!({
+            "contents": [{"parts": [{"text": "hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "flag-off leaves no route");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
 /// Batch API end-to-end: upload JSONL, run batch, poll to completion,
 /// download output file with per-custom_id results.
 #[tokio::test]
@@ -5771,6 +6243,8 @@ async fn e2e__llamacpp_only_gates__routed_lane_beats_active_row() {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         })
         .unwrap();
     });
@@ -6988,6 +7462,1389 @@ while ($true) {
     assert!(
         msg.contains("mcp_tools") && msg.contains("admits none"),
         "teaching names the tool lane: {msg}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Break a real store for the failed-read tests: the gateway keeps its
+/// cached SQLite connection open, but the table job lookups read is gone,
+/// so the next lookup fails for real (no stub, no mock).
+fn drop_jobs_table(ts: &TestServer) {
+    let raw = rusqlite::Connection::open(ts.dirs.db_file()).expect("raw sqlite handle");
+    raw.busy_timeout(Duration::from_secs(5))
+        .expect("sqlite busy timeout");
+    raw.execute_batch("DROP TABLE jobs;")
+        .expect("break the jobs table");
+}
+
+/// Three outcomes stay apart: `Ok(None)` is an honest absence, `Err` is a
+/// store that could not answer, and the best-effort variant counts the
+/// failure instead of hiding it behind the same `None`.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__store_read__separates_absent_from_failed() {
+    let ts = start(Config::default()).await;
+
+    let absent = ts
+        .state
+        .read_store("jobs.lookup", |s| s.get_job("no-such-job"))
+        .expect("healthy store answers");
+    assert!(absent.is_none(), "unknown job id is an honest absence");
+    assert_eq!(
+        ts.state.store_read_error_metrics(),
+        "",
+        "a healthy store exposes no error series"
+    );
+
+    drop_jobs_table(&ts);
+
+    let message = ts
+        .state
+        .read_store("jobs.lookup", |s| s.get_job("no-such-job"))
+        .expect_err("a dropped table is a failed read, not an absent row");
+    assert!(
+        message.contains("jobs"),
+        "the error names the failing query: {message}"
+    );
+    let first = ts
+        .state
+        .read_store_or_absent("jobs.lookup", |s| s.get_job("no-such-job"));
+    let second = ts
+        .state
+        .read_store_or_absent("jobs.lookup", |s| s.get_job("no-such-job"));
+    assert!(
+        first.is_none() && second.is_none(),
+        "best-effort reads degrade to absent"
+    );
+    let metrics = ts.state.store_read_error_metrics();
+    assert!(
+        metrics.contains(r#"blazar_store_read_errors_total{op="jobs.lookup"} 3"#),
+        "every failed read is counted once: {metrics}"
+    );
+
+    // An honest answer on a healthy table is not an error.
+    let model = ts
+        .state
+        .read_store_or_absent("models.lookup", |s| s.get_model("m1"));
+    assert_eq!(model.map(|m| m.name).as_deref(), Some("m1"));
+    let metrics = ts.state.store_read_error_metrics();
+    assert!(
+        !metrics.contains("models.lookup"),
+        "answered reads add no series: {metrics}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// A store that cannot even open (its data directory path is occupied by
+/// a regular file) answers `Err` - never `Ok(None)` - and the best-effort
+/// variant still counts it.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__store_read__unavailable_store_is_an_error() {
+    let ts = start(Config::default()).await;
+    let blocked = tempfile::tempdir().unwrap();
+    let dirs = BlazarDirs {
+        config_dir: blocked.path().join("c"),
+        data_dir: blocked.path().join("not-a-dir"),
+    };
+    std::fs::write(&dirs.data_dir, b"occupied").unwrap();
+    let state = AppState::new(
+        dirs,
+        &Config::default(),
+        ts.state.sup.clone(),
+        EventBus::default(),
+    );
+
+    let outcome = state.read_store("jobs.lookup", |s| s.get_job("x"));
+    let message = outcome.expect_err("an unopenable store cannot claim absence");
+    assert!(
+        message.contains("store unavailable"),
+        "the error says the store is unavailable: {message}"
+    );
+    assert!(
+        state
+            .read_store_or_absent("jobs.lookup", |s| s.get_job("x"))
+            .is_none()
+    );
+    assert!(
+        state
+            .store_read_error_metrics()
+            .contains(r#"blazar_store_read_errors_total{op="jobs.lookup"} 2"#)
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// A job lookup against a store that cannot answer is a 503 with the
+/// failure named, not a 404 claiming the job never existed - and the
+/// failure shows up in /metrics.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__jobs_lookup_answers_503_when_store_cannot_answer() {
+    let ts = start(Config::default()).await;
+    drop_jobs_table(&ts);
+
+    let resp = client()
+        .get(format!("{}/v1/jobs/abc", ts.base))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("jobs"), "the failure is named: {body}");
+    assert!(
+        body.contains("store"),
+        "the body says the store could not answer: {body}"
+    );
+
+    let metrics = client()
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(r#"blazar_store_read_errors_total{op="jobs.lookup"} 1"#),
+        "{metrics}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Removes one table through a raw SQLite handle so store queries against
+/// it fail for real - no mock, the same failure a corrupt store produces.
+fn drop_table(ts: &TestServer, table: &str) {
+    let conn = rusqlite::Connection::open(ts.dirs.db_file()).expect("open store");
+    conn.busy_timeout(Duration::from_secs(5))
+        .expect("set busy timeout");
+    conn.execute_batch(&format!("DROP TABLE {table};"))
+        .expect("drop table");
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__model_lookup_answers_503_when_models_table_is_unreadable() {
+    let ts = start(Config::default()).await;
+    drop_table(&ts, "models");
+
+    let resp = client()
+        .post(format!("{}/api/show", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.contains("store"),
+        "the body says the store could not answer: {body}"
+    );
+
+    let metrics = client()
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_store_read_errors_total{op=\"models.resolve\"} 1"),
+        "the failed read is counted once: {metrics}"
+    );
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// The typed model resolver behind every model-named handler: a ladder
+/// miss stays a 404 with its teaching text, while a store that cannot
+/// answer is a 503 on chat, the model lists and the tags surface, and
+/// the failed read is counted on `/metrics`.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__chat_and_model_lists_answer_503_when_models_table_is_unreadable() {
+    let ts = start(Config::default()).await;
+
+    let miss = client()
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(
+            &serde_json::json!({"model": "nope", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = miss.status();
+    let body = miss.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.contains("nope"),
+        "the 404 names the requested model: {body}"
+    );
+
+    drop_table(&ts, "models");
+
+    let chat = client()
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&serde_json::json!({"model": "m1", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let status = chat.status();
+    let body = chat.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.contains("store"),
+        "the body says the store could not answer: {body}"
+    );
+
+    for path in ["/v1/models", "/api/tags"] {
+        let resp = client()
+            .get(format!("{}{path}", ts.base))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: {body}"
+        );
+        assert!(
+            body.contains("store"),
+            "{path} says the store could not answer: {body}"
+        );
+    }
+
+    let metrics = client()
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_store_read_errors_total{op=\"models.resolve\"}"),
+        "the failed model reads are counted: {metrics}"
+    );
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// How many times the daemon decoded the installed engine manifests for
+/// routing since boot (`blazar_engine_view_builds_total`).
+async fn engine_view_builds(base: &str) -> u64 {
+    let metrics = client()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("blazar_engine_view_builds_total ")
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or_else(|| panic!("engine view build counter missing from /metrics:\n{metrics}"))
+}
+
+/// GET /v1/models through `c`.
+async fn list_models_once(c: &reqwest::Client, base: &str) -> reqwest::Response {
+    c.get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .expect("list models")
+}
+
+/// Routing decodes the engine manifests once per engine-row change, not
+/// once per model per request: listings and chat reuse the decoded view
+/// while the rows are unchanged (flat build counter), and a real store
+/// write rebuilds it exactly once.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__engine_view_is_decoded_once_until_engine_rows_change() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let list_models = || list_models_once(&c, &ts.base);
+    // Warm-up: the first routing read builds the view.
+    list_models().await.error_for_status().unwrap();
+    let built = engine_view_builds(&ts.base).await;
+    assert!(built >= 1, "the warm-up listing built the view once");
+    for _ in 0..5 {
+        list_models().await.error_for_status().unwrap();
+    }
+    for _ in 0..3 {
+        let resp = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&serde_json::json!({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 4,
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    }
+    assert_eq!(
+        engine_view_builds(&ts.base).await,
+        built,
+        "unchanged engine rows reuse the decoded view"
+    );
+    // A real engine-row write (another row becomes active) is picked up
+    // on the very next read: one rebuild, then flat again.
+    ts.state
+        .with_store(|s| {
+            s.upsert_engine(&blazar_core::EngineRow {
+                tag: "view-t".into(),
+                asset: "stub".into(),
+                sha256: "view".into(),
+                installed_at: 1,
+                active: true,
+                manifest: "{}".into(),
+                kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+            })
+            .unwrap();
+            s.set_active_engine("view-t").unwrap();
+        })
+        .unwrap();
+    list_models().await.error_for_status().unwrap();
+    assert_eq!(
+        engine_view_builds(&ts.base).await,
+        built + 1,
+        "one rebuild per engine-row change"
+    );
+    list_models().await.error_for_status().unwrap();
+    assert_eq!(engine_view_builds(&ts.base).await, built + 1);
+
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__metrics_expose_log_sink_counters() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    let resp = c.get(format!("{}/metrics", ts.base)).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("blazar_log_events_total "), "{text}");
+    assert!(
+        text.contains("blazar_log_sink_writes_total{sink=\"stderr\"} "),
+        "{text}"
+    );
+    assert!(
+        text.contains("blazar_log_sink_stall_total{sink=\"stderr\"} 0\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("blazar_log_sink_writes_total{sink=\"sentinel\"} "),
+        "{text}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Real OTLP/HTTP receiver: answers one `POST /v1/traces` with 200 and
+/// hands the decoded request body back - the same wire a collector sees.
+async fn otlp_capture() -> (String, tokio::task::JoinHandle<serde_json::Value>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 8192];
+        let head_end = loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "collector connection closed before the head");
+            raw.extend_from_slice(&buf[..n]);
+            if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().expect("content-length digits"))
+            })
+            .expect("collector POST carries content-length");
+        while raw.len() < head_end + len {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "collector connection closed mid-body");
+            raw.extend_from_slice(&buf[..n]);
+        }
+        sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        serde_json::from_slice(&raw[head_end..head_end + len]).expect("OTLP/JSON body")
+    });
+    (endpoint, task)
+}
+
+/// Start the gateway's real exporter flusher for a test server: the test
+/// harness serves the router directly, so `serve` never gets to spawn it.
+fn start_otlp_flusher(ts: &TestServer) {
+    let otlp = Arc::clone(&ts.state.otlp);
+    tokio::spawn(async move {
+        blazar_core::tls::ensure_tls_provider();
+        otlp.run(reqwest::Client::new()).await;
+    });
+}
+
+/// The one span a captured export carries for `trace_id`.
+fn exported_span<'a>(payload: &'a serde_json::Value, trace_id: &str) -> &'a serde_json::Value {
+    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("spans array");
+    spans
+        .iter()
+        .find(|span| span["traceId"] == trace_id)
+        .unwrap_or_else(|| panic!("no exported span for trace {trace_id}: {spans:?}"))
+}
+
+/// Split `version-trace-span-flags` into its trace and span ids.
+fn trace_and_span(header: &str) -> (String, String) {
+    let parts: Vec<&str> = header.split('-').collect();
+    assert_eq!(parts.len(), 4, "version 00 traceparent: {header}");
+    (parts[1].to_string(), parts[2].to_string())
+}
+
+/// Last record the stub child appended to its header log, once present.
+/// Message text naming one trace-context test: the stub's header log
+/// line for that request is picked by it, not by arrival order (the
+/// gateway also talks to the same child on its own behalf).
+fn probe_text(test: &str) -> String {
+    format!("trace-context probe {test}")
+}
+
+async fn child_headers(path: &std::path::Path, probe: &str) -> serde_json::Value {
+    for _ in 0..400 {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Some(line) = text.lines().rev().find(|l| l.contains(probe))
+        {
+            return serde_json::from_str(line).expect("stub header record");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("stub child never logged the probe request {probe:?}");
+}
+
+/// Child env that makes the stub log the trace headers it receives,
+/// plus the path that log lands in.
+fn header_log_env(dir: &tempfile::TempDir) -> (Vec<(String, String)>, PathBuf) {
+    let path = dir.path().join("headers.jsonl");
+    (
+        vec![
+            ("STUB_HEADER_LOG".into(), path.display().to_string()),
+            (
+                "STUB_HEADER_LOG_HEADERS".into(),
+                "traceparent,tracestate".into(),
+            ),
+        ],
+        path,
+    )
+}
+
+async fn chat(c: &reqwest::Client, base: &str, probe: &str) -> reqwest::Response {
+    c.post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": probe}]
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn captured_export(handle: tokio::task::JoinHandle<serde_json::Value>) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(20), handle)
+        .await
+        .expect("exporter posted the span")
+        .expect("capture task")
+}
+
+const CALLER_TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+const CALLER_SPAN: &str = "00f067aa0ba902b7";
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__trace_context__continues_the_caller_trace_and_parents_the_child() {
+    let (endpoint, captured) = otlp_capture().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let (child_env, header_log) = header_log_env(&log_dir);
+    let probe = probe_text("continues");
+    let ts = start_with(
+        Config {
+            otlp_endpoint: endpoint,
+            ..Config::default()
+        },
+        child_env,
+    )
+    .await;
+    start_otlp_flusher(&ts);
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .header("traceparent", format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"))
+        .header("tracestate", "vendor=value,rojo=state")
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": probe}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let echoed = resp
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .expect("the gateway reports its span to a tracing caller")
+        .to_string();
+    let (trace, gateway_span) = trace_and_span(&echoed);
+    assert_eq!(trace, CALLER_TRACE, "the caller's trace continues");
+    assert_eq!(gateway_span.len(), 16);
+    resp.bytes().await.unwrap();
+
+    let child = child_headers(&header_log, &probe).await;
+    assert_eq!(
+        child["traceparent"][0], echoed,
+        "child parent is the gateway span"
+    );
+    assert_eq!(
+        child["tracestate"][0], "vendor=value,rojo=state",
+        "vendor state travels on unchanged"
+    );
+
+    let payload = captured_export(captured).await;
+    let span = exported_span(&payload, CALLER_TRACE);
+    assert_eq!(span["spanId"], gateway_span.as_str());
+    assert_eq!(span["parentSpanId"], CALLER_SPAN);
+    assert_eq!(span["traceState"], "vendor=value,rojo=state");
+    assert_eq!(span["flags"], 1);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__trace_context__restarts_an_invalid_context_and_drops_its_state() {
+    let (endpoint, captured) = otlp_capture().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let (child_env, header_log) = header_log_env(&log_dir);
+    let probe = probe_text("restarts");
+    let ts = start_with(
+        Config {
+            otlp_endpoint: endpoint,
+            ..Config::default()
+        },
+        child_env,
+    )
+    .await;
+    start_otlp_flusher(&ts);
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        // All-zero trace id: the spec forbids it, so this is no context.
+        .header(
+            "traceparent",
+            format!("00-00000000000000000000000000000000-{CALLER_SPAN}-01"),
+        )
+        .header("tracestate", "vendor=value")
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": probe}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(
+        resp.headers().get("traceparent").is_none(),
+        "a restarted trace is not the caller's to continue"
+    );
+    resp.bytes().await.unwrap();
+
+    let child = child_headers(&header_log, &probe).await;
+    let child_parent = child["traceparent"][0]
+        .as_str()
+        .expect("child got a parent");
+    let (trace, gateway_span) = trace_and_span(child_parent);
+    assert_ne!(trace, "00000000000000000000000000000000");
+    assert!(child_parent.ends_with("-00"), "{child_parent}");
+    assert!(
+        child["tracestate"].is_null(),
+        "vendor state of a restarted trace is dropped: {child}"
+    );
+
+    let payload = captured_export(captured).await;
+    let span = exported_span(&payload, &trace);
+    assert_eq!(span["spanId"], gateway_span.as_str());
+    assert!(span.get("parentSpanId").is_none(), "{span}");
+    assert!(span.get("traceState").is_none(), "{span}");
+    assert!(span.get("flags").is_none(), "{span}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__trace_context__plain_request_stays_a_root_span() {
+    let (endpoint, captured) = otlp_capture().await;
+    let log_dir = tempfile::tempdir().unwrap();
+    let (child_env, header_log) = header_log_env(&log_dir);
+    let probe = probe_text("plain");
+    let ts = start_with(
+        Config {
+            otlp_endpoint: endpoint,
+            ..Config::default()
+        },
+        child_env,
+    )
+    .await;
+    start_otlp_flusher(&ts);
+    let resp = chat(&client(), &ts.base, &probe).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(
+        resp.headers().get("traceparent").is_none(),
+        "no caller context, nothing to report back"
+    );
+    resp.bytes().await.unwrap();
+
+    let child = child_headers(&header_log, &probe).await;
+    let child_parent = child["traceparent"][0]
+        .as_str()
+        .expect("child got a parent");
+    let (trace, gateway_span) = trace_and_span(child_parent);
+    assert!(child_parent.ends_with("-00"), "{child_parent}");
+    assert!(child["tracestate"].is_null(), "{child}");
+
+    let payload = captured_export(captured).await;
+    let span = exported_span(&payload, &trace);
+    assert_eq!(span["spanId"], gateway_span.as_str());
+    for absent in ["parentSpanId", "traceState", "flags"] {
+        assert!(span.get(absent).is_none(), "{absent} in {span}");
+    }
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__trace_context__without_an_exporter_headers_pass_through_untouched() {
+    let log_dir = tempfile::tempdir().unwrap();
+    let (child_env, header_log) = header_log_env(&log_dir);
+    let probe = probe_text("passthrough");
+    let ts = start_with(Config::default(), child_env).await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .header("traceparent", format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"))
+        .header("tracestate", "vendor=value")
+        .json(&serde_json::json!({
+            "model": "m1",
+            "stream": false,
+            "messages": [{"role": "user", "content": probe}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.headers().get("traceparent").is_none());
+    resp.bytes().await.unwrap();
+
+    let child = child_headers(&header_log, &probe).await;
+    assert_eq!(
+        child["traceparent"][0],
+        format!("00-{CALLER_TRACE}-{CALLER_SPAN}-01"),
+        "a pass-through proxy forwards the caller's context as sent"
+    );
+    assert_eq!(child["tracestate"][0], "vendor=value");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+// ---- prompt-fit limit under unified KV, /v1/tokenize, /v1/detokenize
+
+/// `words` four-letter words: the stub tokenizes one word per token, so
+/// the exact count equals the word count.
+fn words_prompt(words: usize) -> String {
+    "aaaa ".repeat(words)
+}
+
+fn chat_body(prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "m1",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4
+    })
+}
+
+async fn chat_status_text(c: &reqwest::Client, base: &str, prompt: &str) -> (u16, String) {
+    let r = c
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat_body(prompt))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    (status, r.text().await.unwrap())
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__prompt_fit__limit_is_the_unified_pool_not_the_slot_share() {
+    // 32k configured, 2 slots: one slot's SHARE is 16384, but a
+    // unified-KV child enforces the whole 32768 pool per prompt. A
+    // 20000-token prompt fits the pool and must be served, cold or warm.
+    let ts = start_unified_kv(Config {
+        default_ctx: 32_768,
+        slots: 2,
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    let prompt = words_prompt(20_000);
+    let (status, text) = chat_status_text(&c, &ts.base, &prompt).await;
+    assert_eq!(status, 200, "cold 20k-token prompt: {text}");
+    let (status, text) = chat_status_text(&c, &ts.base, &prompt).await;
+    assert_eq!(status, 200, "warm 20k-token prompt: {text}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__prompt_fit__overflow_names_the_pool_and_the_real_limit() {
+    // Beyond the pool: refused with the exact count, the real limit and
+    // what the engine would do (reject - context shift is off).
+    let ts = start_unified_kv(Config {
+        default_ctx: 32_768,
+        slots: 2,
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    assert_eq!(chat_status_text(&c, &ts.base, "hi").await.0, 200);
+    let (status, text) = chat_status_text(&c, &ts.base, &words_prompt(40_000)).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("(exact)"), "{text}");
+    assert!(text.contains("40000"), "{text}");
+    assert!(text.contains("32768-token context"), "{text}");
+    assert!(text.contains("context shift is off"), "{text}");
+    assert!(!text.contains("silently truncate"), "{text}");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__prompt_fit__certain_overflow_is_refused_before_a_cold_load() {
+    // Hex blobs tokenize near one token per character on every tokenizer
+    // measured: past the limit the gateway refuses on the estimate and
+    // never pays the model load.
+    let ts = start_unified_kv(Config {
+        default_ctx: 32_768,
+        slots: 2,
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    let blob = "0123456789abcdef".repeat(7_500);
+    let (status, text) = chat_status_text(&c, &ts.base, &blob).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("(estimated)"), "{text}");
+    assert!(
+        ts.state.sup.ps().is_empty(),
+        "a certain overflow must not spawn the model"
+    );
+    let metrics = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let counted = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with(
+                "blazar_prompt_preflight_verdicts_total{verdict=\"estimated_refuse\"} ",
+            )
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<u64>().ok());
+    assert!(
+        counted.is_some_and(|n| n >= 1),
+        "the refusal is counted on /metrics:\n{metrics}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__prompt_fit__uncertain_cold_prompt_is_counted_exactly_once_loaded() {
+    // Plain words sit in the wide band of the estimate: the gateway
+    // admits the request, loads the model, then counts exactly and
+    // refuses before any generation when the prompt is over the limit.
+    let ts = start_unified_kv(Config {
+        default_ctx: 32_768,
+        slots: 2,
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    let (status, text) = chat_status_text(&c, &ts.base, &words_prompt(34_000)).await;
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("(exact)"), "{text}");
+    assert!(text.contains("34000"), "{text}");
+    assert!(text.contains("32768-token context"), "{text}");
+    assert!(
+        !ts.state.sup.ps().is_empty(),
+        "the exact count needs the running child"
+    );
+    // A prompt inside the pool still goes through after the refusal.
+    assert_eq!(chat_status_text(&c, &ts.base, "hi").await.0, 200);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__tokenize_routes__return_ids_and_text_from_the_live_engine() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    assert_eq!(
+        chat_status_text(&c, &ts.base, "warm the child").await.0,
+        200
+    );
+
+    let r = c
+        .post(format!("{}/v1/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "prompt": "a bb ccc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"tokens": [2, 3, 4], "count": 3})
+    );
+
+    let r = c
+        .post(format!("{}/v1/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "input": ["a bb", "ccc"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"tokens": [[2, 3], [4]], "count": [2, 1]})
+    );
+
+    let r = c
+        .post(format!("{}/v1/detokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "tokens": [2, 3]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"prompt": "a aa"})
+    );
+
+    let r = c
+        .post(format!("{}/v1/detokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "tokens": [[2, 3], [4]]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"prompt": ["a aa", "aaa"]})
+    );
+
+    // The ollama-compat route keeps its count-only shape.
+    let r = c
+        .post(format!("{}/api/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "prompt": "a bb ccc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"count": 3})
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__tokenize_routes__teach_when_the_model_is_absent_or_cold() {
+    let ts = start(Config::default()).await;
+    let c = client();
+    // Unknown model: the resolver's not-found message.
+    let r = c
+        .post(format!("{}/v1/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "nope", "prompt": "a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    // Known but not resident: 503 with the warm-up hint, never a
+    // silent multi-GiB load from a counting probe.
+    let r = c
+        .post(format!("{}/v1/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "prompt": "a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+    let text = r.text().await.unwrap();
+    assert!(text.contains("warm"), "{text}");
+    let r = c
+        .post(format!("{}/v1/detokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1", "tokens": [2]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 503);
+    // Malformed bodies are named.
+    let r = c
+        .post(format!("{}/v1/tokenize", ts.base))
+        .json(&serde_json::json!({"model": "m1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// Value of the first `/metrics` sample line containing `needle`.
+async fn metric_sample(base: &str, needle: &str) -> Option<u64> {
+    let text = client()
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    text.lines()
+        .find(|line| line.contains(needle) && !line.starts_with('#'))
+        .and_then(|line| line.split_whitespace().next_back())
+        .and_then(|value| value.parse().ok())
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__sentinel__ctx_checks_use_the_pool_not_the_slot_share() {
+    // Under unified KV a prompt may be as long as the whole KV pool, not
+    // the per-slot share. The sentinel's context window must be the pool
+    // too, or every long prompt on a multi-slot model is reported as
+    // running near its limit.
+    let ts = start_unified_kv(Config {
+        default_ctx: 8192,
+        slots: 4,
+        ..Config::default()
+    })
+    .await;
+    let c = client();
+    let (status, text) = chat_status_text(&c, &ts.base, "hi").await;
+    assert_eq!(status, 200, "warm-up loads the stub child: {text}");
+    let before = metric_sample(&ts.base, "blazar_sentinel_records_total").await;
+    let (status, text) = chat_status_text(&c, &ts.base, &words_prompt(3_000)).await;
+    assert_eq!(status, 200, "the prompt fits the 8192-token pool: {text}");
+    let mut recorded = false;
+    for _ in 0..50 {
+        if let Some(after) = metric_sample(&ts.base, "blazar_sentinel_records_total").await
+            && after > before.unwrap_or(0)
+        {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(recorded, "the sentinel records the finished request");
+    let near_limit = metric_sample(&ts.base, "code=\"ctx_near_limit\"").await;
+    let truncated = metric_sample(&ts.base, "code=\"ctx_truncated\"").await;
+    assert_eq!(
+        near_limit.unwrap_or(0),
+        0,
+        "a prompt inside the pool is not near a limit"
+    );
+    assert_eq!(truncated.unwrap_or(0), 0, "nothing was truncated");
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+// ---- cancel-and-replay preemption (opt-in) -------------------------------
+//
+// The stub answers every request `STUB_DELAY_MS` late, so a request holds
+// the single slot for that long before its first byte. `slots: 1` makes a
+// second request queue. Completion order is the evidence: without
+// preemption the first request always finishes first; with it, a
+// high-priority arrival takes the slot and finishes first while the
+// cancelled request is replayed behind it, byte for byte complete.
+
+fn preempt_frame_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.starts_with("data: "))
+        .count()
+}
+
+async fn preempt_chat(
+    c: &reqwest::Client,
+    base: &str,
+    priority: Option<&str>,
+    delay_ms: u64,
+) -> (std::time::Instant, u16, String) {
+    if delay_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+    let mut req = c
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })
+            .to_string(),
+        );
+    if let Some(value) = priority {
+        req = req.header("x-blazar-priority", value);
+    }
+    let resp = req.send().await.expect("chat request");
+    let status = resp.status().as_u16();
+    let bytes = resp.bytes().await.expect("chat body");
+    (
+        std::time::Instant::now(),
+        status,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
+fn preempt_config(mode: &str) -> Config {
+    Config {
+        slots: 1,
+        preemption: mode.to_string(),
+        preempt_after_ms: 300,
+        ..Config::default()
+    }
+}
+
+const PREEMPT_CHILD_DELAY_MS: &str = "900";
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__preemption__off_keeps_first_come_first_served() {
+    let ts = start_with(
+        preempt_config("off"),
+        vec![(
+            "STUB_DELAY_MS".to_string(),
+            PREEMPT_CHILD_DELAY_MS.to_string(),
+        )],
+    )
+    .await;
+    let c = client();
+    // Load the model first: on a cold model the two requests below would race
+    // the same spawn and both proceed, which says nothing about queue order.
+    let _ = preempt_chat(&c, &ts.base, None, 0).await;
+    let (first, second) = tokio::join!(
+        preempt_chat(&c, &ts.base, None, 0),
+        preempt_chat(&c, &ts.base, Some("high"), 100)
+    );
+    assert_eq!((first.1, second.1), (200, 200));
+    assert!(
+        first.0 < second.0,
+        "without preemption the first request finishes first"
+    );
+    assert_eq!(
+        metric_sample(&ts.base, "blazar_preemptions_total{outcome=\"cancelled\"}").await,
+        Some(0)
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__preemption__urgent_request_takes_the_slot_and_the_victim_is_replayed_intact() {
+    let ts = start_with(
+        preempt_config("replay"),
+        vec![(
+            "STUB_DELAY_MS".to_string(),
+            PREEMPT_CHILD_DELAY_MS.to_string(),
+        )],
+    )
+    .await;
+    let c = client();
+    let (_, _, baseline) = preempt_chat(&c, &ts.base, None, 0).await;
+    let expected_frames = preempt_frame_count(&baseline);
+    assert!(
+        expected_frames >= 2,
+        "baseline stream has {expected_frames} frames"
+    );
+    let (victim, urgent) = tokio::join!(
+        preempt_chat(&c, &ts.base, None, 0),
+        preempt_chat(&c, &ts.base, Some("high"), 100)
+    );
+    assert_eq!((victim.1, urgent.1), (200, 200));
+    assert!(
+        urgent.0 < victim.0,
+        "the urgent request finishes first: the victim gave up its slot"
+    );
+    // The stub answers every request 900 ms after it reaches the child.
+    // A replay that queued behind the urgent request therefore lands at
+    // least 900 ms after it; a replay that took the freed slot back
+    // instead would land right next to it.
+    assert!(
+        victim.0.duration_since(urgent.0) >= Duration::from_millis(800),
+        "the replay waited for the urgent request: {:?} after it",
+        victim.0.duration_since(urgent.0)
+    );
+    assert_eq!(
+        preempt_frame_count(&victim.2),
+        expected_frames,
+        "victim stream"
+    );
+    assert_eq!(
+        preempt_frame_count(&urgent.2),
+        expected_frames,
+        "urgent stream"
+    );
+    assert_eq!(
+        victim.2.matches("data: [DONE]").count(),
+        1,
+        "the replayed stream closes exactly once"
+    );
+    assert_eq!(
+        metric_sample(&ts.base, "blazar_preemptions_total{outcome=\"cancelled\"}").await,
+        Some(1)
+    );
+    assert_eq!(
+        metric_sample(&ts.base, "blazar_preemptions_total{outcome=\"replayed\"}").await,
+        Some(1)
+    );
+    assert_eq!(
+        metric_sample(&ts.base, "blazar_preemptions_total{outcome=\"too_late\"}").await,
+        Some(0)
+    );
+    assert_eq!(
+        metric_sample(
+            &ts.base,
+            "blazar_preemptions_total{outcome=\"replay_failed\"}"
+        )
+        .await,
+        Some(0)
+    );
+    assert_eq!(ts.state.queue.depth(), 0, "nothing is left waiting");
+    let ps = ts.state.sup.ps();
+    assert!(
+        ps.iter().all(|row| row.in_flight == 0),
+        "in-flight accounting is back to zero: {ps:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__preemption__a_request_that_already_streamed_a_byte_is_never_cancelled() {
+    // First byte at ~600 ms; the urgent request arrives at 700 ms and its
+    // preemptor fires at 1000 ms, by which time the victim has streamed.
+    let ts = start_with(
+        preempt_config("replay"),
+        vec![("STUB_DELAY_CHUNK_MS".to_string(), "600".to_string())],
+    )
+    .await;
+    let c = client();
+    let _ = preempt_chat(&c, &ts.base, None, 0).await;
+    let (victim, urgent) = tokio::join!(
+        preempt_chat(&c, &ts.base, None, 0),
+        preempt_chat(&c, &ts.base, Some("high"), 700)
+    );
+    assert_eq!((victim.1, urgent.1), (200, 200));
+    assert!(victim.0 < urgent.0, "a streaming request keeps its slot");
+    assert_eq!(
+        metric_sample(&ts.base, "blazar_preemptions_total{outcome=\"cancelled\"}").await,
+        Some(0)
+    );
+    assert!(
+        metric_sample(
+            &ts.base,
+            "blazar_preemption_refusals_total{reason=\"no_candidate\"}"
+        )
+        .await
+        .unwrap_or(0)
+            >= 1
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+// Two prompt classes of a replicated model must both be admitted: the
+// gateway's admission ceiling counts the slots of every live child, not
+// one child's slot count (live 2026-11-24: with two children of one slot
+// each the gate parked the third request although a child was idle).
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn e2e__replicas__admission_counts_the_slots_of_every_child() {
+    let mut cfg = Config {
+        slots: 1,
+        ..Config::default()
+    };
+    cfg.model_overrides.insert(
+        "m1".into(),
+        blazar_core::config::ModelOverride {
+            replicas: Some(2),
+            ..Default::default()
+        },
+    );
+    // The stub answers every request 700 ms after it reaches the child.
+    let ts = start_with(cfg, vec![("STUB_DELAY_MS".into(), "700".into())]).await;
+    let c = client();
+    let systems = [
+        "You are the inventory clerk of a single shared warehouse.",
+        "You are the night watchman of a lighthouse on a tidal island.",
+    ];
+    let say = |system: &str, turn: &str| {
+        serde_json::json!({
+            "model": "m1",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": turn}
+            ],
+            "max_tokens": 4
+        })
+    };
+    // One warm-up per class starts one child per class.
+    for system in systems {
+        let warm = c
+            .post(format!("{}/v1/chat/completions", ts.base))
+            .json(&say(system, "warm-up"))
+            .send()
+            .await
+            .expect("warm-up request");
+        assert_eq!(warm.status(), 200);
+    }
+    let replicas = ts
+        .state
+        .sup
+        .ps()
+        .into_iter()
+        .filter(|row| row.name == "m1")
+        .map(|row| row.replica)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        replicas.len(),
+        2,
+        "both prompt classes got their child: {replicas:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for (system, turn) in [
+        (systems[0], "order 1"),
+        (systems[0], "order 2"),
+        (systems[1], "watch 1"),
+        (systems[1], "watch 2"),
+    ] {
+        let c = c.clone();
+        let base = ts.base.clone();
+        let body = say(system, turn);
+        handles.push(tokio::spawn(async move {
+            let resp = c
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&body)
+                .send()
+                .await
+                .expect("chat request");
+            (resp.status(), turn)
+        }));
+    }
+    let mut statuses = Vec::new();
+    for handle in handles {
+        statuses.push(handle.await.expect("request task"));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        statuses.iter().all(|(status, _)| *status == 200),
+        "every conversation answered: {statuses:?}"
+    );
+    // Two children with one slot each answer two requests per class in
+    // two parallel waves (1.4 s); a ceiling of one slot runs four waves
+    // (2.8 s).
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "four requests on two children took {elapsed:?}"
+    );
+    ts.state.sup.shutdown_all().await.unwrap();
+}
+
+/// llama.cpp cancels queued requests with a bare "Context size has been
+/// exceeded." once a unified-KV child runs out of shared cache cells (live
+/// 2026-11-24: eight slots on a 16384-token pool, a 24-deep burst of
+/// 2.5k-token prompts, 16 of 24 cancelled). The gateway keeps the engine's
+/// status and message and appends the pool numbers and the remedies.
+#[allow(non_snake_case)]
+#[tokio::test]
+async fn e2e__context_pool__engine_cancellation_is_explained_with_the_pool_numbers() {
+    let config = Config {
+        default_ctx: 8192,
+        slots: 4,
+        ..Config::default()
+    };
+    let ts = start_with_manifest(
+        config,
+        vec![("STUB_CHAT_ERROR".to_string(), "pool".to_string())],
+        |manifest| {
+            manifest.flags.insert("--kv-unified".to_string());
+        },
+    )
+    .await;
+    let c = client();
+    let resp = c
+        .post(format!("{}/v1/chat/completions", ts.base))
+        .json(&chat_body("hi"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        500,
+        "the engine's status is relayed"
+    );
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("Context size has been exceeded."), "{text}");
+    assert!(text.contains("shared KV pool"), "{text}");
+    assert!(text.contains("8192 tokens shared by 4 slots"), "{text}");
+    assert!(text.contains("kv_unified = false"), "{text}");
+    let metrics = c
+        .get(format!("{}/metrics", ts.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("blazar_context_pool_failures_total 1"),
+        "{metrics}"
     );
     ts.state.sup.shutdown_all().await.unwrap();
 }

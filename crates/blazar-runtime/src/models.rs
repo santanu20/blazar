@@ -411,7 +411,11 @@ pub fn reconcile_models(dirs: &BlazarDirs, store: &Store) -> ReconcileReport {
     // One idempotent upsert per drifted row; failures are silent
     // pass-overs (next boot retries) - heal is an accuracy upgrade,
     // never a boot blocker.
-    for row in store.list_models().unwrap_or_default() {
+    // A failed listing is logged and reads as "nothing owned"; every
+    // adoption candidate still fails closed on its own store read below.
+    for row in
+        blazar_core::store::row_or_warn("models.list", store.list_models()).unwrap_or_default()
+    {
         if let Some(drift) = heal_dir_row(store, &row) {
             report.healed.push((row.name.clone(), drift));
         }
@@ -427,7 +431,11 @@ fn ownership_set(store: &Store) -> (HashSet<PathBuf>, HashSet<(u64, u64)>) {
     let mut owned: HashSet<PathBuf> = HashSet::new();
     #[cfg_attr(not(unix), allow(unused_mut))] // inode twins only tracked on unix
     let mut owned_inodes: HashSet<(u64, u64)> = HashSet::new();
-    for row in store.list_models().unwrap_or_default() {
+    // A failed listing is logged and reads as "nothing owned"; every
+    // adoption candidate still fails closed on its own store read below.
+    for row in
+        blazar_core::store::row_or_warn("models.list", store.list_models()).unwrap_or_default()
+    {
         for p in [
             Some(PathBuf::from(&row.path)),
             row.mmproj_path.map(PathBuf::from),
@@ -457,6 +465,32 @@ struct AdoptCtx<'a> {
     sidecars: &'a [String],
     attached_sidecars: &'a mut HashSet<String>,
     adopted_inodes: &'a mut HashSet<(u64, u64)>,
+}
+
+/// Why an adopted file got the name it got, or why it got none.
+enum NamePick {
+    /// The first portable candidate no stored row uses.
+    Free(String),
+    /// The store answered, but every derived name is taken or unusable.
+    Taken(Vec<String>),
+    /// A store read failed: the row set is unknown, so "free" cannot be
+    /// established and adoption must stop rather than mint a colliding
+    /// name.
+    StoreFailed(String),
+}
+
+fn pick_free_name(store: &Store, candidates: &[String]) -> NamePick {
+    for candidate in candidates {
+        if portable_model_name(candidate).is_err() {
+            continue;
+        }
+        match store.get_model(candidate) {
+            Ok(None) => return NamePick::Free(candidate.clone()),
+            Ok(Some(_)) => {}
+            Err(e) => return NamePick::StoreFailed(e.to_string()),
+        }
+    }
+    NamePick::Taken(candidates.to_vec())
 }
 
 /// Adopt one GGUF (or a whole shard set) at its EXISTING location.
@@ -513,19 +547,24 @@ fn adopt_gguf(
     // First free-and-portable candidate wins; quant siblings share
     // embedded metadata names (base + fp16 both say "Qwen2.5 0.5B
     // Instruct") and must not shadow each other.
-    let Some(model_name) = candidates
-        .iter()
-        .find(|c| portable_model_name(c).is_ok() && store.get_model(c).ok().flatten().is_none())
-        .cloned()
-    else {
-        report.skipped.push((
-            label,
-            format!(
-                "every derived name is taken or unusable: {}",
-                candidates.join(", ")
-            ),
-        ));
-        return;
+    let model_name = match pick_free_name(store, &candidates) {
+        NamePick::Free(name) => name,
+        NamePick::StoreFailed(reason) => {
+            report
+                .skipped
+                .push((label, format!("store read failed: {reason}")));
+            return;
+        }
+        NamePick::Taken(candidates) => {
+            report.skipped.push((
+                label,
+                format!(
+                    "every derived name is taken or unusable: {}",
+                    candidates.join(", ")
+                ),
+            ));
+            return;
+        }
     };
     let bytes: u64 = leaves
         .iter()
@@ -557,6 +596,8 @@ fn adopt_gguf(
         ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
         pulled_at: now_secs(),
         last_used_at: now_secs(),
+
+        license: None,
     };
     match store.upsert_model(&row) {
         Ok(()) => report.adopted.push(AdoptedModel {
@@ -655,12 +696,22 @@ fn adopt_dir(
         report.skipped.push((dir_name.to_string(), reason));
         return;
     }
-    if store.get_model(model_name).ok().flatten().is_some() {
-        report.skipped.push((
-            dir_name.to_string(),
-            format!("name `{model_name}` already taken by another row"),
-        ));
-        return;
+    match store.get_model(model_name) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            report.skipped.push((
+                dir_name.to_string(),
+                format!("name `{model_name}` already taken by another row"),
+            ));
+            return;
+        }
+        Err(e) => {
+            report.skipped.push((
+                dir_name.to_string(),
+                format!("store read failed for name `{model_name}`: {e}"),
+            ));
+            return;
+        }
     }
     let bytes: u64 = weights
         .iter()
@@ -683,6 +734,8 @@ fn adopt_dir(
         ctx_train: meta.ctx_train.and_then(|c| i64::try_from(c).ok()),
         pulled_at: now_secs(),
         last_used_at: now_secs(),
+
+        license: None,
     };
     match store.upsert_model(&row) {
         Ok(()) => report.adopted.push(AdoptedModel {
@@ -852,6 +905,8 @@ pub fn copy_model(dirs: &BlazarDirs, src: &str, dst: &str) -> Result<()> {
         ctx_train: row.ctx_train,
         pulled_at: row.pulled_at,
         last_used_at: row.last_used_at,
+
+        license: None,
     })?;
     Ok(())
 }
@@ -909,6 +964,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
 
@@ -941,6 +998,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
         // Session banks as the supervisor writes them: per-name subtree
@@ -1006,6 +1065,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         };
         store
             .upsert_model(&row("m", &d.join("dit.gguf").display().to_string()))
@@ -1030,6 +1091,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
 
@@ -1072,6 +1135,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
 
@@ -1104,6 +1169,8 @@ mod tests {
                     ctx_train: None,
                     pulled_at: 1,
                     last_used_at: 1,
+
+                    license: None,
                 })
                 .unwrap();
         }
@@ -1134,6 +1201,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         })
         .unwrap();
         let err = copy_model(&dirs, "m", "m-alias").unwrap_err();
@@ -1176,6 +1245,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         })
         .unwrap();
         copy_model(&dirs, "m", "m-alias").unwrap();
@@ -1239,6 +1310,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         }
     }
 
@@ -1573,6 +1646,29 @@ mod tests {
         );
         // File survives untouched - adoption never deletes.
         assert!(d.join("dup.gguf").exists());
+    }
+
+    #[test]
+    fn unit__reconcile__unreadable_store_adopts_nothing() {
+        let (_t, dirs) = setup();
+        let d = dirs.models_dir();
+        let store = Store::open(&dirs).unwrap();
+        // An unreadable row set answers nothing about ownership: the scan
+        // must adopt nothing rather than mint rows for files existing
+        // rows may already own.
+        store.conn().execute_batch("DROP TABLE models;").unwrap();
+        write_gguf(&d.join("orphan-q8_0.gguf"), "llama", Some("orphan"));
+
+        let r = reconcile_models(&dirs, &store);
+        assert!(r.adopted.is_empty(), "{:?}", r.adopted);
+        assert!(
+            r.skipped
+                .iter()
+                .any(|(f, why)| f == "orphan-q8_0.gguf" && why.contains("store read failed")),
+            "the skip must name the store, not a taken name: {:?}",
+            r.skipped
+        );
+        assert!(d.join("orphan-q8_0.gguf").exists());
     }
 
     #[test]

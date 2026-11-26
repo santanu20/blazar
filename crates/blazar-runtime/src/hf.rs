@@ -340,6 +340,27 @@ pub struct HfModelInfo {
     pub siblings: Vec<HfSibling>,
     #[serde(default)]
     pub gguf: Option<HfGgufInfo>,
+    /// Model-card front matter from the Hub models API; carries the
+    /// upstream licence when the card declares one.
+    #[serde(default, rename = "cardData")]
+    pub card_data: Option<HfCardData>,
+}
+
+/// `cardData` block of the Hub models API response. Unknown keys are
+/// ignored so new Hub card fields never break a pull.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HfCardData {
+    #[serde(default)]
+    pub license: Option<String>,
+}
+
+/// Best-effort licence text from the model card; `None` when the card
+/// declares none (imported and adopted models legitimately have none).
+#[must_use]
+fn license_from_info(info: &HfModelInfo) -> Option<String> {
+    info.card_data
+        .as_ref()
+        .and_then(|card| card.license.clone())
 }
 
 /// One file to download (a model shard or an mmproj).
@@ -525,6 +546,68 @@ pub fn parse_shard_marker_pub(fname: &str) -> Option<(u32, u32, String)> {
     }
     let base = before[..idx_start - 1].to_string();
     Some((idx, count, base))
+}
+
+/// Enumerate every leaf of a gguf-split set from one leaf of it.
+///
+/// `Ok(None)` means the file is not a split leaf (an ordinary single-file
+/// GGUF). `Err` names the first missing sibling: a partial set must
+/// refuse the import instead of recording a model that can never load
+/// (ollama issue 5245). Returns `(count, original-case base, leaves in
+/// index order)`; sibling names are rebuilt with the source's own digit
+/// width and marker spelling so `%05d` and short forms both resolve.
+pub fn shard_set_leaves(leaf: &Path) -> Result<Option<(u32, String, Vec<PathBuf>)>> {
+    let Some(file_name) = leaf.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None); // non-UTF-8 names take the single-file path
+    };
+    let Some((given_idx, count, _)) = parse_shard_marker_pub(file_name) else {
+        return Ok(None);
+    };
+    // Marker math above ran on a lowercased copy; redo the offsets on the
+    // original bytes so case survives. ASCII markers are length-stable -
+    // any other spelling falls back to single-file import rather than
+    // risk a mis-sliced name.
+    let lower = file_name.to_lowercase();
+    if lower.len() != file_name.len() {
+        return Ok(None);
+    }
+    let Some(stem_len) = lower.strip_suffix(".gguf").map(str::len) else {
+        return Ok(None);
+    };
+    let stem = &file_name[..stem_len];
+    let lower_stem = &lower[..stem_len];
+    let Some(of_pos) = lower_stem.rfind("-of-") else {
+        return Ok(None);
+    };
+    let Some(dash) = lower_stem[..of_pos].rfind('-') else {
+        return Ok(None);
+    };
+    let base = stem[..dash].to_string();
+    let idx_width = stem[dash + 1..of_pos].len();
+    let of_tok = &stem[of_pos..of_pos + 4];
+    let count_tok = &stem[of_pos + 4..];
+    let ext = &file_name[stem_len..];
+    let parent = leaf.parent().unwrap_or_else(|| Path::new("."));
+    let mut leaves = Vec::with_capacity(count as usize);
+    for i in 1..=count {
+        if i == given_idx {
+            leaves.push(leaf.to_path_buf());
+            continue;
+        }
+        let sibling = parent.join(format!("{base}-{i:0idx_width$}{of_tok}{count_tok}{ext}"));
+        if !sibling.is_file() {
+            return Err(anyhow!(
+                "shard set is incomplete: {} is missing (found {} of {} \
+                 leaves beside {}); split models import only as a full set",
+                sibling.display(),
+                leaves.len(),
+                count,
+                leaf.display()
+            ));
+        }
+        leaves.push(sibling);
+    }
+    Ok(Some((count, base, leaves)))
 }
 
 fn plan(s: &HfSibling) -> FilePlan {
@@ -2177,6 +2260,7 @@ fn safetensors_model_row(
     dir: &std::path::Path,
     sel: &SafetensorsSelection,
     digest: String,
+    license: Option<String>,
 ) -> Result<ModelRow> {
     let meta = blazar_core::hfmeta::read_hf_config(dir)
         .map_err(|e| anyhow!("hf model dir {} unusable: {e}", dir.display()))?;
@@ -2202,6 +2286,7 @@ fn safetensors_model_row(
             .unwrap_or(i64::MAX),
         last_used_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
             .unwrap_or(i64::MAX),
+        license,
     })
 }
 
@@ -2574,7 +2659,14 @@ impl Puller {
         // shard it names must be on disk (H1: fail now, not at load).
         verify_index_coverage(&dir)?;
 
-        let row = safetensors_model_row(name, &target.repo, &dir, &sel, digest)?;
+        let row = safetensors_model_row(
+            name,
+            &target.repo,
+            &dir,
+            &sel,
+            digest,
+            license_from_info(info),
+        )?;
         // Admission preview rides the pull banner: warn at download
         // time when no installed sglang lane could ever load this
         // format, instead of letting the first spawn discover it.
@@ -2773,6 +2865,7 @@ impl Puller {
             ctx_train: None,
             pulled_at: now,
             last_used_at: now,
+            license: license_from_info(info),
         };
         store.upsert_model(&row)?;
         self.bus.publish(BlazarEvent::ModelPulled {
@@ -3070,6 +3163,7 @@ impl Puller {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+                license: license_from_info(info),
             };
             // Untagged diffusion pulls carry no slot; the GGUF default
             // is the family's usual pick.
@@ -3099,6 +3193,8 @@ impl Puller {
                 .unwrap_or(i64::MAX),
             last_used_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
                 .unwrap_or(i64::MAX),
+
+            license: license_from_info(info),
         };
         store.upsert_model(&row)?;
         self.bus.publish(BlazarEvent::ModelPulled {
@@ -3569,6 +3665,8 @@ fn build_model_row(
                 .unwrap_or(i64::MAX),
             last_used_at: i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
                 .unwrap_or(i64::MAX),
+
+            license: license_from_info(info),
         },
         pull_warning,
     ))
@@ -3803,6 +3901,70 @@ mod tests {
         assert!(msg.contains("-GGUF"), "teaches the quant lane: {msg}");
     }
 
+    #[test]
+    fn unit__shard_set_leaves__enumerates_all_leaves_in_index_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l1 = tmp.path().join("Model-Q4_K_M-00001-of-00002.gguf");
+        let l2 = tmp.path().join("Model-Q4_K_M-00002-of-00002.gguf");
+        std::fs::write(&l1, b"leaf-one").unwrap();
+        std::fs::write(&l2, b"leaf-two").unwrap();
+        // Asking from either leaf yields the same full set, base case intact.
+        let (count, base, leaves) = shard_set_leaves(&l2).unwrap().unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(base, "Model-Q4_K_M");
+        assert_eq!(leaves, vec![l1.clone(), l2.clone()]);
+        let (_, _, leaves) = shard_set_leaves(&l1).unwrap().unwrap();
+        assert_eq!(leaves, vec![l1, l2]);
+    }
+
+    #[test]
+    fn unit__shard_set_leaves__missing_sibling_is_a_loud_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l1 = tmp.path().join("set-q8_0-00001-of-00002.gguf");
+        std::fs::write(&l1, b"only-leaf").unwrap();
+        let err = shard_set_leaves(&l1).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("shard set is incomplete"), "{msg}");
+        assert!(msg.contains("00002-of-00002.gguf"), "names the file: {msg}");
+        assert!(msg.contains("1 of 2"), "counts what was found: {msg}");
+    }
+
+    #[test]
+    fn unit__shard_set_leaves__plain_single_file_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("model-q4_k_m.gguf");
+        std::fs::write(&plain, b"x").unwrap();
+        assert!(shard_set_leaves(&plain).unwrap().is_none());
+        // `count < 2` markers are not split sets either.
+        let one = tmp.path().join("model-00001-of-00001.gguf");
+        std::fs::write(&one, b"x").unwrap();
+        assert!(shard_set_leaves(&one).unwrap().is_none());
+    }
+
+    #[test]
+    fn unit__shard_set_leaves__marker_case_and_suffix_survive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l1 = tmp.path().join("M-Q4-00001-OF-00002.GGUF");
+        let l2 = tmp.path().join("M-Q4-00002-OF-00002.GGUF");
+        std::fs::write(&l1, b"a").unwrap();
+        std::fs::write(&l2, b"b").unwrap();
+        // Reconstruction must reuse the source's own marker spelling and
+        // suffix case, not assume the canonical lowercase form.
+        let (count, base, leaves) = shard_set_leaves(&l1).unwrap().unwrap();
+        assert_eq!((count, base.as_str()), (2, "M-Q4"));
+        assert_eq!(leaves, vec![l1, l2]);
+    }
+
+    #[test]
+    fn unit__shard_set_leaves__non_ascii_name_falls_back_to_single_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // U+0130 lowercases to two bytes, so offsets computed on the
+        // lowercased copy would mis-slice - refuse instead of guessing.
+        let f = tmp.path().join("İ-00001-of-00002.gguf");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(shard_set_leaves(&f).unwrap().is_none());
+    }
+
     fn engine_lane(tag: &str, kind: EngineKind, manifest: &str) -> EngineRow {
         EngineRow {
             tag: tag.to_string(),
@@ -3905,6 +4067,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -5165,6 +5329,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -5753,6 +5919,10 @@ mod tests {
 
         assert_eq!(row.name, "m-repo");
         assert_eq!(row.quant, "Q4_K_M");
+        assert_eq!(
+            row.license, None,
+            "no cardData upstream means no licence on record"
+        );
         let path = Path::new(&row.path);
         assert!(path.exists(), "file must land at stable path");
         assert_eq!(std::fs::read(path).unwrap(), content);
@@ -5760,6 +5930,72 @@ mod tests {
 
         let store = Store::open(&dirs).unwrap();
         assert_eq!(store.get_model("m-repo").unwrap().unwrap().quant, "Q4_K_M");
+    }
+
+    #[test]
+    fn unit__hf_model_info__card_data_license_decoded_and_unknown_fields_tolerated() {
+        let json =
+            r#"{"id":"o/m","siblings":[],"cardData":{"license":"apache-2.0","tags":["gguf"]}}"#;
+        let info: HfModelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            info.card_data.as_ref().and_then(|c| c.license.clone()),
+            Some("apache-2.0".to_string()),
+            "cardData.license must decode alongside unrelated card fields"
+        );
+        let bare: HfModelInfo = serde_json::from_str(r#"{"id":"o/m"}"#).unwrap();
+        assert!(bare.card_data.is_none(), "absent cardData stays absent");
+    }
+
+    #[tokio::test]
+    async fn integration__pull_single_file__captures_card_license() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+
+        let content = b"gguf-bytes-here".to_vec();
+        let sha = payload(&content);
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/models/owner/licensed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "owner/licensed",
+                "siblings": [ sibling_json("licensed-q4_k_m.gguf", content.len() as u64, &sha) ],
+                "cardData": { "license": "apache-2.0" }
+            })))
+            .mount(&api)
+            .await;
+        let dl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/owner/licensed/resolve/main/licensed-q4_k_m.gguf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .mount(&dl)
+            .await;
+
+        let client = HfClient::with_bases(
+            &api.uri(),
+            &dl.uri(),
+            None,
+            vec![
+                api.uri().trim_start_matches("http://").to_string(),
+                dl.uri().trim_start_matches("http://").to_string(),
+            ],
+        )
+        .unwrap();
+        let puller = Puller {
+            dirs,
+            client,
+            bus: EventBus::default(),
+            force: false,
+        };
+        let row = puller.pull("owner/licensed:Q4_K_M").await.unwrap().row;
+        assert_eq!(
+            row.license.as_deref(),
+            Some("apache-2.0"),
+            "the model card licence must land in the stored row"
+        );
     }
 
     #[tokio::test]
@@ -6514,7 +6750,20 @@ mod tests {
             }],
             shard_count: 1,
         };
-        let row = safetensors_model_row("q", "o/q", tmp.path(), &sel, "digest".into()).unwrap();
+        let row = safetensors_model_row(
+            "q",
+            "o/q",
+            tmp.path(),
+            &sel,
+            "digest".into(),
+            Some("mit".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            row.license.as_deref(),
+            Some("mit"),
+            "licence flows into the row"
+        );
         assert_eq!(row.quant, "TORCHAO");
         let params = row
             .params

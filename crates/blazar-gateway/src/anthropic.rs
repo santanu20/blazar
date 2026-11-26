@@ -222,11 +222,13 @@ pub async fn messages(
         );
     }
     let eff = crate::preflight::admission_ctx(&state, &model);
-    if let Err(resp) =
-        crate::preflight::enforce_prompt_fits(&state, &model, &openai_body, eff).await
-    {
-        return *resp;
-    }
+    // A cold model with a straddling estimate is counted exactly once
+    // loaded (right after the admission below).
+    let recheck_prompt =
+        match crate::preflight::enforce_prompt_fits(&state, &model, &openai_body, eff).await {
+            Ok(needed) => needed,
+            Err(resp) => return *resp,
+        };
     let priority = Priority::from_header(
         headers
             .get("x-blazar-priority")
@@ -262,6 +264,12 @@ pub async fn messages(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    if recheck_prompt
+        && let Err(resp) =
+            crate::preflight::recheck_prompt_fits(&state, &model, &openai_body, &engine).await
+    {
+        return *resp;
+    }
     // llama.cpp LoRA-variant ride (see proxy.rs::llamacpp_variant_lora):
     // `base+adapter` on the resident base child carries the per-request
     // `lora` field and the engine's own model name in the translated

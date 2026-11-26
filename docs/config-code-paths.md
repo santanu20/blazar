@@ -30,7 +30,7 @@ perf-relevant subset on/off through the real gateway; the golden-QC gate
 token quality are surfaced as drift.
 
 
-## Config (top-level keys) - 273 fields, 0 dead
+## Config (top-level keys) - 276 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -122,6 +122,8 @@ token quality are surfaced as drift.
 | slot_prompt_similarity | 0.0 | engine-argv | `blazar-core/src/profile.rs:1858` in `the`; `blazar-core/src/profile.rs:1860` in `the` |
 | sentinel | true | cli + runtime/gateway + gateway-http | `crates/blazar-cli/src/main.rs:6964` in `doctor_group`; `crates/blazar-cli/src/main.rs:9253` in `unit__doctor_group__known_names_map_and_order_is_stable`; `crates/blazar-runtime/src/hf.rs:4211` in `unit__search_path__format_filter_sentinels_and_browse`; `crates/blazar-runtime/src/hf.rs:4211` in `unit__search_path__format_filter_sentinels_and_browse`; `crates/blazar-gateway/src/openai.rs:661` in `openai_proxy`; `crates/blazar-gateway/src/openai.rs:661` in `openai_proxy` |
 | sentinel_stall_secs | 30 | gateway-http | `crates/blazar-gateway/src/state.rs:50` in `new`; `crates/blazar-gateway/tests/sentinel.rs:463` in `integration__sentinel__stalled_stream_detected_and_stream_survives` |
+| preemption | off | gateway-http | `crates/blazar-gateway/src/preempt.rs:51` in `enabled`; `crates/blazar-gateway/src/proxy.rs:3822` in `admission_gate_slo` |
+| preempt_after_ms | 250 | gateway-http | `crates/blazar-gateway/src/preempt.rs:638` in `arm` |
 | child_header_timeout_secs | 120 | gateway-http | `crates/blazar-gateway/src/proxy.rs:938` in `child_send`; `crates/blazar-gateway/src/proxy.rs:938` in `child_send` |
 | sdcpp_child_header_timeout_secs | 900 | gateway-http | `crates/blazar-gateway/src/proxy.rs:938` in `child_send`; `crates/blazar-gateway/src/proxy.rs:938` in `child_send` |
 | sdcpp_cache_mode | None | engine-argv | `crates/blazar-core/src/profile.rs:4313` in `push_sdcpp_tuning`; `crates/blazar-core/src/profile.rs:18144` in `unit__compile_sdcpp__tuning_knobs_emitted_and_gated` |
@@ -140,6 +142,7 @@ token quality are surfaced as drift.
 | media_job_wait_secs | 900 | gateway-http | `crates/blazar-gateway/src/images.rs:1990` in `await_native_job`; `crates/blazar-gateway/src/images.rs:1990` in `await_native_job` |
 | sentinel_enforce | false | gateway-http | `crates/blazar-gateway/src/sentinel.rs:1526` in `enforce_enabled`; `crates/blazar-gateway/tests/sentinel.rs:734` in `integration__sentinel__enforce_config_global_and_ollama_path` |
 | audit_log | true | gateway-http | `crates/blazar-gateway/tests/compat.rs:1082` in `client__audit_log__generation_lines_written`; `crates/blazar-gateway/src/state.rs:50` in `new` |
+| gemini_translate | true | gateway-http | `crates/blazar-gateway/src/lib.rs` in `router` (conditional route mount of the `/v1beta` translate lane); `crates/blazar-gateway/src/gemini.rs` in `generate_content`; `crates/blazar-gateway/tests/gateway.rs` in `e2e__gemini_flag_off_unmounts_the_route` |
 | tls_cert | String::new() | gateway-http | `crates/blazar-gateway/src/lib.rs:1385` in `well_known`; `crates/blazar-gateway/src/lib.rs:1550` in `serve` |
 | tls_key | String::new() | gateway-http | `crates/blazar-gateway/src/lib.rs:2153` in `rustls_server_config`; `crates/blazar-gateway/src/lib.rs:2153` in `rustls_server_config` |
 | cors_origins | Vec::new() | gateway-http | `crates/blazar-gateway/tests/gateway.rs:2473` in `e2e__tls_serves_https_and_cors_headers`; `crates/blazar-gateway/src/lib.rs:558` in `router` |
@@ -342,7 +345,7 @@ token quality are surfaced as drift.
 | calibration_file | - | engine-argv | `crates/blazar-core/src/profile.rs:3128` (calibration prompts feeding imatrix generation); hint block `crates/blazar-cli/src/main.rs:13890` |
 | isq_organization | - | engine-argv | `crates/blazar-core/src/profile.rs:3138` (`default` or `moqe` weight organization); hint block `crates/blazar-cli/src/main.rs:13891` |
 
-## SglangTuning ([sglang]) - 91 fields, 0 dead
+## SglangTuning ([sglang]) - 93 fields, 0 dead
 
 | field | default | lane | consumption site (fn) |
 |---|---|---|---|
@@ -356,6 +359,8 @@ token quality are surfaced as drift.
 | kv_cache_dtype | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block` |
 | mem_fraction_static | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block`; `crates/blazar-core/src/config_edit.rs:1042` in `unit__set_table_key__replace_create_and_grouping` |
 | cpu_offload_gb | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block` |
+| paged_experts | - | engine-argv + runtime/gateway + cli | `crates/blazar-core/src/profile.rs:7900` in `sglang_gpu_fit`; `crates/blazar-runtime/src/supervisor.rs:6870` in `the J3 paged host floor`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block` |
+| paged_experts_num_resident | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:7900` in `sglang_gpu_fit`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block` |
 | page_size | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block`; `crates/blazar-core/src/config_edit.rs:1042` in `unit__set_table_key__replace_create_and_grouping` |
 | schedule_policy | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block` |
 | schedule_conservativeness | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-core/src/profile.rs:5400` in `compile_sglang`; `crates/blazar-cli/src/main.rs:22394` in `knob_hint_block` |
@@ -438,6 +443,16 @@ token quality are surfaced as drift.
 | enable_two_batch_overlap | - | engine-argv | `crates/blazar-core/src/profile.rs:4890` (TBO, micro-batch overlap) |
 | enable_tf32_matmul | - | engine-argv | `crates/blazar-core/src/profile.rs:4903` (TF32 matmul toggle) |
 | enable_priority_scheduling | Some(true) | engine-argv | `crates/blazar-core/src/profile.rs:4916` (request priority scheduling) |
+
+## VllmTuning ([vllm]) - 5 fields, 0 dead
+
+| field | default | surfaces | where |
+|---|---|---|---|
+| gpu_memory_utilization | 0.85 at compile | engine-argv + cli | `crates/blazar-core/src/profile.rs:5329` in `compile_vllm` (always emitted; an explicit pin wins over the 0.85 compile default; 0.05..=0.95 validated) |
+| kv_offload | VllmKvOffload::default() | engine-argv + runtime | `crates/blazar-core/src/profile.rs:5401` in `compile_vllm` (gated emission of `--kv-transfer-config`; `offload` connector = OffloadingConnector CPU+fs tiers, default root `<data_dir>/kv/vllm`; the `lmcache` connector choice is refused in `VllmKvOffload::validate` until upstream ships a cross-layout converter) |
+| tool_call_parser | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5361` in `compile_vllm` (explicit pin wins over the family auto-detect; emits the atomic `--enable-auto-tool-choice` + `--tool-call-parser` pair) |
+| spec_method | - | engine-argv + cli | `crates/blazar-core/src/profile.rs:5395` in `compile_vllm` (draft-free speculators only - `suffix` or `ngram`; emits `--spec-method` with `--spec-tokens`; manual spec flags in extra_args are refused while the knob is set) |
+| spec_num_tokens | 4 at compile | engine-argv + cli | `crates/blazar-core/src/profile.rs:5396` in `compile_vllm` (proposal window; must stay below the compiled `--max-model-len` or compilation refuses pre-load) |
 
 ## ModelOverride ([models."name"]) - 49 fields, 0 dead
 

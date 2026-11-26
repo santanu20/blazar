@@ -16,9 +16,7 @@ use crate::state::AppState;
 pub async fn engines(State(state): State<Arc<AppState>>) -> Json<Value> {
     let cfg = state.sup.cfg();
     let sglang_lmcache = cfg.kv.lmcache.enabled && cfg.sglang.lmcache.enabled;
-    let rows = state
-        .with_store(|s| s.list_engines().unwrap_or_default())
-        .unwrap_or_default();
+    let rows = state.read_store_list_or_empty("engines.list", blazar_core::Store::list_engines);
     let cards: Vec<Value> = rows
         .iter()
         .map(|r| {

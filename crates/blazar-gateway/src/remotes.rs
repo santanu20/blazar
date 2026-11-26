@@ -1021,10 +1021,15 @@ pub async fn try_fallback_forward(
     if !fallback_enabled(&state.cfg()) {
         return None;
     }
-    let local_miss = state
-        .with_store(|s| crate::proxy::resolve_model(s, model).err())
-        .flatten()
-        .is_some_and(|e| e.contains("not found") && !e.contains("ambiguous"));
+    // Only a store that ANSWERED "no such row" makes this a local miss:
+    // a store that could not answer proves nothing either way, so the
+    // request stays local instead of being forwarded to a peer.
+    let local_miss = match state.read_store("models.resolve", |s| {
+        crate::proxy::resolve_model_typed(s, model).map(Some)
+    }) {
+        Ok(Some(Err(e))) => e.contains("not found") && !e.contains("ambiguous"),
+        Ok(Some(Ok(_)) | None) | Err(_) => false,
+    };
     if !local_miss {
         return None;
     }

@@ -463,11 +463,12 @@ pub fn raw_json_to_chat(raw: &Value, tool_names: &[String]) -> Value {
                 .collect::<Vec<_>>(),
         })
     };
-    let finish = if calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
-    };
+    let child_finish = raw
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str);
+    // The chat shape has to state a reason, so a child that gives none
+    // keeps the ordinary end it always got.
+    let finish = chat_finish(child_finish, !calls.is_empty()).unwrap_or("stop");
     let mut chat = json!({
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     });
@@ -475,6 +476,25 @@ pub fn raw_json_to_chat(raw: &Value, tool_names: &[String]) -> Value {
         chat["usage"] = u.clone();
     }
     chat
+}
+
+/// Finish reason the chat caller is told, from what the child stated.
+/// A lifted tool call always ends the turn as `tool_calls`. A generation
+/// the child cut at its token budget is reported as `length`, so an
+/// agent can see the answer is incomplete: reporting `stop` there hid
+/// every truncation on this lane. Any other reason the child states is
+/// an ordinary end. `None` means the child stated nothing - whether the
+/// turn completed is not ours to vouch for.
+#[must_use]
+fn chat_finish(child_finish: Option<&str>, calls_lifted: bool) -> Option<&'static str> {
+    if calls_lifted {
+        return Some("tool_calls");
+    }
+    match child_finish {
+        Some("length") => Some("length"),
+        Some(_) => Some("stop"),
+        None => None,
+    }
 }
 
 /// Caller-facing identity stamped onto adapted chat payloads. The
@@ -549,7 +569,8 @@ pub fn raw_json_to_chat_stamped(raw: &Value, tool_names: &[String], stamp: &Chat
 /// and tool calls surface as one closing delta chunk - the exact shape
 /// a native tool-streaming child emits, so every downstream concern
 /// (sentinel, timings, NDJSON translation) reuses the child lane
-/// unchanged. All state rides the stream (no globals).
+/// unchanged. The turn then closes with the finish reason the child
+/// stated. All state rides the stream (no globals).
 struct Adapt {
     /// Upstream BYTES not yet split into complete SSE lines. Bytes,
     /// never a String: a multibyte UTF-8 char may straddle TCP
@@ -576,6 +597,11 @@ struct Adapt {
     /// `None` on the ollama lane, whose frames stay byte-identical to
     /// before this field existed.
     stamp: Option<Value>,
+    /// Finish reason the child stated, if it ever does (last one wins).
+    child_finish: Option<String>,
+    /// Set once a frame that ends the turn went out, so `finish()` never
+    /// states a second reason behind it.
+    turn_ended: bool,
     done: bool,
 }
 
@@ -585,6 +611,12 @@ fn process_frame(st: &mut Adapt, frame: &Value) {
         .is_some_and(|u| u.as_object().is_some_and(|o| !o.is_empty()))
     {
         st.usage = frame.get("usage").cloned();
+    }
+    if let Some(reason) = frame
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        st.child_finish = Some(reason.to_string());
     }
     let text = frame
         .pointer("/choices/0/text")
@@ -639,6 +671,17 @@ fn finish(st: &mut Adapt) {
     if !calls.is_empty() {
         st.ready
             .push(sse_tool_calls_chunk(&calls, st.stamp.as_ref()));
+        st.turn_ended = true;
+    }
+    // A turn that ends without a lifted call still owes the caller its
+    // finish reason: a native chat child states one on its last frame,
+    // and clients read its absence as "nothing to worry about". Only
+    // what the child stated is repeated (see `chat_finish`).
+    if !st.turn_ended
+        && let Some(reason) = chat_finish(st.child_finish.as_deref(), false)
+    {
+        st.ready.push(sse_finish_chunk(reason, st.stamp.as_ref()));
+        st.turn_ended = true;
     }
     if let Some(u) = st.usage.clone() {
         st.ready.push(format!(
@@ -701,6 +744,8 @@ where
         usage: None,
         tool_names,
         stamp,
+        child_finish: None,
+        turn_ended: false,
         done: false,
     };
     let mut upstream = upstream;
@@ -767,6 +812,7 @@ where
                         "raw-lane upstream stream failed mid-body: {e} - closing legally with arrived bytes"
                     );
                     st.ready.push(sse_truncated_chunk(&e, st.stamp.as_ref()));
+                    st.turn_ended = true;
                     finish(&mut st);
                 }
                 std::task::Poll::Ready(None) => {
@@ -835,6 +881,18 @@ fn sse_tool_calls_chunk(calls: &[ParsedToolCall], stamp: Option<&Value>) -> Stri
         "data: {}\n\n",
         with_stamp(
             serde_json::json!({"choices": [{"index": 0, "delta": {"tool_calls": chunks}, "finish_reason": "tool_calls"}]}),
+            stamp
+        )
+    )
+}
+
+/// Closing frame of a turn without a lifted call: empty delta, the
+/// child's finish reason - the frame a native chat child ends with.
+fn sse_finish_chunk(reason: &str, stamp: Option<&Value>) -> String {
+    format!(
+        "data: {}\n\n",
+        with_stamp(
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}),
             stamp
         )
     )
@@ -1030,6 +1088,141 @@ mod tests {
             joined.trim_end().ends_with("data: [DONE]"),
             "adapter terminates: {joined}"
         );
+    }
+
+    /// Every `data:` frame of an adapted stream, terminator excluded.
+    fn data_frames(joined: &str) -> Vec<Value> {
+        joined
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str(payload).expect("adapted frame parses"))
+            .collect()
+    }
+
+    /// `(frame position, reason)` for every frame that states a finish.
+    fn stated_finishes(frames: &[Value]) -> Vec<(usize, &str)> {
+        frames
+            .iter()
+            .enumerate()
+            .filter_map(|(position, frame)| {
+                let reason = frame.pointer("/choices/0/finish_reason")?.as_str()?;
+                Some((position, reason))
+            })
+            .collect()
+    }
+
+    fn stated_reasons(joined: &str) -> Vec<String> {
+        stated_finishes(&data_frames(joined))
+            .into_iter()
+            .map(|(_, reason)| reason.to_string())
+            .collect()
+    }
+
+    fn bytes(text: &'static str) -> axum::body::Bytes {
+        axum::body::Bytes::from_static(text.as_bytes())
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__sse_adapter__token_budget_cut_reaches_the_caller_as_length() {
+        // Live incident pin (mlx lane, max_tokens 64): the child ended
+        // the generation with finish_reason "length" and the adapted
+        // stream carried no finish frame at all, so a client read a
+        // cut-off answer as a complete one.
+        let (joined, all_ok) = collect_sse(vec![
+            Ok(bytes(
+                "data: {\"choices\":[{\"text\":\"cut off mid-\"}]}\n\n",
+            )),
+            Ok(bytes(
+                "data: {\"choices\":[{\"text\":\"sen\",\"finish_reason\":\"length\"}]}\n\n",
+            )),
+            Ok(bytes("data: [DONE]\n\n")),
+        ])
+        .await;
+        assert!(all_ok, "no raw Err items");
+        let frames = data_frames(&joined);
+        let finishes = stated_finishes(&frames);
+        assert_eq!(
+            finishes
+                .iter()
+                .map(|(_, reason)| *reason)
+                .collect::<Vec<_>>(),
+            vec!["length"],
+            "one terminal frame stating the cut: {joined}"
+        );
+        assert_eq!(
+            finishes[0].0 + 1,
+            frames.len(),
+            "the finish frame is the last data frame: {joined}"
+        );
+        assert!(joined.trim_end().ends_with("data: [DONE]"), "{joined}");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__sse_adapter__complete_generation_closes_with_a_stop_frame() {
+        // mlx-lm states the finish on its last text frame and sends
+        // usage as a frame of its own. The terminal frame the caller is
+        // owed follows the text and precedes the usage frame.
+        let (joined, all_ok) = collect_sse(vec![
+            Ok(bytes(
+                "data: {\"choices\":[{\"text\":\"Hello\",\"index\":0,\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(bytes("data: {\"choices\":[{\"text\":\"!\",\"index\":0,\"finish_reason\":\"stop\"}]}\n\n")),
+            Ok(bytes("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n")),
+            Ok(bytes("data: [DONE]\n\n")),
+        ])
+        .await;
+        assert!(all_ok, "no raw Err items");
+        let frames = data_frames(&joined);
+        let finishes = stated_finishes(&frames);
+        assert_eq!(finishes.len(), 1, "exactly one terminal frame: {joined}");
+        assert_eq!(finishes[0].1, "stop", "{joined}");
+        let usage_at = frames
+            .iter()
+            .position(|frame| frame.get("usage").is_some())
+            .expect("usage frame forwarded");
+        assert!(finishes[0].0 < usage_at, "finish precedes usage: {joined}");
+        assert_eq!(usage_at + 1, frames.len(), "usage is last: {joined}");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__sse_adapter__mid_body_error_states_its_finish_once() {
+        // The truncation frame already ends the turn with `error`; the
+        // regular terminal frame must not follow it with a second finish.
+        let frames = futures::stream::iter(vec![
+            Ok(bytes(
+                "data: {\"choices\":[{\"text\":\"partial answer\",\"finish_reason\":null}]}\n\n",
+            )),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset mid-body",
+            )),
+        ]);
+        let mut out = raw_sse_to_chat_sse(frames, Vec::new());
+        let mut joined = String::new();
+        while let Some(item) = out.next().await {
+            joined.push_str(&String::from_utf8_lossy(item.as_ref().unwrap()));
+        }
+        assert_eq!(stated_reasons(&joined), vec!["error"], "{joined}");
+        assert!(joined.contains("partial answer"), "{joined}");
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
+    async fn unit__sse_adapter__child_stating_no_finish_adds_none() {
+        // Whether the turn completed is the child's statement to make. A
+        // child that never states a finish gets no invented one: `stop`
+        // would vouch for a turn nobody saw end.
+        let (joined, all_ok) = collect_sse(vec![Ok(bytes(
+            "data: {\"choices\":[{\"text\":\"done-less child\"}]}\n\n",
+        ))])
+        .await;
+        assert!(all_ok, "no raw Err items");
+        assert!(stated_reasons(&joined).is_empty(), "{joined}");
+        assert!(joined.contains("done-less child"), "{joined}");
     }
 
     fn body(messages: &Value, tools: Option<Value>) -> Value {
@@ -1301,6 +1494,56 @@ mod tests {
             Some(&json!("tool_calls"))
         );
         assert_eq!(chat.pointer("/choices/0/message/content"), Some(&json!("")));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__raw_json_to_chat__token_budget_cut_is_not_reported_as_stop() {
+        // Live incident pin (mlx lane, max_tokens 128): the child ended
+        // at the token budget and the adapted response said "stop".
+        let raw = json!({
+            "choices": [{"index": 0, "text": "cut off mid-", "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 128}
+        });
+        let chat = raw_json_to_chat(&raw, &[]);
+        assert_eq!(
+            chat.pointer("/choices/0/finish_reason"),
+            Some(&json!("length"))
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__raw_json_to_chat__finish_follows_the_child_unless_a_call_was_lifted() {
+        let stated = |finish: Option<&str>| {
+            let mut choice = json!({"index": 0, "text": "an answer"});
+            if let Some(finish) = finish {
+                choice["finish_reason"] = json!(finish);
+            }
+            let chat = raw_json_to_chat(&json!({"choices": [choice]}), &[]);
+            chat.pointer("/choices/0/finish_reason").cloned()
+        };
+        assert_eq!(stated(Some("stop")), Some(json!("stop")));
+        // A spelling outside the chat vocabulary is still an ordinary end.
+        assert_eq!(stated(Some("eos")), Some(json!("stop")));
+        // The chat shape must state a reason; a child that gives none
+        // keeps the ordinary end it always got.
+        assert_eq!(stated(None), Some(json!("stop")));
+
+        // A call the parser lifted is complete even if the child was cut
+        // right after it: the caller has something to act on.
+        let cut_call = json!({
+            "choices": [{
+                "index": 0,
+                "text": "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Oslo\"}}</tool_call>",
+                "finish_reason": "length"
+            }]
+        });
+        let chat = raw_json_to_chat(&cut_call, &["get_weather".to_string()]);
+        assert_eq!(
+            chat.pointer("/choices/0/finish_reason"),
+            Some(&json!("tool_calls"))
+        );
     }
 
     #[tokio::test]

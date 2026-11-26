@@ -22,7 +22,8 @@
 //! path mlx-lm resolves); macOS installs plain `mlx-lm` whose Darwin
 //! marker pulls Metal `mlx` natively; CPU-only Linux refuses with
 //! teaching - a CPU mlx lane would silently serve at toy speed next to
-//! the CUDA lanes.
+//! the CUDA lanes. `install_plan` decides all of it from the host's OS,
+//! CPU, libc and glibc before anything is downloaded.
 
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
@@ -68,50 +69,157 @@ const MLX_INSTALL_TIMEOUT_SECS: u64 = 1200;
 /// slow one.
 const MLX_BOOT_SMOKE_TIMEOUT_SECS: u64 = 300;
 
+/// Where mlx runs its kernels on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlxBackend {
+    /// Apple Silicon: the Metal backend rides the plain `mlx` wheel.
+    Metal,
+    /// Linux: the CUDA backend rides `mlx` as the `cuda12` extra.
+    Cuda,
+}
+
+/// What an install has to pin for one host. It is decided before anything
+/// is downloaded, so every refusal names its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub backend: MlxBackend,
+    /// pip requirements added next to `mlx-lm==<version>`.
+    pub extra_pins: Vec<String>,
+}
+
+/// The Linux wheels are `manylinux_2_35`, which means glibc 2.35.
+const MLX_WHEEL_GLIBC_FLOOR: (u32, u32) = (2, 35);
+
+const GLIBC_QUERY_TIMEOUT_SECS: u64 = 10;
+
+const HOST_LIBC: &str = if cfg!(target_env = "musl") {
+    "musl"
+} else {
+    "gnu"
+};
+
+/// The install for one host: Apple Silicon gets the Metal backend, Linux
+/// with an NVIDIA card the CUDA backend. Every other host is refused with
+/// its reason, because each would fail later inside pip with a message
+/// that names none of it: an Intel Mac has no wheel at all, and a musl or
+/// old glibc host cannot load the Linux wheels.
+pub fn install_plan(
+    os: &str,
+    arch: &str,
+    libc_env: &str,
+    host_glibc: Option<(u32, u32)>,
+) -> Result<InstallPlan> {
+    match (os, arch) {
+        ("macos", "aarch64") => Ok(InstallPlan {
+            backend: MlxBackend::Metal,
+            extra_pins: Vec::new(),
+        }),
+        ("macos", other) => anyhow::bail!(
+            "mlx publishes Apple Silicon wheels only (arm64, macOS 14 or newer); \
+             this Mac runs {other}. Use the llama.cpp lane instead: \
+             blazar engine install --kind llamacpp"
+        ),
+        ("linux", "x86_64" | "aarch64") => {
+            if libc_env == "musl" {
+                anyhow::bail!(
+                    "mlx ships glibc (manylinux) wheels for Linux; a musl host such as \
+                     Alpine has no wheel to install"
+                );
+            }
+            if let Some((major, minor)) = host_glibc
+                && (major, minor) < MLX_WHEEL_GLIBC_FLOOR
+            {
+                anyhow::bail!(
+                    "mlx Linux wheels need glibc {}.{} or newer; this host runs {major}.{minor}",
+                    MLX_WHEEL_GLIBC_FLOOR.0,
+                    MLX_WHEEL_GLIBC_FLOOR.1
+                );
+            }
+            Ok(cuda_plan())
+        }
+        ("linux", other) => anyhow::bail!(
+            "mlx publishes Linux wheels for x86_64 and aarch64 only; this host runs {other}"
+        ),
+        (other, _) => anyhow::bail!(
+            "the mlx lane ships a POSIX `mlx-server` shim, so Blazar runs it on macOS \
+             and Linux only; on {other} use WSL2 or another engine kind"
+        ),
+    }
+}
+
+fn cuda_plan() -> InstallPlan {
+    InstallPlan {
+        backend: MlxBackend::Cuda,
+        extra_pins: [MLX_CUDA_PIN, MLX_CUDA_RUNTIME_PIN, MLX_CUDA_NVCC_PIN]
+            .iter()
+            .map(|pin| (*pin).to_string())
+            .collect(),
+    }
+}
+
+/// The glibc this host runs, read from `getconf`. `None` when the tool is
+/// missing or prints something else. `None` does not refuse an install:
+/// the floor is a courtesy check and pip stays the judge.
+fn glibc_version() -> Option<(u32, u32)> {
+    let output = crate::probe::probe_output(
+        std::process::Command::new("getconf").arg("GNU_LIBC_VERSION"),
+        GLIBC_QUERY_TIMEOUT_SECS,
+    )?;
+    parse_glibc_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses the `getconf GNU_LIBC_VERSION` line, `glibc 2.39`.
+fn parse_glibc_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.trim().strip_prefix("glibc ")?.trim();
+    let (major, minor) = version.split_once('.')?;
+    Some((major.trim().parse().ok()?, minor.trim().parse().ok()?))
+}
+
+/// Two independent signals, because either can be missing on a healthy
+/// box: the `nvidia-smi` tool and the driver library it is a client of.
+fn nvidia_gpu_visible() -> bool {
+    !crate::probe::nvidia_smi_gpus().is_empty() || crate::gpu_census::nvml_total_mib().is_some()
+}
+
 /// Create the venv + install mlx-lm + backend + write the shim inside
 /// `dir`. `dir` must exist and be empty; on failure the caller removes
 /// `dir` (F88 discipline lives with the `EngineManager` entry point).
 pub async fn install_into(dir: &Path, version: &str) -> Result<PathBuf> {
-    if cfg!(target_os = "macos") {
-        // macOS: mlx-lm's own platform marker pulls Metal mlx - nothing
-        // extra to pin.
-        install_platform(dir, version, &[]).await
-    } else if cfg!(target_os = "linux") {
-        // Linux requires an NVIDIA GPU: the mlx CUDA backend is the only
-        // supported accelerator on this OS, and a CPU-only mlx install
-        // would silently serve at toy speed next to the CUDA lanes.
-        if crate::probe::nvidia_smi_gpus().is_empty() {
-            anyhow::bail!(
-                "the mlx lane on Linux uses the CUDA backend and needs an NVIDIA GPU; \
-                 none is visible (nvidia-smi). On Apple Silicon machines the lane \
-                 installs natively; on this host pick another engine kind"
-            );
-        }
-        let venv = install_platform(
-            dir,
-            version,
-            &[
-                MLX_CUDA_PIN.to_string(),
-                MLX_CUDA_RUNTIME_PIN.to_string(),
-                MLX_CUDA_NVCC_PIN.to_string(),
-            ],
-        )
-        .await?;
-        // The farm must exist before the row can ever serve: JIT kernel
-        // compiles happen at generation time, so a missing farm is an
-        // instant broken lane, not a degraded one. The helper itself is
-        // Linux-only (CUDA farm), so the reference is gated to match -
-        // this branch is selected at runtime, not compile time.
-        #[cfg(target_os = "linux")]
-        link_cuda_home(dir)?;
-        Ok(venv)
+    // The glibc floor is only readable where glibc is the host libc; every
+    // other host passes `None` and the plan decides without it.
+    let host_glibc = if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        glibc_version()
     } else {
+        None
+    };
+    let plan = install_plan(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        HOST_LIBC,
+        host_glibc,
+    )?;
+    // Linux requires an NVIDIA GPU: the mlx CUDA backend is the only
+    // supported accelerator on this OS, and a CPU-only mlx install would
+    // silently serve at toy speed next to the CUDA lanes.
+    if plan.backend == MlxBackend::Cuda && !nvidia_gpu_visible() {
         anyhow::bail!(
-            "mlx upstream supports macOS (Metal) and Linux (CUDA); {} installs \
-             are not supported by the engine itself",
-            std::env::consts::OS
+            "the mlx lane on Linux uses the CUDA backend and needs an NVIDIA GPU; \
+             none is visible through the NVIDIA driver library (NVML) or nvidia-smi. \
+             On Apple Silicon machines the lane installs natively; on this host \
+             pick another engine kind"
         );
     }
+    let venv = install_platform(dir, version, &plan.extra_pins).await?;
+    // The farm must exist before the row can ever serve: JIT kernel
+    // compiles happen at generation time, so a missing farm is an
+    // instant broken lane, not a degraded one. The helper itself exists
+    // on Linux only (CUDA farm), so the call is gated to match; the
+    // backend is chosen at runtime.
+    #[cfg(target_os = "linux")]
+    if plan.backend == MlxBackend::Cuda {
+        link_cuda_home(dir)?;
+    }
+    Ok(venv)
 }
 
 /// Shared venv build for both supported platforms: `extra_pins` carries
@@ -361,5 +469,105 @@ mod tests {
         link_cuda_home(&root).unwrap();
         assert!(farm.join("include/cuda_fp8.h").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod plan_tests {
+    use anyhow::Result;
+
+    use super::{
+        HOST_LIBC, InstallPlan, MLX_CUDA_NVCC_PIN, MLX_CUDA_PIN, MLX_CUDA_RUNTIME_PIN, MlxBackend,
+        glibc_version, install_plan, parse_glibc_version,
+    };
+
+    fn refusal(plan: Result<InstallPlan>) -> String {
+        plan.expect_err("this host is refused").to_string()
+    }
+
+    #[test]
+    fn unit__install_plan__apple_silicon_installs_metal_with_no_extra_pin() {
+        assert_eq!(
+            install_plan("macos", "aarch64", HOST_LIBC, None).unwrap(),
+            InstallPlan {
+                backend: MlxBackend::Metal,
+                extra_pins: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn unit__install_plan__intel_mac_is_refused_and_pointed_at_llama_cpp() {
+        let message = refusal(install_plan("macos", "x86_64", HOST_LIBC, None));
+        assert!(message.contains("Apple Silicon"), "{message}");
+        assert!(
+            message.contains("blazar engine install --kind llamacpp"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn unit__install_plan__linux_installs_cuda_with_the_three_backend_pins() {
+        assert_eq!(
+            install_plan("linux", "x86_64", "gnu", None).unwrap(),
+            InstallPlan {
+                backend: MlxBackend::Cuda,
+                extra_pins: vec![
+                    MLX_CUDA_PIN.to_string(),
+                    MLX_CUDA_RUNTIME_PIN.to_string(),
+                    MLX_CUDA_NVCC_PIN.to_string(),
+                ],
+            }
+        );
+        // The floor is inclusive and the aarch64 wheels share it.
+        assert_eq!(
+            install_plan("linux", "aarch64", "gnu", Some((2, 35)))
+                .unwrap()
+                .backend,
+            MlxBackend::Cuda
+        );
+    }
+
+    #[test]
+    fn unit__install_plan__old_glibc_is_refused_with_both_versions_named() {
+        let message = refusal(install_plan("linux", "x86_64", "gnu", Some((2, 31))));
+        assert!(message.contains("glibc 2.35"), "{message}");
+        assert!(message.contains("2.31"), "{message}");
+    }
+
+    #[test]
+    fn unit__install_plan__musl_host_is_refused_whatever_version_it_reports() {
+        let message = refusal(install_plan("linux", "x86_64", "musl", Some((2, 35))));
+        assert!(message.contains("musl"), "{message}");
+    }
+
+    #[test]
+    fn unit__install_plan__other_linux_cpu_is_refused() {
+        let message = refusal(install_plan("linux", "riscv64", "gnu", None));
+        assert!(message.contains("x86_64 and aarch64"), "{message}");
+    }
+
+    #[test]
+    fn unit__install_plan__windows_is_refused_for_the_shim_not_for_upstream() {
+        let message = refusal(install_plan("windows", "x86_64", "gnu", None));
+        assert!(message.contains("WSL2"), "{message}");
+        assert!(message.contains("shim"), "{message}");
+    }
+
+    #[test]
+    fn unit__parse_glibc_version__reads_the_getconf_line() {
+        assert_eq!(parse_glibc_version("glibc 2.39\n"), Some((2, 39)));
+        assert_eq!(parse_glibc_version("glibc 2.31"), Some((2, 31)));
+        assert_eq!(parse_glibc_version("not a version"), None);
+        assert_eq!(parse_glibc_version(""), None);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn unit__glibc_version__reads_this_host() {
+        let (major, minor) =
+            glibc_version().expect("getconf GNU_LIBC_VERSION answers on a glibc host");
+        assert!(major >= 2, "read glibc {major}.{minor}");
     }
 }

@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crate::AppState;
 use crate::ollama::api_error;
-use crate::proxy::{ensure_with_admission, resolve_model};
+use crate::proxy::ensure_with_admission;
 use crate::queue::{Priority, WorkClass};
 
 /// Default per-peer bound for a replicate warm call. Generous on
@@ -184,8 +184,9 @@ fn warm_scope_gate(
     model: &str,
 ) -> Option<Response> {
     let canonical = state
-        .with_store(|s| resolve_model(s, model))
-        .and_then(std::result::Result::ok)
+        .read_store_or_absent("models.resolve", |s| {
+            crate::proxy::resolve_model_checked(s, model).map(crate::proxy::ModelResolution::found)
+        })
         .map(|row| row.name);
     match canonical.as_deref() {
         Some(name) => {
@@ -261,9 +262,9 @@ pub async fn warm(
     }
     // Canonical name first: the post-load ps() lookup keys on it, and a
     // tag-form alias (`qwen3-1.7b:bf16`) must resolve like chat does.
-    let resolved = state
-        .with_store(|s| resolve_model(s, model))
-        .and_then(std::result::Result::ok);
+    let resolved = state.read_store_or_absent("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, model).map(crate::proxy::ModelResolution::found)
+    });
     let Some(row) = resolved else {
         return api_error(
             StatusCode::NOT_FOUND.as_u16(),
@@ -809,9 +810,9 @@ pub async fn route(
     {
         return api_error(code, &msg);
     }
-    let local_row = state
-        .with_store(|s| resolve_model(s, &model))
-        .and_then(std::result::Result::ok);
+    let local_row = state.read_store_or_absent("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, &model).map(crate::proxy::ModelResolution::found)
+    });
     // Pool names resolve to their member table instead (boot guard
     // refuses pool/model collisions, so the two namespaces cannot
     // overlap here): the decision payload shows every member's score

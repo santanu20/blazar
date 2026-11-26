@@ -453,6 +453,8 @@ mod tests {
             ctx_train: Some(32_768),
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 

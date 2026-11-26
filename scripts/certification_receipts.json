@@ -96,6 +96,18 @@
       "flag": "--enable-prompt-tokens-details",
       "receipt": "bench-artifacts/20261120-kokoro-vllm-cert/README.md",
       "note": "E2E lane cert 2026-11-20 (isolated debug daemon, qwen2.5-coder-0.5b BF16, explain source=pin): usage.prompt_tokens_details.cached_tokens present in gateway response"
+    },
+    {
+      "lane": "vllm",
+      "flag": "--spec-method",
+      "receipt": "bench-artifacts/2026-11-23-sota-roadmap/vllm-suffix-decoding-receipt.md",
+      "note": "E2 spec cert 2026-11-26 (sandbox daemon, qwen2.5-coder-0.5b BF16, spec_method=suffix): child argv observed with --spec-method suffix; steady decode 190.5->884.4 tok/s median on a suffix-heavy prompt, temp-0 outputs byte-identical"
+    },
+    {
+      "lane": "vllm",
+      "flag": "--spec-tokens",
+      "receipt": "bench-artifacts/2026-11-23-sota-roadmap/vllm-suffix-decoding-receipt.md",
+      "note": "E2 spec cert 2026-11-26 (sandbox daemon, qwen2.5-coder-0.5b BF16, spec_num_tokens=4): child argv observed with --spec-tokens 4; planned-fact line in /api/ps; bound below compiled ctx at config time"
     }
   ]
 }

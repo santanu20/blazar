@@ -55,6 +55,8 @@ fn setup(models: &[(&str, u64)]) -> (tempfile::TempDir, BlazarDirs) {
                 ctx_train: Some(40_960),
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
     }
@@ -1395,6 +1397,8 @@ async fn integration__openaihost_lane__shared_child_collapse_and_teardown() {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .unwrap();
     }
@@ -1455,4 +1459,461 @@ async fn integration__openaihost_lane__shared_child_collapse_and_teardown() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(refused, "lane child port closed after shutdown_all");
+}
+
+/// H1 provenance pin: the auto GPU pick may only name a device the ROUTED
+/// engine itself lists. A routed spawn under a census-less global engine
+/// (sglang, vllm) used to pick from the system census instead, whose rows
+/// carry vendor product strings - llama.cpp aborts those ("invalid device").
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__auto_gpu_pick__token_comes_from_routed_engine_census() {
+    let (tmp, dirs) = setup(&[("m1", 500)]);
+    let argv_file = dirs.run_dir().join("argv.json");
+    let mut lane = stub_manifest();
+    lane.flags.insert("--device".into());
+    Store::open(&dirs)
+        .unwrap()
+        .upsert_engine(&blazar_core::store::EngineRow {
+            tag: "stub-cuda".into(),
+            asset: "stub".into(),
+            sha256: String::new(),
+            installed_at: 2,
+            active: false,
+            manifest: serde_json::to_string(&lane).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        })
+        .unwrap();
+    let mut cfg = base_config();
+    cfg.model_overrides.insert(
+        "m1".into(),
+        blazar_core::config::ModelOverride {
+            engine: Some("stub-cuda".into()),
+            ..Default::default()
+        },
+    );
+    // Routed adapters inherit the daemon engine env. The CPU row carries
+    // the most free memory and must never win the pick.
+    cfg.engine_env
+        .insert("STUB_ARGV_FILE".into(), argv_file.display().to_string());
+    cfg.engine_env.insert(
+        "STUB_DEVICES".into(),
+        "STUB0: STUB GPU A (8000 MiB, 5000 MiB free);STUB1: STUB GPU B (12000 MiB, 11000 MiB free);CPU: STUB CPU (64000 MiB, 60000 MiB free)".into(),
+    );
+    // Global lane: a binary that lists no devices at all, like sglang.
+    let script = tmp.path().join("census-less-server");
+    std::fs::write(&script, b"#!/bin/sh\necho 'Available devices:'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut census_less = stub_manifest();
+    census_less.devices = vec![];
+    census_less.server_path = script.display().to_string();
+    let sys_gpu = |name: &str| GpuInfo {
+        name: name.into(),
+        description: format!("NVIDIA {name}"),
+        total_mib: 8_188,
+        free_mib: 8_188,
+    };
+    let hw = Hardware {
+        physical_cores: 4,
+        total_ram_mib: 16_000,
+        mem_available_mib: None,
+        gpus: vec![sys_gpu("sys:nvml:0"), sys_gpu("sys:nvml:1")],
+    };
+    let mut sup = Supervisor::new(
+        dirs.clone(),
+        cfg,
+        EventBus::default(),
+        hw,
+        Arc::new(LlamaCppEngine::new(census_less)),
+    );
+    sup.load_timeout_secs = Some(4);
+    sup.shutdown_grace = Duration::from_secs(2);
+    sup.ensure("m1").await.expect("routed spawn");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
+    let device = argv
+        .iter()
+        .position(|a| a == "--device")
+        .expect("two GPUs on the box and no manual `devices` pin: the spawn gets an auto pick");
+    assert_eq!(
+        argv[device + 1],
+        "STUB1",
+        "the token is the routed engine's own name for its most free accelerator"
+    );
+    sup.shutdown_all().await.unwrap();
+}
+
+/// H4 provenance pin: the llama.cpp `OpenVINO` build lists the CPU as a
+/// device row (`OPENVINO0`, carrying the host RAM as its memory) and takes
+/// its device ONLY from `GGML_OPENVINO_DEVICE`. The auto GPU pick used to
+/// pick the row with the most free memory - the CPU - and pass
+/// `--device OPENVINO0`, which that build aborts whenever the row is not
+/// the environment-selected device.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__auto_gpu_pick__openvino_build_takes_its_device_from_the_env() {
+    let (tmp, dirs) = setup(&[("m1", 500)]);
+    let argv_file = dirs.run_dir().join("argv.json");
+    let ov_row =
+        |name: &str, description: &str, mib: u64| blazar_runtime::engine::manifest::DeviceDesc {
+            name: name.into(),
+            description: description.into(),
+            total_mib: mib,
+            free_mib: mib,
+        };
+    // What `llama-server --list-devices` prints on that build for a host
+    // whose selected device is the NPU: sorted ids, CPU first, and the CPU
+    // row reports the host RAM - so it always "wins" a most-free pick.
+    let rows = [
+        ov_row(
+            "OPENVINO0",
+            "GGML_OPENVINO_DEVICE=CPU - stub cpu (16384 MiB, 16384 MiB free)",
+            16_384,
+        ),
+        ov_row(
+            "OPENVINO1",
+            "GGML_OPENVINO_DEVICE=GPU - stub gpu (16384 MiB, 16384 MiB free)",
+            16_384,
+        ),
+        ov_row(
+            "OPENVINO2",
+            "GGML_OPENVINO_DEVICE=NPU (selected) - stub npu (8192 MiB, 8192 MiB free)",
+            8_192,
+        ),
+    ];
+    let mut lane = stub_manifest();
+    lane.flags.insert("--device".into());
+    lane.devices = rows.to_vec();
+    Store::open(&dirs)
+        .unwrap()
+        .upsert_engine(&blazar_core::store::EngineRow {
+            tag: "stub-openvino".into(),
+            asset: "stub".into(),
+            sha256: String::new(),
+            installed_at: 2,
+            active: false,
+            manifest: serde_json::to_string(&lane).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::LlamaCpp,
+        })
+        .unwrap();
+    let mut cfg = base_config();
+    cfg.model_overrides.insert(
+        "m1".into(),
+        blazar_core::config::ModelOverride {
+            engine: Some("stub-openvino".into()),
+            ..Default::default()
+        },
+    );
+    // Routed adapters inherit the daemon engine env; the stub prints the
+    // listing these variables describe.
+    cfg.engine_env
+        .insert("STUB_ARGV_FILE".into(), argv_file.display().to_string());
+    cfg.engine_env.insert(
+        "STUB_DEVICES".into(),
+        "OPENVINO0: GGML_OPENVINO_DEVICE=CPU - stub cpu (16384 MiB, 16384 MiB free);OPENVINO1: GGML_OPENVINO_DEVICE=GPU - stub gpu (16384 MiB, 16384 MiB free);OPENVINO2: GGML_OPENVINO_DEVICE=NPU (selected) - stub npu (8192 MiB, 8192 MiB free)".into(),
+    );
+    // Global lane: a binary that lists no devices at all, like sglang.
+    let script = tmp.path().join("census-less-server");
+    std::fs::write(&script, b"#!/bin/sh\necho 'Available devices:'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut census_less = stub_manifest();
+    census_less.devices = vec![];
+    census_less.server_path = script.display().to_string();
+    let sys_gpu = |name: &str| GpuInfo {
+        name: name.into(),
+        description: format!("stub {name}"),
+        total_mib: 8_192,
+        free_mib: 8_192,
+    };
+    let hw = Hardware {
+        physical_cores: 4,
+        total_ram_mib: 16_000,
+        mem_available_mib: None,
+        gpus: vec![sys_gpu("sys:stub:0"), sys_gpu("sys:stub:1")],
+    };
+    let mut sup = Supervisor::new(
+        dirs.clone(),
+        cfg,
+        EventBus::default(),
+        hw,
+        Arc::new(LlamaCppEngine::new(census_less)),
+    );
+    sup.load_timeout_secs = Some(4);
+    sup.shutdown_grace = Duration::from_secs(2);
+    sup.ensure("m1").await.expect("routed spawn");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(&argv_file).unwrap()).unwrap();
+    assert!(
+        !argv.iter().any(|a| a == "--device"),
+        "the OpenVINO build reads GGML_OPENVINO_DEVICE; a --device token for any other row aborts the spawn, got argv {argv:?}"
+    );
+    sup.shutdown_all().await.unwrap();
+}
+
+/// E1 fixture: an OLMoE-shaped safetensors model directory. The
+/// safetensors file carries a real header (the moe geometry reader
+/// trusts declared shapes), the config.json carries the router law,
+/// and the row bytes state the model size the admission ladder sees.
+fn write_sglang_moe_dir(
+    dir: &std::path::Path,
+    file_mib: u64,
+    per_expert_mib: u64,
+    quant_method: &str,
+    moe: bool,
+) {
+    // Fixture constants: 2 MoE layers x 40 experts x top-4, the OLMoE
+    // shape the live receipt exercises.
+    let (layers, experts, top_k) = (2_usize, 40_usize, 4_usize);
+    std::fs::create_dir_all(dir).unwrap();
+    let mut cfg = serde_json::json!({
+        "architectures": ["OlmoeForCausalLM"],
+        "model_type": "olmoe",
+        "num_hidden_layers": layers,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "hidden_size": 128,
+        "max_position_embeddings": 32_768,
+        "torch_dtype": "bfloat16",
+        "quantization_config": {"quant_method": quant_method, "bits": 4},
+    });
+    if moe {
+        cfg["num_experts"] = serde_json::json!(experts);
+        cfg["num_experts_per_tok"] = serde_json::json!(top_k);
+    }
+    std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+    // Header-only safetensors: 8-byte LE header length + JSON. Declared
+    // shapes carry the expert bytes (data_offsets stay [0, 0]).
+    let mut tensors = serde_json::Map::new();
+    if moe {
+        let per_tensor_bytes = per_expert_mib * 1_048_576 / layers as u64;
+        for l in 0..layers {
+            for e in 0..experts {
+                let name = format!("model.layers.{l}.experts.{e}.down_proj.weight");
+                let numel = per_tensor_bytes / 2; // F16 itemsize
+                tensors.insert(
+                    name,
+                    serde_json::json!({"dtype": "F16", "shape": [numel], "data_offsets": [0, 0]}),
+                );
+            }
+        }
+    }
+    tensors.insert(
+        "model.layers.0.self_attn.q_proj.weight".to_string(),
+        serde_json::json!({"dtype": "F32", "shape": [16, 16], "data_offsets": [0, 0]}),
+    );
+    let header = serde_json::to_string(&tensors).unwrap();
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    b.extend_from_slice(header.as_bytes());
+    std::fs::write(dir.join("model.safetensors"), b).unwrap();
+    // The supervisor re-measures directory models from real file sizes
+    // (a frozen mid-download size must never feed the fit ladder), so the
+    // fixture body must carry the declared weight bytes. Sparse-extend:
+    // the geometry reader never touches bytes past the header.
+    let f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("model.safetensors"))
+        .unwrap();
+    f.set_len(file_mib * 1_048_576).unwrap();
+}
+
+/// Shared E1 harness: one routed sglang-kind stub lane + a model row whose
+/// path is a safetensors directory, on a `2_560` `MiB` GPU where the `MoE`
+/// shape must page (dense slice fits the pool, full weights do not).
+fn sglang_paged_setup(
+    dirs: &blazar_core::BlazarDirs,
+    model_mib: u64,
+    moe: bool,
+) -> blazar_core::Config {
+    let model_dir = dirs.models_dir().join(if moe { "m1" } else { "m1-dense" });
+    // 40 experts x 26 MiB = 1_040 MiB expert store, dense slice 260 MiB.
+    write_sglang_moe_dir(&model_dir, model_mib, 26, "gptq_marlin", moe);
+    blazar_core::store::Store::open(dirs)
+        .unwrap()
+        .upsert_model(&blazar_core::ModelRow {
+            name: "m1".into(),
+            repo: "shuyuej/OLMoE-1B-7B-0924-GPTQ".into(),
+            quant: "gptq-int4".into(),
+            path: model_dir.display().to_string(),
+            bytes: i64::try_from(model_mib * 1_048_576).unwrap(),
+            sha256: None,
+            mmproj_path: None,
+            components: vec![],
+            shards: 1,
+            arch: Some("olmoe".into()),
+            params: None,
+            ctx_train: Some(32_768),
+            pulled_at: 1,
+            last_used_at: 1,
+
+            license: None,
+        })
+        .unwrap();
+    let argv_file = dirs.run_dir().join("argv.json");
+    let mut lane = stub_manifest();
+    for flag in [
+        "--enable-paged-experts",
+        "--paged-experts-num-resident",
+        "--context-length",
+        "--kv-cache-dtype",
+        "--cpu-offload-gb",
+        "--mem-fraction-static",
+        "--served-model-name",
+        "--model-path",
+        "--tool-call-parser",
+        "--host",
+        "--port",
+    ] {
+        lane.flags.insert(flag.into());
+    }
+    lane.devices = vec![];
+    blazar_core::store::Store::open(dirs)
+        .unwrap()
+        .upsert_engine(&blazar_core::store::EngineRow {
+            tag: "stub-sglang".into(),
+            asset: "stub".into(),
+            sha256: String::new(),
+            installed_at: 2,
+            active: false,
+            manifest: serde_json::to_string(&lane).unwrap(),
+            kind: blazar_core::engine_kind::EngineKind::Sglang,
+        })
+        .unwrap();
+    let mut cfg = base_config();
+    cfg.model_overrides.insert(
+        "m1".into(),
+        blazar_core::config::ModelOverride {
+            engine: Some("stub-sglang".into()),
+            ctx: Some(8_192),
+            ..Default::default()
+        },
+    );
+    cfg.engine_env
+        .insert("STUB_ARGV_FILE".into(), argv_file.display().to_string());
+    cfg.engine_env.insert(
+        "STUB_DEVICES".into(),
+        "stub-gpu: STUB GPU (2560 MiB, 2560 MiB free)".into(),
+    );
+    // Keep the fit ladder on the harness census: with the memory guard
+    // armed the ladder re-probes the LIVE host card (8 GiB here) and the
+    // deficit the pin manufactures disappears. The guard's own paged
+    // floor is pinned by src-side unit tests through the
+    // test_mem_available_mib seam.
+    cfg.spawn_mem_guard = false;
+    cfg
+}
+
+/// E1 pin: a routed `MoE` model whose dense slice fits the ceiling pool but
+/// whose full weights do not must page its experts onto pinned host
+/// memory (paged flags, derived K within the router law) instead of
+/// falling back to the slow whole-weights `--cpu-offload-gb` tier.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__sglang_paged_experts__moe_pages_instead_of_cpu_offload() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_test_writer()
+        .try_init();
+    let (_tmp, dirs) = setup(&[]);
+    let cfg = sglang_paged_setup(&dirs, 1_300, true);
+    let hw = Hardware {
+        physical_cores: 4,
+        total_ram_mib: 16_000,
+        mem_available_mib: None,
+        gpus: vec![GpuInfo {
+            name: "stub-gpu".into(),
+            description: "STUB GPU".into(),
+            total_mib: 2_560,
+            free_mib: 2_560,
+        }],
+    };
+    let mut sup = Supervisor::new(
+        dirs.clone(),
+        cfg,
+        EventBus::default(),
+        hw,
+        Arc::new(LlamaCppEngine::new(stub_manifest())),
+    );
+    sup.load_timeout_secs = Some(4);
+    sup.shutdown_grace = Duration::from_secs(2);
+    sup.ensure("m1").await.expect("routed sglang spawn");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(dirs.run_dir().join("argv.json")).unwrap())
+            .unwrap();
+    assert!(
+        argv.iter().any(|a| a == "--enable-paged-experts"),
+        "a MoE model that fits only via paging must engage paged experts, got argv {argv:?}"
+    );
+    let k = argv
+        .iter()
+        .position(|a| a == "--paged-experts-num-resident")
+        .and_then(|i| argv.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("paged experts need a resident K within the router law");
+    assert!(
+        (4..=40).contains(&k),
+        "resident K must respect the router law (top_k 4, 40 experts), got {k}"
+    );
+    assert!(
+        !argv.iter().any(|a| a == "--cpu-offload-gb"),
+        "paging replaces the whole-weights host-offload tier, got argv {argv:?}"
+    );
+    sup.shutdown_all().await.unwrap();
+}
+
+/// E1 preservation pin: the same lane with a DENSE model keeps the exact
+/// classic plan - no paged flags, the classic host-offload tier is free
+/// to engage - so the feature changes nothing for non-MoE models.
+#[tokio::test]
+#[allow(non_snake_case)]
+async fn integration__sglang_paged_experts__dense_model_keeps_the_classic_plan() {
+    let (_tmp, dirs) = setup(&[]);
+    let cfg = sglang_paged_setup(&dirs, 1_300, false);
+    let hw = Hardware {
+        physical_cores: 4,
+        total_ram_mib: 16_000,
+        mem_available_mib: None,
+        gpus: vec![GpuInfo {
+            name: "stub-gpu".into(),
+            description: "STUB GPU".into(),
+            total_mib: 2_560,
+            free_mib: 2_560,
+        }],
+    };
+    let mut sup = Supervisor::new(
+        dirs.clone(),
+        cfg,
+        EventBus::default(),
+        hw,
+        Arc::new(LlamaCppEngine::new(stub_manifest())),
+    );
+    sup.load_timeout_secs = Some(4);
+    sup.shutdown_grace = Duration::from_secs(2);
+    sup.ensure("m1").await.expect("routed sglang spawn");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(dirs.run_dir().join("argv.json")).unwrap())
+            .unwrap();
+    assert!(
+        !argv.iter().any(|a| a == "--enable-paged-experts")
+            && !argv.iter().any(|a| a == "--paged-experts-num-resident"),
+        "dense models must never page, got argv {argv:?}"
+    );
+    // The classic plan still owns this shape: full weights do not fit
+    // the pool, so the whole-weights host-offload tier engages.
+    assert!(
+        argv.iter().any(|a| a == "--cpu-offload-gb"),
+        "dense deficit keeps the classic host-offload tier, got argv {argv:?}"
+    );
+    sup.shutdown_all().await.unwrap();
 }

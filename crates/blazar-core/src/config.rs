@@ -789,6 +789,20 @@ pub struct Config {
     /// detection specifically (other detections stay on).
     #[serde(default = "default_stall_secs")]
     pub sentinel_stall_secs: u64,
+    /// Cancel-and-replay preemption: `"off"` (default) or `"replay"`.
+    /// When on, a request that has waited `preempt_after_ms` in the
+    /// admission queue may cancel a running request of lower urgency on
+    /// the same model and take its slot. The engine cannot resume an
+    /// interrupted generation, so the cancelled request is re-queued and
+    /// replayed in place: its client only waits longer and still receives
+    /// a complete answer. A request that has already sent a body byte is
+    /// never cancelled.
+    #[serde(default = "default_preemption")]
+    pub preemption: String,
+    /// Queue wait in milliseconds after which a waiting request may
+    /// preempt a running one (see `preemption`).
+    #[serde(default = "default_preempt_after_ms")]
+    pub preempt_after_ms: u64,
     /// Ceiling in seconds for awaiting child response HEADERS
     /// (pre-first-byte). A child that accepts a request but never answers
     /// is a live wedge (observed live: a banked-session slot restore
@@ -997,6 +1011,16 @@ pub struct Config {
     /// request, rotates at 16 MiB); set `false` to disable the trail.
     #[serde(default = "default_true")]
     pub audit_log: bool,
+    /// E4: mount the Gemini `generateContent` translate lane
+    /// (`/v1beta/models/{model}:{generateContent|streamGenerateContent}`).
+    /// `true` (default) serves the dialect - the kill switch, not an
+    /// opt-in: the surface is local-only, admission-gated and
+    /// budgeted like the Anthropic lane, so the default posture is
+    /// feature-on (the lane appears in the route census and the
+    /// engines doc). `false` unmounts every route (404) for boxes
+    /// that want the surface absent.
+    #[serde(default = "default_true")]
+    pub gemini_translate: bool,
     /// TLS: PEM certificate chain path. Empty = plain HTTP. Must be set
     /// together with `tls_key` (both or neither - validated).
     #[serde(default)]
@@ -1857,6 +1881,23 @@ pub struct SglangTuning {
     /// engine flag is integer-GB - fractional pins round UP at emission
     /// with a teaching warning.
     pub cpu_offload_gb: Option<f32>,
+    /// `--enable-paged-experts`: keep only K routed experts per `MoE`
+    /// layer resident on the GPU, paging the rest from pinned host
+    /// memory on demand (sglang 0.5.23; single GPU; `MoE` checkpoints
+    /// whose quant the paged `MoE` runners read - GPTQ/AWQ/FP8/MXFP4/
+    /// INT8 families and unquantized). `None` = ladder-auto: engages
+    /// only in the low-VRAM tier, only when the checkpoint declares
+    /// routed experts the ladder can size, and never beside a host
+    /// offload or a spec lane. `true` engages whenever the expert
+    /// geometry is readable (a quant outside the supported set warns,
+    /// it does not refuse). `false` never pages - the exact
+    /// pre-feature behavior.
+    pub paged_experts: Option<bool>,
+    /// `--paged-experts-num-resident <K>`: manual resident-expert
+    /// count. Requires `paged_experts = true`; the compile-time gate
+    /// refuses a K below the router top-k or above the expert count
+    /// (both are engine startup errors).
+    pub paged_experts_num_resident: Option<u64>,
     /// `--page-size` (tokens per KV page).
     pub page_size: Option<u64>,
     /// `--schedule-policy` (lpm, fcfs, dfs-weight...).
@@ -2213,6 +2254,23 @@ pub struct VllmTuning {
     /// it and `tools` requests keep the engine's explicit 400 instead
     /// of a wrong parser corrupting calls. An explicit pin always wins.
     pub tool_call_parser: Option<String>,
+    /// `--spec-method`: speculative decoding family for the vllm lane.
+    /// The draft-free speculators (`suffix`, `ngram`) need no second
+    /// model - they propose continuations from the request stream
+    /// itself (`SuffixDecoding`: longest-suffix match plus a
+    /// device-resident cross-request corpus), so a plain model spawn
+    /// can turn them on. Draft-model families (`eagle`, `draft_model`)
+    /// are refused at validation: they need `--spec-model`, which
+    /// stays in `extra_args` for users who hand-assemble that plan.
+    /// When unset, the profile compiler emits no speculative flags.
+    pub spec_method: Option<String>,
+    /// `--spec-tokens`: how many tokens the speculator proposes ahead
+    /// per step. Must stay strictly below the compiled
+    /// `--max-model-len` (vllm refuses `spec_tokens + 1 > max_len`);
+    /// when unset, the compiler pairs the method with a small default
+    /// (4) instead of vllm's own `min(8, tree_depth)` deep default,
+    /// which costs throughput at high concurrency.
+    pub spec_num_tokens: Option<u64>,
 }
 
 /// `[vllm.kv_offload]`: persistent KV reuse for the vllm lane.
@@ -2491,6 +2549,7 @@ impl VllmTuning {
     }
 
     fn validate(&self, where_: &str) -> Result<(), CoreError> {
+        const DRAFT_FREE: [&str; 2] = ["suffix", "ngram"];
         if let Some(frac) = self.gpu_memory_utilization
             && !(0.05..=0.95).contains(&frac)
         {
@@ -2499,6 +2558,35 @@ impl VllmTuning {
             )));
         }
         self.kv_offload.validate(&format!("{where_}.kv_offload"))?;
+        // Speculative decoding (vllm 0.34) gates: only the draft-free
+        // speculators are first-class knobs - a draft-method pin here
+        // would strand `--spec-model` in the same struct's blind spot
+        // and the child dies at argv parse. A token count without a
+        // method is a knob the engine would never see, and zero
+        // proposals per step is not speculation at all.
+        if let Some(method) = &self.spec_method
+            && !DRAFT_FREE.contains(&method.as_str())
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.spec_method must be one of {} (draft-free speculators); \
+                 draft-model families need --spec-model via extra_args",
+                DRAFT_FREE.join(", ")
+            )));
+        }
+        if self.spec_num_tokens.is_some() && self.spec_method.is_none() {
+            return Err(CoreError::Config(format!(
+                "{where_}.spec_num_tokens needs {where_}.spec_method - a \
+                 token count without a speculator is a knob the engine \
+                 would silently ignore"
+            )));
+        }
+        if let Some(k) = self.spec_num_tokens
+            && k == 0
+        {
+            return Err(CoreError::Config(format!(
+                "{where_}.spec_num_tokens must be >= 1, got {k}"
+            )));
+        }
         Ok(())
     }
 }
@@ -2535,6 +2623,36 @@ impl SglangTuning {
                 "{where_}.lmcache.enabled and {where_}.hicache_enable are \
                  mutually exclusive - sglang accepts --enable-lmcache XOR \
                  --enable-hierarchical-cache, never both"
+            )));
+        }
+        // Paged experts (sglang 0.5.23) exclusivity, refused at parse so
+        // no spawn reaches the ladder with two host-memory plans: the
+        // expert host store and a weights host offload both draw on the
+        // same RAM; a sharded spawn cannot page (upstream single-GPU
+        // constraint); a resident pin without the enable flag is a knob
+        // the engine would silently ignore.
+        // A zero offload is the plan switched off, not a second host
+        // plan competing for the same RAM, so it stays allowed here.
+        if self.paged_experts == Some(true) && self.cpu_offload_gb.is_some_and(|gb| gb > 0.0) {
+            return Err(CoreError::Config(format!(
+                "{where_}.paged_experts and {where_}.cpu_offload_gb are \
+                 mutually exclusive - sglang pages routed experts from a pinned \
+                 host store and never combines that with a weights host offload; \
+                 pick one host-memory plan"
+            )));
+        }
+        if self.paged_experts == Some(true) && self.parallel_pinned() {
+            return Err(CoreError::Config(format!(
+                "{where_}.paged_experts is single-GPU in sglang 0.5.23 (TP/DP/PP/EP \
+                 are refused with paging engaged) - unset the parallel size pins or \
+                 the paged knob"
+            )));
+        }
+        if self.paged_experts_num_resident.is_some() && self.paged_experts != Some(true) {
+            return Err(CoreError::Config(format!(
+                "{where_}.paged_experts_num_resident needs \
+                 {where_}.paged_experts = true - a resident count without the \
+                 enable flag is a knob the engine would silently ignore"
             )));
         }
         Ok(())
@@ -4138,6 +4256,7 @@ impl Default for Config {
             pools_ops_persist: false,
             reserve_budgets: false,
             reserve_default_tokens: 1024,
+            gemini_translate: true,
             default_ctx: 16384,
             idle_sleep_secs: 300,
             cpu_range: String::new(),
@@ -4218,6 +4337,8 @@ impl Default for Config {
             deterministic_isolate: false,
             slot_prompt_similarity: 0.0,
             sentinel: true,
+            preemption: default_preemption(),
+            preempt_after_ms: default_preempt_after_ms(),
             sentinel_stall_secs: 30,
             child_header_timeout_secs: 120,
             sdcpp_child_header_timeout_secs: 900,
@@ -4633,6 +4754,7 @@ const SECTION_FIELDS: &[(&str, &[&str])] = &[
             "sse_ping_interval",
             "server_timeout_secs",
             "audit_log",
+            "gemini_translate",
         ],
     ),
     (
@@ -5059,6 +5181,11 @@ impl Config {
             "mcp_max_request_secs",
         );
         push_if(old.sentinel != new.sentinel, "sentinel");
+        push_if(old.preemption != new.preemption, "preemption");
+        push_if(
+            old.preempt_after_ms != new.preempt_after_ms,
+            "preempt_after_ms",
+        );
         push_if(
             old.sentinel_stall_secs != new.sentinel_stall_secs,
             "sentinel_stall_secs",
@@ -5759,6 +5886,14 @@ impl Config {
             Some(other) => {
                 return Err(CoreError::Config(format!(
                     "autotune must be one of \"off\", \"advise\" or \"scheduled\", got {other:?}"
+                )));
+            }
+        }
+        match self.preemption.as_str() {
+            "off" | "replay" => {}
+            other => {
+                return Err(CoreError::Config(format!(
+                    "preemption must be one of \"off\", \"replay\", got {other:?}"
                 )));
             }
         }
@@ -7098,6 +7233,14 @@ fn default_stall_secs() -> u64 {
     30
 }
 
+fn default_preemption() -> String {
+    "off".to_string()
+}
+
+fn default_preempt_after_ms() -> u64 {
+    250
+}
+
 fn default_child_header_timeout_secs() -> u64 {
     120
 }
@@ -8072,6 +8215,129 @@ mod tests {
     }
 
     #[test]
+    fn unit__sglang_tuning__paged_experts_knob_exclusivity() {
+        // The paged-expert host store, a weights host offload and a
+        // sharded spawn are three plans the engine never combines:
+        // each pair is refused at parse for the global lane and every
+        // model override.
+        for where_ in ["sglang", "model_overrides.m1.sglang"] {
+            let err = SglangTuning {
+                paged_experts: Some(true),
+                cpu_offload_gb: Some(4.0),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(
+                err.contains("paged_experts and") && err.contains("cpu_offload_gb"),
+                "{where_}: {err}"
+            );
+            let err = SglangTuning {
+                paged_experts: Some(true),
+                tp_size: Some(2),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(err.contains("single-GPU"), "{where_}: {err}");
+            let err = SglangTuning {
+                paged_experts_num_resident: Some(8),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(
+                err.contains("paged_experts_num_resident needs"),
+                "{where_}: {err}"
+            );
+            // The engaged knob alone validates; geometry and K bounds
+            // are compile-time facts the ladder owns.
+            SglangTuning {
+                paged_experts: Some(true),
+                paged_experts_num_resident: Some(8),
+                ..Default::default()
+            }
+            .validate(where_)
+            .unwrap_or_else(|e| panic!("{where_}: engaged pair must validate: {e}"));
+            // Auto (None) with an offload pin is legal - the ladder
+            // simply never auto-engages beside a host offload.
+            SglangTuning {
+                cpu_offload_gb: Some(4.0),
+                ..Default::default()
+            }
+            .validate(where_)
+            .unwrap_or_else(|e| panic!("{where_}: auto + offload must validate: {e}"));
+            // Opt-out stays exact: false with any neighbor is inert.
+            SglangTuning {
+                paged_experts: Some(false),
+                ..Default::default()
+            }
+            .validate(where_)
+            .unwrap_or_else(|e| panic!("{where_}: opt-out must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn unit__vllm_tuning__spec_knob_gates() {
+        // Speculative decoding joins the vllm lane as two flat knobs:
+        // only the draft-free speculators are first-class (a draft
+        // family would strand `--spec-model` outside the struct), a
+        // token count without a method never reaches the engine, and
+        // zero proposals per step is not speculation. Same gates for
+        // the global lane and every model override.
+        for where_ in ["vllm", "model_overrides.m1.vllm"] {
+            let err = VllmTuning {
+                spec_method: Some("eagle".into()),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(
+                err.contains("spec_method must be one of suffix, ngram")
+                    && err.contains("extra_args"),
+                "{where_}: {err}"
+            );
+            let err = VllmTuning {
+                spec_num_tokens: Some(4),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(err.contains("spec_num_tokens needs"), "{where_}: {err}");
+            let err = VllmTuning {
+                spec_method: Some("suffix".into()),
+                spec_num_tokens: Some(0),
+                ..Default::default()
+            }
+            .validate(where_)
+            .expect_err(where_)
+            .to_string();
+            assert!(
+                err.contains("spec_num_tokens must be >= 1"),
+                "{where_}: {err}"
+            );
+            // The engaged pair and the unset default both validate -
+            // the gates refuse pairings, never the feature.
+            VllmTuning {
+                spec_method: Some("ngram".into()),
+                spec_num_tokens: Some(4),
+                ..Default::default()
+            }
+            .validate(where_)
+            .unwrap_or_else(|e| panic!("{where_}: engaged pair must validate: {e}"));
+            VllmTuning::default()
+                .validate(where_)
+                .unwrap_or_else(|e| panic!("{where_}: default must validate: {e}"));
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // unit__<x>__<y> double-underscore convention
     fn unit__sglang_tuning__lmcache_and_hicache_are_exclusive() {
         // Upstream 0.5.23 rejects --enable-lmcache together with
         // --enable-hierarchical-cache at engine boot; the same XOR

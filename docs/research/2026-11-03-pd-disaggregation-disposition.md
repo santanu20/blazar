@@ -60,6 +60,7 @@ token streams, and both pools scale independently.
 
 1. DEFER the sglang PD lane until a multi-box deployment target exists. The
    engine supports it; blazar gains nothing wiring it for a single laptop.
+   _Outcome (2026-11-23): `sglang.disagg_pair` with a supervised sgl-router shipped in 0.32.0 (CHANGELOG). docs/benchmarks.md measures +27-44% steady-state e2e on one GPU, i.e. a topology-tier feature, which matches the single-box verdict above._
    Trigger to revisit: a real second-GPU-box target or user demand for
    prefill-heavy multi-tenant serving.
 2. WATCH upstream llama.cpp for a KV-transfer API between processes (the

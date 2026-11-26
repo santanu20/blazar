@@ -22,11 +22,11 @@ Gateway measured at blazar 0.13.0; ratios travel better than absolutes.
 
 <div class="stat-grid" markdown="1">
 
-- **~2%** gateway overhead - 40.6 t/s through the gateway vs 41.5 t/s direct
+- **~2%** gateway overhead - 40.6 t/s through the gateway vs 41.5 t/s direct (Qwen3.5-9B at blazar 0.13.0; re-measured 2026-11-22 on qwen2.5-0.5b-instruct: 331.9 t/s vs 338.0 t/s direct, -1.8%, see BENCHMARK.md)
 - **104.8 t/s** aggregate at C=4 (40.0 -> 65.9 -> 104.8 across the sweep)
 - **554 ms** TTFT p99 at C=4 under sustained bursts
 - **117 ms** tool-call TTFT p50 vs 284 ms (ollama) - 2.4x
-- **3.63 s** idle-wake to first token
+- **3.63 s** idle-wake to first token (Qwen3.5-9B; the 0.5B lane wakes in 27 ms vs 1753 ms for ollama, BENCHMARK.md 2026-11-22)
 - **49.1 -> 63.0 t/s** adaptive reshape under sustained load, zero failed requests
 
 </div>

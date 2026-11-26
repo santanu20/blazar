@@ -2,6 +2,8 @@
 
 Date: 2026-11-14 · Status: research complete, decision pending · Scope: 10th engine lane (ComfyUI) alongside sdcpp for diffusion/video.
 
+_Correction (2026-11-23): vLLM was the tenth serving lane (CHANGELOG 0.34.0); ComfyUI would be the eleventh._
+
 ## Verdict up front
 
 - **Need: real, but it is a *differentiation* need, not a coverage need.** Plain txt2img/img2img/video is already served lighter by the sdcpp lane. What only ComfyUI brings: node-graph **workflows** (multi-model chained pipelines in one request), the **custom-node ecosystem** (official Registry), and **day-0 support for new diffusion families** (Comfy-Org repackages same-day; sd.cpp lags architectures).

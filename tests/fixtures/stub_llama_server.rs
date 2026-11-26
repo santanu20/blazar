@@ -24,6 +24,9 @@
 //!                       which models a wedged child (parked, slot idle).
 //!   `STUB_HANG_ONCE_FILE` when set, only the FIRST child to claim this path hangs;
 //!                       respawned children serve the retry (evict-and-retry pins)
+//!   `STUB_HEADER_LOG`   with `STUB_HEADER_LOG_HEADERS` (comma-separated names): append the
+//!                       listed request headers, as received, as one JSON line per
+//!                       chat request (absent headers log as null)
 
 use axum::extract::State;
 use axum::response::IntoResponse;
@@ -325,6 +328,7 @@ fn build_app(alias: &str, api_key: Option<&str>) -> axum::routing::Router {
         .route("/infill", post(infill))
         .route("/v1/chat/completions/control", post(control_vectors))
         .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
         .route("/embedding", post(embedding_legacy))
         .route("/slots/{id_slot}", post(slots_action))
         // Model-scoped upstream surfaces forwarded by the gateway's
@@ -728,6 +732,22 @@ async fn chat_completions(
         return axum::http::StatusCode::LENGTH_REQUIRED.into_response();
     }
     let req_text: String = request_text(&req);
+    header_log(&headers, &req_text);
+    // Opt-in: the error llama.cpp returns when a unified-KV child cancels a
+    // queued task because the shared cache is full.
+    if std::env::var("STUB_CHAT_ERROR").as_deref() == Ok("pool") {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": 500,
+                    "message": "Context size has been exceeded.",
+                    "type": "server_error"
+                }
+            })),
+        )
+            .into_response();
+    }
     let delay_ms: u64 = std::env::var("STUB_DELAY_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -869,6 +889,57 @@ async fn chat_completions(
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
+}
+
+/// Record the request headers a test named in `STUB_HEADER_LOG_HEADERS`
+/// (comma-separated) as one JSON line in `STUB_HEADER_LOG`: the evidence
+/// for what the gateway actually forwarded. Several values of one header
+/// log as an array, an absent one as null.
+fn header_log(headers: &axum::http::HeaderMap, req_text: &str) {
+    use std::io::Write;
+    let (Ok(path), Ok(names)) = (
+        std::env::var("STUB_HEADER_LOG"),
+        std::env::var("STUB_HEADER_LOG_HEADERS"),
+    ) else {
+        return;
+    };
+    let mut record = serde_json::Map::new();
+    // The request text names the request, so a caller of the log can pick
+    // its own line out of the gateway's other traffic to this child.
+    record.insert(
+        "text".to_string(),
+        serde_json::Value::String(req_text.chars().take(160).collect()),
+    );
+    for name in names.split(',').map(str::trim) {
+        let values: Vec<serde_json::Value> = headers
+            .get_all(name)
+            .iter()
+            .map(|value| {
+                serde_json::Value::String(String::from_utf8_lossy(value.as_bytes()).into_owned())
+            })
+            .collect();
+        record.insert(
+            name.to_string(),
+            if values.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::Array(values)
+            },
+        );
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    // One write call per record: the gateway talks to this child on its
+    // own behalf between a caller's requests, and a record written piece
+    // by piece interleaves into unreadable lines.
+    let mut line = serde_json::Value::Object(record).to_string();
+    line.push('\n');
+    let _ = file.write_all(line.as_bytes());
 }
 
 fn sse_events(
@@ -1401,6 +1472,23 @@ async fn tokenize(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
         .map(|w| w.len() as u64 + 1)
         .collect();
     axum::Json(serde_json::json!({ "tokens": tokens }))
+}
+
+/// Inverse of [`tokenize`]: id `n` decodes to the `n - 1`-letter word,
+/// so a tokenize -> detokenize round trip reproduces the whitespace-
+/// separated input.
+async fn detokenize(body: axum::body::Bytes) -> axum::Json<serde_json::Value> {
+    let text = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["tokens"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|id| {
+            "a".repeat(usize::try_from(id.as_u64().unwrap_or(1).saturating_sub(1)).unwrap_or(0))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    axum::Json(serde_json::json!({ "content": text }))
 }
 
 /// Legacy single-doc embedding route (upstream shape): accepts

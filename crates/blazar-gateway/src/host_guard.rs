@@ -3,8 +3,9 @@
 //! Loopback-bound servers are reachable from any web page the local user
 //! visits: a public site can rebind a DNS name to `127.0.0.1` and issue
 //! requests that look locally originated (the ollama CVE-2024-28224
-//! class). The middleware in this module rejects requests whose `Host`
-//! header cannot belong to a local caller, which breaks the rebinding
+//! class). The middleware in this module rejects requests whose
+//! authority (the HTTP/1.1 `Host` header, or `:authority` on HTTP/2)
+//! cannot belong to a local caller, which breaks the rebinding
 //! trick: a rebound name arrives carrying the attacker's host, not ours.
 //!
 //! Scope follows ollama's semantics: the guard is armed only when the
@@ -149,6 +150,20 @@ fn authority_is_default_host(authority: &str) -> bool {
     )
 }
 
+/// Authority a request names itself with: the URI authority (the HTTP/2
+/// `:authority` pseudo-header, or an absolute-form target) when present,
+/// else the HTTP/1.1 `Host` header.
+fn request_host<'a>(uri: &'a axum::http::Uri, headers: &'a axum::http::HeaderMap) -> &'a str {
+    uri.authority()
+        .map(axum::http::uri::Authority::as_str)
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+        })
+        .unwrap_or_default()
+}
+
 /// Middleware body: reject requests whose `Host` cannot be local when
 /// the guard is armed. Preflights (`OPTIONS`) must reach the CORS layer
 /// to stay answerable, and the health paths stay open.
@@ -163,11 +178,7 @@ pub async fn host_guard_mw(
     {
         return next.run(req).await;
     }
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    let host = request_host(req.uri(), req.headers());
     if host_is_allowed(host) {
         return next.run(req).await;
     }
@@ -241,6 +252,29 @@ mod tests {
         ] {
             assert!(!host_is_allowed(bad), "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn unit__request_host__reads_http2_authority_and_http1_host() {
+        // HTTP/2: the authority rides the URI and there is no Host header.
+        let h2 = axum::http::Uri::from_static("https://127.0.0.1:11435/v1/models");
+        assert_eq!(
+            request_host(&h2, &axum::http::HeaderMap::new()),
+            "127.0.0.1:11435"
+        );
+        // HTTP/1.1: origin-form target, the authority only lives in Host.
+        let h1 = axum::http::Uri::from_static("/v1/models");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "host",
+            axum::http::HeaderValue::from_static("localhost:11435"),
+        );
+        assert_eq!(request_host(&h1, &headers), "localhost:11435");
+        // Both present: the target wins, so a spoofed Host cannot vouch
+        // for a foreign authority.
+        assert_eq!(request_host(&h2, &headers), "127.0.0.1:11435");
+        let rebound = axum::http::Uri::from_static("https://evil.example/v1/models");
+        assert!(!host_is_allowed(request_host(&rebound, &headers)));
     }
 
     #[test]

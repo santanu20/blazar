@@ -1311,10 +1311,9 @@ fn persist_profile(
     // cannot be told apart from another machine's numbers later, which
     // is exactly what the evidence-axes audit flagged. Derived from the
     // engine manifest (the binary that actually ran the grid).
-    let hw =
-        store.active_engine().ok().flatten().and_then(|e| {
-            blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest)
-        });
+    let hw = blazar_core::store::row_or_warn("engines.active", store.active_engine())
+        .flatten()
+        .and_then(|e| blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest));
     store.put_bench_result_with_axes(
         input.model_name,
         input.engine_tag,

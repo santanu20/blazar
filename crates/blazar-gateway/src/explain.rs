@@ -125,23 +125,36 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     // Canonical gateway ladder (exact -> colon-swap -> colonless strip ->
     // prefix -> suggestion) so the `name:quant` display form /api/tags emits
     // resolves here exactly like it does on /api/chat.
-    let resolved = match state.with_store(|s| crate::proxy::resolve_model(s, &model)) {
-        Some(Ok(row)) => row.name,
-        Some(Err(teach)) => return crate::error_response(404, &teach),
-        None => {
+    let resolved = match crate::proxy::resolve_model_for_handler(&state, &model) {
+        Ok(Ok(row)) => row.name,
+        Ok(Err(teach)) => return crate::error_response(404, &teach),
+        Err(message) => {
             return crate::error_response(
-                404,
-                "store unavailable - start the daemon with a writable data dir",
+                503,
+                &format!(
+                    "store could not resolve model {model:?} ({message}) - retry once the store recovers"
+                ),
             );
         }
     };
-    let Some(Some(row)) = state.with_store(|s| s.get_model(&resolved).ok().flatten()) else {
-        return crate::error_response(
-            404,
-            &format!(
-                "unknown model: {model} - `blazar ls` lists the store, `blazar pull` adds one"
-            ),
-        );
+    let row = match state.read_store("models.get", |s| s.get_model(&resolved)) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return crate::error_response(
+                404,
+                &format!(
+                    "unknown model: {model} - `blazar ls` lists the store, `blazar pull` adds one"
+                ),
+            );
+        }
+        Err(message) => {
+            return crate::error_response(
+                503,
+                &format!(
+                    "store could not read model {model} ({message}) - retry once the store recovers"
+                ),
+            );
+        }
     };
 
     let overlay = state.cfg().overlay_for(&resolved);
@@ -164,7 +177,16 @@ pub async fn explain(State(state): State<Arc<AppState>>, Path(model): Path<Strin
     // serving_lane. The global tag rides along so the no-lane case can
     // still name the engine that WOULD serve (mirrors routed_engine_lane).
     let lane: Option<LaneLookup> = state.with_store(|s| {
-        let engine_rows = s.list_engines().unwrap_or_default();
+        let engine_rows = match s.list_engines() {
+            Ok(rows) => rows,
+            Err(message) => {
+                return (
+                    None,
+                    Err(format!("engine rows unreadable: {message}")),
+                    Vec::new(),
+                );
+            }
+        };
         let global = engine_rows
             .iter()
             .find(|r| r.active)

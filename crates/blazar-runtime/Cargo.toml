@@ -58,10 +58,13 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # W1: 8.3 short-path conversion for the whisper `-m` argv (upstream
 # aborts on non-ASCII paths, whisper.cpp #4018). Same version the
 # workspace graph already carries transitively - no new code enters
-# the build beyond the one linker symbol used here.
+# the build beyond the linker symbols used here. The library loader
+# symbols serve the GPU census (NVML and the Vulkan loader are optional
+# at run time and are loaded on demand).
 windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_System_LibraryLoader",
 ] }
 
 [dev-dependencies]

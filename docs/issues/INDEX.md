@@ -25,6 +25,8 @@ Wave map (dependency order):
 | 011-kv-interop-certification-matrix.md | Cross-engine KV interoperability certification matrix | P1 | 5 | B07 | - |
 | 012-silent-log-freeze.md | Daemon log sinks go silently dark under load (heartbeat + poison-recovery hardening) | P1 | hotfix | - | - |
 
+_Closure evidence for 004-007 (2026-11-23): the stage-timing, ExecutionPlan, feature-policy and canonical-planner code landed in commit `b8c2a4d` ("feat: engine capability truth, execution planner, observability, KV interop certs"); the CHANGELOG entries for these four issues were never written._
+
 Deferred on purpose (do not file): new inference engine work, a distributed
 KV service, RL-based scheduling, wholesale promotion of upstream engine flags
 to first-class config, workspace reorganization crates, automatic speculative

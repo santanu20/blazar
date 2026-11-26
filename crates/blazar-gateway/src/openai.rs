@@ -32,7 +32,7 @@ use axum::Extension;
 /// already-validated body - the hot path parsed it once inside the
 /// preflight block); a prompt that merely MENTIONS `"tools"` only
 /// tightens its own admission class, never correctness.
-fn body_has_tools(bytes: &[u8]) -> bool {
+pub(crate) fn body_has_tools(bytes: &[u8]) -> bool {
     bytes.windows(7).any(|w| w == b"\"tools\"")
 }
 
@@ -46,10 +46,12 @@ async fn model_modality_cache(
     state: &Arc<AppState>,
 ) -> std::collections::HashMap<String, Vec<String>> {
     let mut modality_cache: std::collections::HashMap<String, Vec<String>> = state
-        .with_store(blazar_core::Store::all_model_modalities)
-        .and_then(Result::ok)
-        .map(|rows| rows.into_iter().collect())
-        .unwrap_or_default();
+        .read_store_list_or_empty(
+            "models.modalities_all",
+            blazar_core::Store::all_model_modalities,
+        )
+        .into_iter()
+        .collect();
     let uncached: Vec<_> = state
         .sup
         .live_http_endpoints()
@@ -110,20 +112,29 @@ async fn model_modality_cache(
 }
 
 pub async fn models(State(state): State<Arc<AppState>>) -> Response {
-    let list = match state.with_store(blazar_core::Store::list_models) {
-        Some(Ok(l)) => l,
-        Some(Err(e)) => return openai_error(500, &e.to_string()),
-        None => return openai_error(500, "store unavailable"),
+    let list = match state.read_store_list("models.list", blazar_core::Store::list_models) {
+        Ok(list) => list,
+        Err(message) => {
+            return openai_error(
+                503,
+                &format!("store unavailable ({message}) - retry once the store recovers"),
+            );
+        }
     };
     let modality_cache = model_modality_cache(&state).await;
+    // One decode of the installed engine rows for the whole listing:
+    // every row below resolves against the same view.
+    let engine_view = state.engine_view();
     let data: Vec<serde_json::Value> = list
         .iter()
         .map(|m| {
             // Which engine row WOULD serve this model right now (routed
             // lane, or the global active row in manual mode). null =
             // nothing can serve it - the spawn path teaches on use.
-            let engine =
-                crate::proxy::resolve_serving(&state, &m.name, &m.path).and_then(|lane| lane.tag);
+            let engine = engine_view
+                .as_ref()
+                .and_then(|view| crate::proxy::resolve_serving_with(&state, view, &m.name, &m.path))
+                .and_then(|lane| lane.tag);
             // Blazar-native capability surface (audit MM13): vision from
             // the row's mmproj sidecar, engine-advertised output
             // modalities from the cache - union, deduped, sorted so the
@@ -227,8 +238,10 @@ pub async fn embeddings(
     if req_has_image_input(&body)
         && requested.as_deref().is_none_or(|m| {
             state
-                .with_store(|s| crate::proxy::resolve_model(s, m).ok())
-                .flatten()
+                .read_store_or_absent("models.resolve", |s| {
+                    crate::proxy::resolve_model_checked(s, m)
+                        .map(crate::proxy::ModelResolution::found)
+                })
                 .is_some_and(|row| candle_lane_serves(row.arch.as_deref()))
         })
     {
@@ -236,8 +249,9 @@ pub async fn embeddings(
     }
     let late = requested.as_deref().is_some_and(|m| {
         state
-            .with_store(|s| crate::proxy::resolve_model(s, m).ok())
-            .flatten()
+            .read_store_or_absent("models.resolve", |s| {
+                crate::proxy::resolve_model_checked(s, m).map(crate::proxy::ModelResolution::found)
+            })
             .is_some_and(|row| state.cfg().effective_late_chunking(&row.name))
     });
     if !late {
@@ -392,8 +406,10 @@ async fn clip_embeddings(
     // teachings are shown so the remedy names a real candidate.
     let lane_siglip = requested.is_some_and(|name| {
         state
-            .with_store(|s| crate::proxy::resolve_model(s, name).ok())
-            .flatten()
+            .read_store_or_absent("models.resolve", |s| {
+                crate::proxy::resolve_model_checked(s, name)
+                    .map(crate::proxy::ModelResolution::found)
+            })
             .is_some_and(|row| row.arch.as_deref() == Some("SiglipModel"))
     });
     let resolved: Result<(String, std::path::PathBuf), String> = if lane_siglip {
@@ -617,9 +633,9 @@ fn inject_default_think_off(state: &AppState, body: &mut serde_json::Value) -> b
     if !crate::ollama::think_default_off_for_lane(state, model) {
         return false;
     }
-    let row = state
-        .with_store(|s| crate::proxy::resolve_model(s, model).ok())
-        .flatten();
+    let row = state.read_store_or_absent("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, model).map(crate::proxy::ModelResolution::found)
+    });
     inject_default_think_off_row(row.as_ref(), body)
 }
 
@@ -994,11 +1010,12 @@ pub async fn openai_proxy(
     }
     // Strict tool-def lint: catch broken definitions before the model
     // burns a turn (chat/responses lanes only). Prompt-fit preflight:
-    // refuse what the engine would silently truncate. FIX8: the LIVE
+    // refuse what the engine cannot serve as sent. FIX8: the LIVE
     // instance ctx wins over config (tuned/overridden instances).
     let chat_family = uri.path().ends_with("/chat/completions")
         || uri.path().ends_with("/completions")
         || uri.path().ends_with("/responses");
+    let mut recheck_prompt = false;
     if chat_family && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
         if let Some(err) = state.sentinel.strict_tool_def_error_cached(&v) {
             return openai_error(400, &format!("invalid tools: {err}"));
@@ -1018,9 +1035,11 @@ pub async fn openai_proxy(
             );
         }
         let eff = crate::preflight::admission_ctx(&state, &model);
-        if let Err(resp) = crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await {
-            return *resp;
-        }
+        recheck_prompt = match crate::preflight::enforce_prompt_fits(&state, &model, &v, eff).await
+        {
+            Ok(needed) => needed,
+            Err(resp) => return *resp,
+        };
     }
     let priority = Priority::from_header(
         headers
@@ -1113,6 +1132,12 @@ pub async fn openai_proxy(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    if recheck_prompt
+        && let Some(v) = parsed_body.as_ref()
+        && let Err(resp) = crate::preflight::recheck_prompt_fits(&state, &model, v, &engine).await
+    {
+        return *resp;
+    }
     let model_name = engine.name.clone();
     // Prefix heat (FIX3): chat-family traffic warms the RESOLVED name -
     // aliases would never match the instance key and the eviction bias
@@ -1460,10 +1485,19 @@ pub async fn conversations_get(
         return openai_error(400, "invalid conversation id");
     }
     let owner = key_ext.as_deref().map(|k| k.name.clone());
-    let rows = state
-        .with_store(|s| s.list_conversation(&id, owner.as_deref()).ok())
-        .flatten()
-        .unwrap_or_default();
+    let rows = match state.read_store_list("conversations.get", |s| {
+        s.list_conversation(&id, owner.as_deref())
+    }) {
+        Ok(rows) => rows,
+        Err(message) => {
+            return openai_error(
+                503,
+                &format!(
+                    "store could not read conversation {id} ({message}) - retry once the store recovers"
+                ),
+            );
+        }
+    };
     if rows.is_empty() {
         return openai_error(
             404,
@@ -1570,6 +1604,44 @@ pub async fn chat_completion_update(
     }
 }
 
+/// Background-mode retrieval: the job row (same id namespace by
+/// construction) says where the run is while no body is stored yet.
+fn background_job_response(id: &str, job: &blazar_core::store::JobRow) -> Response {
+    match job.state.as_str() {
+        "queued" | "running" => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": id,
+                "object": "response",
+                "status": "in_progress",
+                "background": true,
+            })),
+        )
+            .into_response(),
+        "failed" => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": id,
+                "object": "response",
+                "status": "failed",
+                "background": true,
+                "error": job.error,
+            })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": id,
+                "object": "response",
+                "status": job.state,
+                "background": true,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/responses/{id}` - retrieve a stored (chained) response:
 /// `OpenAI` retrieval surface over the gateway registry (memory-first,
 /// SQLite ledger fallback - stored responses survive restarts). Expired
@@ -1583,9 +1655,17 @@ pub async fn responses_get(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     // Exact-body fidelity first (background always, foreground since v10).
-    let row = state
-        .with_store(|s| s.get_response(&id).ok().flatten())
-        .flatten();
+    let row = match state.read_store("responses.get", |s| s.get_response(&id)) {
+        Ok(row) => row,
+        Err(message) => {
+            return openai_error(
+                503,
+                &format!(
+                    "store could not read response {id} ({message}) - retry once the store recovers"
+                ),
+            );
+        }
+    };
     // BLZ-1: every read path below (ledger body, job plane, memory) is
     // scoped to the calling key; a foreign id reads exactly like an
     // expired one - the shared 404 leaks no existence.
@@ -1609,49 +1689,22 @@ pub async fn responses_get(
     }
     // Background lifecycle: no stored body yet - the job row says where
     // the run is (same id namespace by construction).
-    if row.is_none()
-        && let Some(job) = state
-            .with_store(|s| s.get_job(&id).ok().flatten())
-            .flatten()
+    let background_job = if row.is_none() {
+        match crate::jobs::job_row_or_503(&state, &id) {
+            Ok(job) => job,
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
+    if let Some(job) = background_job
         && crate::keys::owner_allows(
             job.owner.as_deref(),
             key_ext.as_deref(),
             state.cfg().legacy_open_records,
         )
     {
-        return match job.state.as_str() {
-            "queued" | "running" => (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "id": id,
-                    "object": "response",
-                    "status": "in_progress",
-                    "background": true,
-                })),
-            )
-                .into_response(),
-            "failed" => (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "id": id,
-                    "object": "response",
-                    "status": "failed",
-                    "background": true,
-                    "error": job.error,
-                })),
-            )
-                .into_response(),
-            _ => (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({
-                    "id": id,
-                    "object": "response",
-                    "status": job.state,
-                    "background": true,
-                })),
-            )
-                .into_response(),
-        };
+        return background_job_response(&id, &job);
     }
     let found = state
         .stored_response(&id)
@@ -1815,8 +1868,7 @@ fn mlx_forced_tool_choice_gate(
         .and_then(|m| crate::proxy::routed_kind_for(state, m))
         .or_else(|| {
             state
-                .with_store(|s| s.active_engine().ok().flatten())
-                .flatten()
+                .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
                 .map(|r| r.kind)
         })?;
     if kind != blazar_core::engine_kind::EngineKind::Mlx {
@@ -1888,8 +1940,7 @@ fn llamacpp_only_gate(state: &Arc<AppState>, uri: &Uri, model: Option<&str>) -> 
         .and_then(|m| crate::proxy::routed_kind_for(state, m))
         .or_else(|| {
             state
-                .with_store(|s| s.active_engine().ok().flatten())
-                .flatten()
+                .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
                 .map(|r| r.kind)
         })?;
     if !path_gated_for(kind, path) {
@@ -2805,9 +2856,14 @@ pub async fn lora_adapters(
     {
         return openai_error(code, &msg);
     }
-    let store_first = match state.with_store(|s| s.list_models().ok()) {
-        Some(list) => list.and_then(|v| v.into_iter().next().map(|m| m.name)),
-        None => return openai_error(500, "store unavailable"),
+    let store_first = match state.read_store_list("models.list", blazar_core::Store::list_models) {
+        Ok(models) => models.into_iter().next().map(|m| m.name),
+        Err(message) => {
+            return openai_error(
+                503,
+                &format!("store unavailable ({message}) - retry once the store recovers"),
+            );
+        }
     };
     let live: Vec<(String, String, u64)> = state
         .sup
@@ -3117,6 +3173,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         let mut v = json!({"model": "m", "messages": []});
         assert!(inject_default_think_off_row(Some(&row), &mut v));

@@ -1002,13 +1002,10 @@ fn experiment_provenance(
     store: &Store,
     input: &ProfileInput<'_>,
 ) -> (Option<String>, Option<String>) {
-    let hw =
-        store.active_engine().ok().flatten().and_then(|e| {
-            blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest)
-        });
-    let quant = store
-        .get_model(input.model_name)
-        .ok()
+    let hw = blazar_core::store::row_or_warn("engines.active", store.active_engine())
+        .flatten()
+        .and_then(|e| blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest));
+    let quant = blazar_core::store::row_or_warn("models.get", store.get_model(input.model_name))
         .flatten()
         .map(|m| m.quant);
     (hw, quant)

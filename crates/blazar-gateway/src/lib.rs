@@ -19,11 +19,13 @@ pub mod explain;
 pub mod fabric;
 pub mod federation;
 pub mod fleet;
+pub mod gemini;
 pub mod histogram;
 pub mod host_guard;
 pub mod http_pool;
 pub mod images;
 pub mod jobs;
+pub mod log_health;
 pub mod model_doctor;
 pub mod pd;
 pub mod quantiles;
@@ -43,6 +45,7 @@ pub mod ollama;
 pub mod openai;
 pub mod otlp;
 pub mod pools;
+pub mod preempt;
 pub mod preflight;
 pub mod prompt_recipe;
 pub mod proxy;
@@ -55,6 +58,8 @@ pub mod semcache;
 pub mod sentinel;
 pub mod sessions;
 pub mod state;
+pub mod tokenize;
+pub mod trace_context;
 pub mod translate;
 pub mod vram;
 
@@ -296,6 +301,15 @@ async fn request_log(
             }
         }
     }
+    // W3C Trace Context: with an exporter the gateway takes part in the
+    // caller's trace - it continues that context (or restarts an invalid
+    // one) and hands children its own operation as their parent. Without
+    // an exporter the inbound headers pass through untouched.
+    let propagation = state.otlp.enabled().then(|| {
+        let propagation = trace_context::Propagation::for_request(req.headers());
+        propagation.rewrite(req.headers_mut());
+        propagation
+    });
     let started = std::time::Instant::now();
     let span_start_nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -310,6 +324,13 @@ async fn request_log(
     let status = resp.status().as_u16();
     if let Ok(v) = axum::http::HeaderValue::from_str(&trace) {
         resp.headers_mut().insert("x-blazar-trace-id", v);
+    }
+    // The gateway's span goes back only to a caller whose trace it
+    // continued: that tells the caller's tracer this hop took part.
+    if let Some(propagation) = propagation.as_ref().filter(|p| p.inherited())
+        && let Ok(value) = axum::http::HeaderValue::from_str(&propagation.header())
+    {
+        resp.headers_mut().insert("traceparent", value);
     }
     // F64: auth runs INSIDE this layer now; the key arrives on the
     // response extensions (stamped by `auth`), not the request.
@@ -348,26 +369,26 @@ async fn request_log(
     // F-S3 (stream lifecycle): build the span here but do NOT export at
     // header time - the wrap below closes it when the response STREAM
     // completes (streaming lanes keep generating past this point).
-    let otlp_span = state.otlp.enabled().then(|| {
-        let (trace_hex, span_hex) = otlp::new_ids();
-        otlp::OtlpSpan {
-            trace_id_hex: trace_hex,
-            span_id_hex: span_hex,
-            name: format!("{method} {path}"),
-            start_unix_nano: span_start_nanos,
-            end_unix_nano: 0,
-            http_status: status,
-            attributes: vec![
-                ("blazar.trace_id".to_string(), trace.clone()),
-                ("http.request.method".to_string(), method.to_string()),
-                ("url.path".to_string(), path.clone()),
-                ("http.response.status_code".to_string(), status.to_string()),
-                (
-                    "blazar.queue_depth".to_string(),
-                    state.queue.depth().to_string(),
-                ),
-            ],
-        }
+    let otlp_span = propagation.map(|propagation| otlp::OtlpSpan {
+        trace_id_hex: propagation.trace_id,
+        span_id_hex: propagation.span_id,
+        parent_span_id_hex: propagation.parent_span_id,
+        trace_state: propagation.trace_state,
+        trace_flags: propagation.trace_flags,
+        name: format!("{method} {path}"),
+        start_unix_nano: span_start_nanos,
+        end_unix_nano: 0,
+        http_status: status,
+        attributes: vec![
+            ("blazar.trace_id".to_string(), trace.clone()),
+            ("http.request.method".to_string(), method.to_string()),
+            ("url.path".to_string(), path.clone()),
+            ("http.response.status_code".to_string(), status.to_string()),
+            (
+                "blazar.queue_depth".to_string(),
+                state.queue.depth().to_string(),
+            ),
+        ],
     });
     // F-S4-3: attach the refusing gate's teaching excerpt to the
     // access line so a bare "status=400" is never the only evidence.
@@ -681,6 +702,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // commit (STT -> chat -> TTS through the gateway's own lanes).
         .route("/v1/realtime", get(realtime::realtime_session))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        // Token ids and text from the live engine's own tokenizer.
+        .route("/v1/tokenize", post(tokenize::v1_tokenize))
+        .route("/v1/detokenize", post(tokenize::v1_detokenize))
         // Anthropic Message Batches: inline-request batch dialect. The
         // worker replays each params body through our own /v1/messages.
         .route(
@@ -718,6 +742,22 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(openai::scoped_proxy).delete(openai::scoped_proxy),
         )
         .route("/v1/streams/lookup", post(openai::scoped_proxy));
+
+    // E4: Gemini `generateContent` dialect - flag-gated mount
+    // (default on; `gemini_translate = false` unmounts the routes for
+    // boxes that want the surface absent). axum/matchit refuses a
+    // parameter plus a literal suffix in one segment (`{model}:
+    // generateContent` panics 'Only one parameter is allowed per path
+    // segment'), so the route is a single-segment catch-all and the
+    // handler splits the LAST `:` (model names with `:` keep parsing).
+    let openai_any = if state.cfg().gemini_translate {
+        openai_any.route(
+            "/v1beta/models/{model_verb}",
+            post(gemini::generate_content),
+        )
+    } else {
+        openai_any
+    };
 
     let api = Router::new()
         .route("/api/version", get(ollama::version))
@@ -1384,8 +1424,7 @@ async fn keys_rotate(
 /// engine identity. Clients introspect instead of probing.
 async fn well_known(State(state): State<Arc<AppState>>) -> Response {
     let engine = state
-        .with_store(|s| s.active_engine().ok().flatten())
-        .flatten()
+        .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
         .map_or(
             serde_json::Value::Null,
             |e| serde_json::json!({"tag": e.tag, "asset": e.asset, "kind": e.kind.as_str()}),
@@ -1396,12 +1435,14 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
         "engine": engine,
         // F52: the messages lane TRANSLATES and refuses passthrough -
         // the label must not advertise passthrough semantics.
-        "apis": ["openai", "ollama", "anthropic"],
+        "apis": ["openai", "ollama", "anthropic", "gemini"],
         // F69: full route census (verified against the router table).
         // Audit MM15: extended to the media generation lanes and the
         // engine-scoped surfaces - the census is the machine-readable
         // discovery contract and must not lag the router.
         "endpoints": {
+            "gemini": ["/v1beta/models/{model}:generateContent",
+                       "/v1beta/models/{model}:streamGenerateContent"],
             "openai": ["/v1/chat/completions", "/v1/chat/completions/{id}",
                        "/v1/chat/completions/control",
                        "/v1/chat/completions/input_tokens",
@@ -1409,7 +1450,8 @@ async fn well_known(State(state): State<Arc<AppState>>) -> Response {
                        "/rerank", "/reranking",
                        "/v1/responses", "/v1/responses/{id}", "/v1/conversations/{id}",
                        "/v1/responses/input_tokens",
-                       "/v1/messages", "/v1/messages/count_tokens", "/v1/models",
+                       "/v1/messages", "/v1/messages/count_tokens", "/v1/tokenize",
+                       "/v1/detokenize", "/v1/models",
                        "/v1/systemone",
                        "/v1/adapters", "/v1/batches", "/v1/batches/{id}",
                        "/v1/batches/{id}/cancel", "/v1/files", "/v1/files/{id}",
@@ -1582,9 +1624,7 @@ pub async fn serve(
     if state.cfg().pools_ops_persist {
         let pools_cfg = state.cfg().model_pools.clone();
         let rows = state
-            .with_store(blazar_core::store::Store::load_pool_ops)
-            .and_then(std::result::Result::ok)
-            .unwrap_or_default();
+            .read_store_list_or_empty("pools.ops.load", blazar_core::store::Store::load_pool_ops);
         // Config-change GC: rows whose pool no longer exists are inert
         // by key design but would linger forever - drop them at boot
         // so the store tracks only live pools.
@@ -1608,10 +1648,10 @@ pub async fn serve(
         // flight across a restart keep their member steering (rows
         // older than the affinity TTL are dead by definition and
         // self-clear here, as do rows whose pool vanished).
-        let rows = state
-            .with_store(blazar_core::store::Store::load_pool_affinity)
-            .and_then(std::result::Result::ok)
-            .unwrap_or_default();
+        let rows = state.read_store_list_or_empty(
+            "pools.affinity.load",
+            blazar_core::store::Store::load_pool_affinity,
+        );
         let (rows, gone): (Vec<_>, Vec<_>) = rows
             .into_iter()
             .partition(|(key, ..)| crate::pools::ops_key_pool_known(&pools_cfg, key));
@@ -1629,10 +1669,10 @@ pub async fn serve(
         // graceful restart restores the trend history and rolling hit
         // rate instead of starting from blank (rows beyond the window
         // are dead by definition and drop out of the rebuild).
-        let events = state
-            .with_store(blazar_core::store::Store::load_pool_windows)
-            .and_then(std::result::Result::ok)
-            .unwrap_or_default();
+        let events = state.read_store_list_or_empty(
+            "pools.windows.load",
+            blazar_core::store::Store::load_pool_windows,
+        );
         let now = std::time::Instant::now();
         let (req, hits) = crate::pools::windows_from_persisted(&events, now_unix, now);
         if let Ok(mut m) = state.pools_req_window.lock() {
@@ -1866,8 +1906,7 @@ pub async fn serve(
                     tenants.as_deref(),
                     |base| {
                         state
-                            .with_store(|s| s.get_model(base).ok().flatten())
-                            .flatten()
+                            .read_store_or_absent("models.get", |s| s.get_model(base))
                             .and_then(|m| m.mmproj_path)
                             .and_then(|p| std::fs::metadata(p).ok())
                             .map_or(0, |meta| meta.len())
@@ -1875,6 +1914,35 @@ pub async fn serve(
                     now_unix,
                 );
                 state.admission.replace(rows);
+            }
+        })
+    };
+    // Log-sink liveness detector (issue 012): every window it swaps the
+    // daemon-owned log file handle if the path was replaced on disk, and
+    // compares two sink snapshots - events kept flowing while a sink
+    // wrote nothing for two windows is a stall, counted on /metrics and
+    // named by a marker line that bypasses tracing (a tracing event about
+    // a dead tracing sink would be lost with it). The interval's
+    // immediate first tick records the baseline, so a sink that is dark
+    // from the first request is named two windows after start.
+    let log_health_task = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(crate::log_health::WATCH_INTERVAL);
+            loop {
+                interval.tick().await;
+                let stalled = {
+                    let mut watch = state
+                        .log_sinks
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    crate::log_health::advance(&mut watch)
+                };
+                for sink in stalled {
+                    eprintln!(
+                        "blazar: log sink \"{sink}\" wrote nothing for two detector windows while events were emitted - lines may be missing from that sink"
+                    );
+                }
             }
         })
     };
@@ -2090,16 +2158,23 @@ pub async fn serve(
         let std_listener = listener
             .into_std()
             .map_err(|e| anyhow::anyhow!("tls listener handoff: {e}"))?;
-        // axum-server 0.8 made from_tcp_rustls fallible (its internal
-        // acceptor wiring can reject the listener state up front).
-        axum_server::from_tcp_rustls(std_listener, rustls_config)
+        // axum-server 0.8 makes the acceptor wiring fallible (it can
+        // reject the listener state up front). NoDelayAcceptor runs on
+        // the raw TCP stream before the TLS handshake, giving the TLS
+        // listener the same first-token guarantee as the plain one above.
+        axum_server::from_tcp(std_listener)
             .map_err(|e| anyhow::anyhow!("tls acceptor init: {e}"))?
+            .acceptor(
+                axum_server::tls_rustls::RustlsAcceptor::new(rustls_config)
+                    .acceptor(axum_server::accept::NoDelayAcceptor),
+            )
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|e| anyhow::anyhow!("tls server: {e}"))?;
     }
     otlp_task.abort();
+    log_health_task.abort();
     hint_task.abort();
     reshape_wake_task.abort();
     usage_flush_task.abort();
@@ -2172,9 +2247,15 @@ fn rustls_server_config(
             }
         },
     )?;
-    Ok(rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?)
+        .with_single_cert(certs, key)?;
+    // axum-server negotiates through hyper-util's auto builder but leaves
+    // ALPN to the caller: without a list rustls answers no protocol and
+    // every TLS client stays on HTTP/1.1. h2 first, so ALPN-capable
+    // clients multiplex; http/1.1 keeps older SDKs and plain curl working.
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(server_config)
 }
 
 #[cfg(test)]
@@ -2205,6 +2286,23 @@ mod tests {
         };
         let err = rustls_server_config(&cfg).expect_err("no key section");
         assert_eq!(err.to_string(), "tls_key contains no private key");
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__rustls_server_config__advertises_h2_then_http1() {
+        // axum-server leaves ALPN to the caller: with an empty list rustls
+        // never negotiates HTTP/2 and every TLS client stays on HTTP/1.1.
+        let cfg = blazar_core::Config {
+            tls_cert: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls-cert.pem").into(),
+            tls_key: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls-key.pem").into(),
+            ..blazar_core::Config::default()
+        };
+        let server_config = rustls_server_config(&cfg).expect("fixture certificate loads");
+        assert_eq!(
+            server_config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]

@@ -1175,12 +1175,89 @@ def wait_gpu_idle(max_mib: float = 512.0, timeout_s: float = 60.0) -> bool:
     return gpu_used_mib() <= max_mib
 
 
-def ollama_blob_paths(min_bytes: int = 100 * 1024 * 1024) -> list[Path]:
-    """Model blobs (>100 MiB) from the host ollama store, for fadvise."""
-    blobs = Path.home() / ".ollama" / "models" / "blobs"
-    if not blobs.is_dir():
+OLLAMA_COLD_CACHE_NOTE = (
+    "no ollama model blob could be dropped (store not found or not readable) - "
+    "page cache not dropped, that load may be memory-warm"
+)
+
+
+def ollama_store_dir_from_show(payload: dict) -> Path | None:
+    """Directory of the ollama store, taken from the service's own answer.
+
+    `/api/show` returns the resolved modelfile; its FROM line names the
+    model's blob file, wherever the service keeps its store (a user daemon
+    under the home directory, a system service under its own state
+    directory). Only an absolute path counts - a modelfile built on another
+    tag names that tag, not a file.
+    """
+    modelfile = payload.get("modelfile") if isinstance(payload, dict) else None
+    if not isinstance(modelfile, str):
+        return None
+    for line in modelfile.splitlines():
+        if line.startswith("FROM "):
+            blob = Path(line[len("FROM ") :].strip())
+            return blob.parent if blob.is_absolute() else None
+    return None
+
+
+def ollama_store_dirs(port: int = OLLAMA_PORT) -> list[Path]:
+    """Store directories the measured ollama service keeps its models in."""
+    try:
+        tags = http_json(f"http://127.0.0.1:{port}/api/tags", timeout=5.0)
+        names = [m.get("name") for m in tags.get("models", []) if m.get("name")]
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, AttributeError):
         return []
-    return [p for p in blobs.iterdir() if p.is_file() and p.stat().st_size >= min_bytes]
+    dirs: list[Path] = []
+    for name in names:
+        try:
+            shown = http_json(
+                f"http://127.0.0.1:{port}/api/show", {"model": name}, timeout=15.0
+            )
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            continue
+        store_dir = ollama_store_dir_from_show(shown)
+        if store_dir is not None and store_dir not in dirs:
+            dirs.append(store_dir)
+    return dirs
+
+
+def ollama_blob_paths(
+    min_bytes: int = 100 * 1024 * 1024,
+    port: int = OLLAMA_PORT,
+    home_store: Path | None = None,
+) -> list[Path]:
+    """Model blobs (> min_bytes) of the store the measured service uses, for fadvise.
+
+    The store is not always ~/.ollama: a system service keeps it under its
+    own state directory, and dropping nothing there makes ollama's "cold"
+    load memory-warm while blazar's is disk-cold. The service is asked
+    first; the home directory is only the fallback for a service that
+    cannot answer.
+    """
+    dirs = ollama_store_dirs(port)
+    if not dirs:
+        dirs = [home_store or Path.home() / ".ollama" / "models" / "blobs"]
+    blobs: list[Path] = []
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        blobs.extend(
+            p
+            for p in sorted(directory.iterdir())
+            if p.is_file() and p.stat().st_size >= min_bytes
+        )
+    return blobs
+
+
+def drop_ollama_page_cache(rec: dict, blobs: list[Path] | None = None) -> None:
+    """Cold-cache parity for an ollama lane, with an honest note when the
+    store cannot be reached: a load whose page cache stayed warm must not
+    read as a disk-cold number in the report."""
+    rec["cold_fadvise_files"] = fadvise_dontneed(
+        ollama_blob_paths() if blobs is None else blobs
+    )
+    if not rec["cold_fadvise_files"]:
+        rec["cold_cache_note"] = OLLAMA_COLD_CACHE_NOTE
 
 
 def sudo_systemctl(*args: str, password: str | None = None) -> bool:
@@ -2529,7 +2606,8 @@ def median_run_suite(
     cache - the measured TTFT is the cache-hit path, labeled as such).
     Prefill lane: token-targeted pp prompt; run 1 is the COLD prefill
     (uncached), runs 2+ measure the cache-hit path. True prefill t/s =
-    prompt_tokens / first-token time (or ollama's engine counters).
+    prompt_tokens / first-token time, wall-clock, one definition for
+    every provider (engine counters are reported apart).
     """
     fn = ollama_stream_timed if ollama else openai_stream_timed
 
@@ -2571,19 +2649,26 @@ def median_run_suite(
     ttfbs = [x["ttfb_ms"] for x in decode if x.get("ttfb_ms") is not None]
     itls = [i for x in decode for i in x["itls_ms"]]
 
-    # true prefill throughput: run 1 = cold (uncached), rest = cache-hit
+    # true prefill throughput: run 1 = cold (uncached), rest = cache-hit.
+    # One definition for every provider: prompt tokens over the wall-clock
+    # time to the first token. Engine-internal counters (ollama reports
+    # them) leave out queueing and transport, so they are kept apart.
     def prefill_tps(x: dict) -> float | None:
-        if ollama and x.get("prompt_eval_dur_s"):
-            return x["prompt_tokens"] / x["prompt_eval_dur_s"]
         pt = x.get("prompt_tokens")
         if pt and x["ttft_ms"] > 0:
             return pt / (x["ttft_ms"] / 1000.0)
+        return None
+
+    def engine_tps(x: dict) -> float | None:
+        if ollama and x.get("prompt_eval_dur_s"):
+            return x["prompt_tokens"] / x["prompt_eval_dur_s"]
         return None
 
     cold = prefill[0] if prefill else {}
     cached_runs = prefill[1:] or prefill
     cold_tps = prefill_tps(cold)
     cached_tps_vals = [t for t in (prefill_tps(x) for x in cached_runs) if t]
+    engine_vals = [t for t in (engine_tps(x) for x in cached_runs) if t]
     src = decode[0].get("tokens_source", "chunks") if decode else "chunks"
     return {
         "ttft_ms_p50": statistics.median(ttfts),
@@ -2601,6 +2686,10 @@ def median_run_suite(
         "prefill_tps_cold": cold_tps,
         "prefill_tps_cached": statistics.median(cached_tps_vals)
         if cached_tps_vals
+        else None,
+        "prefill_tps_engine_cold": engine_tps(cold),
+        "prefill_tps_engine_cached": statistics.median(engine_vals)
+        if engine_vals
         else None,
         "ttft_prefill_cold_ms": cold.get("ttft_ms"),
         "ttft_prefill_cached_ms": statistics.median([x["ttft_ms"] for x in cached_runs])
@@ -5455,7 +5544,7 @@ def run_ollama_idle_cell(cfg: dict, args_model: str | None) -> dict:
             )
         else:
             # disk-cold reload: same fadvise parity as the cold lane
-            rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
+            drop_ollama_page_cache(rec)
         m = ollama_stream_timed(
             OLLAMA_PORT,
             {
@@ -5631,7 +5720,10 @@ def run_ollama_conc_cell(
     pick = pick_ollama_model(models, args_model)
     if pick is None:
         return {"error": f"no ollama model comparable to '{args_model}'"}
-    rec: dict[str, Any] = {"ollama_model": pick}
+    rec: dict[str, Any] = {
+        "ollama_model": pick,
+        "ollama_version": ollama_service_version(),
+    }
     sampler = Sampler(None)
     sampler.start()
     try:
@@ -5754,7 +5846,7 @@ def run_ollama_cold_cell(
     try:
         if not ollama_evict(pick):
             rec["cold_gpu_busy_mib"] = round(gpu_used_mib(), 0)
-        rec["cold_fadvise_files"] = fadvise_dontneed(ollama_blob_paths())
+        drop_ollama_page_cache(rec)
         sampler.snap_idle()
         # num_ctx 16384 = the blazar gateway cell's resolved ctx for the
         # matrix model - identical KV allocation on both runtimes
@@ -5793,6 +5885,17 @@ def run_ollama_cold_cell(
     return rec
 
 
+def ollama_service_version() -> str | None:
+    """Version of the ollama service answering on OLLAMA_PORT, or None."""
+    try:
+        version = http_json(
+            f"http://127.0.0.1:{OLLAMA_PORT}/api/version", timeout=5.0
+        ).get("version")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    return str(version) if version else None
+
+
 def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
     try:
         tags = http_json(f"http://127.0.0.1:{OLLAMA_PORT}/api/tags", timeout=5.0)
@@ -5816,6 +5919,7 @@ def run_ollama_cell(cfg: dict, args_model: str | None = None) -> dict:
     try:
         out = {
             "ollama_model": pick,
+            "ollama_version": ollama_service_version(),
             "gpu_busy_mib": gpu_busy,
             **median_run_suite(
                 OLLAMA_PORT, pick, cfg["runs"], cfg["pp"], cfg["tg"], ollama=True
@@ -6015,6 +6119,28 @@ def greedy_completions(port: int, prompt: str, model: str) -> str:
     return (j.get("choices") or [{}])[0].get("text", "")
 
 
+def _popen_engine_child(
+    argv: list[str],
+    cwd: str | None,
+    errfh_path: Path,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen, Sampler]:
+    errfh = open(errfh_path, "wb")  # noqa: SIM115 - stderr sink handed to Popen, lives with the child
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        stdout=subprocess.DEVNULL,
+        stderr=errfh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    errfh.close()
+    sampler = Sampler(proc.pid)
+    sampler.start()
+    return proc, sampler
+
+
 def _greedy_spawn(
     eng: Engine,
     model: Path,
@@ -6049,18 +6175,7 @@ def _greedy_spawn(
         model_repo=model_repo,
     )
     errfh_path = stage_root / f"greedy-{eng.tag}-{port}.stderr"
-    errfh = open(errfh_path, "wb")  # noqa: SIM115 - stderr sink handed to Popen, lives with the child
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(eng.dir),
-        stdout=subprocess.DEVNULL,
-        stderr=errfh,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    errfh.close()
-    sampler = Sampler(proc.pid)
-    sampler.start()
+    proc, sampler = _popen_engine_child(argv, str(eng.dir), errfh_path)
     return port, proc, sampler, staged, errfh_path
 
 
@@ -6071,13 +6186,21 @@ def _greedy_stats(gots: list[str], refs: list[str]) -> dict:
     for got, ref in zip(gots, refs, strict=True):
         if got == ref:
             exact += 1
-        ratios.append(difflib.SequenceMatcher(None, ref, got).ratio())
-        first_div.append(
-            next(
-                (k for k, (a, b) in enumerate(zip(ref, got, strict=False)) if a != b),
-                min(len(ref), len(got)),
+        else:
+            # a divergence point only exists for pairs that differ; counting
+            # the shared length of identical outputs would report a
+            # divergence on an all-exact comparison
+            first_div.append(
+                next(
+                    (
+                        k
+                        for k, (a, b) in enumerate(zip(ref, got, strict=False))
+                        if a != b
+                    ),
+                    min(len(ref), len(got)),
+                )
             )
-        )
+        ratios.append(difflib.SequenceMatcher(None, ref, got).ratio())
     return {
         "exact_matches": exact,
         "prompts": len(refs),
@@ -6087,6 +6210,169 @@ def _greedy_stats(gots: list[str], refs: list[str]) -> dict:
         if first_div
         else None,
     }
+
+
+def _argv_without(argv: list[str], flag: str, takes_value: bool) -> list[str]:
+    """Copy of argv with `flag` gone (and its value when it has one)."""
+    out: list[str] = []
+    skip_value = False
+    for arg in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == flag:
+            skip_value = takes_value
+            continue
+        out.append(arg)
+    return out
+
+
+def _argv_with_value(argv: list[str], flag: str, value: str) -> list[str]:
+    """Copy of argv with the value following `flag` replaced (no-op when
+    the flag is absent)."""
+    out = list(argv)
+    for i, arg in enumerate(out):
+        if arg == flag and i + 1 < len(out):
+            out[i + 1] = value
+            break
+    return out
+
+
+def greedy_feature_variants(argv: list[str]) -> list[tuple[str, list[str]]]:
+    """Single-flag-family rewrites of a captured engine argv, used to
+    attribute managed-child vs bare-spawn divergence. The bare
+    reference differs from the managed child in context size, slot
+    count, speculative decoding and the unified KV cache, so those are
+    the families replayed; only ones present in the argv are returned."""
+    variants: list[tuple[str, list[str]]] = []
+    if "--kv-unified" in argv:
+        variants.append(("no-kv-unified", _argv_without(argv, "--kv-unified", False)))
+    if "--spec-type" in argv:
+        # the dynamic lookup cache only exists to feed ngram speculation
+        no_spec = _argv_without(argv, "--spec-type", True)
+        variants.append(
+            ("no-speculative", _argv_without(no_spec, "--lookup-cache-dynamic", True))
+        )
+    if "-np" in argv:
+        variants.append(("slots-1", _argv_with_value(argv, "-np", "1")))
+    if "--ctx-size" in argv:
+        variants.append(("ctx-4096", _argv_with_value(argv, "--ctx-size", "4096")))
+    return variants
+
+
+def read_proc_environ(pid: int) -> dict[str, str]:
+    """A live process' environment as a dict; {} when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    env: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if sep:
+            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def run_greedy_replay(
+    eng: Engine,
+    argv: list[str],
+    env: dict[str, str] | None,
+    stage_root: Path,
+    label: str,
+    model_name: str,
+) -> list[str] | dict:
+    """Spawn the engine from an already-proven argv and run the greedy
+    prompts. Only the listener port and the auth file are rewritten -
+    neither touches sampling - so the texts are comparable with the
+    process the argv was captured from. Returns the texts, or an
+    {"error": ...} record."""
+    if "--port" not in argv:
+        return {"error": "captured child argv has no --port to rebind"}
+    port = free_port()
+    replay = _argv_with_value(argv, "--port", str(port))
+    for auth_flag in ("--api-key-file", "--api-key"):
+        replay = _argv_without(replay, auth_flag, True)
+    errpath = stage_root / f"greedy-replay-{eng.tag}-{label}-{port}.stderr"
+    proc, sampler = _popen_engine_child(replay, str(eng.dir), errpath, env=env)
+    try:
+        if not wait_healthy(eng.kind, port, 600.0, proc=proc):
+            tail = (
+                errpath.read_text(errors="replace")[-300:] if errpath.exists() else ""
+            )
+            return {
+                "error": f"replay child ({label}) failed to become healthy; "
+                f"stderr tail: {tail!r}"
+            }
+        return [greedy_completions(port, p, model_name) for p in GREEDY_PROMPTS]
+    finally:
+        teardown_proc(proc, sampler)
+
+
+def _greedy_transparency(
+    eng: Engine,
+    child: dict,
+    gots: list[str],
+    reference: list[str],
+    model_name: str,
+) -> dict:
+    """Split the old transparency number into its two causes: gateway
+    lane vs its own child replayed with the captured argv (translation),
+    and that replay vs the bare reference spawn (engine numerics under
+    the flags blazar compiles, attributed one flag family at a time)."""
+    argv: list[str] = child["child_argv"]
+    # the replayed child gets the captured child's environment, so an
+    # engine knob set there cannot leak in as a false difference
+    env = read_proc_environ(child["child_pid"]) or None
+    with tempfile.TemporaryDirectory(prefix="blazar-greedy-replay-") as tmp:
+        stage_root = Path(tmp)
+        replay = run_greedy_replay(eng, argv, env, stage_root, "managed", model_name)
+        if isinstance(replay, dict):
+            return {"error": f"managed replay failed: {replay['error']}"}
+        rec = _greedy_stats(gots, replay)
+        bare = _greedy_stats(replay, reference)
+        rec.update(
+            {
+                "schema": 2,
+                "comparison": (
+                    "gateway lane vs the same engine child replayed with its "
+                    "captured argv; bare_* keys = that replay vs the bare "
+                    "reference spawn (engine-flag numerics, no gateway)"
+                ),
+                "bare_exact_matches": bare["exact_matches"],
+                "bare_prompts": bare["prompts"],
+                "bare_ratio_mean": bare["ratio_mean"],
+                "bare_ratio_min": bare["ratio_min"],
+                "bare_first_divergence_median_chars": bare[
+                    "first_divergence_median_chars"
+                ],
+                "feature_attribution": [],
+            }
+        )
+        if bare["exact_matches"] < bare["prompts"]:
+            for label, variant in greedy_feature_variants(argv):
+                texts = run_greedy_replay(
+                    eng, variant, env, stage_root, label, model_name
+                )
+                if isinstance(texts, dict):
+                    rec["feature_attribution"].append(
+                        {"variant": label, "error": texts["error"]}
+                    )
+                    continue
+                rec["feature_attribution"].append(
+                    {
+                        "variant": label,
+                        "prompts": len(texts),
+                        "exact_vs_managed": _greedy_stats(texts, replay)[
+                            "exact_matches"
+                        ],
+                        "exact_vs_bare": _greedy_stats(texts, reference)[
+                            "exact_matches"
+                        ],
+                    }
+                )
+        return rec
 
 
 def run_greedy_parity(
@@ -6152,9 +6438,13 @@ def run_greedy_gateway_cell(
     model_name: str,
     reference: list[str],
 ) -> dict:
-    """HEADLINE transparency test: same engine, gateway path vs direct
-    path, sampler-pinned. Anything short of 20/20 exact is a gateway
-    translation defect (sampler remap, template drift, truncation)."""
+    """HEADLINE transparency test on a fair baseline: the gateway lane is
+    diffed against its OWN engine child, replayed with the captured
+    child argv (same flags, model and sandbox state) - a miss there is
+    gateway translation (sampler remap, template drift, truncation).
+    The replay is then diffed against the bare reference spawn; that gap
+    is engine numerics under the flags blazar compiles, not gateway
+    drift, and is attributed one flag family at a time."""
     os.environ["BLAZAR_VALIDATE_PORT"] = str(free_port())
     V = importlib.import_module("validate")
     # F139: the module cache returns the FIRST import on later campaigns
@@ -6163,6 +6453,8 @@ def run_greedy_gateway_cell(
     V.PORT = int(os.environ["BLAZAR_VALIDATE_PORT"])
 
     rec: dict = {}
+    child: dict = {}
+    gots: list[str] | None = None
     sb = V.Sandbox()
     try:
         con = sqlite3.connect(Path(sb.data_home) / "blazar" / "blazar.db")
@@ -6202,11 +6494,15 @@ def run_greedy_gateway_cell(
                 },
                 timeout=600.0,
             )
-            capture_child_argv(rec, eng)
-            if rec.get("error"):
-                return rec
+            capture_child_argv(child, eng)
+            if child.get("error"):
+                return child
+            if not child.get("child_argv"):
+                return {
+                    "error": "engine child argv not captured - the fair replay "
+                    f"lane has nothing to replay: {child.get('child_pid_note')}"
+                }
             gots = [greedy_completions(port, p, model_name) for p in GREEDY_PROMPTS]
-            rec = _greedy_stats(gots, reference)
         finally:
             daemon.stop()
             # F141: teardown parity with the speed/conc cells - the port
@@ -6230,6 +6526,10 @@ def run_greedy_gateway_cell(
                 rec["daemon_log_tail"] = "\n".join(
                     dlog.read_text(errors="replace").splitlines()[-8:]
                 )
+        assert gots is not None
+        # the sandbox is still alive here, so the captured argv's model
+        # and cache paths resolve exactly as they did for the gateway run
+        rec.update(_greedy_transparency(eng, child, gots, reference, model_name))
     finally:
         sb.destroy()
     return rec
@@ -6597,15 +6897,22 @@ def _findings(records: list[dict]) -> list[str]:
             if pd < -50:
                 line += f", prefill {pd:+.0f}% (REGRESSION)"
         out.append(line)
-    # greedy gateway transparency
+    # greedy gateway transparency (gateway lane vs its own replayed child)
     for r in records:
         if r.get("provider") == "greedy_gw" and "exact_matches" in r:
             ex, n = r.get("exact_matches", 0), r.get("prompts", 0)
             verdict = "transparent" if ex == n else "NOT TRANSPARENT"
             out.append(
                 f"- gateway greedy transparency (`{r['tag']}`): {ex}/{n} exact "
-                f"vs same-engine direct - {verdict}."
+                f"vs same-engine managed replay - {verdict}."
             )
+            if "bare_exact_matches" in r:
+                out.append(
+                    f"- managed child vs bare engine spawn: "
+                    f"{r['bare_exact_matches']}/{r.get('bare_prompts', 0)} exact "
+                    f"(engine-flag numerics, no gateway; `{r['tag']}`)"
+                    f"{_attribution_note(r)}."
+                )
     # env-failure disclosure
     envfails = [r for r in records if r.get("error") and _env_failure(r["error"])]
     if envfails:
@@ -6614,6 +6921,133 @@ def _findings(records: list[dict]) -> list[str]:
             "co-residency), not product behavior - see Failed cells."
         )
     return out
+
+
+def _attribution_note(r: dict) -> str:
+    """Per replayed flag family: how many prompts became identical to the
+    bare reference once that family was removed from the managed child."""
+    parts = []
+    for a in r.get("feature_attribution") or []:
+        if "exact_vs_bare" in a:
+            parts.append(f"{a['variant']} {a['exact_vs_bare']}/{a.get('prompts', '-')}")
+    return f"; single-flag replays exact vs bare: {', '.join(parts)}" if parts else ""
+
+
+def gateway_transparency_lanes(records: list[dict]) -> list[str]:
+    """Two-lane transparency table: the gateway vs its own child replayed
+    with the captured argv, and that managed child vs the bare reference
+    spawn. Schema-1 records only had the bare-spawn comparison, which
+    mixes the two causes; they render as a legacy row with a note."""
+    gw = [r for r in records if r.get("provider") == "greedy_gw"]
+    if not gw:
+        return []
+    md: list[str] = []
+    md.append(
+        "| engine | lane | exact matches | ratio mean | ratio min |"
+        " first divergence (median chars) |"
+    )
+    md.append("|---|---|---:|---:|---:|---:|")
+
+    def row(r: dict, lane: str, prefix: str = "") -> str:
+        return (
+            f"| {r.get('tag', '-')} | {lane} |"
+            f" {r.get(prefix + 'exact_matches', '-')}/{r.get(prefix + 'prompts', '-')} |"
+            f" {fmt(r.get(prefix + 'ratio_mean'))} | {fmt(r.get(prefix + 'ratio_min'))} |"
+            f" {fmt(r.get(prefix + 'first_divergence_median_chars'))} |"
+        )
+
+    fair = [r for r in gw if "bare_exact_matches" in r]
+    for r in fair:
+        md.append(row(r, "blazar gateway vs same child replayed"))
+    for r in fair:
+        md.append(row(r, "managed child vs bare engine spawn", "bare_"))
+    for r in gw:
+        if r not in fair:
+            md.append(row(r, "blazar gateway vs bare engine spawn (legacy cell)"))
+    md.append("")
+    if len(fair) < len(gw):
+        md.append(
+            "- legacy cell (recorded before the fair replay lane existed):"
+            " the gateway lane was compared with a bare engine spawn, so a"
+            " miss cannot be split between gateway drift and engine-flag"
+            " numerics; re-run the campaign to attribute it."
+        )
+        md.append("")
+    return md
+
+
+def gateway_transparency_attribution(records: list[dict]) -> list[str]:
+    """Expectation bullets and the single-flag attribution table of a
+    schema-2 transparency cell (empty when only legacy cells exist)."""
+    fair = [
+        r
+        for r in records
+        if r.get("provider") == "greedy_gw" and "bare_exact_matches" in r
+    ]
+    if not fair:
+        return []
+    md: list[str] = []
+    md.append(
+        "- expectation for the gateway lane: 20/20 exact, ratio 1.0 against"
+        " its OWN child replayed with the captured argv (same flags, model"
+        " and sandbox state). A miss there is a gateway translation defect"
+        " (sampler remap / template drift / truncation)."
+    )
+    md.append(
+        "- the managed child differs from the bare reference spawn by the"
+        " flags blazar compiles (context size, slots, speculative decoding,"
+        " unified KV cache, prompt-cache state), so that lane measures"
+        " engine numerics under those flags, not gateway drift. The table"
+        " below replays the child with one flag family removed at a time."
+    )
+    for r in fair:
+        rows = r.get("feature_attribution") or []
+        if not rows:
+            continue
+        md.append("")
+        md.append(f"flag attribution for `{r.get('tag', '-')}`:")
+        md.append("")
+        md.append(
+            "| flag family removed | exact vs managed child | exact vs bare spawn |"
+        )
+        md.append("|---|---:|---:|")
+        for a in rows:
+            if "error" in a:
+                md.append(
+                    f"| {a['variant']} | error | {str(a['error']).replace('|', '/')} |"
+                )
+                continue
+            n = a.get("prompts", "-")
+            md.append(
+                f"| {a['variant']} | {a.get('exact_vs_managed', '-')}/{n} |"
+                f" {a.get('exact_vs_bare', '-')}/{n} |"
+            )
+    return md
+
+
+def gateway_transparency_rows(records: list[dict]) -> list[str]:
+    """Lanes table plus attribution without a heading, for report formats
+    that have no transparency heading of their own."""
+    return gateway_transparency_lanes(records) + gateway_transparency_attribution(
+        records
+    )
+
+
+def gateway_transparency_md(records: list[dict]) -> list[str]:
+    """Markdown for the gateway-transparency cell. Schema-2 records carry
+    a fair baseline: the gateway lane vs its own child replayed with the
+    captured argv (translation), that replay vs the bare spawn (engine
+    numerics under the flags blazar compiles) and the single-flag
+    attribution replays. Schema-1 records only had the bare-spawn
+    comparison, which mixes the two causes."""
+    body = gateway_transparency_rows(records)
+    if not body:
+        return []
+    return [
+        "## Quality - gateway transparency (blazar path vs direct, same engine)",
+        "",
+        *body,
+    ]
 
 
 def write_markdown_report(
@@ -6817,29 +7251,7 @@ def write_markdown_report(
             )
         md.append("")
 
-    gw = [r for r in records if r.get("provider") == "greedy_gw"]
-    if gw:
-        md.append(
-            "## Quality - gateway transparency (blazar path vs direct, same engine)\n"
-        )
-        md.append(
-            "| engine | exact matches | ratio mean | ratio min | first divergence (median chars) |"
-        )
-        md.append("|---|---|---|---|---|")
-        for r in gw:
-            md.append(
-                f"| {r.get('tag', '-')} | {r.get('exact_matches', '-')}/{r.get('prompts', '-')} |"
-                f" {fmt(r.get('ratio_mean'))} | {fmt(r.get('ratio_min'))} |"
-                f" {fmt(r.get('first_divergence_median_chars'))} |"
-            )
-        md.append(
-            "- expectation: 20/20 exact, ratio 1.0. A miss has TWO possible"
-            " causes: gateway translation defect (sampler remap / template"
-            " drift), or multi-slot batching numerics (child -np > 1"
-            " changes float reduction order; near-tie logits flip). Pin"
-            " `slots = 1` and re-run: still <20/20 = translation defect,"
-            " 20/20 = slot-count numerics (upstream physics)."
-        )
+    md.extend(gateway_transparency_md(records))
 
     # features: merge persisted cells (resumed campaigns stay complete)
     # with this invocation's fresh probes
@@ -8343,7 +8755,9 @@ def main() -> int:
                         rec = {"error": f"conc cell crashed: {exc}"}
                     emit(eng.tag, eng.kind, "blazar", params, key, rec)
 
-        params = {"reference": True}
+        # prefill_def 2: cached cells from before the one-definition fix
+        # (ollama rows held engine counters) re-run
+        params = {"reference": True, "prefill_def": 2}
         key = cell_key("ollama-host", "ollama", params, model.name)
         if key in done:
             log("[ollama] resumed - skipping")
@@ -9141,7 +9555,9 @@ def main() -> int:
             for eng in text_engines:
                 if eng.kind != "llamacpp":
                     continue
-                params = {"greedy_gw": True}
+                # schema 2: gateway lane vs its own replayed child (the
+                # schema-1 cell compared it with a bare engine spawn)
+                params = {"greedy_gw": True, "schema": 2}
                 key = cell_key(eng.tag, "greedy_gw", params, model.name)
                 if key in done:
                     continue
@@ -9695,7 +10111,7 @@ METHODOLOGY = [
     "Concurrency: N parallel streams x 128 generated tokens each (levels via --conc-sweep, per-row `C` column); system t/s = total tokens / wall clock; sum-stream t/s = sum of per-stream rates (sum >> system indicates serialization).",
     "Greedy parity: 20 fixed prompts, greedy sampling, 256 tokens; exact-match count and text-similarity ratio vs a same-engine reference run.",
     "Tool calls: 6 single-turn scenarios (3-tool set: weather/calculate/flights), temperature 0, max 192 tokens (call JSON must complete); scored on well-formed calls, correct function selection, valid JSON arguments with required keys, and a no-tool control for false positives; stream deltas accumulated per OpenAI spec.",
-    "Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.",
+    "Gateway transparency: a second greedy lane through the blazar gateway with identical sampling, compared with the same engine child replayed under its captured argv (divergence there is a translation defect). The child is also replayed against the bare spawn with one flag family removed at a time to attribute engine-flag numerics.",
     "Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.",
     "Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime - a cold load is disk-cold, not memory-warm.",
     "Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).",
@@ -9799,7 +10215,12 @@ def speed_table(recs: list[dict]) -> str:
             )
     for r in recs:
         if r.get("provider") == "ollama" and "error" not in r:
-            ollama_name = f"ollama 0.33.3 - {r.get('ollama_model', 'same model')}"
+            # The version is read from the receipt; a hard-coded one goes
+            # stale the day the service is upgraded.
+            ollama_name = (
+                f"ollama {r.get('ollama_version') or 'version not recorded'}"
+                f" - {r.get('ollama_model', 'same model')}"
+            )
             if r.get("reference_note"):
                 # the reference serves a different model - without this the
                 # t/s columns read as a fair comparison (F6a)
@@ -10060,15 +10481,33 @@ def greedy_table(recs: list[dict]) -> str:
             )
     for r in recs:
         if r.get("provider") == "greedy_gw":
+            if "bare_exact_matches" not in r:
+                label = f"{engine_label(r['tag'], r.get('kind'))} through blazar gateway vs direct"
+            else:
+                label = (
+                    f"{engine_label(r['tag'], r.get('kind'))} through blazar gateway"
+                    " vs same child replayed"
+                )
             rows.append(
                 (
-                    f"{engine_label(r['tag'], r.get('kind'))} through blazar gateway vs direct",
+                    label,
                     r.get("exact_matches"),
                     r.get("prompts"),
                     r.get("ratio_mean"),
                     r.get("ratio_min"),
                 )
             )
+            if "bare_exact_matches" in r:
+                rows.append(
+                    (
+                        f"{engine_label(r['tag'], r.get('kind'))} managed child"
+                        " (blazar-compiled flags) vs bare engine spawn",
+                        r.get("bare_exact_matches"),
+                        r.get("bare_prompts"),
+                        r.get("bare_ratio_mean"),
+                        r.get("bare_ratio_min"),
+                    )
+                )
     for r in recs:
         if r.get("provider") == "greedy_ollama" and "error" not in r:
             rows.append(
@@ -10940,7 +11379,23 @@ def coldstart_table(recs: list[dict]) -> str:
         f"| {n} | {pfmt(b, 2)} | {pfmt(c, 2)} | {pfmt(t, 0)} | {pfmt(ld, 2)} | {pfmt(r, 0)} |"
         for n, b, c, t, ld, r in rows
     ]
-    return "\n".join([head, sep, *body])
+    # ollama rows carry no note column: state what its numbers are not
+    # (a warm daemon, a load whose page cache could not be dropped)
+    caveats = []
+    for r in recs:
+        if r.get("provider") != "cold-ollama" or "error" in r:
+            continue
+        notes = [
+            note
+            for note in (r.get("ollama_daemon_boot_note"), r.get("cold_cache_note"))
+            if note
+        ]
+        if notes:
+            caveats.append(f"{r.get('ollama_model', 'reference')}: {'; '.join(notes)}")
+    out = [head, sep, *body]
+    if caveats:
+        out += ["", "_ollama caveats - " + " | ".join(caveats) + "_"]
+    return "\n".join(out)
 
 
 def idle_wake_table(recs: list[dict]) -> str:
@@ -10966,7 +11421,14 @@ def idle_wake_table(recs: list[dict]) -> str:
                     r.get("expired"),
                     r.get("idle_wake_ttft_ms"),
                     r.get("idle_reload_s"),
-                    r.get("idle_note"),
+                    # a wake whose page cache stayed warm is not a reload
+                    # from disk - say so next to the policy note
+                    "; ".join(
+                        note
+                        for note in (r.get("idle_note"), r.get("cold_cache_note"))
+                        if note
+                    )
+                    or None,
                 )
             )
     if not rows:
@@ -11101,9 +11563,20 @@ def executive_summary(recs: list[dict]) -> list[str]:
         None,
     )
     if itl and oitl:
+        # The verdict runs in the direction the numbers do: a wider
+        # inter-token tail is a loss, never "0.9x tighter".
+        if oitl > itl:
+            verdict = f"{oitl / itl:.1f}x tighter"
+        elif oitl < itl:
+            verdict = (
+                f"{itl / oitl:.1f}x looser"
+                " - ollama wins the inter-token tail on this lane"
+            )
+        else:
+            verdict = "equal"
         parts.append(
             f"ITL p99 {pfmt(itl, 2)} ms vs ollama {pfmt(oitl, 2)} ms "
-            f"({oitl / itl:.1f}x tighter)"
+            f"({verdict})"
         )
     # tool-call latency parity at equal quality
     tb = next(
@@ -11179,11 +11652,35 @@ def executive_summary(recs: list[dict]) -> list[str]:
             if gd and gd.get("prompts")
             else ""
         )
+        fair = "bare_exact_matches" in gwg
         parts.append(
             f"greedy determinism: {direct_note}gateway transparency "
-            f"{gwg['exact_matches']}/{gwg['prompts']} exact at temp 0 "
-            "(divergence = multi-slot batching numerics, not translation drift)"
+            f"{gwg['exact_matches']}/{gwg['prompts']} exact at temp 0"
+            + (" vs the same child replayed with its captured argv" if fair else "")
         )
+        if fair:
+            # the family whose removal moved the most prompts onto the
+            # bare reference is the dominant engine-numerics cause
+            top = max(
+                (
+                    a
+                    for a in gwg.get("feature_attribution") or []
+                    if "exact_vs_bare" in a
+                ),
+                key=lambda a: a["exact_vs_bare"],
+                default=None,
+            )
+            attr = (
+                f"; largest single-flag effect: {top['variant']}"
+                f" {top['exact_vs_bare']}/{top['prompts']} exact vs bare"
+                if top and top["exact_vs_bare"] > gwg["bare_exact_matches"]
+                else ""
+            )
+            parts.append(
+                f"managed child vs bare engine spawn: "
+                f"{gwg['bare_exact_matches']}/{gwg.get('bare_prompts', 0)} exact"
+                f" (engine-flag numerics, no gateway){attr}"
+            )
     boot = next(
         (r.get("daemon_boot_s") for r in gw.values() if r.get("daemon_boot_s")), None
     )
@@ -11198,9 +11695,10 @@ def executive_summary(recs: list[dict]) -> list[str]:
     )
     if cold_ttft and oc and oc.get("ollama_cold_ttft_ms"):
         ratio = oc["ollama_cold_ttft_ms"] / cold_ttft
+        cache = "; ollama page cache not dropped" if oc.get("cold_cache_note") else ""
         parts.append(
             f"cold TTFT {pfmt(cold_ttft, 0)} ms vs ollama "
-            f"{pfmt(oc['ollama_cold_ttft_ms'], 0)} ms ({ratio:.1f}x)"
+            f"{pfmt(oc['ollama_cold_ttft_ms'], 0)} ms ({ratio:.1f}x{cache})"
         )
     idle_p = next(
         (
@@ -11238,9 +11736,12 @@ def executive_summary(recs: list[dict]) -> list[str]:
         None,
     )
     if idle_p and idle_o:
+        cache = (
+            "; ollama page cache not dropped" if idle_o.get("cold_cache_note") else ""
+        )
         parts.append(
             f"idle wake {pfmt(idle_p['idle_wake_ttft_ms'], 0)} ms (sleep) vs ollama "
-            f"{pfmt(idle_o['idle_wake_ttft_ms'], 0)} ms (full reload)"
+            f"{pfmt(idle_o['idle_wake_ttft_ms'], 0)} ms (full reload{cache})"
         )
         if idle_ev:
             parts.append(
@@ -11508,9 +12009,15 @@ def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
         )
         parity = ""
         if gw_greedy and gw_greedy.get("prompts"):
+            baseline = (
+                "the same child replayed"
+                if "bare_exact_matches" in gw_greedy
+                else "a bare direct spawn"
+            )
             parity = (
-                f", greedy parity through the gateway {gw_greedy.get('exact_matches')}"
-                f"/{gw_greedy['prompts']} exact"
+                f", greedy transparency through the gateway "
+                f"{gw_greedy.get('exact_matches')}/{gw_greedy['prompts']} exact"
+                f" vs {baseline}"
             )
         backed = (
             f"**Gateway overhead vs direct spawn: {verdict}.** {engine_label(pair[0])} "
@@ -11677,9 +12184,11 @@ def text_findings(recs: list[dict]) -> list[tuple[str | None, str]]:
     out.append(
         (
             backed,
-            "**KV q8_0 quantization is decode-neutral and prefill-neutral steady-state**; "
-            "the one cold-prefill outlier below is a first-invocation pipeline-compile "
-            "artifact (controlled re-probe measured full-rate steady state).",
+            "**KV q8_0 quantization: no variant cell in this campaign.** The effect is "
+            "model-dependent, not settled: the 2026-11-22 campaign measured decode 9% "
+            "slower than dense on qwen2.5-0.5b (BENCHMARK.md), while the 2026-10-31 "
+            "self-improvement pass measured faster prefill on another model class. "
+            "Adopt it per model through receipts (`blazar tune`), not as a blanket claim.",
         )
     )
 
@@ -12367,8 +12876,12 @@ def write_publication_report(
             campaign_scoped(greedy_table(recs), "greedy parity", artifacts_dir.name),
             "",
             "_Exact-match divergence across GPU backends is expected float nondeterminism "
-            "(batch shape and backend kernels), not translation drift; bit-parity across "
-            "runs requires single-slot decoding (blazar `deterministic = true` pins it)._",
+            "(batch shape and backend kernels), not translation drift. The managed child "
+            "carries the flags blazar compiles, so the gateway is compared with its own "
+            "child replayed with the captured argv; the managed-vs-bare lane is engine "
+            "numerics under those flags (attribution below)._",
+            "",
+            *gateway_transparency_attribution(recs),
         ],
     )
     L.append("")

@@ -3095,6 +3095,16 @@ pub fn admission_floor_bytes(model_bytes: u64, mmproj_bytes: u64) -> u64 {
         .saturating_add(UNIFIED_SPAWN_OVERHEAD_BYTES)
 }
 
+/// Non-KV, non-weights charge a spawn adds on the GPU (CUDA context,
+/// compute buffers). Public so every surface that quotes a spawn's
+/// standing charge reads one number: [`admission_floor_bytes`] adds it
+/// on top of its KV floor, and the gateway fit ladder adds it on top of a
+/// KV estimate it computes itself.
+#[must_use]
+pub fn spawn_overhead_bytes() -> u64 {
+    UNIFIED_SPAWN_OVERHEAD_BYTES
+}
+
 /// Host-memory lane for the unified host-RAM ledger: how a resident
 /// engine child's pages read against `MemAvailable`. The kernel already
 /// excludes anonymous RSS from `MemAvailable`, so only lanes whose
@@ -3229,6 +3239,86 @@ pub fn host_levers() -> [&'static str; 4] {
 /// 182.7 tok/s at 4 slots - an 18-70x hole a stale pin dug. The pin
 /// is honored only on a real deficit (floor > budget), where it
 /// expresses "offload more than the minimum" intent.
+/// Quantization methods the sglang 0.5.23 paged-experts `MoE` runners
+/// read: triton takes unquantized + FP8/INT8 families, Marlin takes
+/// GPTQ/AWQ/FP4 families (upstream paged-experts table, 0.5.23). A
+/// checkpoint outside this set can still be paged MANUALLY (warned,
+/// never silently); AUTO engagement skips it - the ladder never bets
+/// the spawn on an unverified runner/quant pairing. Keep aligned with
+/// the upstream table when the lane re-probes.
+pub const SGLANG_PAGED_QUANT_METHODS: &[&str] = &[
+    "awq",
+    "awq_marlin",
+    "blockwise_int8",
+    "compressed-tensors",
+    "fp8",
+    "gptq",
+    "gptq_marlin",
+    "modelopt_fp4",
+    "modelopt_fp8",
+    "mxfp4",
+    "nvfp4_online",
+    "quark_mxfp4",
+    "w8a8_fp8",
+    "w8a8_int8",
+];
+
+/// Split a `MoE` checkpoint's weights between the GPU and the paged
+/// expert host store at `k` resident experts per layer: device keeps
+/// the dense slice (attention, embeddings, shared experts, engine
+/// overhead) plus `k` expert slots; the host store pins ALL experts
+/// (the resident `k` are copies, not moves - upstream keeps the full
+/// pinned store). `k` is clamped to the router floor and expert count
+/// so the split can never express an engine-illegal plan. Returns
+/// `(device_bytes, host_pinned_bytes)`.
+#[must_use]
+pub fn paged_expert_split(
+    weights_bytes: u64,
+    geom: &crate::hfmeta::MoeGeometry,
+    k: u64,
+) -> (u64, u64) {
+    let k = k.clamp(geom.top_k, geom.experts);
+    let device = weights_bytes
+        .saturating_sub(geom.expert_weights_bytes)
+        .saturating_add(k.saturating_mul(geom.per_expert_bytes));
+    (device, geom.expert_weights_bytes)
+}
+
+/// Hardware-adaptive resident-expert count: every expert slot the
+/// budget holds past the dense slice and the KV floor, clamped to
+/// `[top_k, experts]`. The floor is upstream law (a router that
+/// activates `top_k` experts cannot run with fewer resident); the
+/// ceiling is physics ( paging every expert is just residency).
+/// Shared by the compile-side ladder and the supervisor admission
+/// gate so argv, admission and the spawn guard price one number.
+#[must_use]
+pub fn paged_expert_resident_k(
+    budget_bytes: u64,
+    non_expert_bytes: u64,
+    kv_floor_bytes: u64,
+    geom: &crate::hfmeta::MoeGeometry,
+) -> u64 {
+    let per_expert = geom.per_expert_bytes.max(1);
+    let room = budget_bytes
+        .saturating_sub(non_expert_bytes)
+        .saturating_sub(kv_floor_bytes);
+    (room / per_expert).clamp(geom.top_k, geom.experts)
+}
+
+/// Host-RAM floor for a paged spawn, sibling of the offload floor the
+/// J3 guard charges: the expert store is pinned for the child's whole
+/// lifetime (not staged and released like the load window), and the
+/// rest of the checkpoint still streams through host memory at half
+/// the dense slice. Both numbers named, never guessed.
+#[must_use]
+pub fn paged_host_floor_mib(model_mib: u64, expert_mib: u64) -> u64 {
+    model_mib
+        .saturating_sub(expert_mib)
+        .div_ceil(2)
+        .saturating_add(expert_mib)
+        .saturating_add(512)
+}
+
 #[must_use]
 pub fn sglang_effective_offload_bytes(
     standing_floor_bytes: u64,
@@ -5193,6 +5283,19 @@ fn vllm_tool_parser_for(architecture: &str) -> Option<&'static str> {
         .map(|(_, parser)| *parser)
 }
 
+/// Spec-decoding argv flags that must not ALSO ride `extra_args` while the
+/// first-class `spec_method`/`spec_num_tokens` knobs are set: upstream's
+/// `create_speculative_config` treats the group flags and
+/// `--speculative-config` as mutually exclusive and refuses the overlap at
+/// child argv parse (the knob lane mirrors the refusal with the conflicting
+/// flag named, so the spawn never reaches the engine's own parse).
+const SPEC_ARGV_FLAGS: [&str; 4] = [
+    "--spec-method",
+    "--spec-model",
+    "--spec-tokens",
+    "--speculative-config",
+];
+
 /// config default, clamped to the trained ceiling), GPU memory
 /// fraction (ALWAYS emitted - vllm's 0.9 default claims nearly the
 /// whole card and starves co-tenants on shared GPUs), and the
@@ -5283,6 +5386,58 @@ fn compile_vllm(input: &ProfileInput<'_>) -> Result<Profile, String> {
             "vllm tuning",
             "--tool-call-parser",
             &parser,
+            &mut warnings,
+        );
+    }
+
+    // --- speculative decoding (opt-in, draft-free): suffix/ngram
+    // propose continuations from the request stream itself - no
+    // second model - so the pair is a plain spawn flag set. The token
+    // window defaults shallow (4): vllm's own unset default is
+    // min(8, tree_depth), deep enough to cost throughput at high
+    // concurrency, and every proposed token is one the verifier must
+    // check. vllm refuses spec_tokens + 1 > max-model-len, but only
+    // after the model load - the same bound fires here, pre-load,
+    // with both numbers.
+    if let Some(method) = &tun.spec_method {
+        let k = tun.spec_num_tokens.unwrap_or(4);
+        if u64::from(ctx) <= k {
+            return Err(format!(
+                "vllm.spec_num_tokens ({k}) must stay below the compiled \
+                 --max-model-len ({ctx}) - vllm refuses the pair at boot, \
+                 after the model load; shrink the window or raise ctx"
+            ));
+        }
+        // Upstream treats the group flags and --speculative-config as
+        // mutually exclusive (create_speculative_config refuses the
+        // overlap), so a knob set plus a manual spec flag riding
+        // extra_args would die at child argv parse - it dies here
+        // with the conflicting flag named.
+        if let Some(extra) = &input.overlay.extra_args {
+            for tok in extra {
+                if SPEC_ARGV_FLAGS.contains(&tok.as_str()) {
+                    return Err(format!(
+                        "vllm extra_args carries {tok} while spec_method is set - \
+                         the speculator is first-class here; upstream refuses \
+                         the manual flags and the knob together, so pick one"
+                    ));
+                }
+            }
+        }
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "vllm tuning",
+            "--spec-method",
+            method,
+            &mut warnings,
+        );
+        push_tuned(
+            &mut argv,
+            input.supported_flags,
+            "vllm tuning",
+            "--spec-tokens",
+            &k.to_string(),
             &mut warnings,
         );
     }
@@ -7438,6 +7593,7 @@ fn sglang_run_fit_ladder(
                 let ceiling_pool = (f64::from(ceiling) * engine_total as f64).round() as u64;
                 let budget = ceiling_pool;
                 let geom = SglangFitGeometry {
+                    moe: crate::hfmeta::moe_geometry(std::path::Path::new(input.model_path)),
                     shard,
                     vram,
                     engine_total,
@@ -7492,6 +7648,11 @@ fn sglang_run_fit_ladder(
 /// helpers and the mem-fraction derive read by name at call sites.
 struct SglangFitGeometry {
     shard: u32,
+    /// Routed-MoE geometry when the checkpoint declares one the
+    /// paged-experts plan can size (read once from the model dir, at
+    /// the top of the ladder). `None` = dense or incomplete - every
+    /// paged decision skips on it.
+    moe: Option<crate::hfmeta::MoeGeometry>,
     vram: u64,
     /// Total device memory the engine applies `--mem-fraction-static`
     /// against - sglang fractions the card TOTAL, not the free slice the
@@ -7703,6 +7864,254 @@ fn sglang_push_pinned_offload(
     clamped
 }
 
+/// How the paged-experts ladder engages for one spawn.
+#[derive(Debug)]
+enum PagedEngagement {
+    /// `paged_experts = true`: the user asked to page. Carries the
+    /// manual K pin when one was set.
+    Manual { k_pin: Option<u64> },
+    /// Ladder-auto: eligible by every static gate; the ladder still
+    /// decides engagement against the live tier verdict.
+    Auto,
+}
+
+/// Resolve paged-experts engagement from the static facts (knobs,
+/// geometry, lane flags, spec, shard). `Err` = a manual request that
+/// cannot be honored (unknown geometry, engine-illegal K, a lane the
+/// engine refuses the pairing on) - teaching text, never a silent
+/// skip of user intent. `Ok(None)` = not engaged: auto conditions
+/// unmet, `paged_experts = false` (exact pre-feature rollback), or no
+/// geometry to size a plan from.
+fn sglang_paged_engagement(
+    tun: &SglangTuning,
+    geom: &SglangFitGeometry,
+    supported_flags: &std::collections::BTreeSet<String>,
+) -> Result<Option<PagedEngagement>, String> {
+    let Some(moe) = geom.moe.as_ref() else {
+        // Manual on a dense/incomplete dir: the user asked to page a
+        // checkpoint with nothing pageable in it.
+        if tun.paged_experts == Some(true) {
+            return Err("sglang.paged_experts = true but the model dir declares no \
+                 routed experts to page (no MoE expert tensors or no router \
+                 top-k in its metadata) - unset the knob or serve a MoE \
+                 checkpoint (blazar fit previews a repo's MoE variants)"
+                .to_string());
+        }
+        return Ok(None);
+    };
+    // A spec lane and paged experts are mutually exclusive upstream
+    // (0.5.23 rejects speculative decoding with paging); the spec
+    // verdict is spawn-resolved, so this gate - not parse-time
+    // validation - is where the pair can first be seen together.
+    if geom.spec_engaged && tun.paged_experts == Some(true) {
+        return Err(
+            "sglang.paged_experts cannot run with speculative decoding - \
+             upstream refuses the pairing. Drop one: options.spec = off (or \
+             models.<name>.spec = off) to page, or unset paged_experts to \
+             speculate"
+                .into(),
+        );
+    }
+    // Upstream paged experts are single-GPU: a sharded plan (manual or
+    // auto TP) cannot page.
+    if geom.shard > 1 && tun.paged_experts == Some(true) {
+        return Err(
+            "sglang.paged_experts is single-GPU in sglang 0.5.23 but this \
+             spawn shards across ranks - unset the parallel pins (tp_size / \
+             dp_size / pp_size / ep_size) or the paged knob"
+                .into(),
+        );
+    }
+    // K bounds are engine startup errors; both numbers are known here.
+    if let Some(k) = tun
+        .paged_experts_num_resident
+        .filter(|_| tun.paged_experts == Some(true))
+    {
+        if k < moe.top_k {
+            return Err(format!(
+                "sglang.paged_experts_num_resident {k} is below the router \
+                 top-k {} - every token activates {} experts, the engine \
+                 refuses fewer resident; raise the pin or unset it (the \
+                 ladder derives one from free VRAM)",
+                moe.top_k, moe.top_k
+            ));
+        }
+        if k > moe.experts {
+            return Err(format!(
+                "sglang.paged_experts_num_resident {k} exceeds the expert \
+                 count {} - there is nothing past {} to keep resident; lower \
+                 the pin or unset it",
+                moe.experts, moe.experts
+            ));
+        }
+    }
+    match tun.paged_experts {
+        Some(true) => {
+            // The engine must actually carry the flags: a manual ask on
+            // a lane too old to page is a refusal with the upgrade
+            // lever, not a silently-ignored knob.
+            for flag in ["--enable-paged-experts", "--paged-experts-num-resident"] {
+                if !supported_flags.contains(flag) {
+                    return Err(format!(
+                        "sglang.paged_experts = true but this sglang engine \
+                         lacks {flag} - page-capable lanes ship 0.5.23+ \
+                         (blazar engine install updates it)"
+                    ));
+                }
+            }
+            // A quant outside the runner table is warned at the flag
+            // emission site (warnings live there); the engine stays
+            // the authority on what it can page.
+            Ok(Some(PagedEngagement::Manual {
+                k_pin: tun.paged_experts_num_resident,
+            }))
+        }
+        Some(false) => Ok(None),
+        None => {
+            // Ladder-auto gates: geometry (checked), single GPU, no
+            // host offload pin, no spec lane, engine carries the
+            // flags, quant inside the runner table (unquantized
+            // checkpoints carry no method string and ride triton).
+            let static_ok = geom.shard == 1
+                && tun.cpu_offload_gb.is_none_or(|gb| gb == 0.0)
+                && !geom.spec_engaged
+                && ["--enable-paged-experts", "--paged-experts-num-resident"]
+                    .iter()
+                    .all(|f| supported_flags.contains(*f))
+                && moe
+                    .quant_method
+                    .as_deref()
+                    .is_none_or(|m| SGLANG_PAGED_QUANT_METHODS.contains(&m));
+            Ok(static_ok.then_some(PagedEngagement::Auto))
+        }
+    }
+}
+
+/// Paged-experts posture for one fit attempt. When the engagement
+/// rules hold and the split lands inside the budget, this emits both
+/// engine flags plus the teaching warnings and returns the post-split
+/// device demand with the host-relief GiB the outcome tiers report.
+/// Any other shape (no engagement, or an auto split that cannot fit)
+/// returns the UNSPLIT weights with zero relief, so the tier ladder
+/// stays byte-identical to the pre-feature behavior.
+#[allow(clippy::too_many_lines)] // one posture emission: split, flags, and the teaching warns read as one block
+fn sglang_paged_device_demand(
+    input: &ProfileInput<'_>,
+    argv: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    geom: &SglangFitGeometry,
+    engagement: Option<&PagedEngagement>,
+    full_residency_fits: bool,
+    kv8_floor: u64,
+) -> Result<(u64, f32), String> {
+    let paged_manual = matches!(engagement, Some(PagedEngagement::Manual { .. }));
+    let paged_auto = matches!(engagement, Some(PagedEngagement::Auto)) && !full_residency_fits;
+    let mut paged_relief_gb: f32 = 0.0;
+    let weights = if paged_manual || paged_auto {
+        let moe = geom.moe.as_ref().expect("engagement guarantees geometry");
+        let k_pin = match engagement {
+            Some(PagedEngagement::Manual { k_pin }) => *k_pin,
+            _ => None,
+        };
+        let k = k_pin.unwrap_or_else(|| {
+            paged_expert_resident_k(
+                geom.budget,
+                geom.weights.saturating_sub(moe.expert_weights_bytes),
+                kv8_floor,
+                moe,
+            )
+        });
+        let (device, host_pinned) = paged_expert_split(geom.weights, moe, k);
+        let paged_fits = device.saturating_add(kv8_floor) <= geom.budget;
+        if !paged_fits && paged_manual {
+            return Err(format!(
+                "model {} does not page onto this GPU: the dense slice plus \
+                 top-{} resident experts plus KV still exceeds the usable \
+                 VRAM budget - paging cannot shrink the dense slice. Use a \
+                 smaller checkpoint, lower ctx, or unset paged_experts for a \
+                 host offload plan",
+                input.model_name, moe.top_k
+            ));
+        }
+        if paged_fits {
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.paged_experts",
+                "--enable-paged-experts",
+                "",
+                warnings,
+            );
+            push_tuned(
+                argv,
+                input.supported_flags,
+                "sglang.paged_experts",
+                "--paged-experts-num-resident",
+                &k.to_string(),
+                warnings,
+            );
+            #[allow(clippy::cast_precision_loss)]
+            let relief = (geom.weights.saturating_sub(device)) as f32 / 1e9;
+            paged_relief_gb = relief;
+            // Manual engagement on a quant outside the runner table:
+            // the engine is the authority - warn, never refuse.
+            if paged_manual
+                && moe
+                    .quant_method
+                    .as_deref()
+                    .is_some_and(|m| !SGLANG_PAGED_QUANT_METHODS.contains(&m))
+            {
+                warnings.push(format!(
+                    "sglang.paged_experts on quant_method '{}' is outside the \
+                     paged runner table (GPTQ/AWQ/FP8/MXFP4/INT8 families and \
+                     unquantized are the verified shapes) - upstream may refuse \
+                     the pairing at load",
+                    moe.quant_method.as_deref().unwrap_or_default()
+                ));
+            }
+            warnings.push(format!(
+                "fit ladder: paged experts engaged - {} of {} experts resident \
+                 per layer, {} paged in on demand; the host store pins every \
+                 expert (~{:.2} GiB) and compute stays on the GPU, so decode \
+                 sits between full residency and a host offload. Override with \
+                 models.<name>.sglang.paged_experts_num_resident, or unset \
+                 paged_experts for the classic tiers",
+                k,
+                moe.experts,
+                moe.experts.saturating_sub(k),
+                bytes_gib(host_pinned)
+            ));
+            // Host-budget mirror of the Tier C gate: the pinned store
+            // must fit the 40%-of-RAM host budget, or the spawn guard
+            // will refuse it - teach here so `blazar fit`-class
+            // previews see the posture before spawn.
+            let host_budget_mib = input
+                .hardware
+                .total_ram_mib
+                .saturating_mul(4)
+                .saturating_div(10);
+            if host_pinned > Hardware::bytes(host_budget_mib) {
+                warnings.push(format!(
+                    "paged expert host store {:.2} GiB exceeds the {:.2} GiB \
+                     host budget (40% of RAM): upstream pins ALL experts - the \
+                     spawn may refuse at the memory guard",
+                    bytes_gib(host_pinned),
+                    bytes_gib(Hardware::bytes(host_budget_mib))
+                ));
+            }
+            device
+        } else {
+            // Auto path that cannot land: classic tiers, no flags, no
+            // split - exact pre-feature behavior.
+            geom.weights
+        }
+    } else {
+        geom.weights
+    };
+    Ok((weights, paged_relief_gb))
+}
+
+#[allow(clippy::too_many_lines)] // one fit derivation across the tiers; splitting it scatters the budget math
 fn sglang_gpu_fit(
     input: &ProfileInput<'_>,
     tun: &SglangTuning,
@@ -7767,6 +8176,25 @@ fn sglang_gpu_fit(
         }
     }
     let (slots, spec_engaged) = (geom.slots, geom.spec_engaged);
+    // --- paged experts: split the routed-expert weights out of the
+    // device demand BEFORE the tier ladder runs, so every tier gate,
+    // the mem-fraction derive and the spawn guards below price one
+    // post-split posture. Manual (`paged_experts = true`) engages
+    // whenever the geometry reads; ladder-auto engages only when full
+    // residency already failed AND the split lands a plan inside the
+    // budget - otherwise the classic tiers run, byte-identical to the
+    // pre-feature behavior.
+    let engagement = sglang_paged_engagement(tun, geom, input.supported_flags)?;
+    let (weights, paged_relief_gb) = sglang_paged_device_demand(
+        input,
+        argv,
+        warnings,
+        geom,
+        engagement.as_ref(),
+        full_residency_fits,
+        kv_floor(kv8_v),
+    )?;
+
     if weights.saturating_add(kv16_v) <= budget {
         // Tier A: full GPU, f16 KV.
         if tun.kv_cache_dtype.is_none() && input.overlay.cache_type.is_none() {
@@ -7783,7 +8211,7 @@ fn sglang_gpu_fit(
                 input.supported_flags,
                 slots,
                 headroom,
-                weights,
+                geom.weights,
                 tun,
                 spec_engaged,
                 warnings,
@@ -7792,7 +8220,7 @@ fn sglang_gpu_fit(
         Ok(SglangFitOutcome {
             gpu_label: "full",
             kv_est_bytes: Some(kv16_v),
-            offload_gb: offload_total_gb,
+            offload_gb: offload_total_gb + paged_relief_gb,
         })
     } else if weights.saturating_add(kv8_v) <= budget {
         // Tier B: fp8 KV fits.
@@ -7813,13 +8241,16 @@ fn sglang_gpu_fit(
                     .into(),
             );
         }
+        // Graph slope follows the TOTAL model (activations capture
+        // wherever the weights live); the headroom counts only what
+        // stays on the GPU - under paging those two diverge.
         let headroom = budget.saturating_sub(weights).saturating_sub(kv8_v);
         sglang_tight_fit_knobs(
             argv,
             input.supported_flags,
             slots,
             headroom,
-            weights,
+            geom.weights,
             tun,
             spec_engaged,
             warnings,
@@ -7827,7 +8258,7 @@ fn sglang_gpu_fit(
         Ok(SglangFitOutcome {
             gpu_label: "full",
             kv_est_bytes: Some(kv8_v),
-            offload_gb: offload_total_gb,
+            offload_gb: offload_total_gb + paged_relief_gb,
         })
     } else {
         sglang_tier_c_host_offload(input, tun, argv, warnings, geom, offload_total_gb)
@@ -18803,6 +19234,7 @@ mod tests {
             dtype: Some("bfloat16".into()),
             quant_bits: None,
             quant_method: None,
+            quant_gptq_marlin_convertible: false,
             vision_tower: false,
             rope_fingerprint: None,
             kv: crate::hfmeta::KvGeom {
@@ -19111,6 +19543,7 @@ mod tests {
             dtype: Some("bfloat16".into()),
             quant_bits: None,
             quant_method: None,
+            quant_gptq_marlin_convertible: false,
             vision_tower: false,
             rope_fingerprint: None,
             kv: crate::hfmeta::KvGeom {
@@ -19453,6 +19886,498 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--mem-fraction-static" && w[1] == "0.876")
         );
+    }
+
+    // --- paged experts (sglang 0.5.23 routed-MoE paging) -------------
+
+    /// Page-capable lane surface: the 0.5.23 probe adds the two paged
+    /// flags to the 0.5.19-era base set. Fixtures that page pin their
+    /// input to this set; the bare base set doubles as the "lane too
+    /// old to page" arm.
+    fn sglang_flags_paged() -> BTreeSet<String> {
+        let mut flags = sglang_flags();
+        flags.insert("--enable-paged-experts".to_string());
+        flags.insert("--paged-experts-num-resident".to_string());
+        flags
+    }
+
+    static SGLANG_FLAGS_PAGED: LazyLock<BTreeSet<String>> = LazyLock::new(sglang_flags_paged);
+
+    /// Write a routed-MoE model dir the ladder can size: `config.json`
+    /// with the expert count and router top-k, plus one root
+    /// safetensors whose HEADER declares the expert tensors. The
+    /// geometry reader trusts declared shapes (stored truth, same as
+    /// the real HF dirs it serves), so a GiB-scale expert store is
+    /// faked from a KB-scale file; the dense companion tensor keeps
+    /// the tensor walk honest. The tempdir is leaked so `model_path`
+    /// can borrow a `&'static str`.
+    fn write_moe_repo(
+        experts: u64,
+        top_k: u64,
+        expert_weights_mib: u64,
+        layers: u64,
+        quant_method: Option<&str>,
+    ) -> &'static str {
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let quant_cfg = quant_method
+            .map(|method| format!(",\"quantization_config\":{{\"quant_method\":\"{method}\"}}"))
+            .unwrap_or_default();
+        let mut config = format!(
+            "{{\"architectures\":[\"OlmoeForCausalLM\"],\"num_experts\":{experts},\
+             \"num_experts_per_tok\":{top_k},\"num_hidden_layers\":{layers}{quant_cfg}"
+        );
+        config.push('}');
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        // One declared expert tensor per (layer, expert): F16 elements
+        // chosen so the summed bytes equal `expert_weights_mib` exactly
+        // (12_000 MiB over 2 layers x 40 experts = 150 MiB per tensor).
+        let numel = expert_weights_mib * MIB / (layers * experts) / 2;
+        let mut tensors: Vec<String> = Vec::new();
+        for layer in 0..layers {
+            for expert in 0..experts {
+                tensors.push(format!(
+                    "\"model.layers.{layer}.experts.{expert}.down_proj.weight\":\
+                     {{\"dtype\":\"F16\",\"shape\":[{numel}],\"data_offsets\":[0,0]}}"
+                ));
+            }
+        }
+        tensors.push(
+            "\"model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\"shape\":[4,4],\
+             \"data_offsets\":[0,0]}"
+                .to_string(),
+        );
+        let header = format!("{{{}}}", tensors.join(","));
+        let mut bytes = Vec::with_capacity(8 + header.len());
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        Box::leak(dir.path().to_str().unwrap().to_string().into_boxed_str())
+    }
+
+    /// Dense twin of `write_moe_repo` with identical total model bytes:
+    /// same KV geometry, same `model_bytes` input, no expert tensors -
+    /// the fixture pair the byte-identical rollback pin compares.
+    fn write_dense_repo() -> &'static str {
+        let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        std::fs::write(
+            dir.path().join("config.json"),
+            "{\"architectures\":[\"Qwen2ForCausalLM\"],\"num_hidden_layers\":2}",
+        )
+        .unwrap();
+        let header = "{\"model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"F32\",\
+                      \"shape\":[4,4],\"data_offsets\":[0,0]}}";
+        let mut bytes = Vec::with_capacity(8 + header.len());
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+        Box::leak(dir.path().to_str().unwrap().to_string().into_boxed_str())
+    }
+
+    /// Geometry for direct `sglang_paged_engagement` calls: 12 GiB card,
+    /// ~10.7 GiB pool, a 40-expert/top-4 `MoE` of 12 GiB.
+    fn paged_test_geom(
+        moe: Option<crate::hfmeta::MoeGeometry>,
+        spec_engaged: bool,
+        shard: u32,
+    ) -> SglangFitGeometry {
+        SglangFitGeometry {
+            moe,
+            shard,
+            vram: Hardware::bytes(12_000),
+            engine_total: Hardware::bytes(12_000),
+            budget: Hardware::bytes(10_700),
+            weights: Hardware::bytes(13_212),
+            draft_weights: 0,
+            kv16_v: 939_524_096,
+            kv8_v: 469_762_048,
+            ceiling_pool: Hardware::bytes(10_700),
+            slots: 2,
+            ctx: 32_768,
+            spec_engaged,
+            spec_trained_drafter: false,
+        }
+    }
+
+    fn test_moe_geometry() -> crate::hfmeta::MoeGeometry {
+        crate::hfmeta::MoeGeometry {
+            experts: 40,
+            top_k: 4,
+            expert_weights_bytes: Hardware::bytes(12_000),
+            per_expert_bytes: Hardware::bytes(300),
+            quant_method: Some("gptq".to_string()),
+        }
+    }
+
+    #[test]
+    fn unit__paged_expert_split__clamps_to_router_law_and_counts_copies() {
+        let geom = test_moe_geometry();
+        let weights = Hardware::bytes(13_212);
+        // k = 12: device keeps the dense slice plus 12 slots; the host
+        // store pins ALL experts (the resident 12 are copies).
+        let (device, host) = paged_expert_split(weights, &geom, 12);
+        assert_eq!(device, Hardware::bytes(1_212) + 12 * Hardware::bytes(300));
+        assert_eq!(host, Hardware::bytes(12_000));
+        // k below the router floor clamps up: the engine refuses fewer
+        // resident experts than top-k.
+        let (device, _) = paged_expert_split(weights, &geom, 2);
+        assert_eq!(device, Hardware::bytes(1_212) + 4 * Hardware::bytes(300));
+        // k above the expert count clamps down: paging everything is
+        // just residency.
+        let (device, _) = paged_expert_split(weights, &geom, 99);
+        assert_eq!(device, Hardware::bytes(1_212) + 40 * Hardware::bytes(300));
+        // A checkpoint smaller than its expert slice saturates instead
+        // of underflowing.
+        let (device, host) = paged_expert_split(Hardware::bytes(6_000), &geom, 12);
+        assert_eq!(device, 12 * Hardware::bytes(300));
+        assert_eq!(host, Hardware::bytes(12_000));
+    }
+
+    #[test]
+    fn unit__paged_expert_resident_k__every_slot_the_budget_holds() {
+        let geom = test_moe_geometry();
+        // room = 10_700 - 1_212 - 448 = 9_040 MiB; 9_040/300 = 30.
+        let k = paged_expert_resident_k(
+            Hardware::bytes(10_700),
+            Hardware::bytes(1_212),
+            Hardware::bytes(448),
+            &geom,
+        );
+        assert_eq!(k, 30);
+        // A budget that holds everything caps at E.
+        let k = paged_expert_resident_k(
+            Hardware::bytes(40_000),
+            Hardware::bytes(1_212),
+            Hardware::bytes(448),
+            &geom,
+        );
+        assert_eq!(k, 40);
+        // No room at all floors at the router top-k.
+        let k = paged_expert_resident_k(Hardware::bytes(0), 0, 0, &geom);
+        assert_eq!(k, 4);
+    }
+
+    #[test]
+    fn unit__paged_host_floor_mib__dense_half_plus_full_pinned_store() {
+        // The expert store is pinned for the child's whole lifetime;
+        // the dense slice still streams at load like any checkpoint.
+        assert_eq!(paged_host_floor_mib(10_000, 6_000), 2_000 + 6_000 + 512);
+        // A model smaller than its expert slice: the dense half-charge
+        // saturates away - the pinned store dominates the floor.
+        assert_eq!(paged_host_floor_mib(4_000, 6_000), 6_000 + 512);
+    }
+
+    #[test]
+    fn unit__sglang_paged_engagement__spec_and_shard_refuse_the_manual_pairing() {
+        let mut tun = SglangTuning {
+            paged_experts: Some(true),
+            ..Default::default()
+        };
+        let flags = sglang_flags_paged();
+        // Upstream rejects speculative decoding with paging - the
+        // refusal teaches the spec off lever.
+        let err = sglang_paged_engagement(
+            &tun,
+            &paged_test_geom(Some(test_moe_geometry()), true, 1),
+            &flags,
+        )
+        .unwrap_err();
+        assert!(err.contains("speculative"), "{err}");
+        // And paged experts are single-GPU in 0.5.23.
+        let err = sglang_paged_engagement(
+            &tun,
+            &paged_test_geom(Some(test_moe_geometry()), false, 2),
+            &flags,
+        )
+        .unwrap_err();
+        assert!(err.contains("single-GPU"), "{err}");
+        // Auto never trips those refusals: it just declines to engage.
+        tun.paged_experts = None;
+        assert!(
+            sglang_paged_engagement(
+                &tun,
+                &paged_test_geom(Some(test_moe_geometry()), true, 1),
+                &flags
+            )
+            .is_ok_and(|e| e.is_none())
+        );
+        assert!(
+            sglang_paged_engagement(
+                &tun,
+                &paged_test_geom(Some(test_moe_geometry()), false, 2),
+                &flags
+            )
+            .is_ok_and(|e| e.is_none())
+        );
+    }
+
+    #[test]
+    fn unit__sglang__paged_manual_pin_emits_both_flags() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                paged_experts: Some(true),
+                paged_experts_num_resident: Some(12),
+                ..Default::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        inp.model_path = repo;
+        inp.overlay = &overlay;
+        inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // Manual pages whenever the geometry reads - even where full
+        // residency would fit: the user asked for the host store.
+        assert!(
+            p.argv.iter().any(|a| a == "--enable-paged-experts"),
+            "argv: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--paged-experts-num-resident" && w[1] == "12")
+        );
+        assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("paged experts engaged"))
+        );
+        // device = 13212 - 12000 + 12*300 = 4812 MiB; +kv16 896 fits
+        // the ~10.7 GiB pool: Tier A, no KV dtype flag.
+        assert!(!p.argv.iter().any(|a| a == "--kv-cache-dtype"));
+        assert_eq!(p.gpu, "full");
+    }
+
+    #[test]
+    fn unit__sglang__paged_auto_deficit_derives_resident_k() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        let overlay = sglang_ctx_overlay();
+        // Weights 13212 MiB (12700 model + 512 overhead) vs the ~10.7
+        // GiB pool: full residency fails, so ladder-auto engages. k =
+        // floor((pool - 1212 dense - 448 kv8) / 300 per-expert) = 30;
+        // device = 1212 + 9000 = 10212 MiB, +448 kv8 = 10660 fits ->
+        // Tier B with fp8 KV.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        inp.model_path = repo;
+        inp.overlay = &overlay;
+        inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv.iter().any(|a| a == "--enable-paged-experts"),
+            "argv: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--paged-experts-num-resident" && w[1] == "30")
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--kv-cache-dtype" && w[1] == "fp8_e5m2")
+        );
+        assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("30 of 40 experts resident"))
+        );
+        assert_eq!(p.gpu, "full");
+        assert_eq!(p.kv_est_bytes, Some(469_762_048));
+    }
+
+    #[test]
+    fn unit__sglang__paged_auto_not_engaged_when_residency_fits() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        let overlay = sglang_ctx_overlay();
+        // 8000 MiB model + 512 overhead + 896 kv16 = 9408 MiB: fits the
+        // pool whole - auto declines, the classic Tier A plan runs.
+        let mut inp = sglang_input(&hf, &hw, &cfg, 8_000 * MIB);
+        inp.model_path = repo;
+        inp.overlay = &overlay;
+        inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(!p.argv.iter().any(|a| a == "--enable-paged-experts"));
+        assert!(!p.argv.iter().any(|a| a == "--paged-experts-num-resident"));
+        assert!(!p.argv.iter().any(|a| a == "--cpu-offload-gb"));
+        assert!(!p.argv.iter().any(|a| a == "--kv-cache-dtype"));
+        assert_eq!(p.gpu, "full");
+    }
+
+    #[test]
+    fn unit__sglang__paged_opt_out_is_byte_identical_classic_plan() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        let dense = write_dense_repo();
+        // paged_experts = false is the exact rollback: the MoE repo
+        // plans the same classic host-offload argv a dense repo of the
+        // same size plans - no paged flags, Tier C offload engaged.
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                paged_experts: Some(false),
+                ..Default::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut moe_inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        moe_inp.model_path = repo;
+        moe_inp.overlay = &overlay;
+        moe_inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let paged_off = compile(&moe_inp, &TuningOverrides::default()).unwrap();
+        let mut dense_inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        dense_inp.model_path = dense;
+        dense_inp.overlay = &overlay;
+        dense_inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let dense_p = compile(&dense_inp, &TuningOverrides::default()).unwrap();
+        assert_eq!(paged_off.argv, dense_p.argv);
+        assert!(!paged_off.argv.iter().any(|a| a == "--enable-paged-experts"));
+        assert!(
+            paged_off
+                .argv
+                .windows(2)
+                .any(|w| w[0] == "--cpu-offload-gb")
+        );
+        assert_eq!(paged_off.gpu, "partial");
+    }
+
+    #[test]
+    fn unit__sglang__paged_manual_on_dense_model_refuses() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let dense = write_dense_repo();
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                paged_experts: Some(true),
+                ..Default::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        inp.model_path = dense;
+        inp.overlay = &overlay;
+        inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("no routed experts to page"), "{err}");
+    }
+
+    #[test]
+    fn unit__sglang__paged_k_outside_router_bounds_refuses() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        for bad_k in [2u64, 41] {
+            let overlay = ModelOverride {
+                ctx: Some(32_768),
+                sglang: Some(SglangTuning {
+                    paged_experts: Some(true),
+                    paged_experts_num_resident: Some(bad_k),
+                    ..Default::default()
+                }),
+                ..DEFAULT_OVERLAY.clone()
+            };
+            let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+            inp.model_path = repo;
+            inp.overlay = &overlay;
+            inp.supported_flags = &SGLANG_FLAGS_PAGED;
+            let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+            if bad_k < 4 {
+                assert!(err.contains("below the router top-k 4"), "{err}");
+            } else {
+                assert!(err.contains("exceeds the expert count 40"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn unit__sglang__paged_manual_on_old_lane_refuses() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                paged_experts: Some(true),
+                ..Default::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        inp.model_path = repo;
+        inp.overlay = &overlay;
+        // The bare 0.5.19-era flag set: the lane predates paging.
+        inp.supported_flags = &SGLANG_FLAGS;
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(err.contains("lacks --enable-paged-experts"), "{err}");
+    }
+
+    #[test]
+    fn unit__sglang__paged_auto_requires_page_capable_lane() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("gptq"));
+        let overlay = sglang_ctx_overlay();
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        inp.model_path = repo;
+        inp.overlay = &overlay;
+        inp.supported_flags = &SGLANG_FLAGS;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // Same deficit hardware, lane without the flags: auto declines
+        // and the classic Tier C host-offload plan runs.
+        assert!(!p.argv.iter().any(|a| a == "--enable-paged-experts"));
+        assert!(p.argv.windows(2).any(|w| w[0] == "--cpu-offload-gb"));
+        assert_eq!(p.gpu, "partial");
+    }
+
+    #[test]
+    fn unit__sglang__paged_manual_out_of_table_quant_warns() {
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let repo = write_moe_repo(40, 4, 12_000, 2, Some("aqlm"));
+        let overlay = ModelOverride {
+            ctx: Some(32_768),
+            sglang: Some(SglangTuning {
+                paged_experts: Some(true),
+                paged_experts_num_resident: Some(12),
+                ..Default::default()
+            }),
+            ..DEFAULT_OVERLAY.clone()
+        };
+        let mut inp = sglang_input(&hf, &hw, &cfg, 12_700 * MIB);
+        inp.model_path = repo;
+        inp.overlay = &overlay;
+        inp.supported_flags = &SGLANG_FLAGS_PAGED;
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        // The engine stays the authority: warn, never refuse.
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("outside the paged runner table")),
+            "warnings: {:?}",
+            p.warnings
+        );
+        assert!(p.argv.iter().any(|a| a == "--enable-paged-experts"));
     }
 
     #[test]
@@ -21758,6 +22683,8 @@ mod tests {
             "--kv-transfer-config",
             "--enable-auto-tool-choice",
             "--tool-call-parser",
+            "--spec-method",
+            "--spec-tokens",
         ]
         .iter()
         .map(|f| (*f).to_string())
@@ -21884,6 +22811,8 @@ mod tests {
             gpu_memory_utilization: None,
             kv_offload: crate::config::VllmKvOffload::default(),
             tool_call_parser: Some("pythonic".into()),
+            spec_method: None,
+            spec_num_tokens: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -21904,6 +22833,121 @@ mod tests {
                 .windows(2)
                 .any(|w| w[0] == "--tool-call-parser" && w[1] == "hermes"),
             "family default must not double-ride: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__spec_knobs_emit_method_and_token_pair() {
+        // The draft-free speculator pair is a plain spawn flag set:
+        // method rides verbatim, the explicit window rides verbatim.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            spec_method: Some("suffix".into()),
+            spec_num_tokens: Some(6),
+            ..Default::default()
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-method" && w[1] == "suffix"),
+            "method rides verbatim: {:?}",
+            p.argv
+        );
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-tokens" && w[1] == "6"),
+            "window rides verbatim: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__spec_window_defaults_shallow_when_unset() {
+        // An unset window pairs with 4, not vllm's deep min(8, tree
+        // depth) default that costs throughput at high concurrency.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            spec_method: Some("ngram".into()),
+            ..Default::default()
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            p.argv
+                .windows(2)
+                .any(|w| w[0] == "--spec-tokens" && w[1] == "4"),
+            "default window is the shallow 4: {:?}",
+            p.argv
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__spec_window_at_ctx_refuses_pre_load() {
+        // vllm refuses spec_tokens + 1 > max-model-len, but only
+        // after the multi-GB load; the same bound fires here with
+        // both numbers instead.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta(); // ctx_train 32768
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.ctx = Some(4_096);
+        overlay.vllm = Some(crate::config::VllmTuning {
+            spec_method: Some("suffix".into()),
+            spec_num_tokens: Some(4_096),
+            ..Default::default()
+        });
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("must stay below the compiled") && err.contains("4096"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__spec_flags_in_extra_args_refuse_when_knob_set() {
+        // Upstream treats the group flags and --speculative-config as
+        // mutually exclusive; a knob set plus a smuggled manual spec
+        // flag would die at child argv parse - so it dies here.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let mut overlay = DEFAULT_OVERLAY.clone();
+        overlay.vllm = Some(crate::config::VllmTuning {
+            spec_method: Some("suffix".into()),
+            ..Default::default()
+        });
+        overlay.extra_args = Some(vec!["--spec-method".to_string(), "suffix".to_string()]);
+        let inp = vllm_input(&hf, &hw, &cfg, &overlay);
+        let err = compile(&inp, &TuningOverrides::default()).unwrap_err();
+        assert!(
+            err.contains("extra_args") && err.contains("--spec-method"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unit__vllm_compile__unset_spec_knobs_stay_out_of_the_argv() {
+        // No spec knobs, no spec flags: the classic plan is untouched.
+        let cfg = Config::default();
+        let hw = gpu_hw(12_000, 32_000, 8);
+        let hf = hf_meta();
+        let inp = vllm_input(&hf, &hw, &cfg, &DEFAULT_OVERLAY);
+        let p = compile(&inp, &TuningOverrides::default()).unwrap();
+        assert!(
+            !p.argv.contains(&"--spec-method".to_string())
+                && !p.argv.contains(&"--spec-tokens".to_string()),
+            "unset knobs stay out of the argv: {:?}",
             p.argv
         );
     }
@@ -21959,6 +23003,8 @@ mod tests {
                 gpu_memory_utilization: Some(0.6),
                 kv_offload: crate::config::VllmKvOffload::default(),
                 tool_call_parser: None,
+                spec_method: None,
+                spec_num_tokens: None,
             },
             ..Config::default()
         };
@@ -21979,6 +23025,8 @@ mod tests {
             gpu_memory_utilization: Some(0.3),
             kv_offload: crate::config::VllmKvOffload::default(),
             tool_call_parser: None,
+            spec_method: None,
+            spec_num_tokens: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -22045,6 +23093,8 @@ mod tests {
                 connector: crate::config::KvConnectorChoice::default(),
             },
             tool_call_parser: None,
+            spec_method: None,
+            spec_num_tokens: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -22089,6 +23139,8 @@ mod tests {
                 connector: crate::config::KvConnectorChoice::default(),
             },
             tool_call_parser: None,
+            spec_method: None,
+            spec_num_tokens: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let p = compile(&inp, &TuningOverrides::default()).unwrap();
@@ -22137,6 +23189,8 @@ mod tests {
                 ..Default::default()
             },
             tool_call_parser: None,
+            spec_method: None,
+            spec_num_tokens: None,
         });
         let inp = vllm_input(&hf, &hw, &cfg, &overlay);
         let err = compile(&inp, &TuningOverrides::default()).unwrap_err();

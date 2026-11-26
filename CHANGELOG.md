@@ -8,6 +8,25 @@ tracked here.
 
 ### Added
 
+- **TLS listeners negotiate HTTP/2.** The rustls config offers ALPN `h2`/`http/1.1` and the axum-server acceptor sets `TCP_NODELAY`; an end-to-end SSE-over-TLS test pins the negotiated protocol.
+- **Inbound `traceparent` continues into OTLP.** The gateway reads the W3C header on every request, continues the span in the existing exporter, and echoes it beside `x-blazar-trace-id` - no new dependency.
+- **Optional mimalloc allocator.** `--features mimalloc` builds the daemon with mimalloc; the A/B saturation receipt left the gain inside run-to-run noise, so the default allocator is unchanged and the feature stays opt-in.
+- **Exact admission at the slot boundary.** `/v1/tokenize` and `/v1/detokenize` answer exact token counts, and the admission gate near the slot boundary counts exactly instead of estimating.
+- **Admission floors are evidence-led.** The admission memory floors follow measured saturation evidence rather than static guesses.
+- **Opt-in request preemption.** `preemption` with `preempt_after_ms` (default off) lets a queued request of a higher tier cancel and replay an in-flight lower-tier request instead of waiting behind it.
+- **Replica pools admit as one.** A replica set enforces a single admission ceiling across its members and pool cancellation reports the member it hit; the spill variant was reverted on the evidence.
+- **Vendor-neutral GPU census.** A `gpu_census` module reads the accelerator inventory through one vendor-neutral path, and `--device` records the provenance of the accelerator a lane pinned.
+- **Hardware receipt registry.** `hardware_receipts` plus per-lane receipts record what each lane actually exercised on a host; lanes with no matching hardware on this host (Apple Silicon MLX, ROCm, SYCL) ship code and fixtures and are flagged, never claimed.
+- **Truthful ROCm/SYCL installer picks.** The llama.cpp installer picks the build the host can actually run and says so when the AMD or oneAPI runtime is absent.
+- **NPU decision recorded.** OpenVINO joins the registry as an experimental lane with receipts, LiteRT-LM rides the CPU runtime, and `docs/research/2026-11-25-npu-decision.md` records the call.
+- **SGLang Paged Experts.** `[sglang]` exposes the paged-experts knobs with a ladder that auto-engages them on capable builds, a host-memory floor for the geometry, and a GPTQ gate fix; the receipts show 2.8x KV capacity at temp-0 identical output.
+- **vLLM speculative decoding and `n>1`.** `spec_method`/`spec_num_tokens` compile into the vLLM server argv (suffix decoding runs 4.6x decode at byte-identical temp-0 output), `n>1` completions are supported, and the llama.cpp currency battery moved the floor to b12756.
+- **`blazar launch` agent presets.** Six presets exec agent CLIs with the gateway base-URL environment pre-wired; `--dry-run`, `--self-test`, `--list` and `--restore` (redacted state file) cover the lifecycle.
+- **Gemini `generateContent` dialect behind a flag.** `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent` speak the Gemini shape on the same serving lane - `gemini.rs` translates both directions and preserves `candidateCount`/`topK` semantics.
+- **Head-to-head receipts vs ollama 0.40.17.** The matched campaign (qwen2.5-0.5b Q4_K_M, warm and cold, a C=1..8 ladder, a temp-0 quality battery) plus the non-stream per-request overhead lane - gateway versus the matched direct engine, p50 delta in microseconds - ships as `scripts/bench_ollama_head_to_head.py` with receipts under `bench-artifacts/2026-11-23-sota-roadmap/`.
+- **Licence notices travel with the model.** Pulls from the ollama registry capture the licence layer, pulls from Hugging Face capture the model card's `cardData.license`, and the row stores the text (schema v25). `/api/show` and `blazar show` print it - the old "see upstream model card" placeholder now appears only for rows that genuinely have no licence on record (imported and adopted models, pre-v25 pulls).
+- **Pip-lane installs are verified and re-verifiable.** A pip lane (SGLang, vLLM, MLX, LiteRT, kokoro) finishes install by re-hashing every file its venv `RECORD` manifests list and stamps the engine row with `pip:<sha256>` - drift, missing files, or paths escaping the venv fail the install with the file named. `blazar engine verify <tag>` re-checks any recorded digest later: pip lanes re-walk the RECORDs, GitHub lanes re-hash the cached download archive, and a digest verified at install whose cache is gone is an honest skip, not a failure. `blazar engine verify` with no tag sweeps every installed lane at once - one report per engine - so drift on a quiet lane surfaces without naming tags by hand.
+- **Split GGUFs import as one model.** `blazar import` on any shard of a `*-00001-of-00002.gguf` set imports the whole set: every leaf linked in, the row recording `shards: 2` and the first leaf's digest, serving identical to the unsplit file. An incomplete set is refused with the missing leaf named.
 - **The web console is now a management surface.** `/ui` grew from a read-only dashboard into a full operations console: nine tabs (Dashboard, Models, Fabric, Routing, Config, Benchmarks, Jobs, Sessions, Keys) with live JSON polling on the active tab and a `/api/events` SSE strip. Actions run the same validated write planes the CLI and HTTP API expose - config set/unset/reload, warm/evict, job cancel, key add/rotate/remove, failover pin/unpin and pool member drain/pin - so the console can never bypass a validation gate.
 - **File pins surfaced in the config GUI.** `GET /api/config` carries `pins`: every scalar pin the config file makes, as dotted keys in the same grammar `config set`/`unset` speak. The console's Config tab badges each row pinned-in-file vs built-in default - the same distinction `blazar config get` prints.
 - **Event replay for reconnecting dashboards.** The EventBus keeps a bounded 256-event replay ring (recorded before broadcast, so a late subscriber never misses an event); `/api/events` prepends the backlog, oldest first, before the live tail. A browser refresh no longer reads as "nothing happened while I was away".
@@ -23,6 +42,7 @@ tracked here.
 
 ### Changed
 
+- **One overhead number, one place.** The gateway-overhead headline is stated once and linked from the other docs; the 1-3% and 5-6% claims carried in the October notes are reconciled to it.
 - **Admission enforces a host-RAM ledger with pressure relief** - spawn admission now accounts host RAM across resident engines and relieves pressure instead of admitting into swap.
 - **SGLang residency is planned in engine units with an adaptive think-default.** Related planner work: dense full residency is preferred over a legal-but-offloaded speculative plan; self-drafting spec lanes are charged the dense capture reserve; a registered-but-unfit spec lane degrades to dense instead of refusing; the dense per-slot reserve is recalibrated to a receipt-calibrated 100 MiB/slot; and the aggregate-throughput tradeoff of a slots=1 full-residency plan is taught explicitly.
 - **`slot_cap` honors the manual overlay pin before the config default.**
@@ -54,6 +74,10 @@ tracked here.
 
 ### Fixed
 
+- **Greedy determinism is measured, not asserted.** The receipts state what the direct engine matches (itself, 20/20) and what changes through the gateway (multi-slot batching numerics), replacing three contradictory notes.
+- **The C=2 throughput dip is fixed.** Root-caused and fixed at the cause: the saturation ladder no longer shows the unexplained gateway-over-direct dip at C=2.
+- **Store read failures are loud.** The call chains that turned a failed store read into a missing row (surfacing as "model not found" or "key absent") now propagate the error - a locked or corrupted store reports itself.
+- **Log-sink liveness is observable.** The unreproducible all-sinks-dark freeze now has heartbeat counters and a detector, so a recurrence records itself instead of disappearing.
 - **Spec-legal malformed tool-args history is repaired after an upstream 500** - a request whose tool-call round the engine failed mid-flight now gets a spec-legal repair instead of surfacing the engine error on every follow-up turn.
 - **The installer pins the downloaded binary to the installer release version** - an upgrade can no longer leave a mixed-version install.
 - **Silent log-sink outages are provable and recoverable**: the log tee recovers from lock poisoning with a one-time stderr marker, and the incident class is documented in `docs/issues/012-silent-log-freeze.md`.

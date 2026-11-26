@@ -110,6 +110,24 @@ struct WaitKey(u8, u8, u128, u64);
 // deadline (EDF within a class - SLO tiers), then earliest arrival (FIFO).
 // No deadline (bulk) sorts last via u128::MAX.
 
+/// Ends a wait cleanly when the waiting future is dropped without an
+/// answer (a request granted a slot another request handed over): the
+/// queue entry must not linger as phantom demand.
+struct WaitEntry<'a> {
+    queue: &'a PriorityQueue,
+    key: Option<WaitKey>,
+}
+
+impl Drop for WaitEntry<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key {
+            let mut q = self.queue.inner.lock().expect("queue lock");
+            q.waiters.remove(&key);
+            q.meta.remove(&key);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Waiter {
     #[allow(dead_code)]
@@ -279,8 +297,13 @@ impl PriorityQueue {
             key
         };
         self.notify.notify_waiters();
+        let mut entry = WaitEntry {
+            queue: self,
+            key: Some(key),
+        };
         match tokio::time::timeout(timeout, &mut rx).await {
             Ok(Ok(())) => {
+                entry.key = None;
                 self.wait_obs.observe_secs(started.elapsed().as_secs_f64());
                 Ok(())
             }
@@ -294,6 +317,7 @@ impl PriorityQueue {
                 // still counts as empty here); anything but a live admission
                 // falls through to the honest timeout path below.
                 if rx.try_recv().is_ok() {
+                    entry.key = None;
                     self.wait_obs.observe_secs(started.elapsed().as_secs_f64());
                     return Ok(());
                 }

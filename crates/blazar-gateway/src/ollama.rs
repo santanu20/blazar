@@ -62,7 +62,8 @@ pub async fn version() -> Response {
 /// The gateway holds no in-process tokenizer (exact counts come from the
 /// running child engine, same source `enforce_prompt_fits` uses); a model
 /// that is not resident answers 503 with a warm-up hint rather than
-/// silently spawning a multi-GiB load from a counting probe.
+/// silently spawning a multi-GiB load from a counting probe. Engines
+/// without a tokenize route answer 501.
 pub async fn tokenize(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     use serde_json::json;
 
@@ -72,37 +73,16 @@ pub async fn tokenize(State(state): State<Arc<AppState>>, body: Bytes) -> Respon
     };
     let model = req["model"].as_str().unwrap_or_default();
     let prompt = req["prompt"].as_str().unwrap_or_default();
-    let Some(engine) = state
-        .sup
-        .live_http_endpoints()
-        .into_iter()
-        .find(|e| e.name == model)
-    else {
+    let Some(engine) = crate::tokenize::resident(&state, model) else {
         return api_error(
             503,
             "model not running - /api/tokenize counts via the live engine; warm it with a request or blazar CLI first",
         );
     };
-    let base = crate::proxy::child_base(&engine.endpoint);
-    let resp = crate::proxy::child_auth(
-        crate::state::child_client(&state, &engine.endpoint).post(format!("{base}/tokenize")),
-        &engine,
-    )
-    .json(&json!({ "content": prompt }))
-    .send()
-    .await;
-    match resp {
-        Ok(r) => match r.json::<serde_json::Value>().await {
-            Ok(v) => {
-                let count = v
-                    .get("tokens")
-                    .and_then(|t| t.as_array())
-                    .map_or(0, Vec::len);
-                axum::Json(json!({ "count": count })).into_response()
-            }
-            Err(e) => api_error(502, &format!("engine tokenize failed: {e}")),
-        },
-        Err(e) => api_error(502, &format!("engine tokenize request failed: {e}")),
+    match crate::tokenize::count_prompt(&state, &engine, prompt).await {
+        Ok(count) => axum::Json(json!({ "count": count })).into_response(),
+        Err(e @ crate::tokenize::TokenizeError::Unsupported(_)) => api_error(501, &e.to_string()),
+        Err(e) => api_error(502, &e.to_string()),
     }
 }
 
@@ -261,12 +241,37 @@ pub async fn why(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
     .into_response()
 }
 
+/// Model resolution for Ollama-dialect handlers: the row, or the
+/// response to return - 404 with the ladder's teaching message when the
+/// store answered and no unique row exists, 503 when the store could not
+/// answer (a broken store is never reported as "model not found").
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+pub(crate) fn resolve_model_ollama(
+    state: &AppState,
+    model: &str,
+) -> Result<blazar_core::ModelRow, Response> {
+    match crate::proxy::resolve_model_for_handler(state, model) {
+        Ok(Ok(row)) => Ok(row),
+        Ok(Err(message)) => Err(api_error(404, &message)),
+        Err(message) => Err(api_error(
+            503,
+            &format!(
+                "store could not resolve model {model:?} ({message}) - retry once the store recovers"
+            ),
+        )),
+    }
+}
+
 /// GET /api/tags
 pub async fn tags(State(state): State<Arc<AppState>>) -> Response {
-    let models = match state.with_store(blazar_core::Store::list_models) {
-        Some(Ok(l)) => l,
-        Some(Err(e)) => return api_error(500, &e.to_string()),
-        None => return api_error(500, "store unavailable"),
+    let models = match state.read_store_list("models.list", blazar_core::Store::list_models) {
+        Ok(list) => list,
+        Err(message) => {
+            return api_error(
+                503,
+                &format!("store unavailable ({message}) - retry once the store recovers"),
+            );
+        }
     };
     let rows: Vec<Value> = models
         .iter()
@@ -373,19 +378,33 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     let name = req["model"].as_str().unwrap_or_default().to_string();
     // One cached-connection visit gathers row + profile: the guard lives
     // and drops inside this sync block (never across await).
-    let Some((row, profile)) = state.with_store(|s| {
-        let row = resolve_model(s, &name);
-        let profile = match &row {
-            Ok(r) => s
-                .active_engine()
-                .ok()
-                .flatten()
-                .and_then(|e| s.get_profile(&r.name, &e.tag).ok().flatten()),
-            Err(_) => None,
-        };
-        (row, profile)
-    }) else {
-        return api_error(500, "store unavailable");
+    let row = match state.read_store("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, &name).map(crate::proxy::ModelResolution::found)
+    }) {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => match state.read_store_or_absent(
+            "models.resolve_message",
+            |s| -> Result<Option<String>, blazar_core::CoreError> {
+                Ok(resolve_model(s, &name).err())
+            },
+        ) {
+            Some(message) => Err(message),
+            None => return api_error(503, "store unavailable - retry once the store recovers"),
+        },
+        Err(message) => {
+            return api_error(
+                503,
+                &format!("store unavailable ({message}) - retry once the store recovers"),
+            );
+        }
+    };
+    let profile = match &row {
+        Ok(r) => state
+            .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
+            .and_then(|e| {
+                state.read_store_or_absent("models.profile", |s| s.get_profile(&r.name, &e.tag))
+            }),
+        Err(_) => None,
     };
     let row = match row {
         Ok(r) => r,
@@ -423,7 +442,13 @@ pub async fn show(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         capabilities.push("thinking");
     }
     let mut resp = json!({
-        "license": "see upstream model card",
+        // E5: real licence when the pull captured one (registry licence
+        // layer / HF cardData); the honest upstream pointer only for
+        // rows with none on record (imported, adopted).
+        "license": row
+            .license
+            .clone()
+            .unwrap_or_else(|| "see upstream model card".to_string()),
         "modelfile": format!("# blazar: plain GGUF at {}", row.path),
         "parameters": "see config overlay",
         "capabilities": capabilities,
@@ -461,10 +486,9 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
     // `name:quant` string GET /api/tags rendered - a raw store-key probe
     // here 404'd on the tags-displayed name. Same rule the CLI's
     // `blazar rm` applies before removing.
-    let row = match state.with_store(|s| crate::proxy::resolve_model(s, name)) {
-        Some(Ok(row)) => row,
-        Some(Err(msg)) => return api_error(404, &msg),
-        None => return api_error(500, "store unavailable"),
+    let row = match resolve_model_ollama(&state, name) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     let key = row.name;
     // F22: classify from typed state, not error-string substrings - an
@@ -504,13 +528,17 @@ pub async fn delete(State(state): State<Arc<AppState>>, body: Bytes) -> Response
             // classify from live state again, never from the message text.
             if blazar_runtime::instance_running(&state.dirs, &key) {
                 api_error(409, &format!("{e:#}"))
-            } else if state
-                .with_store(|s| s.get_model(&key).ok().flatten().is_none())
-                .unwrap_or(false)
-            {
-                api_error(404, &format!("{e:#}"))
             } else {
-                api_error(500, &format!("{e:#}"))
+                match state.read_store("models.get", |s| s.get_model(&key)) {
+                    Ok(None) => api_error(404, &format!("{e:#}")),
+                    Ok(Some(_)) => api_error(500, &format!("{e:#}")),
+                    Err(store_message) => api_error(
+                        503,
+                        &format!(
+                            "store could not confirm the removal ({store_message}) - retry once the store recovers"
+                        ),
+                    ),
+                }
             }
         }
     }
@@ -921,19 +949,16 @@ async fn expand_openaihost_ps(state: &Arc<AppState>, rows: Vec<Value>) -> Vec<Va
         },
         _ => return rows,
     };
-    let Some(litert_rows) = state.with_store(|s| {
-        s.list_models()
-            .map(|ms| {
-                ms.into_iter()
-                    .filter(blazar_core::ModelRow::is_litert_bundle)
-                    .collect::<Vec<_>>()
-            })
-            // Store read failure degrades to "no expansion", same as an
-            // unavailable store - the synthetic lane row stays visible.
-            .unwrap_or_default()
-    }) else {
-        return rows;
-    };
+    // A store read failure degrades to "no expansion", same as an
+    // unavailable store - the synthetic lane row stays visible and the
+    // failure is counted in blazar_store_read_errors_total.
+    let litert_rows = state.read_store_list_or_empty("models.list", |s| {
+        s.list_models().map(|ms| {
+            ms.into_iter()
+                .filter(blazar_core::ModelRow::is_litert_bundle)
+                .collect::<Vec<_>>()
+        })
+    });
     let engine_tag = lane["blazar_engine"].clone();
     let gpu = lane["blazar_gpu"].clone();
     let expires = lane["expires_at"].clone();
@@ -1289,10 +1314,9 @@ fn event_kind(e: &blazar_runtime::BlazarEvent) -> &'static str {
 /// still win (R3, same contract as the serve-then-evict path), then a
 /// minimal lane-shaped done body.
 async fn unload_ping(state: &Arc<AppState>, model: &str, chat_shape: bool) -> Response {
-    let row = match state.with_store(|s| resolve_model(s, model)) {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => return api_error(404, &e),
-        None => return api_error(500, "store unavailable"),
+    let row = match resolve_model_ollama(state, model) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     let pinned = state
         .sup
@@ -1534,9 +1558,9 @@ pub async fn chat(
     if is_unload_ping {
         return unload_ping(&state, &model_field, true).await;
     }
-    let row = match state.with_store(|s| resolve_model(s, &model_field)) {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => {
+    let row = match crate::proxy::resolve_model_for_handler(&state, &model_field) {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // Federation fallback on the ollama lane too: a bare name
             // no local row owns routes to a live peer that lists it
             // (ollama shape preserved by the remote chat translator).
@@ -1572,7 +1596,14 @@ pub async fn chat(
             }
             return api_error(404, &e);
         }
-        None => return api_error(500, "store unavailable"),
+        Err(message) => {
+            return api_error(
+                503,
+                &format!(
+                    "store could not resolve model {model_field:?} ({message}) - retry once the store recovers"
+                ),
+            );
+        }
     };
 
     // Key admission already ran above (F11 hoist) - scope check against
@@ -1653,18 +1684,19 @@ pub async fn chat(
     {
         return api_error(400, &msg);
     }
-    // Prompt-fit preflight (num_ctx request override counts).
-    {
+    // Prompt-fit preflight (num_ctx request override counts). A cold
+    // model with a straddling estimate is counted exactly once loaded.
+    let recheck_prompt = {
         let eff = match req
             .pointer("/options/num_ctx")
             .and_then(serde_json::Value::as_u64)
         {
             Some(v) => v,
-            // Live per-slot ctx when resident (auto-fit may have
-            // narrowed it); config estimate only for cold lanes.
+            // Live limit when resident (auto-fit may have narrowed it,
+            // unified KV widened it); config estimate only for cold lanes.
             None => u64::from(crate::preflight::admission_ctx(&state, &row.name)),
         };
-        if let Err(resp) = crate::preflight::enforce_prompt_fits(
+        match crate::preflight::enforce_prompt_fits(
             &state,
             &row.name,
             &req,
@@ -1672,9 +1704,10 @@ pub async fn chat(
         )
         .await
         {
-            return *resp;
+            Ok(needed) => needed,
+            Err(resp) => return *resp,
         }
-    }
+    };
 
     // F27: validate num_ctx BEFORE the semantic cache - a hit must not
     // skip the validation a miss enforces (miss->400, hit->200 asymmetry).
@@ -1914,6 +1947,12 @@ pub async fn chat(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    if recheck_prompt
+        && let Err(resp) =
+            crate::preflight::recheck_prompt_fits(&state, &row.name, &req, &engine).await
+    {
+        return *resp;
+    }
     // llama.cpp LoRA-variant ride (generation surface): a `base+adapter`
     // spelling resolved to the resident base child selects the adapter
     // per request through the completion-schema `lora` field. The
@@ -2363,10 +2402,9 @@ pub(crate) async fn apply_num_ctx(
     // silently skipping the preflight and queueing a phantom ctx under
     // the display alias. Unknown names fail fast with the ladder's
     // teaching message - the serving path would 404 identically.
-    let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
-        Some(Ok(row)) => row.name,
-        Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
-        None => return Err(Box::new(api_error(500, "store unavailable"))),
+    let model = match resolve_model_ollama(state, model) {
+        Ok(row) => row.name,
+        Err(response) => return Err(Box::new(response)),
     };
     // ctx preflight (I5): refuse a num_ctx no spawn could host, BEFORE
     // the evict below can take a healthy instance down. One placement
@@ -2376,9 +2414,7 @@ pub(crate) async fn apply_num_ctx(
     // query exists across backends): anything that passes still gets
     // the engine's own fit juggling at spawn.
     {
-        let row = state
-            .with_store(|s| s.get_model(&model).ok().flatten())
-            .flatten();
+        let row = state.read_store_or_absent("models.get", |s| s.get_model(&model));
         if let Some(row) = row
             && let Ok(meta) = blazar_core::read_metadata_file(std::path::Path::new(&row.path))
         {
@@ -2492,10 +2528,9 @@ pub(crate) async fn apply_spec(
     // matches the instance key (the OpenAI header path feeds the raw
     // body name) and unknown names fail fast instead of queuing a
     // phantom spec under the display alias.
-    let model = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
-        Some(Ok(row)) => row.name,
-        Some(Err(msg)) => return Err(Box::new(api_error(404, &msg))),
-        None => return Err(Box::new(api_error(500, "store unavailable"))),
+    let model = match resolve_model_ollama(state, model) {
+        Ok(row) => row.name,
+        Err(response) => return Err(Box::new(response)),
     };
     if let Some(p) = state.sup.ps().into_iter().find(|p| p.name == model) {
         if p.spec_mode != want && p.in_flight == 0 {
@@ -3501,10 +3536,9 @@ pub async fn embeddings(
     if let Some(resp) = refuse_remote_prefix(&state, &model) {
         return resp;
     }
-    let row = match state.with_store(|s| resolve_model(s, &model)) {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => return api_error(404, &e),
-        None => return api_error(500, "store unavailable"),
+    let row = match resolve_model_ollama(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     // Scope + request count (plain embeds carry no token usage, so budgets
     // apply on request counts; late-chunking embeds additionally charge
@@ -3664,10 +3698,9 @@ pub async fn embed(
     if let Some(resp) = refuse_remote_prefix(&state, &model) {
         return resp;
     }
-    let row = match state.with_store(|s| resolve_model(s, &model)) {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => return api_error(404, &e),
-        None => return api_error(500, "store unavailable"),
+    let row = match resolve_model_ollama(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     if let Some(Extension(k)) = &key_ext
         && let Some(entry) = state.keys.entry(&k.name)
@@ -3856,10 +3889,9 @@ pub async fn rerank(
     if let Some(resp) = refuse_remote_prefix(&state, &model) {
         return resp;
     }
-    let row = match state.with_store(|s| resolve_model(s, &model)) {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => return api_error(404, &e),
-        None => return api_error(500, "store unavailable"),
+    let row = match resolve_model_ollama(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     if let Some(Extension(k)) = &key_ext
         && let Some(entry) = state.keys.entry(&k.name)
@@ -4005,10 +4037,9 @@ pub async fn generate(
     if let Some(resp) = refuse_remote_prefix(&state, &model) {
         return resp;
     }
-    let row = match state.with_store(|s| resolve_model(s, &model)) {
-        Some(Ok(r)) => r,
-        Some(Err(e)) => return api_error(404, &e),
-        None => return api_error(500, "store unavailable"),
+    let row = match resolve_model_ollama(&state, &model) {
+        Ok(row) => row,
+        Err(response) => return response,
     };
     if let Some((_name, entry)) = &key_entry
         && let Err(rej) = state.keys.admit(entry, &row.name)
@@ -4060,12 +4091,12 @@ pub async fn generate(
     let keep_alive = parse_keep_alive(req.get("keep_alive"));
     // F13: prompt-fit preflight (num_ctx request override counts) - the
     // same pre-hoc contract /api/chat enforces.
-    {
+    let recheck_prompt = {
         let eff = req
             .pointer("/options/num_ctx")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_else(|| u64::from(crate::preflight::admission_ctx(&state, &row.name)));
-        if let Err(resp) = crate::preflight::enforce_prompt_fits(
+        match crate::preflight::enforce_prompt_fits(
             &state,
             &row.name,
             &req,
@@ -4073,9 +4104,10 @@ pub async fn generate(
         )
         .await
         {
-            return *resp;
+            Ok(needed) => needed,
+            Err(resp) => return *resp,
         }
-    }
+    };
     // F13: honor options.num_ctx - restart once at the requested size;
     // router mode cannot (one shared child), fail fast with the overlay
     // fix instead of silently ignoring (complaint #13, chat parity).
@@ -4168,6 +4200,12 @@ pub async fn generate(
         Ok(ok) => ok,
         Err(resp) => return *resp,
     };
+    if recheck_prompt
+        && let Err(resp) =
+            crate::preflight::recheck_prompt_fits(&state, &row.name, &req, &engine).await
+    {
+        return *resp;
+    }
     // F12: keep_alive parity with /api/chat - pin window at admission,
     // explicit evict after the response on 0 (session pins still win).
     if let Some(secs) = keep_alive {
@@ -4304,10 +4342,17 @@ pub async fn evict(State(state): State<Arc<AppState>>, body: Bytes) -> Response 
     // bare store names, and a raw passthrough here no-op'd 200 on the
     // tags form while the model kept serving (live-repro'd against
     // bge-reranker-v2-m3:q8_0). Same rule /api/delete applies.
-    let key = match state.with_store(|s| crate::proxy::resolve_model(s, model)) {
-        Some(Ok(row)) => row.name,
-        Some(Err(msg)) => return evict_unresolved(&state, model, &msg).await,
-        None => return api_error(500, "store unavailable"),
+    let key = match crate::proxy::resolve_model_for_handler(&state, model) {
+        Ok(Ok(row)) => row.name,
+        Ok(Err(msg)) => return evict_unresolved(&state, model, &msg).await,
+        Err(message) => {
+            return api_error(
+                503,
+                &format!(
+                    "store could not confirm what {model:?} names ({message}) - retry once the store recovers"
+                ),
+            );
+        }
     };
     // Router mode: the engine owns per-model lifecycle - forward the
     // unload to the router child (models stay preset-listed, just unloaded).
@@ -4452,8 +4497,7 @@ pub async fn session(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
         .and_then(|m| crate::proxy::routed_kind_for(&state, m))
         .or_else(|| {
             state
-                .with_store(|s| s.active_engine().ok().flatten())
-                .flatten()
+                .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
                 .map(|e| e.kind)
         });
     if let Some(kind) = engine_kind
@@ -4894,15 +4938,15 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     // image, video) - after a restart this drops to zero via the boot
     // sweep, which is exactly the signal an operator wants.
     let durable_jobs_active = state
-        .with_store(|s| {
+        .read_store_list_or_empty("jobs.metrics_active", |s| {
             s.list_jobs(Some("queued"), None, 1000, None)
-                .unwrap_or_default()
-                .len()
-                + s.list_jobs(Some("running"), None, 1000, None)
-                    .unwrap_or_default()
-                    .len()
         })
-        .unwrap_or(0);
+        .len()
+        + state
+            .read_store_list_or_empty("jobs.metrics_active", |s| {
+                s.list_jobs(Some("running"), None, 1000, None)
+            })
+            .len();
     let _ = write!(
         merged,
         "# HELP blazar_jobs_active Durable job rows not yet terminal (all lanes)\n# TYPE blazar_jobs_active gauge\nblazar_jobs_active {durable_jobs_active}\n"
@@ -4952,6 +4996,30 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
             .audit_dropped
             .load(std::sync::atomic::Ordering::Relaxed)
     );
+    // Store reads that could not answer (per operation). Non-zero means
+    // persisted state is being served without; the matching warn-once
+    // line "store read failed (<op>)" names the failing query.
+    merged.push_str(&state.store_read_error_metrics());
+    // Engine view builds: flat while the installed engines are
+    // unchanged; climbing under steady traffic would mean the rows
+    // keep changing.
+    merged.push_str(&state.engine_view_metrics());
+    // Issue 012: tracing sink accounting (events enabled vs lines
+    // written per sink), the sentinel.jsonl arm, and the stall detector.
+    merged.push_str(&blazar_core::telemetry::sink_metrics());
+    let (sentinel_lines, sentinel_failures) = state.sentinel.persist_counts();
+    let _ = write!(
+        merged,
+        "blazar_log_sink_writes_total{{sink=\"sentinel\"}} {sentinel_lines}\nblazar_log_sink_write_failures_total{{sink=\"sentinel\"}} {sentinel_failures}\n"
+    );
+    let stalls = state
+        .log_sinks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    merged.push_str(&crate::log_health::stall_metrics(&stalls));
+    merged.push_str(&crate::preflight::verdict_metrics());
+    merged.push_str(&state.preempt.metrics());
+    merged.push_str(&crate::proxy::context_pool_failure_metrics());
     // F81: spans never exported (channel saturated or POST failed) -
     // same honesty contract as the audit drop counter.
     let _ = write!(
@@ -5325,6 +5393,8 @@ mod tests {
             ctx_train: Some(40960),
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 

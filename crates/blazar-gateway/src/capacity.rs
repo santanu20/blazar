@@ -4,11 +4,12 @@
 //! tooling wants the LIVE numbers as an API, not logs. This endpoint
 //! joins three sources, each honest about its own limits:
 //!
-//! - `nvidia-smi` device census (index, name, total/free VRAM,
-//!   utilization) - absent on non-NVIDIA boxes, reported as an empty
-//!   device list with a note, never guessed.
+//! - device census: `nvidia-smi` rows (index, name, total/free VRAM,
+//!   utilization) when the tool is installed, else the runtime's system
+//!   census (names and memory totals, no utilization), with a note naming
+//!   the source. Never a guess.
 //! - `nvidia-smi --query-compute-apps` (pid + used VRAM) - the ONLY
-//!   per-process memory authority on the box.
+//!   per-process memory authority on the box; absent without the tool.
 //! - the supervisor's live instance rows (`Supervisor::ps`) - model,
 //!   engine, slots, state, placement. Joining by pid attributes VRAM to
 //!   Blazar residents; unmatched compute apps surface as `external`
@@ -124,21 +125,78 @@ pub(crate) fn parse_compute_apps(text: &str) -> Vec<(u32, u64)> {
         .collect()
 }
 
+/// Honesty note for a census `nvidia-smi` could not deliver.
+pub(crate) const SYSTEM_CENSUS_NOTE: &str = "no nvidia-smi census on this box - device rows come from the system census (NVML / DRM sysfs / Vulkan / macOS displays): no utilization, no per-process VRAM";
+
+/// Honesty note for a box where no source reports a GPU.
+pub(crate) const NO_CENSUS_NOTE: &str = "no GPU census on this box - nvidia-smi is not installed and no system source (NVML / DRM sysfs / Vulkan / macOS displays) reports a GPU";
+
+/// Device rows of the runtime's system census: the names and memory
+/// totals the serving planner places on, without a utilization signal.
+#[must_use]
+pub(crate) fn system_device_rows(gpus: &[blazar_core::GpuInfo]) -> Vec<DeviceRow> {
+    gpus.iter()
+        .enumerate()
+        .map(|(i, g)| DeviceRow {
+            index: u32::try_from(i).expect("device index fits u32"),
+            name: g.name.clone(),
+            total_mib: g.total_mib,
+            free_mib: g.free_mib,
+            util_pct: 0,
+        })
+        .collect()
+}
+
+/// The rows a census consumer works with, and whether they came from the
+/// system census: `nvidia-smi` rows win whenever the tool answers.
+fn choose_census(smi_rows: Vec<DeviceRow>, system_rows: Vec<DeviceRow>) -> (Vec<DeviceRow>, bool) {
+    if smi_rows.is_empty() {
+        (system_rows, true)
+    } else {
+        (smi_rows, false)
+    }
+}
+
+/// Path id of a device row: `cuda:N` for `nvidia-smi` rows, the llama.cpp
+/// device namespace residents are placed on; `gpu:N` for system census
+/// rows, which belong to no single backend namespace.
+#[must_use]
+pub(crate) fn device_id(from_system_census: bool, index: u32) -> String {
+    let namespace = if from_system_census { "gpu" } else { "cuda" };
+    format!("{namespace}:{index}")
+}
+
+/// The live GPU census of this box: `nvidia-smi` rows when the tool
+/// answers, else the runtime's system census, so the endpoints agree with
+/// what a spawn would place on. Blocking (process spawns, library loads):
+/// run it off the async runtime threads.
+pub(crate) fn live_gpu_census() -> (Vec<DeviceRow>, bool) {
+    let smi_rows = bounded_output(
+        std::process::Command::new("nvidia-smi").args([
+            "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]),
+        5,
+    )
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .map(|t| parse_devices(&t))
+    .unwrap_or_default();
+    let system_rows = if smi_rows.is_empty() {
+        system_device_rows(&blazar_runtime::probe_hardware(None).gpus)
+    } else {
+        Vec::new()
+    };
+    choose_census(smi_rows, system_rows)
+}
+
 /// GET /api/capacity - device census + per-resident VRAM attribution.
 #[allow(clippy::too_many_lines)] // census + join + honest notes: one response body assembled in reading order
 pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
-    // Two nvidia-smi spawns (~30-60 ms each) + pipe polling: blocking
-    // work, off the async runtime threads.
-    let (devices_raw, apps_raw) = tokio::task::spawn_blocking(|| {
-        let devices = bounded_output(
-            std::process::Command::new("nvidia-smi").args([
-                "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ]),
-            5,
-        )
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    // nvidia-smi spawns (~30-60 ms each; the system census when the tool
+    // is silent) + pipe polling: blocking work, off the async runtime
+    // threads.
+    let ((device_rows, from_system), apps_raw) = tokio::task::spawn_blocking(|| {
         let apps = bounded_output(
             std::process::Command::new("nvidia-smi").args([
                 "--query-compute-apps=pid,used_gpu_memory",
@@ -148,33 +206,38 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
         )
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-        (devices, apps)
+        (live_gpu_census(), apps)
     })
     .await
-    .unwrap_or((None, None));
+    .unwrap_or(((Vec::new(), false), None));
 
     let mut notes = Vec::new();
-    let devices: Vec<serde_json::Value> = if let Some(text) = devices_raw.as_deref() {
-        parse_devices(text)
-            .into_iter()
-            .map(|d| {
-                serde_json::json!({
-                    "id": format!("cuda:{}", d.index),
-                    "index": d.index,
-                    "name": d.name,
-                    "total_vram_bytes": d.total_mib * 1024 * 1024,
-                    "free_vram_bytes": d.free_mib * 1024 * 1024,
-                    "utilization_percent": d.util_pct,
-                })
+    if from_system {
+        notes.push(if device_rows.is_empty() {
+            NO_CENSUS_NOTE
+        } else {
+            SYSTEM_CENSUS_NOTE
+        });
+        notes.push("residents below still come from the supervisor");
+    }
+    let devices: Vec<serde_json::Value> = device_rows
+        .iter()
+        .map(|d| {
+            let utilization = if from_system {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(d.util_pct)
+            };
+            serde_json::json!({
+                "id": device_id(from_system, d.index),
+                "index": d.index,
+                "name": d.name,
+                "total_vram_bytes": d.total_mib * 1024 * 1024,
+                "free_vram_bytes": d.free_mib * 1024 * 1024,
+                "utilization_percent": utilization,
             })
-            .collect()
-    } else {
-        notes.push(
-            "no nvidia-smi census on this box - non-NVIDIA GPU boxes report an empty \
-             device list (residents below still come from the supervisor)",
-        );
-        Vec::new()
-    };
+        })
+        .collect();
 
     // Supervisor rows are the resident truth; compute-apps attributes VRAM.
     let ps_rows = state.sup.ps();
@@ -276,12 +339,15 @@ pub async fn capacity(State(state): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-/// Mirror of `profile::UNIFIED_SPAWN_OVERHEAD_BYTES` (private upstream) so
-/// `/api/fit` demand matches the spawn guard exactly.
-/// `unit__fit__overhead_mirror_matches_admission_floor` pins this against
-/// the public `admission_floor_bytes` - if the upstream constant ever
-/// changes, that test fails and forces a sync here.
-const FIT_SPAWN_OVERHEAD_MIB: u64 = 700;
+/// Spawn overhead (the non-KV, non-weights charge) in MiB, read from the
+/// same function the spawn guard uses, so `/api/fit` demand and the guard
+/// can never drift apart. The ladder models KV itself from the context
+/// size, so only the overhead is added here.
+/// `unit__fit__overhead_mirror_matches_admission_floor` pins the two
+/// together.
+fn fit_spawn_overhead_mib() -> u64 {
+    blazar_core::profile::spawn_overhead_bytes() / (1024 * 1024)
+}
 
 /// Halve `ctx` (floor 1024) until `weights + kv(ctx) + overhead` fits
 /// `free_mib` - the same ladder `blazar fit` walks. Returns the largest
@@ -289,7 +355,7 @@ const FIT_SPAWN_OVERHEAD_MIB: u64 = 700;
 fn ctx_ladder(weights_mib: u64, kv_mib: impl Fn(u64) -> u64, free_mib: u64, start_ctx: u64) -> u64 {
     let mut ctx = start_ctx.max(1024);
     loop {
-        if weights_mib + kv_mib(ctx) + FIT_SPAWN_OVERHEAD_MIB <= free_mib {
+        if weights_mib + kv_mib(ctx) + fit_spawn_overhead_mib() <= free_mib {
             return ctx;
         }
         if ctx <= 1024 {
@@ -317,6 +383,7 @@ fn per_device_fit(
     ctx_evaluated: u64,
     demand_mib: u64,
     devs: &[DeviceRow],
+    backend: &str,
 ) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut recommended = None;
     let rows = devs
@@ -337,7 +404,7 @@ fn per_device_fit(
             // Whole instances of this demand the card holds at free time.
             let max_parallel = dev.free_mib / demand_mib.max(1);
             serde_json::json!({
-                "id": format!("cuda:{}", dev.index),
+                "id": format!("{backend}:{}", dev.index),
                 "name": dev.name,
                 "free_mib": dev.free_mib,
                 "fits": fits,
@@ -370,11 +437,23 @@ pub(crate) async fn fit(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<FitRequest>,
 ) -> Response {
-    let Some(row) = state.with_store(|s| crate::proxy::resolve_model(s, &body.model).ok()) else {
-        return crate::ollama::api_error(500, "store unavailable");
-    };
-    let Some(row) = row else {
-        return crate::ollama::api_error(404, &format!("model '{}' not found", body.model));
+    let row = match state.read_store("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, &body.model)
+            .map(crate::proxy::ModelResolution::found)
+    }) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return crate::ollama::api_error(404, &format!("model '{}' not found", body.model));
+        }
+        Err(message) => {
+            return crate::ollama::api_error(
+                503,
+                &format!(
+                    "store could not resolve model '{}' ({message}) - retry once the store recovers",
+                    body.model
+                ),
+            );
+        }
     };
 
     let weights_mib = std::fs::metadata(&row.path).map_or(0, |m| m.len() / (1024 * 1024));
@@ -389,29 +468,28 @@ pub(crate) async fn fit(
         u64::from,
     );
 
-    // Same census command as `capacity()`; the primary GPU is device 0.
-    let census = tokio::task::spawn_blocking(|| {
-        bounded_output(
-            std::process::Command::new("nvidia-smi").args([
-                "--query-gpu=index,name,memory.total,memory.free,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ]),
-            5,
-        )
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    })
-    .await
-    .unwrap_or(None);
+    // Same census as `capacity()`; the primary GPU is device 0.
+    let (census_rows, from_system) = tokio::task::spawn_blocking(live_gpu_census)
+        .await
+        .unwrap_or((Vec::new(), false));
+    let backend = if from_system { "gpu" } else { "cuda" };
 
     let kv = |ctx: u64| crate::preflight::kv_f16_mib(&meta, ctx);
     let kv_mib = kv(ctx_evaluated);
-    let demand_mib = weights_mib + kv_mib + FIT_SPAWN_OVERHEAD_MIB;
+    let demand_mib = weights_mib + kv_mib + fit_spawn_overhead_mib();
 
     let mut notes = Vec::new();
-    let census_rows = census.as_deref().map(parse_devices).unwrap_or_default();
-    let (devices, recommended) =
-        per_device_fit(weights_mib, kv, ctx_evaluated, demand_mib, &census_rows);
+    if from_system && !census_rows.is_empty() {
+        notes.push(SYSTEM_CENSUS_NOTE);
+    }
+    let (devices, recommended) = per_device_fit(
+        weights_mib,
+        kv,
+        ctx_evaluated,
+        demand_mib,
+        &census_rows,
+        backend,
+    );
     let primary = census_rows.first().cloned();
     let pick = recommended
         .and_then(|idx| census_rows.get(idx).cloned())
@@ -430,7 +508,7 @@ pub(crate) async fn fit(
         );
         let max_parallel = dev.free_mib / demand_mib.max(1);
         (
-            format!("cuda:{} {}", dev.index, dev.name),
+            format!("{backend}:{} {}", dev.index, dev.name),
             dev.free_mib,
             Some(fits),
             Some(max_ctx),
@@ -438,16 +516,14 @@ pub(crate) async fn fit(
             Some(max_parallel),
         )
     } else {
-        notes.push(
-            "no nvidia-smi census on this box - fit math reported, fits/max_ctx null \
-             (non-NVIDIA boxes: consult the engine's own loader)",
-        );
+        notes.push(NO_CENSUS_NOTE);
+        notes.push("fit math reported, fits/max_ctx null");
         ("unknown".to_string(), 0, None, None, None, None)
     };
     if max_ctx == Some(0) {
         notes.push("even ctx 1024 does not fit free VRAM - smaller quant or free capacity first");
     }
-    let recommended_device = recommended.map(|idx| format!("cuda:{}", census_rows[idx].index));
+    let recommended_device = recommended.map(|idx| format!("{backend}:{}", census_rows[idx].index));
 
     // Measured-vs-predicted calibration for this exact model, when a load
     // has been observed (ties the fit answer to `/api/admission-accuracy`
@@ -480,14 +556,17 @@ pub(crate) async fn fit(
     // plus notes instead.
     let (media_jobs, media_notes) = {
         let (running, queued) = state
-            .with_store(|s| {
-                (
-                    s.list_jobs(Some("running"), None, 1000, None)
-                        .unwrap_or_default(),
-                    s.list_jobs(Some("queued"), None, 1000, None)
-                        .unwrap_or_default(),
-                )
-            })
+            .read_store(
+                "capacity.media_jobs",
+                |s| -> blazar_core::CoreResult<Option<_>> {
+                    Ok(Some((
+                        s.list_jobs(Some("running"), None, 1000, None)?,
+                        s.list_jobs(Some("queued"), None, 1000, None)?,
+                    )))
+                },
+            )
+            .ok()
+            .flatten()
             .unwrap_or_default();
         let mut media_notes = Vec::new();
         let block = media_jobs_block(&running, &queued);
@@ -507,23 +586,32 @@ pub(crate) async fn fit(
     // newest installed row's probed flag vocabulary gates every axis
     // reported, so no combo is suggested the child would reject.
     let parallelism = {
-        let serving = state.with_store(|s| {
-            let engines = s.list_engines().unwrap_or_default();
-            let kinds: Vec<blazar_core::engine_kind::EngineKind> =
-                engines.iter().map(|r| r.kind).collect();
-            let shape = blazar_core::engine_kind::FormatShape {
-                diffusion: row.has_component_set(),
-                shards: blazar_core::engine_kind::ShardFormat::detect(
-                    std::path::Path::new(&row.path).is_dir(),
-                    blazar_core::store::quantized_safetensors_signal(&row.name, "", &row.path),
-                    row.is_mlx(),
-                    row.is_litert_bundle(),
-                ),
-            };
-            let policy = state.cfg().engine_routing.policy;
-            let kind = blazar_core::engine_kind::EngineKind::route_format(shape, &kinds, policy);
-            (kind, engines)
-        });
+        let serving = state
+            .read_store(
+                "capacity.serving_kinds",
+                |s| -> blazar_core::CoreResult<Option<_>> {
+                    let engines = s.list_engines()?;
+                    let kinds: Vec<blazar_core::engine_kind::EngineKind> =
+                        engines.iter().map(|r| r.kind).collect();
+                    let shape = blazar_core::engine_kind::FormatShape {
+                        diffusion: row.has_component_set(),
+                        shards: blazar_core::engine_kind::ShardFormat::detect(
+                            std::path::Path::new(&row.path).is_dir(),
+                            blazar_core::store::quantized_safetensors_signal(
+                                &row.name, "", &row.path,
+                            ),
+                            row.is_mlx(),
+                            row.is_litert_bundle(),
+                        ),
+                    };
+                    let policy = state.cfg().engine_routing.policy;
+                    let kind =
+                        blazar_core::engine_kind::EngineKind::route_format(shape, &kinds, policy);
+                    Ok(Some((kind, engines)))
+                },
+            )
+            .ok()
+            .flatten();
         let flags = serving.and_then(|(kind, engines)| {
             kind.and_then(|k| {
                 engines
@@ -548,11 +636,13 @@ pub(crate) async fn fit(
 
     // PD-disaggregation advisory: multi-GPU + sglang lane + long ctx.
     let sglang_installed = state
-        .with_store(|s| {
-            s.list_engines().is_ok_and(|rows| {
-                rows.iter()
-                    .any(|r| r.kind == blazar_core::engine_kind::EngineKind::Sglang)
-            })
+        .read_store_or_absent("engines.list", |s| {
+            s.list_engines()
+                .map(|rows| {
+                    rows.iter()
+                        .any(|r| r.kind == blazar_core::engine_kind::EngineKind::Sglang)
+                })
+                .map(Some)
         })
         .unwrap_or(false);
     let pd = pd_advisory(census_rows.len(), ctx_evaluated, sglang_installed);
@@ -570,7 +660,7 @@ pub(crate) async fn fit(
             "ctx_evaluated": ctx_evaluated,
             "weights_mib": weights_mib,
             "kv_mib": kv_mib,
-            "spawn_overhead_mib": FIT_SPAWN_OVERHEAD_MIB,
+            "spawn_overhead_mib": fit_spawn_overhead_mib(),
             "demand_mib": demand_mib,
             "device": device,
             "free_mib": free_mib,
@@ -714,7 +804,7 @@ fn parallelism_advisor(
     // null (a guessed free number would drive real spawn decisions).
     let viable_tp: Option<Vec<u64>> = min_free_mib.map(|free| {
         (2..=n_devices as u64)
-            .filter(|&tp| weights_mib / tp + kv_mib / tp + FIT_SPAWN_OVERHEAD_MIB <= free)
+            .filter(|&tp| weights_mib / tp + kv_mib / tp + fit_spawn_overhead_mib() <= free)
             .collect()
     });
     Some(serde_json::json!({
@@ -774,12 +864,14 @@ mod tests {
 
     #[test]
     fn unit__fit__overhead_mirror_matches_admission_floor() {
-        // admission_floor_bytes = weights + KV floor (512) + spawn overhead.
-        // If this ever fails, UNIFIED_SPAWN_OVERHEAD_BYTES changed upstream
-        // and FIT_SPAWN_OVERHEAD_MIB must be resynced.
+        // The fit ladder reads the same overhead the spawn guard charges:
+        // admission floor = weights + KV floor (512) + spawn overhead. The
+        // second assertion pins the number itself, so a change upstream
+        // surfaces here as a value to re-read, not as drift.
         let mib = |m: u64| m * 1024 * 1024;
         let floor = blazar_core::profile::admission_floor_bytes(mib(100), 0) / (1024 * 1024);
-        assert_eq!(floor, 100 + 512 + FIT_SPAWN_OVERHEAD_MIB);
+        assert_eq!(floor, 100 + 512 + fit_spawn_overhead_mib());
+        assert_eq!(fit_spawn_overhead_mib(), 700);
     }
 
     #[test]
@@ -809,7 +901,7 @@ mod tests {
         // full card 0 and lands on card 1, whose free MiB holds four
         // whole instances of the demand.
         let devs = [dev_row(0, "RTX 4070", 4096), dev_row(1, "RTX 3090", 24_575)];
-        let (rows, rec) = per_device_fit(5000, |c| c / 10, 8192, 5700, &devs);
+        let (rows, rec) = per_device_fit(5000, |c| c / 10, 8192, 5700, &devs, "cuda");
         assert_eq!(rec, Some(1));
         assert_eq!(rows[0]["fits"], serde_json::json!(false));
         assert_eq!(rows[0]["max_parallel"], serde_json::json!(0));
@@ -818,15 +910,62 @@ mod tests {
         assert_eq!(rows[1]["max_parallel"], serde_json::json!(4));
         assert_eq!(rows[1]["max_ctx"], serde_json::json!(8192));
         assert_eq!(rows[1]["id"], serde_json::json!("cuda:1"));
+        // A system census row belongs to no backend namespace: its id says so.
+        let (rows, _) = per_device_fit(5000, |c| c / 10, 8192, 5700, &devs, "gpu");
+        assert_eq!(rows[1]["id"], serde_json::json!("gpu:1"));
     }
 
     #[test]
     fn unit__per_device_fit__fits_nowhere_recommends_none() {
         let devs = [dev_row(0, "a", 1000), dev_row(1, "b", 2000)];
-        let (rows, rec) = per_device_fit(6000, |c| c / 10, 8192, 6700, &devs);
+        let (rows, rec) = per_device_fit(6000, |c| c / 10, 8192, 6700, &devs, "cuda");
         assert_eq!(rec, None);
         assert!(rows.iter().all(|r| r["fits"] == serde_json::json!(false)));
         assert!(rows.iter().all(|r| r["max_ctx"] == serde_json::json!(0)));
+    }
+
+    fn system_gpu(name: &str, total_mib: u64, free_mib: u64) -> blazar_core::GpuInfo {
+        blazar_core::GpuInfo {
+            name: name.to_string(),
+            description: format!("NVIDIA {name}"),
+            total_mib,
+            free_mib,
+        }
+    }
+
+    #[test]
+    fn unit__system_device_rows__carry_memory_totals_without_a_utilization_signal() {
+        let rows =
+            system_device_rows(&[system_gpu("NVIDIA GeForce RTX 4070 Laptop GPU", 8188, 6842)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].index, rows[0].name.as_str()),
+            (0, "NVIDIA GeForce RTX 4070 Laptop GPU")
+        );
+        assert_eq!(
+            (rows[0].total_mib, rows[0].free_mib, rows[0].util_pct),
+            (8188, 6842, 0)
+        );
+    }
+
+    #[test]
+    fn unit__choose_census__nvidia_smi_rows_win_and_system_rows_step_in_when_the_tool_is_silent() {
+        let smi = [dev_row(0, "RTX 4070", 4096)];
+        let system = system_device_rows(&[system_gpu("sys:pci:0000:0a:00.0", 16_384, 12_000)]);
+        let (rows, from_system) = choose_census(smi.to_vec(), system.clone());
+        assert_eq!((rows.len(), from_system), (1, false));
+        assert_eq!(rows[0].name, "RTX 4070");
+        let (rows, from_system) = choose_census(Vec::new(), system);
+        assert_eq!((rows.len(), from_system), (1, true));
+        assert_eq!(rows[0].name, "sys:pci:0000:0a:00.0");
+        let (rows, from_system) = choose_census(Vec::new(), Vec::new());
+        assert_eq!((rows.len(), from_system), (0, true));
+    }
+
+    #[test]
+    fn unit__device_id__names_the_namespace_of_the_rows() {
+        assert_eq!(device_id(false, 1), "cuda:1");
+        assert_eq!(device_id(true, 1), "gpu:1");
     }
 
     #[test]

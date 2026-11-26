@@ -39,6 +39,8 @@ fn model(path: &str, mmproj: Option<&str>) -> ModelRow {
         ctx_train: None,
         pulled_at: 0,
         last_used_at: 0,
+
+        license: None,
     }
 }
 

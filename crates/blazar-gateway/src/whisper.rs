@@ -1416,9 +1416,7 @@ pub async fn audio_jobs_get(
         ) {
             return openai_error(404, "job not found");
         }
-    } else if let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
+    } else if let Ok(row) = crate::jobs::load_job(&state, &job_id)
         && !crate::keys::owner_allows(
             row.owner.as_deref(),
             key_ext.as_deref(),
@@ -1438,17 +1436,20 @@ pub async fn audio_jobs_get(
     }
     // Live registry miss (evicted cap slot or a restarted gateway): the
     // ledger is the afterlife.
-    if let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
-    {
-        return axum::Json(crate::jobs::row_payload(&row)).into_response();
+    match state.read_store("jobs.lookup", |s| s.get_job(&job_id)) {
+        Ok(Some(row)) => axum::Json(crate::jobs::row_payload(&row)).into_response(),
+        Ok(None) => openai_error(
+            404,
+            "job not found - live audio handles are capped and gateway-owned; durable records \
+             live at /v1/jobs/{id} (completed results survive restarts)",
+        ),
+        Err(message) => openai_error(
+            503,
+            &format!(
+                "store could not read job {job_id} ({message}) - retry once the store recovers"
+            ),
+        ),
     }
-    openai_error(
-        404,
-        "job not found - live audio handles are capped and gateway-owned; durable records \
-         live at /v1/jobs/{id} (completed results survive restarts)",
-    )
 }
 
 /// POST /v1/audio/jobs/{id}/cancel - abort a queued/running job. The
@@ -1472,10 +1473,10 @@ pub async fn audio_jobs_cancel(
     // cancel (BLZ-1); registry first, durable row as after-restart truth.
     let entry_owner: Option<String> = match state.audio_jobs.owner_of(&job_id) {
         Some(owner) => owner,
-        None => state
-            .with_store(|s| s.get_job(&job_id).ok().flatten())
-            .flatten()
-            .and_then(|row| row.owner),
+        None => match crate::jobs::load_job(&state, &job_id) {
+            Ok(row) => row.owner,
+            Err(response) => return response,
+        },
     };
     if !crate::keys::owner_allows(
         entry_owner.as_deref(),
@@ -1497,29 +1498,40 @@ pub async fn audio_jobs_cancel(
                 serde_json::to_vec(&payload).unwrap_or_default(),
             ))
             .unwrap_or_else(|_| openai_error(500, "response build").into_response())
-    } else if let Some(row) = state
-        .with_store(|s| s.get_job(&job_id).ok().flatten())
-        .flatten()
-    {
+    } else {
         // Registry miss but a ledger row exists (restarted gateway or an
         // evicted cap slot): close an in-flight row - its task died with
         // the old process - and answer from the row.
-        if matches!(row.state.as_str(), "queued" | "running") {
-            state.jobs.record_cancelled(&state, &job_id);
+        match state.read_store("jobs.lookup", |s| s.get_job(&job_id)) {
+            Ok(Some(row)) => {
+                if matches!(row.state.as_str(), "queued" | "running") {
+                    state.jobs.record_cancelled(&state, &job_id);
+                }
+                match state.read_store("jobs.lookup", |s| s.get_job(&job_id)) {
+                    Ok(Some(fresh)) => axum::Json(crate::jobs::row_payload(&fresh)).into_response(),
+                    Ok(None) => {
+                        openai_error(404, "job not found - durable records live at /v1/jobs/{id}")
+                    }
+                    Err(message) => openai_error(
+                        503,
+                        &format!(
+                            "store could not read job {job_id} ({message}) - retry once the store recovers"
+                        ),
+                    ),
+                }
+            }
+            Ok(None) => openai_error(
+                404,
+                "job not found - live audio handles are capped and gateway-owned; durable records \
+                 live at /v1/jobs/{id}",
+            ),
+            Err(message) => openai_error(
+                503,
+                &format!(
+                    "store could not read job {job_id} ({message}) - retry once the store recovers"
+                ),
+            ),
         }
-        let fresh = state
-            .with_store(|s| s.get_job(&job_id).ok().flatten())
-            .flatten();
-        match fresh {
-            Some(fresh) => axum::Json(crate::jobs::row_payload(&fresh)).into_response(),
-            None => openai_error(404, "job not found - durable records live at /v1/jobs/{id}"),
-        }
-    } else {
-        openai_error(
-            404,
-            "job not found - live audio handles are capped and gateway-owned; durable records \
-             live at /v1/jobs/{id}",
-        )
     }
 }
 
@@ -1855,7 +1867,9 @@ pub async fn audio_transcriptions(
     // resolve to store rows, so the whisper.cpp lane below is
     // untouched for every input it serves today.
     if let Some(name) = model.as_deref()
-        && let Some(Ok(row)) = state.with_store(|s| crate::proxy::resolve_model(s, name))
+        && let Some(row) = state.read_store_or_absent("models.resolve", |s| {
+            crate::proxy::resolve_model_checked(s, name).map(crate::proxy::ModelResolution::found)
+        })
         && crate::proxy::routed_kind_for(&state, name)
             == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
     {
@@ -2005,7 +2019,9 @@ pub async fn audio_translations(
     // (2) Engine-row lane (same routing as transcriptions; the child
     // endpoint is shared - `translate` rides the rebuilt fields).
     if let Some(name) = model.as_deref()
-        && let Some(Ok(row)) = state.with_store(|s| crate::proxy::resolve_model(s, name))
+        && let Some(row) = state.read_store_or_absent("models.resolve", |s| {
+            crate::proxy::resolve_model_checked(s, name).map(crate::proxy::ModelResolution::found)
+        })
         && crate::proxy::routed_kind_for(&state, name)
             == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
     {

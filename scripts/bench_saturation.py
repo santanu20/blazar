@@ -69,9 +69,11 @@ import contextlib
 import json
 import math
 import random
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -346,24 +348,73 @@ def drive_rung(
 
 # --------------------------------------------------------- matched argv
 
-# Gateway-child flags that are sandbox state rather than inference
-# shape: they must not ride into the matched direct child (a direct leg
-# warm-started from the gateway's slot banks would measure nothing).
-DIRECT_STRIP_FLAGS = ("--api-key-file", "--slot-save-path", "--lookup-cache-dynamic")
+# `--api-key-file` guards the gateway's private child port and never
+# rides into the direct leg. The slot-bank and lookup-cache paths are
+# engine features the gateway child runs WITH, so the direct child keeps
+# them - redirected into a private state dir so neither leg can
+# warm-start from the other's state. Dropping them made the "direct"
+# leg a different engine configuration (2026-11-23 split lanes: neither
+# flag carries a reproducible decode cost).
+DIRECT_DROP_FLAGS = ("--api-key-file",)
+DIRECT_SLOT_SAVE_FLAG = "--slot-save-path"
+DIRECT_LOOKUP_CACHE_FLAG = "--lookup-cache-dynamic"
+DIRECT_STATE_FLAGS = (DIRECT_SLOT_SAVE_FLAG, DIRECT_LOOKUP_CACHE_FLAG)
 
 
-def matched_direct_argv(gateway_argv: list[str], port: int) -> list[str]:
-    """Gateway child argv verbatim minus sandbox-state flags, plus the
-    direct port/alias. Same binary, same model, same ctx/slots/threads
-    - the gateway hop stays the only difference."""
+def argv_flag_value(argv: list[str], flag: str) -> str | None:
+    """Value of `flag` in either `--flag value` or `--flag=value` form."""
+    for i, a in enumerate(argv):
+        if a == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def make_direct_state_dir(gateway_argv: list[str]) -> Path:
+    """Private slot-bank dir + lookup-cache copy for the direct child.
+    The copy starts from the gateway's cache file as it stands at
+    campaign start, so both legs begin with the same ngram history."""
+    state_dir = Path(tempfile.mkdtemp(prefix="blazar-sat-direct-"))
+    (state_dir / "slots").mkdir()
+    lookup = argv_flag_value(gateway_argv, DIRECT_LOOKUP_CACHE_FLAG)
+    if lookup:
+        try:
+            shutil.copy2(lookup, state_dir / "lookup-cache.bin")
+        except OSError as e:
+            print(f"direct state: lookup cache not seeded ({e})", file=sys.stderr)
+    return state_dir
+
+
+def matched_direct_argv(
+    gateway_argv: list[str], port: int, state_dir: Path
+) -> list[str]:
+    """Gateway child argv verbatim minus the child auth file, with the
+    slot-bank and lookup-cache paths redirected into `state_dir`, plus
+    the direct port/alias. Same binary, model, ctx/slots/threads and
+    engine features - the gateway hop stays the only difference."""
     out: list[str] = []
     skip_value = False
     for a in gateway_argv:
         if skip_value:
             skip_value = False
             continue
-        if any(a == f or a.startswith(f + "=") for f in DIRECT_STRIP_FLAGS):
+        if any(a == f or a.startswith(f + "=") for f in DIRECT_DROP_FLAGS):
             skip_value = "=" not in a
+            continue
+        state_flag = next(
+            (f for f in DIRECT_STATE_FLAGS if a == f or a.startswith(f + "=")), None
+        )
+        if state_flag:
+            skip_value = "=" not in a
+            target = (
+                state_dir / "slots"
+                if state_flag == DIRECT_SLOT_SAVE_FLAG
+                else state_dir / "lookup-cache.bin"
+            )
+            # Two-element form: llama-server rejects `--slot-save-path=`
+            # and `--lookup-cache-dynamic=` with "invalid argument".
+            out.extend([state_flag, str(target)])
             continue
         if a == "--port":
             skip_value = True
@@ -381,6 +432,27 @@ def matched_direct_argv(gateway_argv: list[str], port: int) -> list[str]:
     return out
 
 
+# The serving child always names its model; the daemon's short-lived
+# engine probes (`llama-server --list-devices` for the hardware census)
+# share the binary and carry none.
+ENGINE_MODEL_FLAGS = ("-m", "--model")
+
+
+def pick_serving_child_argv(candidates: list[list[str]]) -> list[str] | None:
+    """The gateway's engine child among a daemon's child argvs.
+
+    A probe argv handed to the direct leg runs the census and exits
+    before listening, so the leg dies as "connection refused" with a
+    two-line log; only the child that serves a model counts.
+    """
+    for argv in candidates:
+        if not argv or "llama-server" not in Path(argv[0]).name:
+            continue
+        if any(flag in argv[1:] for flag in ENGINE_MODEL_FLAGS):
+            return argv
+    return None
+
+
 def child_argv_from_proc(daemon_pid: int) -> list[str] | None:
     """Best-effort argv capture of the gateway's engine child on Linux.
     Returns None anywhere else - the caller falls back to the operator
@@ -390,16 +462,13 @@ def child_argv_from_proc(daemon_pid: int) -> list[str] | None:
         pids: list[int] = []
         for f in children:
             pids.extend(int(x) for x in f.read_text().split())
+        candidates: list[list[str]] = []
         for pid in pids:
             argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-            argv = [a.decode("utf-8", "replace") for a in argv if a]
-            if any(
-                "llama-server" in a or "llama-server" in Path(a).name for a in argv[:1]
-            ):
-                return argv
+            candidates.append([a.decode("utf-8", "replace") for a in argv if a])
+        return pick_serving_child_argv(candidates)
     except OSError:
         return None
-    return None
 
 
 def warm_gateway_model(gateway_base: str, model: str, tg: int) -> None:
@@ -946,16 +1015,19 @@ def run_campaign(args: argparse.Namespace) -> int:
         print("need --child-argv-file or --daemon-pid", file=sys.stderr)
         return 2
 
-    direct_argv = matched_direct_argv(gateway_argv, args.direct_port)
+    direct_state_dir = make_direct_state_dir(gateway_argv)
+    direct_argv = matched_direct_argv(gateway_argv, args.direct_port, direct_state_dir)
 
     # Spawn the matched direct child; readiness-gated; torn down in finally.
-    # Startup stderr is kept in the artifacts - a direct child that dies
+    # Startup output is kept in the artifacts - a direct child that dies
     # before /health (VRAM exhaustion, bad flag combination) must leave
-    # evidence, not a bare "connection refused".
+    # evidence, not a bare "connection refused". Both streams go to the
+    # file: llama-server prints argument errors on stdout and its startup
+    # banner on stderr.
     direct_stderr_path = out_dir / "direct_stderr.log"
     direct_stderr = direct_stderr_path.open("w")
     direct_proc = subprocess.Popen(
-        direct_argv, stdout=subprocess.DEVNULL, stderr=direct_stderr
+        direct_argv, stdout=direct_stderr, stderr=direct_stderr
     )
     receipt: dict = {
         "model": args.model,
@@ -972,6 +1044,7 @@ def run_campaign(args: argparse.Namespace) -> int:
         "gateway_np_by_rung": {"gateway": {}, "orchestration": {}},
         "gateway_child_argv": gateway_argv,
         "direct_argv": direct_argv,
+        "direct_state": "private slot-bank dir + lookup-cache copy (same engine features as the gateway child)",
         "leg_order": "alternating per round (direct-first on even, gateway-first on odd)",
         "token_accounting": "actual (usage.completion_tokens, content-delta fallback); gen_tokens per round",
         "length_policy": "forced (EOS suppressed via logit_bias)"
@@ -1046,6 +1119,7 @@ def run_campaign(args: argparse.Namespace) -> int:
         except subprocess.TimeoutExpired:
             direct_proc.kill()
         direct_stderr.close()
+        shutil.rmtree(direct_state_dir, ignore_errors=True)
 
     acceptance = run_verdicts(receipt)
     (out_dir / "sat_receipt.json").write_text(json.dumps(receipt, indent=2))
@@ -1216,7 +1290,34 @@ def selftest() -> int:
         str(ci1),
     )
 
-    # matched_direct_argv: strips sandbox flags, rebinds port/alias.
+    # child argv capture: the daemon also runs short-lived engine
+    # probes (llama-server --list-devices); only the child that serves
+    # a model is the gateway's engine child.
+    serving = ["llama-server", "-m", "/m.gguf", "--port", "8199"]
+    probe = ["llama-server", "--list-devices"]
+    check(
+        "argv capture skips the device-census probe",
+        pick_serving_child_argv([probe, serving]) == serving,
+    )
+    check(
+        "argv capture finds the serving child behind several probes",
+        pick_serving_child_argv([probe, list(probe), serving]) == serving,
+    )
+    check(
+        "argv capture never returns a probe alone",
+        pick_serving_child_argv([probe]) is None,
+    )
+    check(
+        "argv capture ignores non-engine children",
+        pick_serving_child_argv([["nvidia-smi"], ["sh", "-c", "llama-server"]]) is None,
+    )
+
+    # matched_direct_argv: drops the child auth file, redirects the
+    # slot-bank / lookup-cache state into the private dir, rebinds
+    # port/alias.
+    state = tempfile.mkdtemp(prefix="blazar-sat-selftest-")
+    state_dir = Path(state)
+    (state_dir / "slots").mkdir()
     argv = matched_direct_argv(
         [
             "llama-server",
@@ -1226,12 +1327,14 @@ def selftest() -> int:
             "8199",
             "--slot-save-path",
             "/x",
+            "--lookup-cache-dynamic=/gw/lcache.bin",
             "--api-key-file",
             "/k",
             "--parallel",
             "2",
         ],
         8299,
+        state_dir,
     )
     check(
         "argv port rebound",
@@ -1239,10 +1342,23 @@ def selftest() -> int:
         str(argv),
     )
     check(
-        "sandbox flags stripped",
-        "--slot-save-path" not in argv and "--api-key-file" not in argv,
+        "child auth file dropped, engine state redirected",
+        "--api-key-file" not in argv
+        # llama-server accepts these two flags only as `--flag value`
+        # (`--flag=value` exits with "invalid argument"), so the rewrite
+        # must keep the two-element form.
+        and argv[argv.index("--slot-save-path") + 1] == f"{state_dir}/slots"
+        and argv[argv.index("--lookup-cache-dynamic") + 1]
+        == f"{state_dir}/lookup-cache.bin"
+        and not any(
+            a.startswith("--slot-save-path=") or a.startswith("--lookup-cache-dynamic=")
+            for a in argv
+        )
+        and "/x" not in argv
+        and "/gw/lcache.bin" not in argv,
         str(argv),
     )
+    shutil.rmtree(state, ignore_errors=True)
     check("--parallel preserved", argv[argv.index("--parallel") + 1] == "2", str(argv))
 
     # argv_np: the shape probe behind drift detection.

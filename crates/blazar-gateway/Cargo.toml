@@ -47,6 +47,12 @@ proptest = "1.11.0"
 # WebSocket client for the /v1/realtime session tests (dev-only; the
 # server side rides axum's ws feature).
 tokio-tungstenite = "0.30"
+# ALPN h2 offer for the TLS negotiation tests (test-only feature of the
+# existing client; the gateway's own child client stays on HTTP/1.1).
+reqwest = { workspace = true, features = ["http2"] }
+# Raw SQLite handle for the broken-store tests: a table is dropped in a
+# real store so failed reads are exercised without a stub.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

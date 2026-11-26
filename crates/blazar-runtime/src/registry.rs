@@ -170,6 +170,12 @@ pub struct RegistryConfig {
 
 pub const OLLAMA_MODEL_LAYER: &str = "application/vnd.ollama.image.model";
 pub const OLLAMA_PROJECTOR_LAYER: &str = "application/vnd.ollama.image.projector";
+/// Ollama licence layers: small UTF-8 text notices captured onto the store
+/// row (`ModelRow::license`) for `/api/show` and `blazar model show`.
+const OLLAMA_LICENSE_LAYER: &str = "application/vnd.ollama.image.license";
+/// Licence layers are tiny text notices; anything larger is a manifest
+/// anomaly, skipped from the manifest alone before any bytes move.
+const MAX_LICENSE_LAYER_BYTES: u64 = 256 * 1024;
 
 impl HfClient {
     /// Fetch and parse the manifest for `repository:tag`. Returns the
@@ -267,9 +273,10 @@ impl Puller {
     }
 
     /// Pull a model from registry.ollama.ai (weight layer + optional
-    /// projector; template/params/license/adapter layers are skipped with
-    /// a log line - the GGUF's own chat template and sampler defaults are
-    /// authoritative in blazar).
+    /// projector; template/params/adapter layers are skipped with a log
+    /// line - the GGUF's own chat template and sampler defaults are
+    /// authoritative in blazar - while the licence notice layer is
+    /// captured onto the row).
     #[allow(clippy::too_many_lines)] // one cohesive lane: resolve -> manifest -> reuse-vs-network decision -> materialize
     pub async fn pull_ollama(&self, input: &str) -> Result<PullOutcome> {
         let target = parse_registry_target(input)?;
@@ -320,6 +327,7 @@ impl Puller {
         let RegistryPlan {
             model_layer,
             projector,
+            license,
             quant,
         } = &plan;
 
@@ -370,7 +378,7 @@ impl Puller {
             return Ok(outcome);
         }
 
-        let (dest, model_plan, mmproj_dest) = match &local {
+        let (dest, model_plan, mmproj_dest, license_text) = match &local {
             Some(hit) => {
                 // Zero-network lane: bring the verified blobs into the
                 // models dir under the exact names the download lane
@@ -400,6 +408,9 @@ impl Puller {
                         Ok::<_, anyhow::Error>(dest)
                     })
                     .transpose()?;
+                // Advisory notice from the verified store: read the blob
+                // best-effort, strictly zero network.
+                let license_text = hit.license_blob.as_deref().and_then(license_text_from_blob);
                 tracing::info!(
                     model = %name,
                     "reused local ollama store blob (no download)"
@@ -410,7 +421,7 @@ impl Puller {
                     downloaded: total,
                     total,
                 });
-                (dest, model_plan, mmproj_dest)
+                (dest, model_plan, mmproj_dest, license_text)
             }
             None => {
                 self.download_registry_layers(
@@ -419,6 +430,7 @@ impl Puller {
                     &target,
                     model_layer,
                     projector.as_ref(),
+                    license.as_ref(),
                 )
                 .await?
             }
@@ -430,6 +442,7 @@ impl Puller {
             &model_plan,
             &dest,
             mmproj_dest.as_ref(),
+            license_text,
             quant,
         )?;
         // Same steering as the HF lane: ollama-export renames (`glmocr`)
@@ -485,8 +498,15 @@ impl Puller {
         })
     }
 
-    /// Full-download phase of [`Self::pull_ollama`]: the model blob plus the
-    /// optional projector blob, one shared progress bar.
+    /// Full-download phase of [`Self::pull_ollama`]: the model blob, the
+    /// optional projector blob, and the optional licence notice, one
+    /// shared progress bar. The notice is best-effort - a fetch or decode
+    /// failure leaves `None` and never fails the pull.
+    // Best-effort notice fetch + digest-honest model/projector
+    // download + size guard in one envelope; splitting it would hide
+    // the ordering contract (licence is fetched last, after the
+    // weights that gate the pull).
+    #[allow(clippy::too_many_lines)]
     async fn download_registry_layers(
         &self,
         client: &HfClient,
@@ -494,11 +514,25 @@ impl Puller {
         target: &RegistryTarget,
         model_layer: &RegistryLayer,
         projector: Option<&RegistryLayer>,
-    ) -> Result<(PathBuf, FilePlan, Option<PathBuf>)> {
+        license: Option<&RegistryLayer>,
+    ) -> Result<(PathBuf, FilePlan, Option<PathBuf>, Option<String>)> {
         let models_dir = self.dirs.models_dir();
         std::fs::create_dir_all(&models_dir)?;
 
-        let total_bytes = model_layer.size + projector.map_or(0, |p| p.size);
+        // Only a size-plausible notice is fetched; an oversized manifest
+        // entry is refused from the manifest alone, before any bytes move.
+        let license_layer = license.filter(|l| l.size <= MAX_LICENSE_LAYER_BYTES);
+        if license.is_some() && license_layer.is_none() {
+            tracing::warn!(
+                model = name,
+                advertised = license.map_or(0, |l| l.size),
+                limit = MAX_LICENSE_LAYER_BYTES,
+                "licence layer exceeds the notice size cap - skipping it"
+            );
+        }
+        let total_bytes = model_layer.size
+            + projector.map_or(0, |p| p.size)
+            + license_layer.map_or(0, |l| l.size);
         crate::storage::gate_disk(&self.dirs, total_bytes, &format!("{name} (registry lane)"))?;
         let bar = indicatif::ProgressBar::new(total_bytes);
         bar.set_style(
@@ -562,8 +596,51 @@ impl Puller {
                     });
                 })?;
         }
+
+        // Licence notice: fetched through the same digest- and
+        // size-verifying download path as the weights, then decoded as
+        // UTF-8 text. Best-effort by contract - any failure warns and
+        // yields None.
+        let license_text = match license_layer {
+            Some(layer) => {
+                let plan = FilePlan {
+                    filename: format!("{name}-license"),
+                    bytes: layer.size,
+                    sha256: Some(strip_digest_prefix(&layer.digest)),
+                };
+                // Digest-named scratch under the system temp dir: the
+                // pull lock serialises this model and identical digests
+                // carry identical bytes, so the fixed name is benign.
+                let scratch = std::env::temp_dir().join(format!(
+                    "blazar-license-{}.part",
+                    strip_digest_prefix(&layer.digest)
+                ));
+                let fetched = match client.blob_url(&target.repository, &layer.digest) {
+                    Ok(url) => {
+                        match client
+                            .download_to(url, &plan, &scratch, &mut progress)
+                            .await
+                        {
+                            Ok(_) => Some(()),
+                            Err(e) => {
+                                tracing::warn!(model = name, "licence notice download failed: {e}");
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(model = name, "licence notice blob url failed: {e}");
+                        None
+                    }
+                };
+                let text = fetched.and_then(|()| license_text_from_blob(&scratch));
+                let _ = std::fs::remove_file(&scratch);
+                text
+            }
+            None => None,
+        };
         bar.finish_and_clear();
-        Ok((dest, model_plan, mmproj_dest))
+        Ok((dest, model_plan, mmproj_dest, license_text))
     }
 
     /// Act on the gate's decision for the registry lane. `Some(outcome)`
@@ -730,19 +807,26 @@ impl Puller {
             &model_plan,
             std::path::Path::new(&old.path),
             mmproj_dest.as_ref(),
+            // A delta pull means the weights digest is unchanged, so the
+            // recorded notice is still accurate - carry it forward.
+            old.license.clone(),
             &plan.quant,
         )
     }
 }
 
 /// Store row from the downloaded GGUF itself (GGUF facts win over any
-/// registry metadata - same precedence as the HF lane).
+/// registry metadata - same precedence as the HF lane). `license` is the
+/// best-effort notice captured from the registry's licence layer (None
+/// when the manifest carries none or the notice was unreadable).
+#[allow(clippy::too_many_arguments)] // the row assembles every lane artefact
 fn registry_model_row(
     name: &str,
     target: &RegistryTarget,
     model_plan: &FilePlan,
     dest: &std::path::Path,
     mmproj_dest: Option<&PathBuf>,
+    license: Option<String>,
     quant: &str,
 ) -> Result<ModelRow> {
     let gguf_meta = gguf::read_metadata_file(dest).ok();
@@ -790,23 +874,42 @@ fn registry_model_row(
                 .as_secs(),
         )
         .unwrap_or(i64::MAX),
+        license,
     })
 }
 
+/// Decode a licence-notice blob as UTF-8 text. Best-effort: unreadable
+/// or non-UTF-8 content yields `None` with a warning so advisory text
+/// can never fail a pull; an empty notice means no notice.
+fn license_text_from_blob(path: &std::path::Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => Some(text),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                "licence notice at {} is unreadable ({e}) - continuing without it",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// What a registry pull needs after manifest resolution: the model layer
-/// (required), an optional projector layer, and the quant string from the
-/// config blob.
+/// (required), an optional projector layer, an optional licence-notice
+/// layer, and the quant string from the config blob.
 #[derive(Clone)]
 struct RegistryPlan {
     model_layer: RegistryLayer,
     projector: Option<RegistryLayer>,
+    license: Option<RegistryLayer>,
     quant: String,
 }
 
 /// Manifest fetch + digest pin + layer selection + config-blob quant.
-/// Template/params/license/adapter layers are skipped with a log line -
-/// the GGUF's own chat template and sampler defaults are authoritative
-/// in blazar.
+/// Template/params/adapter layers are skipped with a log line - the
+/// GGUF's own chat template and sampler defaults are authoritative in
+/// blazar; the licence notice layer is captured onto the plan.
 async fn resolve_registry_plan(
     client: &HfClient,
     target: &RegistryTarget,
@@ -820,7 +923,7 @@ async fn resolve_registry_plan(
             .map_err(|e| anyhow!("{e} for {}:{}", target.repository, target.tag))?;
     }
 
-    let (model_layer, projector) = select_registry_layers(&manifest, target, name)?;
+    let (model_layer, projector, license) = select_registry_layers(&manifest, target, name)?;
 
     // Quant from the config blob (file_type, e.g. "Q4_K_M"); config
     // trouble must not fail the pull - "registry" is the honest fallback.
@@ -837,20 +940,22 @@ async fn resolve_registry_plan(
     Ok(RegistryPlan {
         model_layer,
         projector,
+        license,
         quant: registry_quant(file_type),
     })
 }
 
-/// Model + projector layer selection, shared by the network lane and the
-/// local ollama-store reuse lane so the two can never disagree about what
-/// a manifest means. Unknown layer types are skipped with a log line
-/// (template, params, license, adapters - the GGUF is authoritative in
-/// blazar).
+/// Model + projector + licence layer selection, shared by the network
+/// lane and the local ollama-store reuse lane so the two can never
+/// disagree about what a manifest means. Unknown layer types are skipped
+/// with a log line (template, params, adapters - the GGUF's own chat
+/// template and sampler defaults are authoritative in blazar); the
+/// licence notice is the one text layer blazar keeps.
 fn select_registry_layers(
     manifest: &RegistryManifest,
     target: &RegistryTarget,
     name: &str,
-) -> Result<(RegistryLayer, Option<RegistryLayer>)> {
+) -> Result<(RegistryLayer, Option<RegistryLayer>, Option<RegistryLayer>)> {
     let model_layer = manifest
         .layers
         .iter()
@@ -868,9 +973,15 @@ fn select_registry_layers(
         .iter()
         .find(|l| l.media_type == OLLAMA_PROJECTOR_LAYER)
         .cloned();
+    let license = manifest
+        .layers
+        .iter()
+        .find(|l| l.media_type == OLLAMA_LICENSE_LAYER)
+        .cloned();
     for layer in &manifest.layers {
-        let known =
-            layer.media_type == OLLAMA_MODEL_LAYER || layer.media_type == OLLAMA_PROJECTOR_LAYER;
+        let known = layer.media_type == OLLAMA_MODEL_LAYER
+            || layer.media_type == OLLAMA_PROJECTOR_LAYER
+            || layer.media_type == OLLAMA_LICENSE_LAYER;
         if !known && !layer.media_type.is_empty() {
             tracing::info!(
                 "skipping layer {} ({} bytes) for {name}",
@@ -879,7 +990,7 @@ fn select_registry_layers(
             );
         }
     }
-    Ok((model_layer, projector))
+    Ok((model_layer, projector, license))
 }
 
 /// Config-blob `file_type` -> store-row quant, with the sanitize rules and
@@ -915,6 +1026,10 @@ struct LocalRegistryHit {
     plan: RegistryPlan,
     model_blob: PathBuf,
     projector_blob: Option<PathBuf>,
+    /// Licence-notice blob path when the manifest carries one and the
+    /// store holds a size-plausible copy. Advisory: read best-effort, it
+    /// never gates the reuse decision.
+    license_blob: Option<PathBuf>,
 }
 
 /// Candidate ollama models directories, in probe order: `OLLAMA_MODELS`
@@ -967,7 +1082,7 @@ fn local_registry_plan_at(
         return None;
     }
     let manifest: RegistryManifest = serde_json::from_slice(&raw).ok()?;
-    let (model_layer, projector) = select_registry_layers(&manifest, target, name).ok()?;
+    let (model_layer, projector, license) = select_registry_layers(&manifest, target, name).ok()?;
 
     let quant = manifest
         .config
@@ -995,14 +1110,25 @@ fn local_registry_plan_at(
         return None;
     }
 
+    // The licence notice is advisory: keep the blob path when the store
+    // holds a size-plausible copy. A missing or oversized notice must
+    // not void an otherwise verified local hit.
+    let license_blob = license.as_ref().and_then(|l| {
+        let path = ollama_blob_path(root, &l.digest);
+        std::fs::metadata(&path)
+            .is_ok_and(|m| m.len() <= MAX_LICENSE_LAYER_BYTES)
+            .then_some(path)
+    });
     Some(LocalRegistryHit {
         plan: RegistryPlan {
             model_layer,
             projector,
+            license,
             quant: registry_quant(quant),
         },
         model_blob,
         projector_blob,
+        license_blob,
     })
 }
 
@@ -1269,6 +1395,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         blazar_core::store::Store::open(&dirs)
             .unwrap()
@@ -1353,6 +1481,264 @@ mod tests {
             cdn_req.headers.get("authorization").is_none(),
             "token must NEVER reach the presigned CDN host"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // E5 licence capture: the registry's licence layer is a small text
+    // notice. The pull records it on the row, best-effort - an absent,
+    // oversized, non-UTF-8, or unreachable notice never fails the pull.
+    // ------------------------------------------------------------------
+
+    /// How the wire rig shapes the manifest's licence layer.
+    enum LicenseRig {
+        /// No licence layer at all.
+        Absent,
+        /// Layer plus a digest-honest blob endpoint.
+        Present(Vec<u8>),
+        /// Layer advertising an oversized payload, with no blob endpoint:
+        /// the size guard must refuse from the manifest alone (zero
+        /// fetches).
+        Oversized { advertised: u64 },
+        /// Layer whose endpoint is missing: the fetch fails and the pull
+        /// must survive without the notice.
+        Unreachable(Vec<u8>),
+    }
+
+    /// Digest-honest manifest + model + config blobs for a made-up model
+    /// (`library/e5lictest:0.6b`). No real ollama store can ever satisfy
+    /// that name, so the network lane is forced hermetically regardless
+    /// of the host machine.
+    async fn network_pull_mock(api: &wiremock::MockServer, license: &LicenseRig) {
+        let model_bytes = gguf_seed_bytes();
+        let model_digest = format!("sha256:{}", hex(&Sha256::digest(&model_bytes)));
+        let config_bytes = br#"{"file_type":"Q4_K_M"}"#.to_vec();
+        let config_digest = format!("sha256:{}", hex(&Sha256::digest(&config_bytes)));
+
+        let mut layers = vec![serde_json::json!({
+            "mediaType": OLLAMA_MODEL_LAYER,
+            "digest": model_digest,
+            "size": model_bytes.len() as u64,
+        })];
+        match license {
+            LicenseRig::Absent => {}
+            LicenseRig::Present(text) | LicenseRig::Unreachable(text) => {
+                let digest = format!("sha256:{}", hex(&Sha256::digest(text)));
+                layers.push(serde_json::json!({
+                    "mediaType": OLLAMA_LICENSE_LAYER,
+                    "digest": digest,
+                    "size": text.len() as u64,
+                }));
+                if let LicenseRig::Present(text) = license {
+                    wiremock::Mock::given(wiremock::matchers::method("GET"))
+                        .and(wiremock::matchers::path(format!(
+                            "/v2/library/e5lictest/blobs/{digest}"
+                        )))
+                        .respond_with(
+                            wiremock::ResponseTemplate::new(200).set_body_bytes(text.clone()),
+                        )
+                        .mount(api)
+                        .await;
+                }
+            }
+            LicenseRig::Oversized { advertised } => {
+                let digest = format!("sha256:{}", hex(&Sha256::digest(b"oversized-notice")));
+                layers.push(serde_json::json!({
+                    "mediaType": OLLAMA_LICENSE_LAYER,
+                    "digest": digest,
+                    "size": advertised,
+                }));
+            }
+        }
+
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.ollama.image.config",
+                "digest": config_digest,
+                "size": config_bytes.len() as u64,
+            },
+            "layers": layers,
+        })
+        .to_string();
+        // The live registry serves JSON as text/plain - keep the lie so
+        // the parser contract stays exercised.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v2/library/e5lictest/manifests/0.6b",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain; charset=utf-8")
+                    .set_body_string(manifest),
+            )
+            .mount(api)
+            .await;
+        for (digest, bytes) in [(model_digest, model_bytes), (config_digest, config_bytes)] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/v2/library/e5lictest/blobs/{digest}"
+                )))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(api)
+                .await;
+        }
+    }
+
+    /// Fresh dirs + wire rig + a full network-lane pull of
+    /// `e5lictest:0.6b`. Returns the server (for request assertions), the
+    /// outcome, and the tempdir keeping the store alive for them.
+    async fn pull_over_wire(
+        license: LicenseRig,
+    ) -> (wiremock::MockServer, PullOutcome, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let api = wiremock::MockServer::start().await;
+        network_pull_mock(&api, &license).await;
+        crate::test_env::set_env("BLAZAR_REGISTRY_BASE", format!("{}/v2/", api.uri()));
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client: registry_client(&api, None, vec![host_of(&api.uri())]),
+            bus: EventBus::default(),
+            force: false,
+        };
+        let outcome = puller.pull_ollama("e5lictest:0.6b").await.unwrap();
+        crate::test_env::remove_env("BLAZAR_REGISTRY_BASE");
+        (api, outcome, tmp)
+    }
+
+    /// Count blob requests whose path carries the given digest.
+    async fn license_blob_hits(api: &wiremock::MockServer, digest: &str) -> usize {
+        api.received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().contains("/blobs/") && r.url.path().contains(digest))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__captures_license_layer() {
+        let notice = "Apache-2.0\n\nCopyright (c) 2025 the e5 licence fixture\n".to_string();
+        let (_, outcome, _) = pull_over_wire(LicenseRig::Present(notice.as_bytes().to_vec())).await;
+        assert_eq!(outcome.row.license.as_deref(), Some(notice.as_str()));
+        assert!(!outcome.already_present);
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__absent_license_layer_leaves_none() {
+        let (_, outcome, _) = pull_over_wire(LicenseRig::Absent).await;
+        assert_eq!(outcome.row.license, None);
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__oversized_license_layer_is_skipped_without_fetch() {
+        let (api, outcome, _) = pull_over_wire(LicenseRig::Oversized {
+            advertised: 300 * 1024,
+        })
+        .await;
+        assert_eq!(
+            outcome.row.license, None,
+            "oversized notice must be refused"
+        );
+        let digest = strip_digest_prefix(&format!(
+            "sha256:{}",
+            hex(&Sha256::digest(b"oversized-notice"))
+        ));
+        assert_eq!(
+            license_blob_hits(&api, &digest).await,
+            0,
+            "the size guard must decide from the manifest before any fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__non_utf8_license_layer_is_skipped() {
+        let (_, outcome, _) =
+            pull_over_wire(LicenseRig::Present(vec![0xff, 0xfe, 0x00, 0x80])).await;
+        assert_eq!(
+            outcome.row.license, None,
+            "non-UTF-8 notice must not reach the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__license_fetch_failure_never_fails_pull() {
+        let (api, outcome, _) =
+            pull_over_wire(LicenseRig::Unreachable(b"unreachable".to_vec())).await;
+        assert_eq!(
+            outcome.row.license, None,
+            "best-effort: a dead licence endpoint must not fail the pull"
+        );
+        let digest =
+            strip_digest_prefix(&format!("sha256:{}", hex(&Sha256::digest(b"unreachable"))));
+        assert_eq!(
+            license_blob_hits(&api, &digest).await,
+            1,
+            "the lane must have tried the fetch before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn integration__registry_pull__local_store_license_blob_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        dirs.ensure().unwrap();
+        let root = ollama_store_fixture(tmp.path(), &gguf_seed_bytes());
+        let notice = "MIT\n\nPermission is hereby granted, free of charge.\n";
+        add_license_blob(&root, notice.as_bytes());
+
+        // Zero-network proof: an empty mock server - any request would
+        // surface as a recorded hit.
+        let api = wiremock::MockServer::start().await;
+        crate::test_env::set_env("BLAZAR_REGISTRY_BASE", format!("{}/v2/", api.uri()));
+        crate::test_env::set_env("OLLAMA_MODELS", root.display().to_string());
+        let puller = Puller {
+            dirs: dirs.clone(),
+            client: registry_client(&api, None, vec![host_of(&api.uri())]),
+            bus: EventBus::default(),
+            force: false,
+        };
+        let outcome = puller.pull_ollama("qwen3:0.6b").await.unwrap();
+        crate::test_env::remove_env("BLAZAR_REGISTRY_BASE");
+        crate::test_env::remove_env("OLLAMA_MODELS");
+        assert_eq!(outcome.row.license.as_deref(), Some(notice));
+        assert_eq!(
+            api.received_requests().await.unwrap_or_default().len(),
+            0,
+            "the reuse lane must stay zero-network"
+        );
+    }
+
+    /// Push a licence layer + blob into an ollama-store fixture, mirroring
+    /// [`add_projector_blob`].
+    fn add_license_blob(root: &std::path::Path, notice: &[u8]) -> String {
+        let digest = format!("sha256:{}", hex(&Sha256::digest(notice)));
+        std::fs::write(root.join("blobs").join(digest.replace(':', "-")), notice).unwrap();
+        let manifest_path = root
+            .join("manifests")
+            .join("registry.ollama.ai")
+            .join("library")
+            .join("qwen3")
+            .join("0.6b");
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest["layers"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "mediaType": OLLAMA_LICENSE_LAYER,
+                "digest": digest,
+                "size": notice.len() as u64,
+            }));
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        digest
     }
 
     // ------------------------------------------------------------------

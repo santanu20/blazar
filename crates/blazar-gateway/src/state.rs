@@ -1,5 +1,6 @@
 //! Shared gateway state.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -146,6 +147,23 @@ impl CacheObs {
     pub fn miss(&self) {
         self.unclassified.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Health of one best-effort store operation (see `AppState::read_store`).
+#[derive(Default)]
+pub struct StoreReadHealth {
+    /// Total reads that could not answer, since process start.
+    pub errors: u64,
+    /// Warn-once latch: armed again by the next successful read.
+    warned: bool,
+}
+
+/// Decoded engine rows plus the row set they were decoded from; kept
+/// while the store keeps returning the same rows.
+struct CachedEngineView {
+    rows: Vec<blazar_core::EngineRow>,
+    active: Option<blazar_core::EngineRow>,
+    view: std::sync::Arc<blazar_runtime::EngineView>,
 }
 
 pub struct AppState {
@@ -351,6 +369,26 @@ pub struct AppState {
     /// failure of an incident logs (store errors otherwise read as
     /// "absent" at every call site); a successful re-open re-arms it.
     pub store_open_warned: std::sync::atomic::AtomicBool,
+    /// Per-operation health of store reads (`read_store`): error counter
+    /// behind `blazar_store_read_errors_total{op}` plus a warn-once
+    /// latch. Only operations that ever failed hold an entry, so a
+    /// healthy store pays one empty-map lookup per read.
+    pub store_read_health:
+        std::sync::Mutex<std::collections::HashMap<&'static str, StoreReadHealth>>,
+    /// Decoded routing view of the installed engines with the row set
+    /// it was decoded from (`engine_view`). Rebuilt only when the rows
+    /// change, so request paths pay a row comparison instead of a
+    /// manifest decode per call.
+    engine_view: std::sync::Mutex<Option<CachedEngineView>>,
+    /// Builds of the decoded engine view since boot
+    /// (`blazar_engine_view_builds_total`); flat while the installed
+    /// engines are unchanged.
+    pub engine_view_builds: std::sync::atomic::AtomicU64,
+    /// Issue 012: rolling window state of the log-sink liveness
+    /// detector (`blazar_log_sink_stall_total{sink}` on `/metrics`).
+    pub log_sinks: std::sync::Mutex<crate::log_health::LogSinkWatch>,
+    /// Running requests that preemption may still cancel (opt-in).
+    pub preempt: std::sync::Arc<crate::preempt::Registry>,
     /// Ordered failover chains (`[[failover]]`): alias resolution,
     /// anti-flap benching, pin/unpin, bounded switch history. Empty
     /// registry = zero request-path cost (one map miss on the alias).
@@ -665,6 +703,11 @@ impl AppState {
             audit_dropped,
             store: std::sync::Mutex::new(store),
             store_open_warned: std::sync::atomic::AtomicBool::new(false),
+            store_read_health: std::sync::Mutex::new(std::collections::HashMap::new()),
+            engine_view: std::sync::Mutex::new(None),
+            engine_view_builds: std::sync::atomic::AtomicU64::new(0),
+            log_sinks: std::sync::Mutex::new(crate::log_health::LogSinkWatch::default()),
+            preempt: std::sync::Arc::new(crate::preempt::Registry::default()),
             failover,
             mcp,
             usage,
@@ -710,6 +753,176 @@ impl AppState {
             }
         }
         guard.as_ref().map(f)
+    }
+
+    /// Store read that keeps the three outcomes apart: `Ok(Some(v))` the
+    /// row exists, `Ok(None)` it honestly does not, `Err` the store could
+    /// not answer (open failure or failed query). Callers that turn the
+    /// answer into a routing or HTTP decision use this, so a broken store
+    /// surfaces as an error instead of "not found".
+    pub fn read_store<T, E: std::fmt::Display>(
+        &self,
+        op: &'static str,
+        f: impl FnOnce(&blazar_core::Store) -> Result<Option<T>, E>,
+    ) -> Result<Option<T>, String> {
+        let answered = self.with_store(|s| f(s).map_err(|e| e.to_string()));
+        let outcome = match answered {
+            Some(result) => result,
+            None => Err(format!(
+                "store unavailable ({}): persisted state cannot be read - start the daemon with a writable data dir",
+                self.dirs.data_dir.display()
+            )),
+        };
+        self.track_store_read(op, outcome)
+    }
+
+    /// Same contract for list queries: an empty list is a valid answer, a
+    /// failed query is not.
+    pub fn read_store_list<T, E: std::fmt::Display>(
+        &self,
+        op: &'static str,
+        f: impl FnOnce(&blazar_core::Store) -> Result<Vec<T>, E>,
+    ) -> Result<Vec<T>, String> {
+        let answered = self.with_store(|s| f(s).map_err(|e| e.to_string()));
+        let outcome = match answered {
+            Some(result) => result,
+            None => Err(format!(
+                "store unavailable ({}): persisted state cannot be read - start the daemon with a writable data dir",
+                self.dirs.data_dir.display()
+            )),
+        };
+        self.track_store_read(op, outcome)
+    }
+
+    /// Best-effort store read: a failure degrades to `None` exactly like
+    /// `with_store(.. .ok().flatten())` did, but it is counted and logged
+    /// once per incident instead of vanishing. For decoration, telemetry
+    /// and boot-time sweeps only - anything that decides where a request
+    /// goes uses `read_store` and acts on the `Err`.
+    pub fn read_store_or_absent<T, E: std::fmt::Display>(
+        &self,
+        op: &'static str,
+        f: impl FnOnce(&blazar_core::Store) -> Result<Option<T>, E>,
+    ) -> Option<T> {
+        self.read_store(op, f).ok().flatten()
+    }
+
+    /// List variant of `read_store_or_absent`: a failure degrades to an
+    /// empty list, counted and logged the same way.
+    pub fn read_store_list_or_empty<T, E: std::fmt::Display>(
+        &self,
+        op: &'static str,
+        f: impl FnOnce(&blazar_core::Store) -> Result<Vec<T>, E>,
+    ) -> Vec<T> {
+        self.read_store_list(op, f).unwrap_or_default()
+    }
+
+    /// Decoded routing view of the installed engines, rebuilt only when
+    /// the engine rows changed since the last call. The rows are re-read
+    /// on every call - the store stays the source of truth, including
+    /// rows written by another process - so an unchanged row set costs
+    /// one comparison and a changed one a single decode. `None` = the
+    /// store could not answer (counted like any failed read): callers
+    /// treat it as "nothing can serve".
+    pub fn engine_view(&self) -> Option<std::sync::Arc<blazar_runtime::EngineView>> {
+        let (rows, active) = self
+            .read_store(
+                "routing.engine_rows",
+                |s| -> Result<_, blazar_core::CoreError> {
+                    Ok(Some((s.list_engines()?, s.active_engine()?)))
+                },
+            )
+            .ok()??;
+        let mut slot = self
+            .engine_view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = slot.as_ref()
+            && cached.rows == rows
+            && cached.active == active
+        {
+            return Some(std::sync::Arc::clone(&cached.view));
+        }
+        self.engine_view_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let view = std::sync::Arc::new(blazar_runtime::EngineView::build(&rows, active.as_ref()));
+        *slot = Some(CachedEngineView {
+            rows,
+            active,
+            view: std::sync::Arc::clone(&view),
+        });
+        Some(view)
+    }
+
+    /// Prometheus text for the engine view build counter.
+    pub fn engine_view_metrics(&self) -> String {
+        format!(
+            "# HELP blazar_engine_view_builds_total Times the installed engine manifests were decoded for routing (one per engine-row change)\n# TYPE blazar_engine_view_builds_total counter\nblazar_engine_view_builds_total {}\n",
+            self.engine_view_builds
+                .load(std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// Prometheus text for failed store reads, one series per operation
+    /// that ever failed; empty while every read answered.
+    pub fn store_read_error_metrics(&self) -> String {
+        let health = self
+            .store_read_health
+            .lock()
+            .expect("store read health map");
+        let mut ops: Vec<(&'static str, u64)> = health
+            .iter()
+            .map(|(op, state)| (*op, state.errors))
+            .collect();
+        ops.sort_unstable();
+        let mut out = String::new();
+        if !ops.is_empty() {
+            out.push_str(
+                "# HELP blazar_store_read_errors_total Store reads that could not answer, by operation\n# TYPE blazar_store_read_errors_total counter\n",
+            );
+        }
+        for (op, errors) in ops {
+            let _ = writeln!(
+                out,
+                "blazar_store_read_errors_total{{op=\"{op}\"}} {errors}"
+            );
+        }
+        out
+    }
+
+    /// Records a read's outcome: errors are counted per `op`; the first
+    /// error of an incident (latch armed) is logged.
+    fn track_store_read<T>(
+        &self,
+        op: &'static str,
+        outcome: Result<T, String>,
+    ) -> Result<T, String> {
+        let mut health = self
+            .store_read_health
+            .lock()
+            .expect("store read health map");
+        match &outcome {
+            Ok(_) => {
+                // A success after failures re-arms the latch: the next
+                // failure is a new incident. Healthy operations never get
+                // an entry, so the metrics surface only names what failed.
+                if let Some(state) = health.get_mut(op) {
+                    state.warned = false;
+                }
+            }
+            Err(message) => {
+                let state = health.entry(op).or_default();
+                state.errors += 1;
+                if !state.warned {
+                    state.warned = true;
+                    tracing::warn!(
+                        target: "blazar::store",
+                        "store read failed ({op}) - the caller sees an error, not an absent row: {message}"
+                    );
+                }
+            }
+        }
+        outcome
     }
 
     /// Memory-first stored-response lookup with SQLite fallback (restart

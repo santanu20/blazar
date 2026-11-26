@@ -51,7 +51,7 @@ test pins this table against the enum, so the two cannot drift.
 | `ENGINE_CRASHED` | 502 | engine child crashed while loading or serving | check daemon logs for child stderr; `blazar ps` shows restarts |
 | `RPC_ENDPOINT_UNREACHABLE` | 503 | an rpc fleet worker endpoint named in rpc_servers is unreachable | start the worker on that host (`blazar rpc worker`) or fix rpc_servers in the config |
 | `INTERNAL` | 500 | unexpected internal error | check daemon logs; report with the x-blazar-trace-id |
-| `PROMPT_TOO_LONG` | 400 | prompt exceeds effective ctx, would be silently truncated | shorten prompt, raise ctx, or set prompt_preflight = false |
+| `PROMPT_TOO_LONG` | 400 | prompt exceeds the live context limit; the engine would reject it (context shift off) or drop its oldest tokens (context shift on) | shorten prompt, raise ctx, or set prompt_preflight = false |
 | `VISION_PROJECTOR_MISSING` | 400 | vision request against a model with no projector sidecar | `blazar mmproj <model> <mmproj.gguf path>` while stopped |
 | `CAPABILITY_VERIFIED_FAILED` | 400 | verified certificate shows FAIL for a needed capability | `blazar scorecard <model>` for passing siblings, or `blazar model-doctor <model>` |
 | `DIFFUSION_TEXT_REFUSAL` | 400 | diffusion component-set model on a text/embedding surface | use the images/videos surface or a text model |

@@ -255,6 +255,12 @@ pub struct PlannedSglang {
     pub context_length: Option<u32>,
     /// `--mem-fraction-static`: static memory fraction, when pinned.
     pub mem_fraction_static: Option<f64>,
+    /// `--enable-paged-experts`: routed experts paged from pinned host
+    /// memory, when the flag is present.
+    pub paged_experts: bool,
+    /// `--paged-experts-num-resident`: experts kept resident on the GPU,
+    /// when paged.
+    pub paged_num_resident: Option<u64>,
 }
 
 /// Effective values parsed from sglang's `/server_info` body.
@@ -276,6 +282,8 @@ pub fn planned_from_argv_sglang(argv: &[String]) -> PlannedSglang {
         max_running_requests: flag_value("--max-running-requests").and_then(|v| v.parse().ok()),
         context_length: flag_value("--context-length").and_then(|v| v.parse().ok()),
         mem_fraction_static: flag_value("--mem-fraction-static").and_then(|v| v.parse().ok()),
+        paged_experts: argv.iter().any(|a| a == "--enable-paged-experts"),
+        paged_num_resident: flag_value("--paged-experts-num-resident").and_then(|v| v.parse().ok()),
     }
 }
 
@@ -402,12 +410,37 @@ pub async fn probe_sglang(endpoint: &Endpoint, auth: Option<&str>, argv: &[Strin
     compare_sglang(&planned_from_argv_sglang(argv), &parse_server_info(&body))
 }
 
+/// Planned speculative-decoding facts pinned in a fresh vLLM child's
+/// argv. vLLM exposes no certified introspection surface to verify
+/// them against, so these stay planned-only facts - the liveness
+/// probe reports them beside its unverified line, never as a
+/// verified effective config.
+pub struct PlannedVllm {
+    /// `--spec-method`: speculative family, when pinned.
+    pub spec_method: Option<String>,
+    /// `--spec-tokens`: proposals per step, when pinned.
+    pub spec_num_tokens: Option<u64>,
+}
+
+/// Parse the spec-decode pins out of a vLLM child's argv (planned
+/// facts only - see [`PlannedVllm`]).
+#[must_use]
+pub fn planned_from_argv_vllm(argv: &[String]) -> PlannedVllm {
+    let flag_value = |long: &str| -> Option<String> {
+        argv.windows(2).find(|w| w[0] == long).map(|w| w[1].clone())
+    };
+    PlannedVllm {
+        spec_method: flag_value("--spec-method"),
+        spec_num_tokens: flag_value("--spec-tokens").and_then(|v| v.parse().ok()),
+    }
+}
+
 /// Probe a fresh vLLM child. vLLM's OpenAI-compatible surface exposes
 /// no certified capacity introspection endpoint, so no argv pin can be
 /// verified; the liveness probe distinguishes "surface absent" (line
 /// below) from "probe never ran", and capacity stays honestly
 /// unverified rather than guessed from argv.
-pub async fn probe_vllm(endpoint: &Endpoint, auth: Option<&str>) -> Vec<String> {
+pub async fn probe_vllm(endpoint: &Endpoint, auth: Option<&str>, argv: &[String]) -> Vec<String> {
     let (client, base) = crate::supervisor::child_dial(endpoint);
     let mut get = client
         .get(format!("{base}/v1/models"))
@@ -416,9 +449,23 @@ pub async fn probe_vllm(endpoint: &Endpoint, auth: Option<&str>) -> Vec<String> 
         get = get.bearer_auth(secret);
     }
     match get.send().await {
-        Ok(r) if r.status().is_success() => vec![
-            "effective config unverified: vllm exposes no capacity introspection surface (liveness confirmed via /v1/models)".to_string(),
-        ],
+        Ok(r) if r.status().is_success() => {
+            let mut lines = vec![
+                "effective config unverified: vllm exposes no capacity introspection surface (liveness confirmed via /v1/models)".to_string(),
+            ];
+            // Planned spec-decode pins ride the same honest line:
+            // reported, never dressed up as a verified config.
+            let planned = planned_from_argv_vllm(argv);
+            if let Some(method) = &planned.spec_method {
+                let window = planned
+                    .spec_num_tokens
+                    .map_or_else(|| "the engine default".to_string(), |k| k.to_string());
+                lines.push(format!(
+                    "planned spec decode: {method} with {window} speculative tokens per step (unverified)"
+                ));
+            }
+            lines
+        }
         Ok(r) => vec![format!(
             "effective config unverified: GET /v1/models answered {} on the fresh child - capacity and liveness both unconfirmed",
             r.status()
@@ -442,7 +489,7 @@ pub async fn probe(
     match kind {
         EngineKind::LlamaCpp => probe_llamacpp(endpoint, auth, argv).await,
         EngineKind::Sglang => probe_sglang(endpoint, auth, argv).await,
-        EngineKind::Vllm => probe_vllm(endpoint, auth).await,
+        EngineKind::Vllm => probe_vllm(endpoint, auth, argv).await,
         _ => Vec::new(),
     }
 }
@@ -702,6 +749,43 @@ mod tests {
 
         let planned = planned_from_argv_sglang(&argv(&["--model-path", "/x"]));
         assert_eq!(planned, PlannedSglang::default());
+    }
+
+    #[test]
+    fn unit__planned_from_argv_vllm__parses_spec_pins() {
+        let planned =
+            planned_from_argv_vllm(&argv(&["--spec-method", "suffix", "--spec-tokens", "4"]));
+        assert_eq!(planned.spec_method.as_deref(), Some("suffix"));
+        assert_eq!(planned.spec_num_tokens, Some(4));
+        // Bare method: the window stays unset, never guessed.
+        let planned = planned_from_argv_vllm(&argv(&["--spec-method", "ngram"]));
+        assert_eq!(planned.spec_method.as_deref(), Some("ngram"));
+        assert_eq!(planned.spec_num_tokens, None);
+        // No spec flags: nothing parsed.
+        let planned = planned_from_argv_vllm(&argv(&["--max-model-len", "4096"]));
+        assert!(planned.spec_method.is_none() && planned.spec_num_tokens.is_none());
+    }
+
+    #[test]
+    fn unit__planned_from_argv_sglang__parses_paged_expert_pins() {
+        let planned = planned_from_argv_sglang(&argv(&[
+            "--model-path",
+            "/x",
+            "--enable-paged-experts",
+            "--paged-experts-num-resident",
+            "12",
+        ]));
+        assert!(planned.paged_experts, "the bare flag marks paging planned");
+        assert_eq!(planned.paged_num_resident, Some(12));
+
+        // A bare flag with no K must not invent a resident count, and a
+        // plan without the flag reports paging off with no K.
+        let planned = planned_from_argv_sglang(&argv(&["--enable-paged-experts"]));
+        assert!(planned.paged_experts);
+        assert_eq!(planned.paged_num_resident, None);
+        let planned = planned_from_argv_sglang(&argv(&["--mem-fraction-static", "0.87"]));
+        assert!(!planned.paged_experts);
+        assert_eq!(planned.paged_num_resident, None);
     }
 
     #[test]

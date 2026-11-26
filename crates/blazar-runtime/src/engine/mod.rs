@@ -11,6 +11,69 @@ pub mod litert_install;
 pub mod manifest;
 pub mod mlx_install;
 pub(crate) mod net_probe;
+pub(crate) mod pip_verify;
+
+/// Outcome of `blazar engine verify <TAG>` - the engine lane's mirror of
+/// the model lane's `VerifyReport`. Every variant names the tag; the
+/// failure variants carry the exact detail so the CLI can tell the user
+/// what to reinstall instead of a bare "failed".
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineVerifyReport {
+    /// The live venv (pip lanes) or the cached archive (GitHub lanes)
+    /// still hashes to the recorded digest.
+    Verified {
+        tag: String,
+        digest: String,
+        detail: String,
+    },
+    /// Something on disk contradicts the recorded digest.
+    Mismatch { tag: String, detail: String },
+    /// The row predates digest recording and has nothing to check.
+    Unverified { tag: String, reason: String },
+    /// A digest exists and passed install-time verification, but no
+    /// cached artifact remains to re-hash - an honest skip, not a
+    /// failure.
+    CacheMiss { tag: String, digest: String },
+    /// No engine row carries this tag.
+    NotFound { tag: String },
+    /// The row exists but its install directory is gone.
+    DirMissing { tag: String, path: PathBuf },
+}
+
+/// Find a download-cache blob whose sha256 equals `want_hex`.
+///
+/// Blobs are flat files in the cache root; lock files, partial
+/// downloads and dotfiles are skipped. Candidates hash smallest-first
+/// so a hit lands before the GiB-class archives when possible.
+fn find_cached_blob_by_digest(root: &Path, want_hex: &str) -> Result<Option<(PathBuf, u64)>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut candidates: Vec<(PathBuf, u64)> = std::fs::read_dir(root)
+        .with_context(|| format!("open engine download cache {}", root.display()))?
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            Some((e.path(), meta))
+        })
+        .filter(|(_, meta)| meta.is_file())
+        .filter(|(path, _)| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            !name.starts_with('.') && ext != "lock" && ext != "part"
+        })
+        .map(|(path, meta)| (path, meta.len()))
+        .collect();
+    candidates.sort_by_key(|(_, len)| *len);
+    for (path, len) in candidates {
+        let (_, hex) = crate::verify::sha256_file(&path)
+            .with_context(|| format!("hash cached blob {}", path.display()))?;
+        if hex == want_hex {
+            return Ok(Some((path, len)));
+        }
+    }
+    Ok(None)
+}
 pub mod sglang_install;
 pub mod vllm_install;
 
@@ -902,6 +965,87 @@ pub fn system_vendor_hint() -> manifest::Vendor {
     manifest::Vendor::Other
 }
 
+/// The vendor of the GPU an engine asset has to serve. A vendor whose
+/// runtime is installed wins ([`system_vendor_hint`]). Otherwise the
+/// system census names the card: an AMD or Intel GPU without `ROCm` or
+/// oneAPI reads `Other` from the runtime hint although it is present.
+#[must_use]
+pub fn system_gpu_vendor() -> manifest::Vendor {
+    gpu_vendor_from(
+        system_vendor_hint(),
+        &crate::gpu_census::system_gpus().vendors,
+    )
+}
+
+/// A named runtime hint needs no census. Without one, the first row of
+/// the census whose vendor Blazar builds for names the GPU.
+fn gpu_vendor_from(runtime_hint: manifest::Vendor, census_vendors: &[u32]) -> manifest::Vendor {
+    if runtime_hint != manifest::Vendor::Other {
+        return runtime_hint;
+    }
+    census_vendors
+        .iter()
+        .find_map(|id| manifest::Vendor::from_pci_vendor(*id))
+        .unwrap_or(manifest::Vendor::Other)
+}
+
+#[cfg(test)]
+mod vendor_tests {
+    #![allow(non_snake_case)] // suite convention: unit__scenario__expected
+    use super::{gpu_vendor_from, kept_cuda_reason};
+    use crate::engine::manifest::Vendor;
+
+    #[test]
+    fn unit__gpu_vendor_from__runtime_hint_wins_without_a_census() {
+        assert_eq!(gpu_vendor_from(Vendor::Amd, &[]), Vendor::Amd);
+        assert_eq!(gpu_vendor_from(Vendor::Nvidia, &[0x1002]), Vendor::Nvidia);
+    }
+
+    #[test]
+    fn unit__gpu_vendor_from__first_census_vendor_names_an_unruntimed_gpu() {
+        // The census drops integrated rows once a discrete card exists,
+        // so the first vendor left is the card to serve.
+        assert_eq!(
+            gpu_vendor_from(Vendor::Other, &[0x1002, 0x8086]),
+            Vendor::Amd
+        );
+        assert_eq!(gpu_vendor_from(Vendor::Other, &[0x8086]), Vendor::Intel);
+    }
+
+    #[test]
+    fn unit__gpu_vendor_from__nothing_buildable_stays_other() {
+        assert_eq!(gpu_vendor_from(Vendor::Other, &[]), Vendor::Other);
+        assert_eq!(
+            gpu_vendor_from(Vendor::Other, &[0x106b, 0x1a03]),
+            Vendor::Other
+        );
+    }
+
+    #[test]
+    fn unit__kept_cuda_reason__states_the_reason_of_that_asset() {
+        // Captured live: a ROCm build registered on an NVIDIA host was
+        // kept inactive with the Vulkan-only reason.
+        assert_eq!(
+            kept_cuda_reason("ubuntu-vulkan-x64"),
+            "Vulkan first-token is measurably slower"
+        );
+        let rocm = kept_cuda_reason("ubuntu-rocm-10.0-x64");
+        assert!(
+            rocm.contains("ROCm build has no device to use here"),
+            "{rocm}"
+        );
+        let sycl = kept_cuda_reason("ubuntu-sycl-fp16-x64");
+        assert!(
+            sycl.contains("SYCL build has no device to use here"),
+            "{sycl}"
+        );
+        assert!(
+            kept_cuda_reason("ubuntu-x64").contains("NVIDIA GPU"),
+            "a CPU build names the GPU it was kept behind"
+        );
+    }
+}
+
 fn which_first(names: &[&str]) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| names.iter().any(|n| build::bin_on_path(&dir, n)))
@@ -981,6 +1125,23 @@ pub fn keep_cuda_skip_pred(
         // aarch64 has no proven standard-lane conflict to guard yet.
         && matches!((os, arch), ("linux" | "windows", "x86_64"))
         && (asset_override == "auto" || asset_override.is_empty())
+}
+
+/// Why a registration on an NVIDIA host did not become active. The
+/// reason is the asset's: only the Vulkan build is kept for its
+/// first-token latency; a `ROCm` or SYCL build has no device to use on
+/// an NVIDIA GPU at all.
+fn kept_cuda_reason(asset_label: &str) -> &'static str {
+    let label = asset_label.to_ascii_lowercase();
+    if label.contains("rocm") {
+        "this host's GPU is NVIDIA; the ROCm build has no device to use here"
+    } else if label.contains("sycl") {
+        "this host's GPU is NVIDIA; the SYCL build has no device to use here"
+    } else if label.contains("vulkan") {
+        "Vulkan first-token is measurably slower"
+    } else {
+        "this host's NVIDIA GPU is served by the CUDA build"
+    }
 }
 
 /// Resolve an unspecified engine version to the registry's latest, with
@@ -1933,6 +2094,18 @@ impl EngineManager {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         let vendor = system_vendor_hint();
+        // No runtime names the vendor. That is also what an AMD or Intel
+        // card without ROCm or oneAPI looks like, and the Vulkan build
+        // serves such a card: ask the loader before falling back to CPU.
+        // Only a discrete card counts; an integrated-only host keeps the
+        // CPU build.
+        let vulkan_device =
+            vendor == manifest::Vendor::Other && crate::gpu_census::vulkan_discrete_gpu_present();
+        if vulkan_device {
+            tracing::info!(
+                "no vendor GPU runtime is installed but Vulkan enumerates a discrete GPU: picking the Vulkan build"
+            );
+        }
         let driver_cuda = if os == "windows" && vendor == manifest::Vendor::Nvidia {
             let (driver_cuda, _) = build::nvidia_gpu_facts().await;
             if driver_cuda.is_none() {
@@ -1953,6 +2126,7 @@ impl EngineManager {
             arch,
             Some(vendor),
             driver_cuda,
+            vulkan_device,
         ))
     }
 
@@ -2164,18 +2338,12 @@ impl EngineManager {
         if !extras.is_empty() {
             asset_label = format!("{asset_label} + {} extra pkg(s)", extras.len());
         }
-        self.install_with_rollback(
-            &tag,
-            &asset_label,
-            "unverified",
-            EngineKind::Sglang,
-            |dir| async move {
-                std::fs::create_dir_all(&dir)?;
-                sglang_install::install_into(&dir, &version, extras)
-                    .await
-                    .map(|_| ())
-            },
-        )
+        self.install_pip_with_rollback(&tag, &asset_label, EngineKind::Sglang, |dir| async move {
+            std::fs::create_dir_all(&dir)?;
+            sglang_install::install_into(&dir, &version, extras)
+                .await
+                .map(|_| ())
+        })
         .await
     }
 
@@ -2226,18 +2394,12 @@ impl EngineManager {
         if !extras.is_empty() {
             asset_label = format!("{asset_label} + {} extra pkg(s)", extras.len());
         }
-        self.install_with_rollback(
-            &tag,
-            &asset_label,
-            "unverified",
-            EngineKind::Vllm,
-            |dir| async move {
-                std::fs::create_dir_all(&dir)?;
-                vllm_install::install_into(&dir, &version, extras)
-                    .await
-                    .map(|_| ())
-            },
-        )
+        self.install_pip_with_rollback(&tag, &asset_label, EngineKind::Vllm, |dir| async move {
+            std::fs::create_dir_all(&dir)?;
+            vllm_install::install_into(&dir, &version, extras)
+                .await
+                .map(|_| ())
+        })
         .await
     }
 
@@ -2274,10 +2436,9 @@ impl EngineManager {
             .ok_or_else(|| anyhow!("release {} lost its {voices_name} asset", release.tag_name))?;
         // Digest of the MODEL asset (the big one) when GH published one;
         // voices ride the same verification inside download_asset_file.
-        let digest = model_asset
-            .digest
-            .clone()
-            .unwrap_or_else(|| "unverified".to_string());
+        // The venv is RECORD-verified regardless, and rows without a GH
+        // digest carry the venv digest instead of "unverified".
+        let model_digest = model_asset.digest.clone();
         // Resolve the pip package like the other pip lanes: PyPI latest
         // at install time, last-verified fallback when the registry
         // cannot answer (warned, never silent).
@@ -2291,10 +2452,9 @@ impl EngineManager {
         let gh = &self.gh;
         let model_dest_name = kokoro_install::MODEL_FILE;
         let voices_dest_name = kokoro_install::VOICES_FILE;
-        self.install_with_rollback(
+        self.install_verified_with_rollback(
             &tag,
             &asset_label,
-            &digest,
             EngineKind::Kokoro,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
@@ -2306,7 +2466,12 @@ impl EngineManager {
                     .await?;
                 kokoro_install::install_into(&dir, &kokoro_pkg)
                     .await
-                    .map(|_| ())
+                    .map(|_| ())?;
+                // Venv verified through its RECORD set; the row prefers
+                // the publisher digest for the model assets and falls
+                // back to the venv digest - never "unverified" again.
+                let venv_digest = pip_verify::verify_venv_record(&dir)?;
+                Ok(model_digest.unwrap_or(venv_digest))
             },
         )
         .await
@@ -2341,16 +2506,10 @@ impl EngineManager {
         let asset_label = format!("pip:mlx-lm=={version}+{}", mlx_install::MLX_CUDA_PIN);
         #[cfg(not(target_os = "linux"))]
         let asset_label = format!("pip:mlx-lm=={version}");
-        self.install_with_rollback(
-            &tag,
-            &asset_label,
-            "unverified",
-            EngineKind::Mlx,
-            |dir| async move {
-                std::fs::create_dir_all(&dir)?;
-                mlx_install::install_into(&dir, &version).await.map(|_| ())
-            },
-        )
+        self.install_pip_with_rollback(&tag, &asset_label, EngineKind::Mlx, |dir| async move {
+            std::fs::create_dir_all(&dir)?;
+            mlx_install::install_into(&dir, &version).await.map(|_| ())
+        })
         .await
     }
 
@@ -2378,10 +2537,9 @@ impl EngineManager {
         }
         let tag = format!("litert-{version}");
         let asset_label = format!("pip:litert-lm=={version}");
-        self.install_with_rollback(
+        self.install_pip_with_rollback(
             &tag,
             &asset_label,
-            "unverified",
             EngineKind::OpenAiHost,
             |dir| async move {
                 std::fs::create_dir_all(&dir)?;
@@ -2927,8 +3085,9 @@ impl EngineManager {
         if keep_cuda {
             tracing::warn!(
                 "NVIDIA GPU present - registered engine {tag} ({asset_label}) but KEPT the \
-             installed CUDA engine active (Vulkan first-token is measurably slower); run \
-             `blazar engine use {tag}` to switch anyway"
+                 installed CUDA engine active ({}); run `blazar engine use {tag}` to switch \
+                 anyway",
+                kept_cuda_reason(asset_label)
             );
         }
         if fork_additive {
@@ -3169,6 +3328,167 @@ impl EngineManager {
         B: FnOnce(PathBuf) -> F,
         F: std::future::Future<Output = Result<()>>,
     {
+        // Adapter over the digest-returning core: lanes that already
+        // know their asset digest keep their `()`-shaped closures.
+        let digest = sha256.to_string();
+        self.install_verified_with_rollback(tag, asset_label, kind, |dir| async move {
+            build(dir).await.map(|()| digest)
+        })
+        .await
+    }
+
+    /// Pip-venv lane envelope: after the venv build lands, every
+    /// RECORD-listed file is re-hashed (PEP 376) and the row carries
+    /// `pip:<hex>` over the normalized RECORD set instead of
+    /// "unverified". A mismatch is a hard failure inside the rollback
+    /// envelope - a corrupted install never replaces a working engine
+    /// and never registers.
+    async fn install_pip_with_rollback<B, F>(
+        &self,
+        tag: &str,
+        asset_label: &str,
+        kind: EngineKind,
+        install: B,
+    ) -> Result<EngineRow>
+    where
+        B: FnOnce(PathBuf) -> F,
+        F: std::future::Future<Output = Result<()>>,
+    {
+        self.install_verified_with_rollback(tag, asset_label, kind, |dir| async move {
+            install(dir.clone()).await?;
+            pip_verify::verify_venv_record(&dir)
+        })
+        .await
+    }
+
+    /// Re-verify an installed engine row against what is on disk -
+    /// the engine lane's mirror of `blazar pull --verify`.
+    ///
+    /// Lane-honest by digest form:
+    /// * `pip:<hex>` rows: re-walk the venv's RECORD manifests and
+    ///   re-fingerprint every installed file - a real tree check.
+    /// * GitHub-lane digests: re-hash the cached download archive the
+    ///   row was installed from, when it still exists. The extracted
+    ///   tree cannot be compared against an archive digest, so a
+    ///   missing cache blob is an honest skip, never a failure.
+    /// * legacy `unverified` rows: say so and point at a reinstall.
+    pub async fn verify_installed(&self, store: &Store, tag: &str) -> Result<EngineVerifyReport> {
+        let Some((row_tag, row_sha)) = store
+            .list_engines()?
+            .into_iter()
+            .find(|e| e.tag == tag)
+            .map(|e| (e.tag, e.sha256))
+        else {
+            return Ok(EngineVerifyReport::NotFound {
+                tag: tag.to_string(),
+            });
+        };
+        let dir = self.dirs.engines_dir().join(&row_tag);
+        if !dir.is_dir() {
+            return Ok(EngineVerifyReport::DirMissing {
+                tag: row_tag,
+                path: dir,
+            });
+        }
+        let sha = row_sha.trim().to_string();
+        if sha.is_empty() || sha == "unverified" {
+            return Ok(EngineVerifyReport::Unverified {
+                tag: row_tag,
+                reason: "row predates digest recording".into(),
+            });
+        }
+        if sha.starts_with(pip_verify::PIP_DIGEST_PREFIX) {
+            let venv_sha = sha.clone();
+            let tag_for_err = row_tag.clone();
+            let actual = tokio::task::spawn_blocking(move || pip_verify::verify_venv_record(&dir))
+                .await
+                .map_err(|e| anyhow!("venv verify worker panicked for {tag_for_err}: {e}"))?;
+            return Ok(match actual {
+                Ok(digest) if digest == venv_sha => EngineVerifyReport::Verified {
+                    tag: row_tag,
+                    digest,
+                    detail: "venv re-verified against its RECORD manifests".into(),
+                },
+                Ok(digest) => EngineVerifyReport::Mismatch {
+                    tag: row_tag,
+                    detail: format!(
+                        "row records {venv_sha} but the live venv now fingerprints \
+                         {digest} - the venv changed after install; reinstall the lane"
+                    ),
+                },
+                Err(e) => EngineVerifyReport::Mismatch {
+                    tag: row_tag,
+                    detail: format!("{e:#} - reinstall the lane to restore it"),
+                },
+            });
+        }
+        // GitHub/archive lane: the digest covers the downloaded archive,
+        // not the extracted tree, so verification re-hashes the cached
+        // blob when it survives and reports an honest skip otherwise.
+        let want = sha.strip_prefix("sha256:").unwrap_or(&sha).to_string();
+        let Some(root) = self.gh.downloads_cache_root() else {
+            return Ok(EngineVerifyReport::CacheMiss {
+                tag: row_tag,
+                digest: want,
+            });
+        };
+        let want_for_worker = want.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            find_cached_blob_by_digest(&root, &want_for_worker)
+        })
+        .await
+        .map_err(|e| anyhow!("archive hash worker panicked: {e}"))?;
+        Ok(match found? {
+            Some((path, bytes)) => EngineVerifyReport::Verified {
+                tag: row_tag,
+                digest: want,
+                detail: format!(
+                    "cached archive re-hashed ({} bytes at {})",
+                    bytes,
+                    path.display()
+                ),
+            },
+            None => EngineVerifyReport::CacheMiss {
+                tag: row_tag,
+                digest: want,
+            },
+        })
+    }
+
+    /// Doctor-sweep form of [`EngineManager::verify_installed`]: one
+    /// report per installed row, in `blazar engine list` order. The
+    /// tag-less `blazar engine verify` renders every lane so drift on
+    /// a quiet lane surfaces alongside the loud ones.
+    pub async fn verify_installed_all(
+        &self,
+        store: &Store,
+    ) -> Result<Vec<(String, EngineVerifyReport)>> {
+        let rows = store.list_engines()?;
+        let mut reports = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tag = row.tag.clone();
+            let report = self.verify_installed(store, &tag).await?;
+            reports.push((tag, report));
+        }
+        Ok(reports)
+    }
+
+    /// Core rollback envelope shared by every lane: `build` lands the
+    /// engine at the final path AND returns the digest the row should
+    /// carry (a known asset digest, or one freshly computed on disk).
+    /// Rollback semantics are the documented `install_with_rollback`
+    /// contract verbatim.
+    async fn install_verified_with_rollback<B, F>(
+        &self,
+        tag: &str,
+        asset_label: &str,
+        kind: EngineKind,
+        build: B,
+    ) -> Result<EngineRow>
+    where
+        B: FnOnce(PathBuf) -> F,
+        F: std::future::Future<Output = Result<String>>,
+    {
         let dir = self.dirs.engines_dir().join(tag);
         // Cross-process same-tag serialization: the retire sweep and
         // the final-dir handoff below are single-writer designs - two
@@ -3194,7 +3514,7 @@ impl EngineManager {
         // debris sweep instead.
         guard.disarm();
         let outcome = build_outcome
-            .and_then(|()| self.register_or_clean(&dir, tag, asset_label, sha256, kind));
+            .and_then(|digest| self.register_or_clean(&dir, tag, asset_label, &digest, kind));
         match outcome {
             Ok(row) => {
                 discard_retired_engine(&self.dirs.data_dir, aside.as_deref());
@@ -5071,6 +5391,284 @@ mod verify_tests {
     /// one must not leak the retired copy. Linux-only: the fixtures are
     /// /bin/sh scripts.
     #[cfg(target_os = "linux")]
+    mod engine_verify_tests {
+        use super::super::*;
+        use super::fake_bin;
+        use blazar_core::engine_kind::EngineKind;
+        use blazar_core::store::{EngineRow, Store};
+
+        /// Like `manager_in` but the download cache is controllable: the
+        /// GH-lane verify arms need a real (or absent) cache root to
+        /// prove blob re-hashing and honest cache-miss skips.
+        fn manager_with_cache(
+            tmp: &tempfile::TempDir,
+            cache: Option<std::path::PathBuf>,
+        ) -> EngineManager {
+            EngineManager {
+                dirs: blazar_core::BlazarDirs {
+                    config_dir: tmp.path().join("cfg"),
+                    data_dir: tmp.path().join("data"),
+                },
+                gh: GhClient::with_base("http://127.0.0.1", None)
+                    .expect("gh client")
+                    .with_downloads_cache(cache),
+                bus: crate::events::EventBus::default(),
+                asset_override: "auto".into(),
+            }
+        }
+
+        /// A llama-server that satisfies the probe contract: `--version`
+        /// prints a `version:` line with a build number, `--help` exits 0.
+        fn healthy_server(dir: &std::path::Path) {
+            fake_bin(
+                dir,
+                "llama-server",
+                "case \"$1\" in --version) echo 'version: 4242 (stub)';; --help) echo 'usage: stub';; esac; exit 0",
+            );
+        }
+
+        /// Seed an installed engine row (plus a probe-healthy dir) so
+        /// `verify_installed` has something to chew on. Returns the dir.
+        fn seed_engine(mgr: &EngineManager, tag: &str, sha256: &str) -> std::path::PathBuf {
+            let dir = mgr.dirs.engines_dir().join(tag);
+            std::fs::create_dir_all(&dir).unwrap();
+            healthy_server(&dir);
+            Store::open(&mgr.dirs)
+                .unwrap()
+                .upsert_engine(&EngineRow {
+                    tag: tag.to_string(),
+                    asset: "fixture".into(),
+                    sha256: sha256.into(),
+                    installed_at: 1,
+                    active: true,
+                    manifest: "{}".into(),
+                    kind: EngineKind::LlamaCpp,
+                })
+                .unwrap();
+            dir
+        }
+
+        /// A minimal venv with one RECORD manifest (mirrors the
+        /// `install_with_rollback_tests` fixture).
+        fn fake_venv(dir: &std::path::Path) {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            let b64 = |bytes: &[u8]| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(bytes))
+            };
+            let site = dir.join("venv/lib/python3.12/site-packages");
+            let dist = site.join("stubpkg-1.0.dist-info");
+            std::fs::create_dir_all(site.join("stubpkg")).unwrap();
+            std::fs::create_dir_all(&dist).unwrap();
+            let init_bytes = b"# lane stub\n";
+            let weird_bytes = b"# comma, quoted path\n";
+            let meta_bytes = b"Metadata-Version: 2.1\n";
+            std::fs::write(site.join("stubpkg/__init__.py"), init_bytes).unwrap();
+            std::fs::write(site.join("stubpkg/weird, name.py"), weird_bytes).unwrap();
+            std::fs::write(dist.join("METADATA"), meta_bytes).unwrap();
+            let record = format!(
+                "stubpkg/__init__.py,sha256={},{}\n\"stubpkg/weird, name.py\",sha256={},{}\n\
+                 stubpkg-1.0.dist-info/METADATA,sha256={},{}\n\
+                 stubpkg-1.0.dist-info/RECORD,,\n",
+                b64(init_bytes),
+                init_bytes.len(),
+                b64(weird_bytes),
+                weird_bytes.len(),
+                b64(meta_bytes),
+                meta_bytes.len(),
+            );
+            std::fs::write(dist.join("RECORD"), record).unwrap();
+        }
+
+        fn hex_sha256(bytes: &[u8]) -> String {
+            use sha2::Digest as _;
+            let digest = sha2::Sha256::digest(bytes);
+            digest.iter().fold(String::new(), |mut acc, b| {
+                use std::fmt::Write as _;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify__pip_row_reverifies_venv_record() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_with_cache(&tmp, None);
+            let dir = tmp.path().join("data/engines/sglang-9.9.9");
+            std::fs::create_dir_all(&dir).unwrap();
+            fake_venv(&dir);
+            let digest = crate::engine::pip_verify::verify_venv_record(&dir).unwrap();
+            seed_engine(&mgr, "sglang-9.9.9", &digest);
+            let store = Store::open(&mgr.dirs).unwrap();
+            let report = mgr.verify_installed(&store, "sglang-9.9.9").await.unwrap();
+            assert_eq!(
+                report,
+                EngineVerifyReport::Verified {
+                    tag: "sglang-9.9.9".into(),
+                    digest,
+                    detail: "venv re-verified against its RECORD manifests".into(),
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify__pip_row_detects_venv_drift() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_with_cache(&tmp, None);
+            let dir = tmp.path().join("data/engines/sglang-9.9.9");
+            std::fs::create_dir_all(&dir).unwrap();
+            fake_venv(&dir);
+            let digest = crate::engine::pip_verify::verify_venv_record(&dir).unwrap();
+            seed_engine(&mgr, "sglang-9.9.9", &digest);
+            std::fs::write(
+                dir.join("venv/lib/python3.12/site-packages/stubpkg/__init__.py"),
+                b"tampered after install\n",
+            )
+            .unwrap();
+            let store = Store::open(&mgr.dirs).unwrap();
+            let report = mgr.verify_installed(&store, "sglang-9.9.9").await.unwrap();
+            match report {
+                EngineVerifyReport::Mismatch { tag, detail } => {
+                    assert_eq!(tag, "sglang-9.9.9");
+                    assert!(
+                        detail.contains("drifted from its RECORD"),
+                        "detail names the drift: {detail}"
+                    );
+                    assert!(
+                        detail.contains("stubpkg/__init__.py"),
+                        "detail names the file: {detail}"
+                    );
+                }
+                other => panic!("expected Mismatch, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify__unverified_row_points_at_reinstall() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_with_cache(&tmp, None);
+            seed_engine(&mgr, "llamacpp-b0000", "unverified");
+            let store = Store::open(&mgr.dirs).unwrap();
+            let report = mgr
+                .verify_installed(&store, "llamacpp-b0000")
+                .await
+                .unwrap();
+            assert_eq!(
+                report,
+                EngineVerifyReport::Unverified {
+                    tag: "llamacpp-b0000".into(),
+                    reason: "row predates digest recording".into(),
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify__gh_row_rehashes_cached_archive() {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = tmp.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            let archive = b"fixture llama.cpp archive bytes";
+            std::fs::write(cache.join("llama-b12728-bin-ubuntu.zip"), archive).unwrap();
+            let mgr = manager_with_cache(&tmp, Some(cache));
+            let digest = hex_sha256(archive);
+            seed_engine(&mgr, "b12728-cuda", &digest);
+            let store = Store::open(&mgr.dirs).unwrap();
+            let report = mgr.verify_installed(&store, "b12728-cuda").await.unwrap();
+            match report {
+                EngineVerifyReport::Verified {
+                    tag,
+                    digest: live,
+                    detail,
+                } => {
+                    assert_eq!(tag, "b12728-cuda");
+                    assert_eq!(live, digest);
+                    assert!(
+                        detail.contains("cached archive"),
+                        "detail says what was hashed: {detail}"
+                    );
+                }
+                other => panic!("expected Verified, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify__gh_digest_prefix_stripped_and_missing_cache_skips() {
+            let tmp = tempfile::tempdir().unwrap();
+            let cache = tmp.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            let mgr = manager_with_cache(&tmp, Some(cache));
+            let digest = hex_sha256(b"never cached anywhere");
+            seed_engine(&mgr, "kokoro-1.0", &format!("sha256:{digest}"));
+            let store = Store::open(&mgr.dirs).unwrap();
+            let report = mgr.verify_installed(&store, "kokoro-1.0").await.unwrap();
+            assert_eq!(
+                report,
+                EngineVerifyReport::CacheMiss {
+                    tag: "kokoro-1.0".into(),
+                    digest,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify__missing_row_and_missing_dir_are_loud() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_with_cache(&tmp, None);
+            let store = Store::open(&mgr.dirs).unwrap();
+            let report = mgr.verify_installed(&store, "ghost").await.unwrap();
+            assert_eq!(
+                report,
+                EngineVerifyReport::NotFound {
+                    tag: "ghost".into()
+                }
+            );
+
+            let dir = seed_engine(&mgr, "vanishing", "unverified");
+            std::fs::remove_dir_all(&dir).unwrap();
+            let report = mgr.verify_installed(&store, "vanishing").await.unwrap();
+            assert_eq!(
+                report,
+                EngineVerifyReport::DirMissing {
+                    tag: "vanishing".into(),
+                    path: dir,
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn unit__engine_verify_all__sweeps_every_row_in_list_order() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_with_cache(&tmp, None);
+            // Rows land newest-first in `blazar engine list` order: the
+            // digest-carrying pip lane seeded last must head the sweep,
+            // and the digest-less legacy row must still be reported
+            // rather than skipped silently.
+            seed_engine(&mgr, "legacy-lane", "unverified");
+            let pip = seed_engine(&mgr, "pip-lane", "unverified");
+            fake_venv(&pip);
+            let digest = super::super::pip_verify::verify_venv_record(&pip).unwrap();
+            seed_engine(&mgr, "pip-lane", &digest);
+            let store = Store::open(&mgr.dirs).unwrap();
+            let reports = mgr.verify_installed_all(&store).await.unwrap();
+            assert_eq!(reports.len(), 2);
+            assert_eq!(reports[0].0, "pip-lane");
+            assert_eq!(reports[1].0, "legacy-lane");
+            assert_eq!(
+                reports[0].1,
+                EngineVerifyReport::Verified {
+                    tag: "pip-lane".into(),
+                    digest,
+                    detail: "venv re-verified against its RECORD manifests".into(),
+                }
+            );
+            assert!(matches!(
+                reports[1].1,
+                EngineVerifyReport::Unverified { .. }
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     mod install_with_rollback_tests {
         use super::super::*;
         use super::fake_bin;
@@ -5282,6 +5880,112 @@ mod verify_tests {
                 "F88: no orphan dir from a failed fresh install"
             );
             assert_eq!(aside_leftovers(&mgr).len(), 0);
+        }
+
+        /// Minimal PEP 376 venv: one dist-info, two hashed files (one
+        /// behind a quoted path carrying a comma - the `RFC 4180` corner
+        /// a RECORD parser must survive) and the hashless RECORD
+        /// self-entry. The engine kind stays `LlamaCpp`: the script stub
+        /// satisfies that probe without a python interpreter, and the
+        /// pip envelope under test is engine-kind agnostic.
+        fn fake_venv(dir: &std::path::Path) {
+            use base64::Engine as _;
+            use sha2::Digest as _;
+            let b64 = |bytes: &[u8]| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(bytes))
+            };
+            let site = dir.join("venv/lib/python3.12/site-packages");
+            let dist = site.join("stubpkg-1.0.dist-info");
+            std::fs::create_dir_all(site.join("stubpkg")).unwrap();
+            std::fs::create_dir_all(&dist).unwrap();
+            let init_bytes = b"# lane stub\n";
+            let weird_bytes = b"# comma, quoted path\n";
+            let meta_bytes = b"Metadata-Version: 2.1\n";
+            std::fs::write(site.join("stubpkg/__init__.py"), init_bytes).unwrap();
+            std::fs::write(site.join("stubpkg/weird, name.py"), weird_bytes).unwrap();
+            std::fs::write(dist.join("METADATA"), meta_bytes).unwrap();
+            let record = format!(
+                "stubpkg/__init__.py,sha256={},{}\n\"stubpkg/weird, name.py\",sha256={},{}\n\
+                 stubpkg-1.0.dist-info/METADATA,sha256={},{}\n\
+                 stubpkg-1.0.dist-info/RECORD,,\n",
+                b64(init_bytes),
+                init_bytes.len(),
+                b64(weird_bytes),
+                weird_bytes.len(),
+                b64(meta_bytes),
+                meta_bytes.len(),
+            );
+            std::fs::write(dist.join("RECORD"), record).unwrap();
+        }
+
+        #[tokio::test]
+        async fn unit__install_pip_with_rollback__verifies_record_and_stamps_pip_digest() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/sglang-9.9.9");
+            let row = mgr
+                .install_pip_with_rollback(
+                    "sglang-9.9.9",
+                    "lbl",
+                    EngineKind::LlamaCpp,
+                    |dir| async move {
+                        std::fs::create_dir_all(&dir).unwrap();
+                        healthy_server(&dir);
+                        fake_venv(&dir);
+                        Ok(())
+                    },
+                )
+                .await
+                .expect("verified venv registers");
+            assert!(
+                row.sha256.starts_with("pip:"),
+                "row carries the venv digest, got {:?}",
+                row.sha256
+            );
+            let live = crate::engine::pip_verify::verify_venv_record(&dir).unwrap();
+            assert_eq!(
+                row.sha256, live,
+                "row digest is the reproducible RECORD digest"
+            );
+            let store = Store::open(&mgr.dirs).unwrap();
+            assert_eq!(store.list_engines().unwrap().len(), 1, "row lands");
+            assert!(aside_leftovers(&mgr).is_empty(), "no aside lingered");
+        }
+
+        #[tokio::test]
+        async fn unit__install_pip_with_rollback__record_mismatch_rolls_back_existing_engine() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_in(&tmp);
+            let dir = tmp.path().join("data/engines/sglang-9.9.9");
+            seed_installed_engine(&mgr, &dir, "sglang-9.9.9");
+            let err = mgr
+                .install_pip_with_rollback("sglang-9.9.9", "lbl", EngineKind::LlamaCpp, |dir| {
+                    async move {
+                        std::fs::create_dir_all(&dir).unwrap();
+                        healthy_server(&dir);
+                        fake_venv(&dir);
+                        // Tamper after the RECORD was written: manifest
+                        // and bytes no longer agree - the exact drift a
+                        // truncated or corrupted install leaves behind.
+                        std::fs::write(
+                            dir.join("venv/lib/python3.12/site-packages/stubpkg/__init__.py"),
+                            b"# tampered\n",
+                        )
+                        .unwrap();
+                        Ok(())
+                    }
+                })
+                .await
+                .expect_err("tampered venv must fail the install");
+            assert!(
+                format!("{err:#}").contains("stubpkg/__init__.py"),
+                "error names the drifted file: {err:#}"
+            );
+            assert!(dir.join("llama-server").exists(), "old binary survives");
+            assert!(dir.join("marker").exists(), "old dir content survives");
+            let store = Store::open(&mgr.dirs).unwrap();
+            assert_eq!(store.list_engines().unwrap().len(), 1, "old row survives");
+            assert!(aside_leftovers(&mgr).is_empty(), "no aside lingered");
         }
     }
 

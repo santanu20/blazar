@@ -436,6 +436,127 @@ assert "qwen3.5:9b" in gollama_tab and "9/20" in gollama_tab, gollama_tab
 assert "0.812" in gollama_tab and "0.514" in gollama_tab, gollama_tab
 print("greedy_table: ollama run-to-run reference row OK")
 
+# --- E-gw-replay: the transparency cell separates gateway drift from
+# engine-flag numerics. Gateway lane is diffed against its OWN child
+# replayed with the captured argv; the managed child is diffed against
+# a bare engine spawn; each flag family is replayed once in isolation.
+greedy_gw_fair = rec(
+    "greedy_gw",
+    {"schema": 2},
+    exact_matches=20,
+    prompts=20,
+    ratio_mean=1.0,
+    ratio_min=1.0,
+    bare_exact_matches=5,
+    bare_prompts=20,
+    bare_ratio_mean=0.4837,
+    bare_ratio_min=0.0269,
+    bare_first_divergence_median_chars=66,
+    feature_attribution=[
+        {
+            "variant": "no-kv-unified",
+            "exact_vs_managed": 6,
+            "exact_vs_bare": 14,
+            "prompts": 20,
+        },
+        {
+            "variant": "slots-1",
+            "exact_vs_managed": 20,
+            "exact_vs_bare": 5,
+            "prompts": 20,
+        },
+    ],
+)
+gw_md = "\n".join(bm.gateway_transparency_md([greedy_gw_fair]))
+assert "blazar gateway vs same child replayed" in gw_md, gw_md
+assert "managed child vs bare engine spawn" in gw_md, gw_md
+assert "| no-kv-unified | 6/20 | 14/20 |" in gw_md, gw_md
+assert "| slots-1 | 20/20 | 5/20 |" in gw_md, gw_md
+assert "multi-slot batching" not in gw_md, gw_md
+gw_legacy_md = "\n".join(bm.gateway_transparency_md([greedy_gw]))
+assert "legacy cell" in gw_legacy_md, gw_legacy_md
+assert "bare engine spawn |" not in gw_legacy_md, gw_legacy_md
+assert "multi-slot batching" not in gw_legacy_md, gw_legacy_md
+gw_findings = "\n".join(bm._findings([greedy_gw_fair]))
+assert "20/20 exact vs same-engine managed replay - transparent" in gw_findings, (
+    gw_findings
+)
+assert "managed child vs bare engine spawn: 5/20 exact" in gw_findings, gw_findings
+gw_exec = "\n".join(bm.executive_summary([greedy_gw_fair]))
+assert "same child replayed with its captured argv" in gw_exec, gw_exec
+assert "managed child vs bare engine spawn: 5/20 exact" in gw_exec, gw_exec
+assert "multi-slot batching" not in gw_exec, gw_exec
+assert "multi-slot batching" not in "\n".join(bm.executive_summary([greedy_gw]))
+gw_rows = bm.greedy_table([greedy_gw_fair])
+assert "through blazar gateway vs same child replayed | 20/20" in gw_rows, gw_rows
+assert "managed child (blazar-compiled flags) vs bare engine spawn | 5/20" in gw_rows, (
+    gw_rows
+)
+variants = dict(
+    bm.greedy_feature_variants(
+        [
+            "llama-server",
+            "-m",
+            "/x.gguf",
+            "--port",
+            "1",
+            "--ctx-size",
+            "32768",
+            "-np",
+            "2",
+            "--spec-type",
+            "ngram-simple",
+            "--kv-unified",
+            "--lookup-cache-dynamic",
+            "/lc",
+            "--api-key-file",
+            "/k",
+        ]
+    )
+)
+assert set(variants) == {"no-kv-unified", "no-speculative", "slots-1", "ctx-4096"}, (
+    variants
+)
+assert "--kv-unified" not in variants["no-kv-unified"]
+assert "--spec-type" in variants["no-kv-unified"]
+assert "--spec-type" not in variants["no-speculative"]
+assert "--lookup-cache-dynamic" not in variants["no-speculative"]
+assert "--kv-unified" in variants["no-speculative"]
+assert variants["slots-1"][variants["slots-1"].index("-np") + 1] == "1"
+assert variants["ctx-4096"][variants["ctx-4096"].index("--ctx-size") + 1] == "4096"
+assert bm.greedy_feature_variants(["llama-server", "--port", "1"]) == []
+
+# the publication report is the artifact readers open, so the fair lanes and
+# the flag attribution have to be embedded there, and the single-slot
+# footnote has to be gone: the live attribution shows slot count does not
+# move greedy output, unified KV and speculative decoding do
+with tempfile.TemporaryDirectory() as td:
+    art = Path(td) / "camp"
+    art.mkdir()
+    out = Path(td) / "BENCHGW.md"
+    bm.write_publication_report([greedy_gw_fair], art, out, None)
+    pubgw = out.read_text()
+    assert "through blazar gateway vs same child replayed | 20/20" in pubgw, pubgw
+    assert "managed child (blazar-compiled flags) vs bare engine spawn | 5/20" in pubgw
+    assert "| engine | lane | exact matches |" not in pubgw, "lanes not printed twice"
+    assert "flag attribution for `b11147-cuda`:" in pubgw, pubgw
+    assert "| no-kv-unified | 6/20 | 14/20 |" in pubgw, pubgw
+    assert "| slots-1 | 20/20 | 5/20 |" in pubgw, pubgw
+    assert "requires single-slot decoding" not in pubgw, pubgw
+    print("write_publication_report: gateway transparency attribution embeds OK")
+
+# first divergence is a property of the pairs that differ; an all-exact
+# comparison has none, so the stat must say so instead of reporting the
+# common output length as a divergence point
+_all_exact = bm._greedy_stats(["abc", "de"], ["abc", "de"])
+assert _all_exact["exact_matches"] == 2, _all_exact
+assert _all_exact["first_divergence_median_chars"] is None, _all_exact
+_one_diff = bm._greedy_stats(["abc", "dX"], ["abc", "de"])
+assert _one_diff["exact_matches"] == 1, _one_diff
+assert _one_diff["first_divergence_median_chars"] == 1, _one_diff
+print("greedy stats: first divergence counts only diverging pairs OK")
+print("gateway transparency: fair replay split + attribution render OK")
+
 
 # --- E4: media image rows aggregate identical configs (median+n) and
 # label the A/B knob so default/fa_off/vae_tiling/sage rows are distinct
@@ -1490,6 +1611,37 @@ finally:
     bm.sized_prompt = _orig_sized
 print("ttfb capture: suites surface queue-wait window, legacy stays None OK")
 
+# prefill t/s is prompt tokens over wall-clock time to the first token for
+# every provider; engine-internal counters are reported apart
+_orig_ollama_stream = bm.ollama_stream_timed
+
+
+def _ollama_stream(port, body, timeout=None):
+    d = dict(_fake_stream(port, body, timeout))
+    d["ttft_ms"] = 10.0
+    d["prompt_eval_dur_s"] = 0.002
+    return d
+
+
+try:
+    bm.openai_stream_timed = lambda port, body, timeout=None: {
+        **_fake_stream(port, body, timeout),
+        "ttft_ms": 10.0,
+    }
+    bm.sized_prompt = lambda port, pp, ollama, model: "prefill probe"
+    bm.ollama_stream_timed = _ollama_stream
+    _wall = bm.median_run_suite(0, "m", runs=3, pp=64, tg=32)
+    _oll = bm.median_run_suite(0, "m", runs=3, pp=64, tg=32, ollama=True)
+    assert _wall["prefill_tps_cold"] == 51200.0, _wall
+    assert _oll["prefill_tps_cold"] == 51200.0, _oll
+    assert _wall.get("prefill_tps_engine_cold") is None, _wall
+    assert _oll["prefill_tps_engine_cold"] == 256000.0, _oll
+finally:
+    bm.ollama_stream_timed = _orig_ollama_stream
+    bm.openai_stream_timed = _orig_stream
+    bm.sized_prompt = _orig_sized
+print("prefill definition: wall-clock for every provider, engine counters apart OK")
+
 # cpu busy accounting: /proc/stat deltas (busy = total - idle - iowait);
 # first tick primes, missing /proc/stat reports unmeasured (0.0), and
 # finalize_power folds cpu_busy_pct only when measured.
@@ -1775,5 +1927,144 @@ with tempfile.TemporaryDirectory() as td:
         "owned stale chart must be swept"
     )
     assert (_sw_dir / "plots" / "notes.svg").exists(), "foreign file kept"
+
+# ollama store discovery: the measured service names its own model files
+# (/api/show modelfile), so a store outside the home directory (a system
+# service) is found and its page cache can be dropped before cold lanes.
+with tempfile.TemporaryDirectory() as td:
+    _svc_store = Path(td) / "svc-store" / "blobs"
+    _svc_store.mkdir(parents=True)
+    (_svc_store / "sha256-big").write_bytes(b"x" * 64)
+    (_svc_store / "sha256-small").write_bytes(b"x" * 8)
+    _home_store = Path(td) / "home-store" / "blobs"
+    _home_store.mkdir(parents=True)
+    (_home_store / "sha256-home").write_bytes(b"x" * 64)
+
+    def _show_http_json(url, payload=None, timeout=30.0):
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "qwen2.5:0.5b"}, {"name": "derived:tag"}]}
+        if url.endswith("/api/show"):
+            if payload["model"] == "qwen2.5:0.5b":
+                return {
+                    "modelfile": (
+                        f"# Modelfile\nFROM {_svc_store / 'sha256-big'}\nTEMPLATE x"
+                    )
+                }
+            return {"modelfile": "FROM qwen2.5:0.5b"}
+        raise AssertionError(f"unexpected url {url}")
+
+    bm.http_json = _show_http_json
+    try:
+        assert bm.ollama_store_dir_from_show(
+            {"modelfile": "FROM /srv/ollama/blobs/sha256-abc\n"}
+        ) == Path("/srv/ollama/blobs"), "store dir comes from the FROM line"
+        assert bm.ollama_store_dir_from_show({"modelfile": "FROM a:tag"}) is None
+        assert bm.ollama_store_dir_from_show({"details": {}}) is None
+        _found = bm.ollama_blob_paths(min_bytes=16, home_store=_home_store)
+        assert _found == [_svc_store / "sha256-big"], (
+            "service-store blobs only; small files and the home store excluded"
+        )
+    finally:
+        bm.http_json = _orig_http_json
+
+    def _dead_http_json(url, payload=None, timeout=30.0):
+        raise OSError("connection refused")
+
+    bm.http_json = _dead_http_json
+    try:
+        _fallback = bm.ollama_blob_paths(min_bytes=16, home_store=_home_store)
+        assert _fallback == [_home_store / "sha256-home"], "home store is the fallback"
+    finally:
+        bm.http_json = _orig_http_json
+
+    _rec = {}
+    bm.drop_ollama_page_cache(_rec, blobs=[_svc_store / "sha256-big"])
+    assert _rec["cold_fadvise_files"] == 1 and "cold_cache_note" not in _rec
+    _rec = {}
+    bm.drop_ollama_page_cache(_rec, blobs=[])
+    assert _rec["cold_fadvise_files"] == 0, "nothing droppable is recorded as zero"
+    assert "page cache not dropped" in _rec["cold_cache_note"]
+
+    _oc = rec(
+        "cold-ollama",
+        {},
+        ollama_model="qwen2.5:0.5b",
+        ollama_cold_ttft_ms=2900.0,
+        ollama_daemon_boot_note="daemon left warm (no --ollama-service-restart)",
+    )
+    _oc_warm = dict(_oc, cold_cache_note=_rec["cold_cache_note"])
+    _cold_md = bm.coldstart_table([_oc])
+    assert "page cache not dropped" not in _cold_md, "no caveat without a cause"
+    _cold_md = bm.coldstart_table([_oc_warm])
+    assert "page cache not dropped" in _cold_md, "cold table names the warm load"
+    assert "daemon left warm" in _cold_md, "cold table names the warm daemon"
+    _idle_row = [
+        line
+        for line in bm.idle_wake_table(
+            [
+                rec(
+                    "idle-ollama",
+                    {},
+                    idle_wake_ttft_ms=5200.0,
+                    cold_cache_note=_rec["cold_cache_note"],
+                )
+            ]
+        ).splitlines()
+        if "ollama -" in line
+    ][0]
+    assert "page cache not dropped" in _idle_row, "idle table carries the caveat"
+    _ex_warm = "\n".join(
+        bm.executive_summary([rec("blazar", {}, cold_ttft_ms=1800.0), _oc_warm])
+    )
+    assert "ollama page cache not dropped" in _ex_warm, "summary flags the cold ratio"
+    _ex_ok = "\n".join(
+        bm.executive_summary([rec("blazar", {}, cold_ttft_ms=1800.0), _oc])
+    )
+    assert "page cache not dropped" not in _ex_ok
+print("ollama store discovery + cold-cache disclosure OK")
+
+# --- ollama identity: the version comes from the receipt, and a slower
+# inter-token tail is named as a loss
+_stamped = bm.speed_table(
+    [
+        rec(
+            "ollama",
+            {},
+            tag="ollama-host",
+            ollama_model="qwen2.5:0.5b",
+            ollama_version="0.40.17",
+            decode_tps_p50=339.2,
+        )
+    ]
+)
+assert "ollama 0.40.17 - qwen2.5:0.5b" in _stamped, _stamped
+_unstamped = bm.speed_table(
+    [
+        rec(
+            "ollama",
+            {},
+            tag="ollama-host",
+            ollama_model="qwen2.5:0.5b",
+            decode_tps_p50=339.2,
+        )
+    ]
+)
+assert "ollama version not recorded - qwen2.5:0.5b" in _unstamped, _unstamped
+assert "0.33.3" not in _stamped + _unstamped, "no hard-coded ollama version"
+_ollama_itl = rec("ollama", {}, tag="ollama-host", itl_p99_ms=3.89)
+_slow_tail = "\n".join(
+    bm.executive_summary(
+        [rec("blazar", {"config": "default"}, itl_p99_ms=4.29), _ollama_itl]
+    )
+)
+assert "ITL p99 4.29 ms vs ollama 3.89 ms (1.1x looser" in _slow_tail, _slow_tail
+assert "tighter" not in _slow_tail, _slow_tail
+_fast_tail = "\n".join(
+    bm.executive_summary(
+        [rec("blazar", {"config": "default"}, itl_p99_ms=3.0), _ollama_itl]
+    )
+)
+assert "1.3x tighter" in _fast_tail and "looser" not in _fast_tail, _fast_tail
+print("ollama version stamp + ITL verdict direction OK")
 
 print("ALL FIXTURE CHECKS GREEN")

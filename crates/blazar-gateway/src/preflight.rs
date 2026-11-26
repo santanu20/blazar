@@ -12,13 +12,134 @@ use blazar_core::GgufMeta;
 /// silent bypass). Both directions now carry this flat figure.
 const IMAGE_TOKEN_EST: u64 = 1500;
 
-fn walk_strings(v: &serde_json::Value, bytes: &mut u64) {
+/// Character classes of the token estimate, indexed like
+/// [`CLASS_PRIORS`].
+const CLASS_COUNT: usize = 10;
+const HEX: usize = 0;
+const ALNUM: usize = 1;
+const SPACE: usize = 2;
+const PUNCT: usize = 3;
+const LATIN2: usize = 4;
+const RTL2: usize = 5;
+const CJK: usize = 6;
+const HANGUL: usize = 7;
+const THREE_BYTE: usize = 8;
+const FOUR_BYTE: usize = 9;
+
+/// Tokens per byte of each class, as `[low, high]` thousandths. Fitted
+/// (2026-11-24) so that every row of a live calibration sits inside its
+/// bracket - eleven text classes tokenized by a Qwen2.5 and a Mistral-7B
+/// tokenizer through the engine's `/tokenize`
+/// (`tests/token_bounds.rs` holds the rows) - then widened where only two
+/// vocabularies were measured. A flat bytes/4 sat OUTSIDE the truth for
+/// four of the eleven classes on the Qwen tokenizer (hex blobs 3.5x more
+/// tokens, Devanagari 1.5x, emoji 1.3x, code 1.2x).
+const CLASS_PRIORS: [[u64; 2]; CLASS_COUNT] = [
+    [600, 1000], // hex runs
+    [140, 400],  // ASCII letters and digits
+    [50, 250],   // ASCII whitespace
+    [100, 1300], // ASCII punctuation
+    [150, 600],  // two-byte Latin, Greek, Cyrillic
+    [100, 550],  // two-byte Arabic, Hebrew
+    [120, 400],  // CJK ideographs and kana
+    [150, 600],  // Hangul
+    [100, 500],  // other three-byte scripts
+    [200, 1000], // four-byte emoji and symbols
+];
+
+type ClassBytes = [u64; CLASS_COUNT];
+
+/// Shortest run of hex digits that reads as a blob (a hash, a GUID)
+/// rather than as a word or a plain number.
+const HEX_RUN_MIN: usize = 8;
+
+fn class_of(c: char) -> usize {
+    let code = c as u32;
+    match c {
+        ' ' | '\t' | '\n' | '\r' | '\u{c}' => SPACE,
+        c if c.is_ascii_alphanumeric() => ALNUM,
+        c if c.is_ascii() => PUNCT,
+        _ if code < 0x530 => LATIN2,
+        _ if code < 0x800 => RTL2,
+        _ if (0x1100..=0x11ff).contains(&code) || (0xac00..=0xd7af).contains(&code) => HANGUL,
+        _ if (0x2e80..=0x9fff).contains(&code)
+            || (0xf900..=0xfaff).contains(&code)
+            || (0xff00..=0xffef).contains(&code) =>
+        {
+            CJK
+        }
+        _ if code < 0x10000 => THREE_BYTE,
+        _ => FOUR_BYTE,
+    }
+}
+
+/// Byte count of `text` per character class. Runs of hex digits that
+/// carry a hex letter count as a blob; plain digit runs stay ordinary
+/// digits (tokenizers group those in twos and threes, far below the
+/// blob rate).
+fn count_text(text: &str, bytes: &mut ClassBytes) {
+    let raw = text.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if !b.is_ascii() {
+            // `i` is a char boundary: every step below advances whole chars.
+            let c = text[i..].chars().next().unwrap_or('\u{fffd}');
+            bytes[class_of(c)] += c.len_utf8() as u64;
+            i += c.len_utf8();
+        } else if b.is_ascii_hexdigit() {
+            let start = i;
+            while i < raw.len() && raw[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            let run = &raw[start..i];
+            let blob = run.len() >= HEX_RUN_MIN
+                && run
+                    .iter()
+                    .any(|d| d.is_ascii_hexdigit() && !d.is_ascii_digit());
+            bytes[if blob { HEX } else { ALNUM }] += run.len() as u64;
+        } else {
+            bytes[if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
+                SPACE
+            } else {
+                PUNCT
+            }] += 1;
+            i += 1;
+        }
+    }
+}
+
+/// `[low, high]` bracket on the token count of `text`, from the class
+/// priors: the exact count of every calibrated tokenizer lies inside.
+#[must_use]
+pub fn token_bounds(text: &str) -> (u64, u64) {
+    let mut bytes = [0u64; CLASS_COUNT];
+    count_text(text, &mut bytes);
+    finish(&bytes, 0)
+}
+
+fn finish(bytes: &ClassBytes, images: u64) -> (u64, u64) {
+    let low_milli = bytes
+        .iter()
+        .zip(CLASS_PRIORS)
+        .map(|(count, [low, _])| count * low)
+        .sum::<u64>();
+    let high_milli = bytes
+        .iter()
+        .zip(CLASS_PRIORS)
+        .map(|(count, [_, high])| count * high)
+        .sum::<u64>();
+    let flat = images * IMAGE_TOKEN_EST;
+    (low_milli / 1000 + flat, high_milli.div_ceil(1000) + flat)
+}
+
+fn walk_body(v: &serde_json::Value, bytes: &mut ClassBytes, images: &mut u64) {
     match v {
-        serde_json::Value::String(s) => *bytes += s.len() as u64,
-        serde_json::Value::Array(a) => a.iter().for_each(|x| walk_strings(x, bytes)),
+        serde_json::Value::String(s) => count_text(s, bytes),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| walk_body(x, bytes, images)),
         serde_json::Value::Object(o) => {
             if o.contains_key("image_url") {
-                *bytes += IMAGE_TOKEN_EST * 4;
+                *images += 1;
                 return;
             }
             o.iter().for_each(|(k, x)| {
@@ -30,9 +151,9 @@ fn walk_strings(v: &serde_json::Value, bytes: &mut u64) {
                     // carry base64 payloads - walking them as raw text
                     // re-creates F82's ~262K-token false trip (a 1 MiB
                     // image must estimate flat, like image_url objects).
-                    *bytes += IMAGE_TOKEN_EST * 4 * x.as_array().map_or(0, Vec::len) as u64;
+                    *images += x.as_array().map_or(0, Vec::len) as u64;
                 } else {
-                    walk_strings(x, bytes);
+                    walk_body(x, bytes, images);
                 }
             });
         }
@@ -40,41 +161,30 @@ fn walk_strings(v: &serde_json::Value, bytes: &mut u64) {
     }
 }
 
-/// Rough token estimate for a chat-family body: total string content
-/// across messages + system + tools serialized, bytes/4 (conservative
-/// for English/code; CJK inflates ~2x and the exact check catches it).
+/// Token bracket for a chat-family body: every string in it (messages,
+/// system, tools) by character class, plus the flat per-image figure.
 #[must_use]
-pub fn prompt_tokens_est(body: &serde_json::Value) -> u64 {
-    let mut bytes = 0u64;
-    walk_strings(body, &mut bytes);
-    (bytes / 4).max(1)
+pub fn prompt_token_bounds(body: &serde_json::Value) -> (u64, u64) {
+    let mut bytes = [0u64; CLASS_COUNT];
+    let mut images = 0u64;
+    walk_body(body, &mut bytes, &mut images);
+    finish(&bytes, images)
 }
 
-/// Context bound for prompt-fit admission: the LIVE per-slot ctx of a
-/// resident instance when one exists (auto-fit or explicit slots may
-/// have traded the configured depth for width - e.g. 16K configured,
-/// 4x4096 compiled - and preflight must bound against what a single
-/// slot actually holds), the configured effective ctx otherwise
-/// (cold-spawn estimate). Rows whose profile has not compiled yet
-/// (ctx == 0) fall back to the config estimate.
+/// Context bound for prompt-fit admission: the LIVE limit of a resident
+/// instance when one exists (auto-fit or explicit slots may have traded
+/// the configured depth for width, e.g. 16K configured, 4x4096 compiled,
+/// and a unified-KV child widens a single prompt's limit back to the
+/// whole pool, see `Supervisor::prompt_ctx`), the configured effective
+/// ctx otherwise (cold-spawn estimate). Rows whose profile has not
+/// compiled yet (ctx == 0) fall back to the config estimate.
 pub fn admission_ctx(state: &crate::state::AppState, model: &str) -> u32 {
     state
         .sup
-        .ps()
-        .into_iter()
-        .find(|p| p.name == model && p.ctx > 0)
-        .map_or_else(|| state.cfg().effective_ctx(model), |p| p.ctx)
+        .prompt_ctx(model)
+        .map_or_else(|| state.cfg().effective_ctx(model), u32::from)
 }
 
-/// Prompt-fit admission (K1): refuse requests that cannot fit the
-/// effective context BEFORE the kernel silently truncates them (the
-/// sentinel's most common post-hoc detection, moved to pre-hoc).
-/// Byte-estimate first (hot path, ~free); exact `/tokenize` only when
-/// the estimate crosses the 90% threshold AND the child is running.
-/// F82: multimodal bodies - collect text fields AND count image parts
-/// (arrays used to tokenize as empty text and bypass the fit check
-/// entirely). `/api/generate` bodies carry the prompt under `prompt`
-/// (F13 - the exact count must not silently see "").
 fn prompt_text_and_images(body: &serde_json::Value) -> (String, u64) {
     body.pointer("/messages")
         .and_then(|m| m.as_array())
@@ -129,82 +239,199 @@ fn prompt_text_and_images(body: &serde_json::Value) -> (String, u64) {
         .unwrap_or_default()
 }
 
+/// How a prompt-fit verdict was reached, in metric-label order: the
+/// bracket cleared the limit, the bracket straddled it with no child
+/// up to count, a running child's tokenizer counted it and it fits,
+/// that count refused it, and the lower bound alone refused it.
+const VERDICT_LABELS: [&str; 5] = [
+    "fits",
+    "uncertain",
+    "exact_fit",
+    "exact_refuse",
+    "estimated_refuse",
+];
+const VERDICT_FITS: usize = 0;
+const VERDICT_UNCERTAIN: usize = 1;
+const VERDICT_EXACT_FIT: usize = 2;
+const VERDICT_EXACT_REFUSE: usize = 3;
+const VERDICT_ESTIMATED_REFUSE: usize = 4;
+static VERDICTS: [std::sync::atomic::AtomicU64; VERDICT_LABELS.len()] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn note_verdict(verdict: usize) {
+    VERDICTS[verdict].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `/metrics` text for the verdict counters: every label, zeros
+/// included, so a dashboard keeps a stable series.
+#[must_use]
+pub fn verdict_metrics() -> String {
+    let mut text = String::from(
+        "# HELP blazar_prompt_preflight_verdicts_total Prompt-fit verdicts, by how they were \
+         reached\n# TYPE blazar_prompt_preflight_verdicts_total counter\n",
+    );
+    for (label, count) in VERDICT_LABELS.iter().zip(VERDICTS.iter()) {
+        // Written straight into the buffer: no throwaway `String` per label.
+        let _ = std::fmt::Write::write_fmt(
+            &mut text,
+            format_args!(
+                "blazar_prompt_preflight_verdicts_total{{verdict=\"{label}\"}} {count}\n",
+                count = count.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+        );
+    }
+    text
+}
+
+/// Prompt-fit admission (K1): refuse requests that cannot fit the
+/// effective context BEFORE the engine rejects or truncates them (the
+/// sentinel's most common post-hoc detection, moved to pre-hoc).
+/// Estimate first (hot path, ~free); the exact `/tokenize` count from a
+/// RUNNING child only when the estimate's bracket reaches 90% of the
+/// limit. Returns `Ok(true)` when that bracket straddles the limit and
+/// no child is up to count exactly: the caller then re-checks through
+/// [`recheck_prompt_fits`] once the model is loaded.
+/// F82: multimodal bodies - collect text fields AND count image parts
+/// (arrays used to tokenize as empty text and bypass the fit check
+/// entirely). `/api/generate` bodies carry the prompt under `prompt`
+/// (F13 - the exact count must not silently see "").
 pub async fn enforce_prompt_fits(
     state: &crate::state::AppState,
     model: &str,
     body: &serde_json::Value,
     effective_ctx: u32,
-) -> Result<(), Box<axum::response::Response>> {
+) -> Result<bool, Box<axum::response::Response>> {
     if !state.cfg().prompt_preflight || effective_ctx == 0 {
-        return Ok(());
+        return Ok(false);
     }
-    let est = prompt_tokens_est(body);
-    // Cheap path: under 90% of ctx - the kernel fits it.
-    if est < u64::from(effective_ctx) * 9 / 10 {
-        return Ok(());
+    let ctx = u64::from(effective_ctx);
+    let (low, high) = prompt_token_bounds(body);
+    // Cheap path: even the upper bound sits under 90% of ctx.
+    if high.saturating_mul(10) < ctx * 9 {
+        note_verdict(VERDICT_FITS);
+        return Ok(false);
     }
-    // Over threshold: try the exact count against a RUNNING child.
-    let running = state
-        .sup
-        .live_http_endpoints()
-        .into_iter()
-        .find(|e| e.name == model)
-        .map(|e| (crate::proxy::child_base(&e.endpoint), e));
-    let exact = match running {
-        Some((base, engine)) => {
-            let (text, images) = prompt_text_and_images(body);
-            match crate::proxy::child_auth(
-                crate::state::child_client(state, &engine.endpoint)
-                    .post(format!("{base}/tokenize")),
-                &engine,
-            )
-            .json(&serde_json::json!({"content": text}))
-            .send()
-            .await
-            {
-                Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| {
-                    v.get("tokens")
-                        .and_then(|t| t.as_array())
-                        .map(std::vec::Vec::len)
-                        .map(|n| n as u64)
-                        .map(|exact| {
-                            // Tools ride as a bytes/4 estimate on top (the
-                            // engine serializes tool defs into the prompt).
-                            let tools_est = body
-                                .get("tools")
-                                .map_or(0, |t| u64::try_from(t.to_string().len()).unwrap_or(0) / 4);
-                            exact
-                                .saturating_add(tools_est)
-                                .saturating_add(images.saturating_mul(IMAGE_TOKEN_EST))
-                        })
-                }),
-                Err(_) => None,
-            }
-        }
-        None => None,
-    };
-    let tokens = exact.unwrap_or(est);
-    if tokens >= u64::from(effective_ctx) {
-        let how = if exact.is_some() {
-            "exact"
+    // Near or past the limit: a running child gives the exact count.
+    if let Some(engine) = crate::tokenize::resident(state, model)
+        && let Some(verdict) = exact_verdict(state, model, &engine, body, ctx).await
+    {
+        note_verdict(if verdict.is_ok() {
+            VERDICT_EXACT_FIT
         } else {
-            "estimated"
-        };
+            VERDICT_EXACT_REFUSE
+        });
+        return verdict.map(|()| false);
+    }
+    // No child, or a lane that cannot count: only a prompt that cannot
+    // fit on any reading is refused here - never pay a model load for it.
+    if low >= ctx {
+        note_verdict(VERDICT_ESTIMATED_REFUSE);
+        return Err(Box::new(
+            prompt_too_long(state, model, low, "estimated", ctx).into_response(),
+        ));
+    }
+    note_verdict(VERDICT_UNCERTAIN);
+    Ok(true)
+}
+
+/// Second half of prompt-fit admission for the cold path: `engine` is
+/// the child a request with a straddling estimate just saw started. The
+/// live tokenizer is available now, so a prompt over the limit is
+/// refused before it burns a prefill. Lanes without a tokenize route
+/// and failed calls pass: the engine reports the overflow itself.
+pub async fn recheck_prompt_fits(
+    state: &crate::state::AppState,
+    model: &str,
+    body: &serde_json::Value,
+    engine: &blazar_runtime::EngineRef,
+) -> Result<(), Box<axum::response::Response>> {
+    if !state.cfg().prompt_preflight {
+        return Ok(());
+    }
+    let ctx = u64::from(admission_ctx(state, model));
+    if ctx == 0 {
+        return Ok(());
+    }
+    let (_, high) = prompt_token_bounds(body);
+    if high.saturating_mul(10) < ctx * 9 {
+        return Ok(());
+    }
+    match exact_verdict(state, model, engine, body, ctx).await {
+        Some(Err(response)) => {
+            note_verdict(VERDICT_EXACT_REFUSE);
+            Err(response)
+        }
+        Some(Ok(())) => {
+            note_verdict(VERDICT_EXACT_FIT);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Exact verdict of a running child: `Some(Err(response))` = over the
+/// limit, `Some(Ok(()))` = fits, `None` = the lane cannot count.
+async fn exact_verdict(
+    state: &crate::state::AppState,
+    model: &str,
+    engine: &blazar_runtime::EngineRef,
+    body: &serde_json::Value,
+    ctx: u64,
+) -> Option<Result<(), Box<axum::response::Response>>> {
+    let (text, images) = prompt_text_and_images(body);
+    let text_tokens = match crate::tokenize::count_prompt(state, engine, &text).await {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::debug!(target: "blazar::preflight", model, "exact token count unavailable: {error}");
+            return None;
+        }
+    };
+    // Tool definitions ride into the prompt as text the engine
+    // serializes: their own bracket, not a second engine call. Only the
+    // LOWER bound refuses - a schema's upper bound must never reject a
+    // request the engine would have served.
+    let (tools_low, _) = body
+        .get("tools")
+        .map_or((0, 0), |tools| token_bounds(&tools.to_string()));
+    let tokens = text_tokens + tools_low + images * IMAGE_TOKEN_EST;
+    Some(if tokens >= ctx {
         Err(Box::new(
-            crate::proxy::openai_error_code(
-                crate::error_codes::BlazarCode::PromptTooLong,
-                &format!(
-                    "prompt {tokens} tokens ({how}) exceeds the {effective_ctx}-token context for \
-                     {model:?} - the engine would silently truncate it. Shorten the prompt, raise \
-                     ctx (config/[model_overrides] ctx or X-Blazar-Num-Ctx), or set \
-                     prompt_preflight = false to allow truncation",
-                ),
-            )
-            .into_response(),
+            prompt_too_long(state, model, tokens, "exact", ctx).into_response(),
         ))
     } else {
         Ok(())
-    }
+    })
+}
+
+/// The refusal: the count, the real limit, and what the engine would
+/// have done with the prompt.
+fn prompt_too_long(
+    state: &crate::state::AppState,
+    model: &str,
+    tokens: u64,
+    how: &str,
+    ctx: u64,
+) -> axum::response::Response {
+    let engine_side = if state.cfg().context_shift {
+        "context shift is on, so the engine would silently drop the oldest tokens to make room"
+    } else {
+        "context shift is off, so the engine would reject it (nothing is truncated silently)"
+    };
+    crate::proxy::openai_error_code(
+        crate::error_codes::BlazarCode::PromptTooLong,
+        &format!(
+            "prompt {tokens} tokens ({how}) exceeds the {ctx}-token context for {model:?} - the \
+             engine cannot serve it as sent: {engine_side}. Shorten the prompt, raise ctx \
+             (config/[model_overrides] ctx or X-Blazar-Num-Ctx), or set prompt_preflight = false \
+             to let the engine answer it"
+        ),
+    )
+    .into_response()
 }
 
 /// f16 KV cache size in MiB for a target ctx. 2 (K+V) * layers *
@@ -341,12 +568,14 @@ pub fn capability_cert_refusal(
     if !needs.any() {
         return None;
     }
-    let cert = state.with_store(|s| s.get_model_caps_dated(model).ok().flatten())??;
+    let cert = state.read_store_or_absent("models.caps", |s| s.get_model_caps_dated(model))?;
     let caps: serde_json::Value = serde_json::from_str(&cert.2).ok()?;
     // Two SEPARATE store borrows: routed_kind_for takes the store mutex
     // itself, so nesting it inside a with_store closure would deadlock
     // the (non-reentrant) mutex and freeze every store-reading request.
-    let cert_kind = state.with_store(|s| s.engine_kind_of_tag(&cert.0).ok().flatten())?;
+    let cert_kind = state.read_store_or_absent("engines.kind_of_tag", |s| {
+        s.engine_kind_of_tag(&cert.0).map(Some)
+    })?;
     let serving_kind = crate::proxy::routed_kind_for(state, model);
     capability_refusal(
         model,
@@ -364,7 +593,25 @@ pub fn capability_cert_refusal(
 mod tests {
     #[test]
     #[allow(non_snake_case)]
-    fn unit__prompt_tokens_est__ollama_images_estimate_flat_not_base64() {
+    fn unit__verdict_metrics__renders_every_verdict_label() {
+        note_verdict(VERDICT_UNCERTAIN);
+        let text = verdict_metrics();
+        for label in VERDICT_LABELS {
+            let prefix = format!("blazar_prompt_preflight_verdicts_total{{verdict=\"{label}\"}} ");
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("no series for verdict {label}:\n{text}"));
+            let value = line.rsplit(' ').next().unwrap_or_default();
+            value
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("{line}: {e}"));
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__prompt_token_bounds__ollama_images_estimate_flat_not_base64() {
         // Ollama dialect: a 1 MiB base64 image inside messages[].images
         // must estimate ~1 image, not ~262K tokens of raw base64/4 (the
         // F82 false-trip, reborn on the sibling-array shape).
@@ -375,12 +622,12 @@ mod tests {
                 {"role": "user", "content": "what is this?", "images": [big]}
             ]
         });
-        let est = prompt_tokens_est(&body);
+        let (low, high) = prompt_token_bounds(&body);
         assert!(
-            est < 10_000,
-            "1 image + tiny text must not estimate as raw base64: {est}"
+            high < 10_000,
+            "1 image + tiny text must not estimate as raw base64: {high}"
         );
-        assert!(est >= 1_500, "the per-image figure is present: {est}");
+        assert!(low >= 1_500, "the per-image figure is present: {low}");
     }
 
     #[test]
@@ -607,6 +854,49 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__token_bounds__each_class_carries_its_own_prior() {
+        // Pure single-class strings: the bracket is that class's prior
+        // times its byte count.
+        assert_eq!(token_bounds("aaaa"), (0, 2));
+        assert_eq!(token_bounds("abcd ef01"), (1, 4));
+        assert_eq!(token_bounds(""), (0, 0));
+        assert_eq!(token_bounds("\u{65e5}\u{672c}"), (0, 3));
+        assert_eq!(token_bounds("😀😀"), (1, 8));
+        // A hex run with a letter is a blob: near one token per character.
+        assert_eq!(token_bounds("deadbeef00"), (6, 10));
+        // A plain digit run is not: low like any other digits.
+        assert_eq!(token_bounds("1234567890"), (1, 4));
+        assert_eq!(token_bounds("1234567"), (0, 3));
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn unit__token_bounds__hex_blobs_no_longer_under_count_like_a_flat_ratio() {
+        // Priors only - the measured tokenizer rows live in
+        // tests/token_bounds.rs. A hash-like blob starts well above the
+        // bytes/4 figure that used to wave it through.
+        let blob = "b4924f81e0c37a5d".repeat(7500);
+        let (low, high) = token_bounds(&blob);
+        assert_eq!((low, high), (72_000, 120_000));
+        assert!(low > (blob.len() as u64) / 4);
+        // The same text inside a chat body keeps that bracket (the
+        // envelope's own strings only add to it).
+        let body = serde_json::json!({"messages": [{"role": "user", "content": blob}]});
+        let (body_low, body_high) = prompt_token_bounds(&body);
+        assert!(body_low >= low && body_high >= high);
+        // Images stay a flat figure on top.
+        let vision = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
+            ]}]
+        });
+        let (low, high) = prompt_token_bounds(&vision);
+        assert!(low >= 1_500 && high < 2_000, "({low}, {high})");
     }
 
     fn meta(layers: u64, heads: u64, kv: u64, emb: u64) -> GgufMeta {

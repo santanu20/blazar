@@ -32,6 +32,14 @@ use blazar_runtime::engine::{EngineManager, STALLED_INSTALL_GRACE};
 use blazar_runtime::engine_impl::Engine;
 use blazar_runtime::{LlamaCppEngine, MistralRsEngine, Supervisor};
 
+mod launch_presets;
+
+// Only compiled with `--features mimalloc`; the default build keeps the
+// system allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "blazar",
@@ -111,15 +119,32 @@ enum Cmd {
     /// base-URL env, ensures the daemon is up, then execs COMMAND
     /// (e.g. `blazar launch claude` / `blazar launch dsh`)
     Launch {
-        /// The CLI to exec (searched on PATH; args after `--`)
+        /// The CLI to exec (searched on PATH; args after `--`);
+        /// known agent CLIs get a preset (see --list)
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
-        /// Model to pre-warm before exec (optional)
+        /// Model to pre-warm before exec (optional); on preset CLIs
+        /// this also injects the CLI's model flag / env
         #[arg(long)]
         warm: Option<String>,
-        /// API key to hand the CLI (`BLAZAR_KEY` env or a key name here)
+        /// API key to hand the CLI (a `plm_` literal or a key name
+        /// from config.toml [[keys]])
         #[arg(long)]
         key: Option<String>,
+        /// Print the resolved env (secrets redacted) and argv, then
+        /// exit without exec-ing
+        #[arg(long)]
+        dry_run: bool,
+        /// Run the preset-table self-test battery and exit 0/1
+        #[arg(long)]
+        self_test: bool,
+        /// List the launch presets
+        #[arg(long)]
+        list: bool,
+        /// Re-launch the last CLI+model this daemon handed out
+        /// (cannot be combined with a CLI word or --warm)
+        #[arg(long)]
+        restore: bool,
     },
     /// blazar account sign-in - refused: no cloud accounts by design
     Signin,
@@ -1123,6 +1148,19 @@ enum EngineCmd {
         /// table and the install-catalog hints
         #[arg(long)]
         json: bool,
+    },
+    /// Re-verify an installed engine against its recorded digest
+    ///
+    /// Pip lanes (sglang/vllm/mlx/litert/kokoro) re-walk the venv
+    /// RECORD manifests and re-hash every installed file; GitHub lanes
+    /// re-hash the cached download archive the engine was installed
+    /// from. A digest that passed install-time verification with no
+    /// cached artifact left to re-hash prints an honest skip - exit 0.
+    Verify {
+        /// Exact engine tag (see `blazar engine list`). Omitted, every
+        /// installed lane is swept: each gets its own verify report,
+        /// and only real drift (or a gone install dir) fails the run.
+        tag: Option<String>,
     },
     /// Activate an installed tag (see `blazar engine list` for tags)
     ///
@@ -2581,9 +2619,9 @@ async fn run(cmd: Cmd) -> Result<()> {
             // once-per-invocation and free.
             let ensured = Box::pin(ensure_run_model(&model)).await;
             let model_ref: &str = ensured.as_deref().unwrap_or(&model);
-            let row = Store::open(&dirs())
-                .ok()
-                .and_then(|s| s.get_model(model_ref).ok().flatten());
+            let row = Store::open(&dirs()).ok().and_then(|s| {
+                blazar_core::store::row_or_warn("models.get", s.get_model(model_ref)).flatten()
+            });
             if let Some(row) = row {
                 let model = model_ref.to_string();
                 match run_lane(&row) {
@@ -2774,7 +2812,15 @@ blazar mmproj <model> <mmproj.gguf path>"
                 gate,
             )
         }
-        Cmd::Launch { command, warm, key } => launch_cmd(command, warm, key).await,
+        Cmd::Launch {
+            command,
+            warm,
+            key,
+            dry_run,
+            self_test,
+            list,
+            restore,
+        } => launch_cmd(command, warm, key, dry_run, self_test, list, restore).await,
         Cmd::Whisper {
             file,
             model,
@@ -6476,7 +6522,9 @@ async fn doctor(flat: bool, json: bool, fix: bool) -> Result<()> {
     checks.extend(doctor_engine(&d).await);
     let active_kind = blazar_core::Store::open(&d)
         .ok()
-        .and_then(|s| s.active_engine().ok().flatten())
+        .and_then(|s| {
+            blazar_core::store::row_or_warn("engines.active", s.active_engine()).flatten()
+        })
         .map(|r| r.kind);
     checks.extend(doctor_engine_versions(&d, active_kind).await);
     checks.extend(doctor_gpu(&d).await);
@@ -6991,6 +7039,7 @@ fn doctor_group(name: &str) -> &'static str {
         | "whisper lane"
         | "whisper currency"
         | "whisper models"
+        | "hardware receipts"
         | "rpc fleet" => "ENGINES",
         "models" | "unmanaged files" | "model types" | "modality coverage" => "MODELS",
         "ccache" => "CHANNELS",
@@ -7424,8 +7473,82 @@ fn doctor_engines(d: &BlazarDirs) -> Vec<Check> {
         }
     }
     out.extend(doctor_manifest_vocab(&engines));
+    out.extend(doctor_hardware_receipts(
+        &engines,
+        blazar_runtime::engine::system_gpu_vendor(),
+    ));
     out.extend(doctor_engine_retention(d, &engines));
     out
+}
+
+/// Which installed GPU lanes have run live on the hardware class of this
+/// host, per `blazar_core::hardware_receipts`. A lane without a receipt
+/// is experimental here: it installs and serves, but nobody measured it.
+/// Lanes whose label states no backend (CPU builds, fork lanes) stay out.
+/// `host_gpu_vendor` is the vendor of this host's GPU
+/// (`blazar_runtime::engine::system_gpu_vendor`), a parameter so the row
+/// can be tested without a GPU.
+fn doctor_hardware_receipts(
+    engines: &[blazar_core::store::EngineRow],
+    host_gpu_vendor: blazar_runtime::engine::manifest::Vendor,
+) -> Option<Check> {
+    use blazar_core::hardware_receipts::{backend_of, lookup};
+    use blazar_runtime::engine::manifest::Vendor;
+
+    const ROW: &str = "hardware receipts";
+    let host_os = std::env::consts::OS;
+    let host_gpu_vendor_name =
+        (host_gpu_vendor != Vendor::Other).then_some(host_gpu_vendor.as_str());
+    let mut flagged: Vec<String> = Vec::new();
+    let mut receipted: Vec<String> = Vec::new();
+    for row in engines {
+        let Some(backend) = backend_of(row.kind.as_str(), &row.asset, host_os) else {
+            continue;
+        };
+        // Vulkan serves every vendor: only the host's GPU names the class.
+        // A host whose vendor no source names cannot be matched to any row.
+        let vendor = backend.implied_vendor().or(host_gpu_vendor_name);
+        let Some(vendor) = vendor else {
+            flagged.push(format!(
+                "{} ({}): host GPU vendor unknown, no receipt can be matched",
+                row.tag,
+                backend.as_str()
+            ));
+            continue;
+        };
+        let entry = format!("{} ({}, {})", row.tag, backend.as_str(), vendor);
+        let receipt = lookup(row.kind.as_str(), backend, vendor).and_then(|class| class.receipt);
+        if receipt.is_some() {
+            receipted.push(entry);
+        } else {
+            flagged.push(entry);
+        }
+    }
+    if flagged.is_empty() && receipted.is_empty() {
+        return None;
+    }
+    if flagged.is_empty() {
+        return Some(Check::ok(
+            ROW,
+            format!(
+                "{} installed GPU lane(s) with a live receipt on this hardware class: {}",
+                receipted.len(),
+                receipted.join(", ")
+            ),
+        ));
+    }
+    let receipted_note = if receipted.is_empty() {
+        "none".to_string()
+    } else {
+        receipted.join(", ")
+    };
+    Some(Check::warn(
+        ROW,
+        format!(
+            "experimental, no live receipt on this hardware class: {}; receipted: {receipted_note} (docs/engines.md, Hardware receipts)",
+            flagged.join(", ")
+        ),
+    ))
 }
 
 /// Vocabulary staleness row: a manifest captured by an older probe (the
@@ -8597,6 +8720,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }];
         // Knob off: the verdict teaches the gate instead of guessing -
         // the pair is layout-different and nothing is admitted.
@@ -8647,6 +8772,8 @@ mod doctor_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             },
             blazar_core::store::ModelRow {
                 name: "hf-twin".into(),
@@ -8663,6 +8790,8 @@ mod doctor_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             },
         ];
         let out = kv_import_rows(&rows, &Config::default(), dir.path());
@@ -8707,6 +8836,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         let rows = kv_import_rows(&[row], &Config::default(), dir.path());
         let joined = format!("{rows:?}");
@@ -8746,6 +8877,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         store
             .upsert_model(&row("hf-twin", hf_dir.display().to_string()))
@@ -8800,6 +8933,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         store
             .upsert_model(&row("qwen-hf", hf.to_str().unwrap()))
@@ -8870,6 +9005,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         let path = hf_dir.display().to_string();
         store.upsert_model(&row("vllm-src", path.clone())).unwrap();
@@ -8943,6 +9080,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         let path = hf_dir.display().to_string();
         store.upsert_model(&row("mlx-src", path.clone())).unwrap();
@@ -9019,6 +9158,8 @@ mod doctor_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         store
             .upsert_model(&row("hf-twin", hf_dir.display().to_string()))
@@ -9826,9 +9967,10 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
                     // Kind-aware smoke: the active row carries the kind
                     // the probe dispatch needs (venv lanes probe their
                     // venv python, not the shim).
-                    let active_row = blazar_core::Store::open(d)
-                        .ok()
-                        .and_then(|s| s.active_engine().ok().flatten());
+                    let active_row = blazar_core::Store::open(d).ok().and_then(|s| {
+                        blazar_core::store::row_or_warn("engines.active", s.active_engine())
+                            .flatten()
+                    });
                     checks.push(engine_smoke_check(
                         active_row.as_ref().map(|r| r.kind),
                         d,
@@ -9887,7 +10029,9 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // source of truth lives in the store).
     let active_kind = blazar_core::Store::open(d)
         .ok()
-        .and_then(|s| s.active_engine().ok().flatten())
+        .and_then(|s| {
+            blazar_core::store::row_or_warn("engines.active", s.active_engine()).flatten()
+        })
         .map(|r| r.kind);
     // CUDA opportunity + toolchain readiness (NVIDIA boxes only): a
     // Vulkan prebuilt on an NVIDIA GPU leaves measured decode/prefill on
@@ -9993,7 +10137,9 @@ fn active_engine_asset(d: &BlazarDirs, active_tag: Option<&str>) -> String {
     };
     Store::open(d)
         .ok()
-        .and_then(|s| s.active_engine().ok().flatten())
+        .and_then(|s| {
+            blazar_core::store::row_or_warn("engines.active", s.active_engine()).flatten()
+        })
         .filter(|row| row.tag == tag)
         .map_or_else(String::new, |row| row.asset)
 }
@@ -12018,6 +12164,11 @@ async fn serve() -> Result<()> {
         hw.gpus.len(),
         hw.total_vram_mib()
     );
+    if !hw.has_gpu()
+        && let Some(hint) = blazar_runtime::probe::missing_gpu_census_hint()
+    {
+        println!("warning: no GPU visible to blazar - {hint}");
+    }
     // Boot preflight (2/2): VRAM already held before blazar spawns any
     // child of its own. Advisory only - blazar never kills another
     // product's process.
@@ -12763,7 +12914,23 @@ fn import(
     copy: bool,
     mmproj: Option<&PathBuf>,
 ) -> Result<()> {
-    let d = dirs();
+    import_model(&dirs(), path, name, quant, copy, mmproj)
+}
+
+/// Import a GGUF (or a whole gguf-split shard set) into the local store.
+/// Split from [`import`] so tests can drive it against a temp [`BlazarDirs`]
+/// without touching the process-global XDG environment.
+// One coherent import narrative (discovery, install, row, receipt);
+// splitting it would scatter the single-file and shard-set paths.
+#[allow(clippy::too_many_lines)]
+fn import_model(
+    d: &BlazarDirs,
+    path: &PathBuf,
+    name: Option<String>,
+    quant: Option<String>,
+    copy: bool,
+    mmproj: Option<&PathBuf>,
+) -> Result<()> {
     d.ensure().ok();
     let meta = blazar_core::read_metadata_file(path.as_path())
         .map_err(|e| anyhow!("not a readable GGUF ({}): {e}", path.display()))?;
@@ -12776,9 +12943,17 @@ fn import(
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
+    // Split GGUF sets (ollama issue 5245): a leaf stands for the whole
+    // set, so quant and name derive from the marker-stripped base, never
+    // from the `-00002-of-00002` tail.
+    let shard_set = blazar_runtime::hf::shard_set_leaves(path)?;
+    let name_source = match &shard_set {
+        Some((_, base, _)) => base.clone(),
+        None => file_name.clone(),
+    };
     // Derive: name from GGUF general.name or explicit; quant from filename token.
     let derived_quant = quant.unwrap_or_else(|| {
-        file_name
+        name_source
             .to_lowercase()
             .trim_end_matches(".gguf")
             .rsplit('-')
@@ -12791,18 +12966,41 @@ fn import(
     let model_name = name.unwrap_or_else(|| {
         meta.name
             .clone()
-            .unwrap_or_else(|| file_name.trim_end_matches(".gguf").to_string())
+            .unwrap_or_else(|| name_source.trim_end_matches(".gguf").to_string())
             .to_lowercase()
             .replace([' ', '.'], "-")
     });
     // GGUF-embedded names are untrusted input too (F98): a crafted
     // general.name with '/' would write outside the models dir.
     blazar_runtime::models::ensure_portable_name(&model_name)?;
-    let dest = d.models_dir().join(format!(
-        "{model_name}-{}.gguf",
-        derived_quant.to_lowercase()
-    ));
-    install_model_file(path, &dest, copy)?;
+    // Install: a single file lands as one blob; a split set installs
+    // every leaf under the same `{model}-{quant}` stem plus its marker,
+    // which is the naming convention llama-server keys on to discover
+    // the siblings.
+    let (dest, set_bytes, set_shards) = if let Some((count, _, leaves)) = &shard_set {
+        let mut leaf_dests = Vec::with_capacity(leaves.len());
+        for (i, leaf) in leaves.iter().enumerate() {
+            let leaf_no = i + 1;
+            let leaf_dest = d.models_dir().join(format!(
+                "{model_name}-{}-{leaf_no:05}-of-{count:05}.gguf",
+                derived_quant.to_lowercase()
+            ));
+            install_model_file(leaf, &leaf_dest, copy)?;
+            leaf_dests.push(leaf_dest);
+        }
+        let total: u64 = leaves
+            .iter()
+            .map(|l| std::fs::metadata(l).map_or(0, |m| m.len()))
+            .sum();
+        (leaf_dests[0].clone(), total, i64::from(*count))
+    } else {
+        let dest = d.models_dir().join(format!(
+            "{model_name}-{}.gguf",
+            derived_quant.to_lowercase()
+        ));
+        install_model_file(path, &dest, copy)?;
+        (dest, size, 1)
+    };
     // Optional vision projector: validated loudly, installed alongside.
     let mmproj_dest = mmproj
         .as_ref()
@@ -12821,7 +13019,7 @@ fn import(
             Ok::<_, anyhow::Error>(mdest)
         })
         .transpose()?;
-    let bytes = i64::try_from(size).unwrap_or(i64::MAX);
+    let bytes = i64::try_from(set_bytes).unwrap_or(i64::MAX);
     let row = blazar_core::ModelRow {
         name: model_name.clone(),
         repo: format!("imported:{}", path.display()),
@@ -12834,9 +13032,9 @@ fn import(
         sha256: file_sha256(&dest),
         mmproj_path: mmproj_dest.map(|p| p.display().to_string()),
         components: vec![],
-        shards: 1,
+        shards: set_shards,
         arch: Some(meta.architecture.clone()),
-        params: Some(blazar_runtime::hf::est_params(size, &derived_quant)),
+        params: Some(blazar_runtime::hf::est_params(set_bytes, &derived_quant)),
         ctx_train: meta.context_length.and_then(|c| i64::try_from(c).ok()),
         pulled_at: i64::try_from(
             std::time::SystemTime::now()
@@ -12852,8 +13050,10 @@ fn import(
                 .as_secs(),
         )
         .unwrap_or(i64::MAX),
+
+        license: None,
     };
-    let store = Store::open(&d)?;
+    let store = Store::open(d)?;
     store.upsert_model(&row)?;
     println!(
         "imported {} ({} {}, arch {}, ctx_train {:?}) -> {}",
@@ -12864,7 +13064,22 @@ fn import(
         meta.context_length,
         dest.display()
     );
-    println!("{}", ok_line("zero extra disk used (link, not copy)"));
+    if shard_set.is_some() {
+        // The link note only holds when nothing was copied; a split set
+        // pulled in with `--copy` moves real bytes.
+        if !copy {
+            println!("{}", ok_line("zero extra disk used (link, not copy)"));
+        }
+        println!(
+            "{}",
+            ok_line(&format!(
+                "{set_shards} shards installed as one model: the row points at \
+                 leaf 1, the engine discovers the rest by naming convention"
+            ))
+        );
+    } else {
+        println!("{}", ok_line("zero extra disk used (link, not copy)"));
+    }
     Ok(())
 }
 
@@ -13459,6 +13674,7 @@ fn show(model: &str, json: bool) -> Result<()> {
                 "bytes": row.bytes,
                 "shards": row.shards,
                 "mmproj": row.mmproj_path,
+                "license": row.license,
                 "meta": meta_json,
                 "profile": profile_json,
             })
@@ -13476,6 +13692,11 @@ fn show(model: &str, json: bool) -> Result<()> {
         ("size", humansize(row.bytes)),
         ("shards", row.shards.to_string()),
     ];
+    // Licence when the pull captured one; rows without one say nothing
+    // rather than printing a guess (the JSON card carries null).
+    if let Some(l) = &row.license {
+        fields.push(("license", l.clone()));
+    }
     if let Some(qm) = hf_quant_method(&row.path) {
         fields.push(("quant_method", qm));
     }
@@ -13598,15 +13819,18 @@ fn group_bench_rows(rows: &[blazar_runtime::bench::BenchRow]) -> Vec<BenchTestRo
 fn bench_calibration_samples(
     store: &Store,
 ) -> Option<(String, Vec<blazar_core::predict::CalibSample>)> {
-    let engine = store.active_engine().ok().flatten()?;
+    let engine = blazar_core::store::row_or_warn("engines.active", store.active_engine())??;
     // Exact-lane history first; engine updates prune old engine rows, so a
     // long-lived store keeps its bench_history under retired tags - fall
     // back to every row on the machine. The returned basis label names
     // WHICH set backed the prediction so it never overstates precision.
-    let lane = store.bench_history_for_lane(&engine.tag).ok()?;
+    let lane = blazar_core::store::row_or_warn(
+        "bench.history_lane",
+        store.bench_history_for_lane(&engine.tag),
+    )?;
     let (history, basis_lane) = if lane.is_empty() {
         (
-            store.bench_history_all().ok()?,
+            blazar_core::store::row_or_warn("bench.history_all", store.bench_history_all())?,
             format!("{} (all recorded lanes)", engine.tag),
         )
     } else {
@@ -13615,9 +13839,7 @@ fn bench_calibration_samples(
     let samples = history
         .iter()
         .filter_map(|h| {
-            let bytes = store
-                .get_model(&h.model)
-                .ok()
+            let bytes = blazar_core::store::row_or_warn("models.get", store.get_model(&h.model))
                 .flatten()
                 .and_then(|r| u64::try_from(r.bytes.max(0)).ok())?;
             Some(blazar_core::predict::CalibSample {
@@ -14075,7 +14297,8 @@ fn canonical_plan_for(
         .iter()
         .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
         .collect();
-    let global_row = store.active_engine().ok().flatten();
+    let global_row =
+        blazar_core::store::row_or_warn("engines.active", store.active_engine()).flatten();
     let global = global_row
         .as_ref()
         .map_or(blazar_core::engine_kind::EngineKind::LlamaCpp, |r| r.kind);
@@ -15000,7 +15223,13 @@ async fn autopilot(apply: bool) -> Result<()> {
             .active_engine()
             .ok()
             .flatten()
-            .and_then(|e| store.get_profile(&row.name, &e.tag).ok().flatten())
+            .and_then(|e| {
+                blazar_core::store::row_or_warn(
+                    "models.profile",
+                    store.get_profile(&row.name, &e.tag),
+                )
+                .flatten()
+            })
             .map(|p| p.updated_at);
         let cert_at = store
             .get_model_caps_dated(&row.name)
@@ -15090,8 +15319,10 @@ fn assemble_passport(
 ) -> Result<serde_json::Value> {
     let row = store.get_model(name)?.ok_or_else(|| no_such_model(name))?;
     let measured = resolve_measured(store, &row.name)?;
-    let caps = store.get_model_caps_dated(&row.name).ok().flatten();
-    let engine = store.active_engine().ok().flatten();
+    let caps =
+        blazar_core::store::row_or_warn("models.caps", store.get_model_caps_dated(&row.name))
+            .flatten();
+    let engine = blazar_core::store::row_or_warn("engines.active", store.active_engine()).flatten();
 
     let identity = serde_json::json!({
         "name": row.name,
@@ -15220,17 +15451,17 @@ async fn certify(name: &str, json: bool, export: Option<PathBuf>, refresh: bool)
         .ok()
         .flatten()
         .map(|(_, _, at)| at);
-    let tuned_at = store
-        .active_engine()
-        .ok()
+    let tuned_at = blazar_core::store::row_or_warn("engines.active", store.active_engine())
         .flatten()
-        .and_then(|e| store.get_profile(&row.name, &e.tag).ok().flatten())
+        .and_then(|e| {
+            blazar_core::store::row_or_warn("models.profile", store.get_profile(&row.name, &e.tag))
+                .flatten()
+        })
         .map(|p| p.updated_at);
-    let cert_at = store
-        .get_model_caps_dated(&row.name)
-        .ok()
-        .flatten()
-        .map(|(_, tested, _)| tested);
+    let cert_at =
+        blazar_core::store::row_or_warn("models.caps", store.get_model_caps_dated(&row.name))
+            .flatten()
+            .map(|(_, tested, _)| tested);
     let arch_class = bench_arch_refusal(row.arch.as_deref());
     let benchable = matches!(run_lane(&row), RunLane::Text)
         && arch_class.is_none()
@@ -15746,7 +15977,9 @@ fn scorecard(model: &str, json: bool) -> Result<()> {
         .get_model(model)?
         .ok_or_else(|| no_such_model(model))?;
     let measured = resolve_measured(&store, &row.name)?;
-    let caps = store.get_model_caps_dated(&row.name).ok().flatten();
+    let caps =
+        blazar_core::store::row_or_warn("models.caps", store.get_model_caps_dated(&row.name))
+            .flatten();
 
     if json {
         scorecard_json(&row, &measured, caps.as_ref());
@@ -18835,6 +19068,8 @@ fn quantize_cmd(
                 .as_secs(),
         )
         .unwrap_or(0),
+
+        license: None,
     })?;
     #[allow(clippy::cast_precision_loss)] // percent display only
     let pct = 100.0 * out_bytes as f64 / src_bytes as f64;
@@ -18850,67 +19085,213 @@ fn quantize_cmd(
 /// `blazar launch <cli> [args...]` - ollama-`launch`-class ergonomics
 /// without ollama's coupling: point any OpenAI/Anthropic/ollama-speaking
 /// CLI at the daemon via env, optionally pre-warm a model, exec.
-async fn launch_cmd(command: Vec<String>, warm: Option<String>, key: Option<String>) -> Result<()> {
-    let Some(program) = command.first().cloned() else {
-        return Err(anyhow!(
-            "usage: blazar launch [--warm MODEL] [--key KEY] <cli> [args...]\n\
-             examples: blazar launch claude\n\
-                        blazar launch --warm qwen3.5-9b dsh\n\
-             the CLI inherits OPENAI_BASE_URL / ANTHROPIC_BASE_URL / OLLAMA_HOST"
-        ));
-    };
-    let base = ensure_daemon().await?;
-    if let Some(model) = &warm {
-        println!("{}", dim_line(&format!("pre-warming {model} ...")));
-        let resp = cli_http()
-            .post(format!("{base}/v1/chat/completions"))
-            .json(&serde_json::json!({
-                "model": model, "max_tokens": 1,
-                "messages": [{"role": "user", "content": "warm"}],
-            }))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
+// One command surface, one handler: the flag set IS the CLI contract,
+// and the body reads as a straight-line runbook (guards, warm, exec).
+#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_lines)]
+async fn launch_cmd(
+    command: Vec<String>,
+    warm: Option<String>,
+    key: Option<String>,
+    dry_run: bool,
+    self_test: bool,
+    list: bool,
+    restore: bool,
+) -> Result<()> {
+    use crate::launch_presets::{self, LaunchState};
+
+    // --self-test and --list are pure: no daemon, no exec.
+    if self_test {
+        let failures = launch_presets::self_test_failures();
+        if failures.is_empty() {
+            println!(
+                "launch presets: {} healthy",
+                launch_presets::LAUNCH_PRESETS.len()
+            );
+            return Ok(());
+        }
+        for f in &failures {
+            eprintln!("self-test: {f}");
+        }
+        bail!(
+            "launch preset self-test failed ({} findings)",
+            failures.len()
+        );
+    }
+    if list {
+        println!("launch presets (agent CLIs with per-CLI env knowledge):");
+        for preset in launch_presets::LAUNCH_PRESETS {
+            let aliases = if preset.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", preset.aliases.join(", "))
+            };
+            println!("  {:<10}{aliases}  {}", preset.name, preset.description);
+        }
+        println!("  any other word launches generically (base-URL env only)");
+        return Ok(());
+    }
+
+    // --restore replays the last launch; selection knobs refuse the
+    // combination (mirrors ollama: a restored launch IS the selection).
+    let (program, args, warm, key) = if restore {
+        if !command.is_empty() || warm.is_some() {
+            bail!(
+                "--restore cannot be combined with a CLI word or --warm \
+(the restored launch carries its own selection)"
+            );
+        }
+        let state_path = dirs().config_dir.join("launch-state.json");
+        let state = launch_presets::read_state(&state_path)
+            .map_err(|e| anyhow!("no launch to restore: {}: {e}", state_path.display()))?;
+        let key = state.key_name.clone();
+        (
+            state.program.clone(),
+            state.argv_tail.clone(),
+            state.model.clone(),
+            key,
+        )
+    } else {
+        let Some(program) = command.first().cloned() else {
             return Err(anyhow!(
-                "warm-up failed: HTTP {} - is {model:?} pulled?",
-                resp.status()
+                "usage: blazar launch [--warm MODEL] [--key KEY] <cli> [args...]\n\
+                 presets:   blazar launch --list\n\
+                 inspect:   blazar launch --dry-run --warm qwen3.5-9b claude\n\
+                 replay:    blazar launch --restore\n\
+                 examples:  blazar launch claude\n\
+                            blazar launch --warm qwen3.5-9b dsh\n\
+                 the CLI inherits OPENAI_BASE_URL / ANTHROPIC_BASE_URL / OLLAMA_HOST"
             ));
+        };
+        (program, command[1..].to_vec(), warm, key)
+    };
+
+    // A dry run resolves and renders; without --warm it must not
+    // need a daemon at all (the base URL comes from config).
+    let (base, daemon_up) = if dry_run && warm.is_none() {
+        let cfg = config()?;
+        let base = daemon_base(&cfg);
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let up = daemon_healthy(&base, &http).await;
+        (base, up)
+    } else {
+        (ensure_daemon().await?, true)
+    };
+
+    // --key: a literal plm_ secret passes through; a key NAME
+    // resolves against config (secret must exist there). Restore
+    // resolves the persisted NAME the same way. Resolved eagerly so
+    // a bad key name fails loud even in a dry run - and BEFORE the
+    // warm-up, which authenticates with the same key: a keyed
+    // daemon must accept the launch's own key, not 401 the warm.
+    let secret: Option<String> = match key.as_deref() {
+        None => None,
+        Some(k) if k.starts_with("plm_") => Some(k.to_string()),
+        Some(k) => {
+            let cfg = config()?;
+            Some(
+                cfg.keys
+                    .iter()
+                    .find(|e| e.name == k)
+                    .map(|e| e.key.clone())
+                    .ok_or_else(|| anyhow!("no key named {k:?} in config.toml [[keys]]"))?,
+            )
+        }
+    };
+
+    if let Some(model) = &warm {
+        if dry_run {
+            let note = if daemon_up {
+                ""
+            } else {
+                " (daemon not running yet)"
+            };
+            println!(
+                "{}",
+                dim_line(&format!("warm: would warm {model} against {base}{note}"))
+            );
+        } else {
+            println!("{}", dim_line(&format!("pre-warming {model} ...")));
+            let mut req =
+                cli_http()
+                    .post(format!("{base}/v1/chat/completions"))
+                    .json(&serde_json::json!({
+                        "model": model, "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "warm"}],
+                    }));
+            if let Some(token) = &secret {
+                req = req.bearer_auth(token);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "warm-up failed: HTTP {} - is {model:?} pulled?",
+                    resp.status()
+                ));
+            }
         }
     }
+
     let http = base.replacen("http://", "", 1);
-    let mut cmd = std::process::Command::new(&program);
-    cmd.args(&command[1..]);
-    for (k, v) in [
-        ("OPENAI_BASE_URL", base.clone()),
-        ("OPENAI_API_BASE", format!("{base}/v1")),
-        ("ANTHROPIC_BASE_URL", base.clone()),
-        ("OLLAMA_HOST", http.clone()),
-    ] {
-        cmd.env(k, v);
+    let plan = launch_presets::resolve(
+        &program,
+        &args,
+        &base,
+        &http,
+        warm.as_deref(),
+        secret.as_deref(),
+    );
+
+    if dry_run {
+        println!("dry run: would exec {} with:", plan.program);
+        println!("  argv:");
+        for a in &plan.argv {
+            println!("    {a}");
+        }
+        println!("  env (secrets redacted):");
+        for (k, v) in launch_presets::render_env(&plan.env) {
+            println!("    {k}={v}");
+        }
+        if plan.preset.is_none() {
+            println!(
+                "{}",
+                dim_line("no preset matched - generic base-URL passthrough")
+            );
+        }
+        return Ok(());
     }
-    if let Some(k) = &key {
-        // A literal plm_ secret passes through; a key NAME resolves
-        // against config (secret must exist there).
-        let secret = if k.starts_with("plm_") {
-            k.clone()
-        } else {
-            let cfg = config()?;
-            cfg.keys
-                .iter()
-                .find(|e| &e.name == k)
-                .map(|e| e.key.clone())
-                .ok_or_else(|| anyhow!("no key named {k:?} in config.toml [[keys]]"))?
-        };
-        cmd.env("OPENAI_API_KEY", &secret);
-        cmd.env("ANTHROPIC_API_KEY", &secret);
+
+    let mut cmd = std::process::Command::new(&plan.program);
+    cmd.args(&plan.argv[1..]);
+    for (k, v) in &plan.env {
+        cmd.env(k, v);
     }
     println!(
         "{}",
         dim_line(&format!("launching {program} against {base}"))
     );
+
     let status = cmd
         .status()
         .map_err(|e| anyhow!("exec {program:?}: {e} - is it on PATH?"))?;
+
+    // Persist the last launch for --restore AFTER a successful exec
+    // (a failed spawn is not a launch worth replaying). Best effort:
+    // a read-only config dir must not turn a successful launch into
+    // an error. The state stores the key NAME, never the secret.
+    let state = LaunchState {
+        program: program.clone(),
+        model: warm.clone(),
+        key_name: key.clone(),
+        argv_tail: args.clone(),
+    };
+    let state_path = dirs().config_dir.join("launch-state.json");
+    if let Err(e) = launch_presets::write_state(&state_path, &state) {
+        eprintln!("{}", dim_line(&format!("launch state not saved: {e}")));
+    }
+
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -21103,7 +21484,13 @@ a long CUDA init. Embedding/rerank speed is measured live per request (/metrics,
     // thread count when one exists (adopted argv carries --threads N);
     // unpinned profiles bench at llama-bench's default, same as serve.
     let pinned_threads = bench_lane_engine(&store)
-        .and_then(|engine| store.get_profile(&row.name, &engine.tag).ok().flatten())
+        .and_then(|engine| {
+            blazar_core::store::row_or_warn(
+                "models.profile",
+                store.get_profile(&row.name, &engine.tag),
+            )
+            .flatten()
+        })
         .and_then(|p| serde_json::from_str::<Vec<String>>(&p.args_json).ok())
         .and_then(|argv| {
             argv.windows(2)
@@ -22309,6 +22696,7 @@ fn sglang_hint_families() -> Vec<&'static str> {
         "tool_call_parser = \"\"    reasoning_parser = \"\"    tokenizer_path = \"\"",
         "dtype = \"bfloat16\"    quantization = \"\"    kv_cache_dtype = \"auto\"",
         "mem_fraction_static = 0.85    cpu_offload_gb = 0    page_size = 1",
+        "paged_experts = true    paged_experts_num_resident = 8    # MoE too big for VRAM: keep K routed experts resident, page the rest from pinned host RAM (single GPU, one GPU only)",
         "schedule_policy = \"fcfs\"    schedule_conservativeness = 1.0",
         "chunked_prefill_size = 8192    max_prefill_tokens = 16384    stream_interval = 1",
         "random_seed = 0    cuda_graph_max_bs = 8    cuda_graph_bs = [1, 2, 4]",
@@ -22388,6 +22776,8 @@ fn vllm_hint_families() -> Vec<&'static str> {
         "gpu_memory_utilization = 0.85    # fraction of GPU memory vllm may claim; lower it when sharing the GPU",
         "[vllm.kv_offload]                # persistent KV reuse: enabled = true, cpu_bytes_gib (default 2), root_dir (default <data>/kv/vllm)",
         "[vllm.kv_offload.connector]      # offload (built-in fs tier; lmcache is refused on this lane until upstream ships a cross-layout converter)",
+        "spec_method = \"suffix\"           # draft-free speculative decoding (suffix or ngram; needs no second model)",
+        "spec_num_tokens = 4              # proposals per step - stay below ctx; unset pairs with the shallow 4 default",
     ]
 }
 
@@ -23128,6 +23518,7 @@ async fn engine_cmd(cmd: EngineCmd) -> Result<()> {
                 );
             }
         }
+        EngineCmd::Verify { tag } => engine_verify(&d, tag.as_deref()).await?,
         EngineCmd::Rm { tag } => {
             refuse_if_engine_in_use(&d, &tag).await?;
             engine_rm(&d, &tag)?;
@@ -26501,6 +26892,133 @@ fn rotate_daemon_log(d: &BlazarDirs) {
 /// Manual trigger for the engine retention policy (runs automatically
 /// after every install): newest `KEEP_TAGS` engines plus `local` and the
 /// active tag survive, everything older is removed.
+/// `blazar engine verify <TAG>`: re-verify an installed engine against
+/// its recorded digest. Pip lanes re-walk the venv RECORD manifests
+/// (every installed file re-hashed); GitHub lanes re-hash the cached
+/// download archive the engine was installed from - a digest that
+/// passed install-time verification with no cached artifact left to
+/// re-hash is reported as an honest skip, not a failure.
+async fn engine_verify(d: &BlazarDirs, tag: Option<&str>) -> Result<()> {
+    let store = Store::open(d)?;
+    let mgr = local_engine_manager(d)?;
+    match tag {
+        Some(tag) => engine_verify_one(&mgr, &store, tag).await,
+        None => engine_verify_sweep(&mgr, &store).await,
+    }
+}
+
+/// Single-lane form: one tag, one report, loud failures - the exact
+/// behavior `blazar engine verify <tag>` has always had.
+async fn engine_verify_one(mgr: &EngineManager, store: &Store, tag: &str) -> Result<()> {
+    match mgr.verify_installed(store, tag).await? {
+        blazar_runtime::EngineVerifyReport::Verified {
+            tag,
+            digest,
+            detail,
+        } => {
+            println!("verified engine {tag}: {digest} ({detail})");
+        }
+        blazar_runtime::EngineVerifyReport::CacheMiss { tag, digest } => {
+            println!(
+                "engine {tag}: digest {digest} was verified at install time; no cached \
+                 artifact remains to re-hash - nothing on disk contradicts it"
+            );
+        }
+        blazar_runtime::EngineVerifyReport::Unverified { tag, reason } => {
+            return Err(anyhow!(
+                "engine {tag} records no usable digest ({reason}) - reinstall the lane to \
+                 record one"
+            ));
+        }
+        blazar_runtime::EngineVerifyReport::Mismatch { tag, detail } => {
+            return Err(anyhow!(
+                "engine {tag} failed verification: {detail} - reinstall the lane to restore \
+                 a known-good engine"
+            ));
+        }
+        blazar_runtime::EngineVerifyReport::NotFound { tag } => {
+            return Err(anyhow!(
+                "engine {tag:?} not found - `blazar engine list` shows installed tags"
+            ));
+        }
+        blazar_runtime::EngineVerifyReport::DirMissing { tag, path } => {
+            return Err(anyhow!(
+                "engine {tag} is recorded but its install dir {} is gone - `blazar engine \
+                 prune` then reinstall the lane",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Tag-less doctor form: report every installed lane, then fail only
+/// when something verifiable is wrong. Unverified rows and vanished
+/// caches are honest skips - a row that predates digest recording is
+/// not drift, and nothing on disk contradicts a digest whose cache
+/// blob was reclaimed.
+async fn engine_verify_sweep(mgr: &EngineManager, store: &Store) -> Result<()> {
+    let reports = mgr.verify_installed_all(store).await?;
+    let mut verified = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for (_, report) in reports {
+        match report {
+            blazar_runtime::EngineVerifyReport::Verified {
+                tag,
+                digest,
+                detail,
+            } => {
+                println!("verified engine {tag}: {digest} ({detail})");
+                verified += 1;
+            }
+            blazar_runtime::EngineVerifyReport::CacheMiss { tag, digest } => {
+                println!(
+                    "engine {tag}: digest {digest} was verified at install time; no cached \
+                     artifact remains to re-hash - nothing on disk contradicts it"
+                );
+                skipped += 1;
+            }
+            blazar_runtime::EngineVerifyReport::Unverified { tag, reason } => {
+                println!(
+                    "engine {tag} records no usable digest ({reason}) - reinstall the lane \
+                     to record one"
+                );
+                skipped += 1;
+            }
+            blazar_runtime::EngineVerifyReport::Mismatch { tag, detail } => {
+                println!(
+                    "FAIL engine {tag}: {detail} - reinstall the lane to restore a \
+                     known-good engine"
+                );
+                failed += 1;
+            }
+            blazar_runtime::EngineVerifyReport::NotFound { tag } => {
+                println!("FAIL engine {tag:?} not found - `blazar engine list` shows tags");
+                failed += 1;
+            }
+            blazar_runtime::EngineVerifyReport::DirMissing { tag, path } => {
+                println!(
+                    "FAIL engine {tag} is recorded but its install dir {} is gone - \
+                     `blazar engine prune` then reinstall the lane",
+                    path.display()
+                );
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "engine sweep: {verified} verified, {skipped} skipped (nothing on record to \
+         contradict), {failed} failed"
+    );
+    if failed > 0 {
+        return Err(anyhow!(
+            "engine sweep: {failed} lane(s) failed verification - reinstall the failing lanes"
+        ));
+    }
+    Ok(())
+}
+
 fn engine_prune(d: &BlazarDirs) -> Result<()> {
     let summary = engine_prune_summary(d)?;
     println!("{summary}");
@@ -27310,7 +27828,9 @@ async fn fit(target: &str, json: bool) -> Result<()> {
     let vram = {
         let store = Store::open(&dirs()).ok();
         store
-            .and_then(|s| s.active_engine().ok().flatten())
+            .and_then(|s| {
+                blazar_core::store::row_or_warn("engines.active", s.active_engine()).flatten()
+            })
             .and_then(|e| serde_json::from_str::<blazar_runtime::Manifest>(&e.manifest).ok())
             .map_or(0, |m| {
                 blazar_runtime::probe_hardware(Some(&m)).total_vram_mib()
@@ -27863,12 +28383,12 @@ fn connect_model_meta(model: &str) -> ConnectModelMeta {
     let (context, tools, reasoning, vision) = Store::open(&dirs())
         .ok()
         .and_then(|s| {
-            let row = s.get_model(model).ok().flatten()?;
-            let caps = s
-                .get_model_caps_dated(model)
-                .ok()
-                .flatten()
-                .and_then(|(_, _, caps_json)| scorecard_caps_rows(&caps_json));
+            let row =
+                blazar_core::store::row_or_warn("models.get", s.get_model(model)).flatten()?;
+            let caps =
+                blazar_core::store::row_or_warn("models.caps", s.get_model_caps_dated(model))
+                    .flatten()
+                    .and_then(|(_, _, caps_json)| scorecard_caps_rows(&caps_json));
             let status = |probe: &str| {
                 caps.as_ref()
                     .and_then(|rows| {
@@ -29376,6 +29896,253 @@ async fn upgrade(version: Option<String>, dry_run: bool) -> Result<()> {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    fn e5_pstr(s: &str) -> Vec<u8> {
+        let mut v = (s.len() as u64).to_le_bytes().to_vec();
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    /// Minimal parseable GGUF (qwen3 header, optional `general.name`).
+    fn e5_gguf(path: &std::path::Path, name: Option<&str>) {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        let mut kvs: Vec<(&str, u8, Vec<u8>)> = vec![
+            ("general.architecture", 8, e5_pstr("qwen3")),
+            ("qwen3.block_count", 4, 28u32.to_le_bytes().to_vec()),
+            ("qwen3.context_length", 4, 40_960u32.to_le_bytes().to_vec()),
+        ];
+        if let Some(n) = name {
+            kvs.push(("general.name", 8, e5_pstr(n)));
+        }
+        b.extend_from_slice(&(kvs.len() as u64).to_le_bytes());
+        for (k, t, v) in kvs {
+            b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            b.extend_from_slice(k.as_bytes());
+            b.extend_from_slice(&u32::from(t).to_le_bytes());
+            b.extend_from_slice(&v);
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// Dirs pair pointing the store at the sandbox, not `$HOME`.
+    fn e5_dirs(tmp: &tempfile::TempDir) -> BlazarDirs {
+        BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        }
+    }
+
+    #[test]
+    fn unit__import_model__shard_set_imports_every_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let leaf1 = src.join("testsplit-q4_k_m-00001-of-00002.gguf");
+        let leaf2 = src.join("testsplit-q4_k_m-00002-of-00002.gguf");
+        e5_gguf(&leaf1, None);
+        e5_gguf(&leaf2, None);
+        // Distinct leaf sizes prove the row records the whole-set total.
+        let mut l2 = std::fs::read(&leaf2).unwrap();
+        l2.extend_from_slice(b"1234567");
+        std::fs::write(&leaf2, l2).unwrap();
+        let d = e5_dirs(&tmp);
+        import_model(&d, &leaf1, None, None, false, None).unwrap();
+        let store = Store::open(&d).unwrap();
+        let row = store
+            .get_model("testsplit-q4_k_m")
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.shards, 2);
+        let first = d
+            .models_dir()
+            .join("testsplit-q4_k_m-q4_k_m-00001-of-00002.gguf");
+        let second = d
+            .models_dir()
+            .join("testsplit-q4_k_m-q4_k_m-00002-of-00002.gguf");
+        assert_eq!(row.path, first.display().to_string());
+        assert!(first.is_file() && second.is_file());
+        let total =
+            std::fs::metadata(&leaf1).unwrap().len() + std::fs::metadata(&leaf2).unwrap().len();
+        assert_eq!(row.bytes, i64::try_from(total).unwrap());
+        // Quant comes from the marker-stripped base, not the `-00002` tail.
+        assert_eq!(row.quant, "Q4_K_M");
+        assert_eq!(row.sha256, file_sha256(&first));
+        assert_eq!(row.repo, format!("imported:{}", leaf1.display()));
+    }
+
+    #[test]
+    fn unit__import_model__shard_set_missing_sibling_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let leaf1 = src.join("testsplit-q4_k_m-00001-of-00002.gguf");
+        e5_gguf(&leaf1, None);
+        let d = e5_dirs(&tmp);
+        let err = import_model(&d, &leaf1, None, None, false, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("shard set is incomplete"), "{msg}");
+        assert!(
+            msg.contains("00002-of-00002"),
+            "names the missing leaf: {msg}"
+        );
+        // Loud refusal, not a partial import: no file, no row.
+        assert!(
+            !d.models_dir()
+                .join("testsplit-q4_k_m-q4_k_m-00001-of-00002.gguf")
+                .exists()
+        );
+        assert!(
+            Store::open(&d)
+                .unwrap()
+                .get_model("testsplit-q4_k_m")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unit__import_model__shard_set_given_second_leaf_still_imports_the_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let leaf1 = src.join("testsplit-q4_k_m-00001-of-00002.gguf");
+        let leaf2 = src.join("testsplit-q4_k_m-00002-of-00002.gguf");
+        e5_gguf(&leaf1, None);
+        e5_gguf(&leaf2, None);
+        let d = e5_dirs(&tmp);
+        import_model(&d, &leaf2, None, None, false, None).unwrap();
+        let row = Store::open(&d)
+            .unwrap()
+            .get_model("testsplit-q4_k_m")
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.shards, 2);
+        // The row's entrypoint is leaf 1 no matter which leaf was named.
+        assert!(row.path.ends_with("-00001-of-00002.gguf"));
+        assert!(
+            d.models_dir()
+                .join("testsplit-q4_k_m-q4_k_m-00001-of-00002.gguf")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn unit__import_model__single_file_import_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let f = src.join("solo-q4_k_m.gguf");
+        e5_gguf(&f, None);
+        let d = e5_dirs(&tmp);
+        import_model(&d, &f, None, None, false, None).unwrap();
+        let row = Store::open(&d)
+            .unwrap()
+            .get_model("solo-q4_k_m")
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.shards, 1);
+        let dest = d.models_dir().join("solo-q4_k_m-q4_k_m.gguf");
+        assert_eq!(row.path, dest.display().to_string());
+        assert!(dest.is_file());
+        assert_eq!(
+            row.bytes,
+            i64::try_from(std::fs::metadata(&f).unwrap().len()).unwrap()
+        );
+        assert_eq!(row.quant, "Q4_K_M");
+        assert_eq!(row.sha256, file_sha256(&dest));
+        assert_eq!(row.repo, format!("imported:{}", f.display()));
+    }
+    #[test]
+    fn unit__launch_flags__clap_parses_the_new_surface() {
+        let cli = Cli::try_parse_from([
+            "blazar",
+            "launch",
+            "--dry-run",
+            "--warm",
+            "qwen3.5-9b",
+            "claude",
+            "--verbose",
+        ])
+        .unwrap();
+        let Cmd::Launch {
+            command,
+            warm,
+            key,
+            dry_run,
+            self_test,
+            list,
+            restore,
+        } = cli.cmd
+        else {
+            panic!("not a launch command");
+        };
+        assert!(dry_run && !self_test && !list && !restore);
+        assert_eq!(warm.as_deref(), Some("qwen3.5-9b"));
+        assert_eq!(key, None);
+        assert_eq!(command, vec!["claude".to_string(), "--verbose".to_string()]);
+
+        let cli = Cli::try_parse_from(["blazar", "launch", "--restore", "--key", "work"]).unwrap();
+        let Cmd::Launch {
+            command,
+            warm,
+            key,
+            dry_run,
+            self_test,
+            list,
+            restore,
+        } = cli.cmd
+        else {
+            panic!("not a launch command");
+        };
+        assert!(restore && !dry_run && !self_test && !list);
+        assert_eq!(key.as_deref(), Some("work"));
+        assert!(command.is_empty() && warm.is_none());
+
+        let cli = Cli::try_parse_from(["blazar", "launch", "--self-test"]).unwrap();
+        let Cmd::Launch { self_test, .. } = cli.cmd else {
+            panic!("not a launch command");
+        };
+        assert!(self_test);
+    }
+
+    #[tokio::test]
+    async fn unit__launch_restore__refuses_selection_combinations() {
+        // Both refusals fire BEFORE any daemon contact, so a plain
+        // tokio test sees the error without a running server.
+        let err = launch_cmd(
+            vec!["claude".to_string()],
+            None,
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--restore cannot be combined"),
+            "got: {err}"
+        );
+        let err = launch_cmd(
+            vec![],
+            Some("qwen3.5-9b".to_string()),
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--restore cannot be combined"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn unit__remove_stale_pidfile__clears_only_the_pid_we_stopped() {
         let tmp = tempfile::tempdir().unwrap();
@@ -29864,6 +30631,8 @@ mod tests {
             ctx_train: Some(40960),
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         }
     }
 
@@ -30589,6 +31358,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -30792,6 +31563,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         // Text rows (no component set) stay on the chat REPL.
         assert!(matches!(run_lane(&base()), RunLane::Text));
@@ -31186,6 +31959,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -33776,6 +34551,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -34269,6 +35046,128 @@ mod tests {
             ret.detail.contains("`blazar engine prune` reclaims disk"),
             "{}",
             ret.detail
+        );
+    }
+
+    /// A lane on a GPU hardware class nobody has measured yet is an
+    /// experimental lane: `blazar doctor` must say so instead of letting
+    /// the docs' support table imply a live receipt exists.
+    #[test]
+    fn unit__doctor_hardware_receipts__installed_lane_without_a_live_receipt_is_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        let store = blazar_core::store::Store::open(&d).unwrap();
+        let mut row = gap_engine_row("b1-rocm", EngineKind::LlamaCpp, &[]);
+        row.asset = "ubuntu-rocm-6.3.4-x64".to_string();
+        store.upsert_engine(&row).unwrap();
+        std::fs::create_dir_all(d.engines_dir().join("b1-rocm")).unwrap();
+        let checks = doctor_engines(&d);
+        let flagged = checks
+            .iter()
+            .find(|c| c.name == "hardware receipts")
+            .expect(
+                "doctor states which installed lanes have no live receipt on their hardware class",
+            );
+        assert!(flagged.warn, "{}", flagged.detail);
+        assert!(
+            flagged.detail.contains("b1-rocm (rocm, amd)"),
+            "{}",
+            flagged.detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_hardware_receipts__receipted_lane_is_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = BlazarDirs {
+            config_dir: tmp.path().join("cfg"),
+            data_dir: tmp.path().join("data"),
+        };
+        std::fs::create_dir_all(d.engines_dir()).unwrap();
+        let store = blazar_core::store::Store::open(&d).unwrap();
+        let mut row = gap_engine_row("b1-cuda", EngineKind::LlamaCpp, &[]);
+        row.asset = "ubuntu-cuda-12.8-x64".to_string();
+        store.upsert_engine(&row).unwrap();
+        std::fs::create_dir_all(d.engines_dir().join("b1-cuda")).unwrap();
+        let checks = doctor_engines(&d);
+        let receipts = checks
+            .iter()
+            .find(|c| c.name == "hardware receipts")
+            .expect("doctor reports the receipts of installed GPU lanes");
+        assert!(!receipts.warn, "{}", receipts.detail);
+        assert!(
+            receipts.detail.contains("b1-cuda (cuda, nvidia"),
+            "{}",
+            receipts.detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_hardware_receipts__lane_without_a_backend_adds_no_row() {
+        let cpu = gap_engine_row("b1-cpu", EngineKind::LlamaCpp, &[]);
+        let mut fork = gap_engine_row("fork-x-cuda", EngineKind::LlamaCpp, &[]);
+        fork.asset = "built-fork".to_string();
+        let unnamed_host = blazar_runtime::engine::manifest::Vendor::Other;
+        assert!(doctor_hardware_receipts(&[cpu, fork], unnamed_host).is_none());
+    }
+
+    /// The llama.cpp `OpenVINO` prebuilt targets the CPU, GPU and NPU of an
+    /// Intel host, and upstream marks the backend work in progress. It is
+    /// the most experimental accelerator build `engine_asset` can install,
+    /// so doctor must flag it instead of skipping it as "no backend".
+    #[test]
+    fn unit__doctor_hardware_receipts__openvino_build_is_flagged_as_experimental() {
+        let mut openvino = gap_engine_row("b1-openvino", EngineKind::LlamaCpp, &[]);
+        openvino.asset = "ubuntu-openvino-2026.4.1-x64".to_string();
+        let check = doctor_hardware_receipts(
+            std::slice::from_ref(&openvino),
+            blazar_runtime::engine::manifest::Vendor::Other,
+        )
+        .expect("an OpenVINO build is an accelerator lane with a tracked class");
+        assert!(check.warn, "{}", check.detail);
+        assert!(
+            check.detail.contains("b1-openvino (openvino, intel)"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// A Vulkan build names no vendor of its own: the host's GPU does. An
+    /// Intel host without oneAPI reads `Other` from the runtime hint and
+    /// must still meet its class instead of "vendor unknown".
+    #[test]
+    fn unit__doctor_hardware_receipts__vulkan_lane_takes_the_vendor_of_the_host_gpu() {
+        let mut vulkan = gap_engine_row("b1-vulkan", EngineKind::LlamaCpp, &[]);
+        vulkan.asset = "ubuntu-vulkan-x64".to_string();
+        let check = doctor_hardware_receipts(
+            std::slice::from_ref(&vulkan),
+            blazar_runtime::engine::manifest::Vendor::Intel,
+        )
+        .expect("a Vulkan build is a GPU lane");
+        assert!(
+            check.detail.contains("b1-vulkan (vulkan, intel)"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn unit__doctor_hardware_receipts__vulkan_lane_on_an_unnamed_host_stays_unknown() {
+        let mut vulkan = gap_engine_row("b1-vulkan", EngineKind::LlamaCpp, &[]);
+        vulkan.asset = "ubuntu-vulkan-x64".to_string();
+        let check = doctor_hardware_receipts(
+            std::slice::from_ref(&vulkan),
+            blazar_runtime::engine::manifest::Vendor::Other,
+        )
+        .expect("a Vulkan build is a GPU lane");
+        assert!(
+            check.detail.contains("host GPU vendor unknown"),
+            "{}",
+            check.detail
         );
     }
 
@@ -35098,6 +35997,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -35416,6 +36317,8 @@ mod config_get_map_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 

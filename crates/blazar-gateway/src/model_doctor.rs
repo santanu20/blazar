@@ -408,10 +408,17 @@ pub async fn run(
     // before any job row exists, and the static caps need the row anyway.
     // Same resolver as /api/chat so `name:quant` display forms resolve
     // identically here.
-    let row = match state.with_store(|s| crate::proxy::resolve_model(s, &model)) {
-        Some(Ok(r)) => r,
-        Some(Err(teach)) => return crate::error_response(404, &teach),
-        None => return crate::error_response(500, "store unavailable"),
+    let row = match crate::proxy::resolve_model_for_handler(&state, &model) {
+        Ok(Ok(r)) => r,
+        Ok(Err(teach)) => return crate::error_response(404, &teach),
+        Err(message) => {
+            return crate::error_response(
+                503,
+                &format!(
+                    "store could not resolve model {model:?} ({message}) - retry once the store recovers"
+                ),
+            );
+        }
     };
     // Model-scope gate (BLZ-2): a scoped key may only probe models it
     // can serve. The canonical row name (not the request alias) is what
@@ -493,9 +500,11 @@ pub async fn cert(
 ) -> Response {
     // Canonical ladder so `name:quant` display forms resolve the same
     // way here as on /api/chat.
-    let resolved = state
-        .with_store(|s| crate::proxy::resolve_model(s, &model).ok().map(|r| r.name))
-        .flatten();
+    let resolved = state.read_store_or_absent("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, &model)
+            .map(crate::proxy::ModelResolution::found)
+            .map(|row| row.map(|r| r.name))
+    });
     let Some(name) = resolved else {
         return crate::error_response(
             404,
@@ -509,9 +518,7 @@ pub async fn cert(
     if let Err((code, msg)) = crate::keys::scope_permits(&state.keys, key_ext.as_deref(), &name) {
         return crate::error_response(code, &msg);
     }
-    let record = state
-        .with_store(|s| s.get_model_caps(&name).ok().flatten())
-        .flatten();
+    let record = state.read_store_or_absent("models.caps", |s| s.get_model_caps(&name));
     let Some((engine_tag, caps_json)) = record else {
         return crate::error_response(
             404,
@@ -548,8 +555,7 @@ async fn run_probes(
     // this stops the actual work instead of burning child time.
     let row_cancelled = |state: &Arc<AppState>| {
         state
-            .with_store(|s| s.get_job(&id).ok().flatten())
-            .flatten()
+            .read_store_or_absent("jobs.cancelled_check", |s| s.get_job(&id))
             .is_some_and(|r| r.state == "cancelled")
     };
 
@@ -926,10 +932,9 @@ async fn run_probes(
     // Failure-KB accumulation: fetch what this exact (model, engine_tag)
     // pair already holds BEFORE building the new cert (a different lane's
     // row is not prior evidence for this lane).
-    let prior = state
-        .with_store(|s| s.get_model_caps_pair(&model, &engine_tag))
-        .and_then(Result::ok)
-        .flatten();
+    let prior = state.read_store_or_absent("models.caps_pair", |s| {
+        s.get_model_caps_pair(&model, &engine_tag)
+    });
     let now = blazar_core::store::unix_now();
     let mut cert = json!({
         "object": "blazar.model-doctor",
@@ -942,23 +947,27 @@ async fn run_probes(
     // v13 evidence axes: model quant + hardware fingerprint of the lane
     // that ran the probes, so the cert row stands alone without a join.
     let axes = state
-        .with_store(|s| {
-            let quant = s.get_model(&model).ok().flatten().map(|r| r.quant);
-            let hw_fingerprint = s.list_engines().ok().and_then(|engines| {
-                engines
+        .read_store(
+            "models.evidence_axes",
+            |s| -> blazar_core::CoreResult<Option<_>> {
+                let quant = s.get_model(&model)?.map(|r| r.quant);
+                let hw_fingerprint = s
+                    .list_engines()?
                     .into_iter()
                     .find(|e| e.tag == engine_tag)
                     .and_then(|e| {
                         blazar_core::store::EvidenceAxes::hw_fingerprint_from_manifest(&e.manifest)
-                    })
-            });
-            blazar_core::store::EvidenceAxes {
-                quant,
-                hw_fingerprint,
-                workload: None,
-                profile_hash: None,
-            }
-        })
+                    });
+                Ok(Some(blazar_core::store::EvidenceAxes {
+                    quant,
+                    hw_fingerprint,
+                    workload: None,
+                    profile_hash: None,
+                }))
+            },
+        )
+        .ok()
+        .flatten()
         .unwrap_or_default();
     // Fold this run into the prior evidence so repeated qualification
     // runs count instead of silently overwriting (statuses stay

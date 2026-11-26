@@ -67,42 +67,166 @@ pub fn child_base(ep: &blazar_core::Endpoint) -> String {
 /// row here; the stem rides the caller's request string through to the
 /// supervisor's variant lane (see `ensure_with_admission`).
 pub fn resolve_model(store: &Store, requested: &str) -> Result<ModelRow, String> {
+    match resolve_model_typed(store, requested) {
+        Ok(found) => found,
+        Err(store_error) => Err(store_error.to_string()),
+    }
+}
+
+/// [`resolve_model`]'s ladder with the two failure classes kept apart:
+/// the outer `Err` is a store that could not answer (a caller turning
+/// the answer into an HTTP or routing decision must never read it as
+/// "no such model"), the inner `Err` is a store that answered and
+/// found no unique row (the user-facing teaching message).
+pub(crate) fn resolve_model_typed(
+    store: &Store,
+    requested: &str,
+) -> Result<Result<ModelRow, String>, blazar_core::CoreError> {
+    match resolve_model_checked(store, requested)? {
+        ModelResolution::Found(row) => Ok(Ok(*row)),
+        ModelResolution::Ambiguous(names) => {
+            Ok(Err(format!("model {requested:?} is ambiguous: {names:?}")))
+        }
+        ModelResolution::NotFound => {
+            let models = store.list_models()?;
+            let colonless = requested
+                .split(':')
+                .next()
+                .unwrap_or(requested)
+                .to_lowercase();
+            let near: Vec<&str> = models
+                .iter()
+                .filter(|m| blazar_core::catalog::levenshtein(&m.name, &colonless) <= 3)
+                .map(|m| m.name.as_str())
+                .collect();
+            if near.is_empty() {
+                Ok(Err(format!(
+                    "model {requested:?} not found; try `blazar list`"
+                )))
+            } else {
+                Ok(Err(format!(
+                    "model {requested:?} not found; did you mean: {}?",
+                    near.join(", ")
+                )))
+            }
+        }
+    }
+}
+
+/// Outcome of the model ladder with a store failure kept apart: the
+/// ladder's `Err(String)` folds "store could not answer" into the same
+/// channel as "no such model", and callers that turn the answer into a
+/// routing or HTTP decision must never read a broken store as "absent".
+#[derive(Debug)]
+pub(crate) enum ModelResolution {
+    /// Boxed: the row dwarfs the other two variants, and every ladder
+    /// miss would otherwise pay for its size.
+    Found(Box<ModelRow>),
+    /// Several rows share the requested prefix - a naming problem, not
+    /// a store problem.
+    Ambiguous(Vec<String>),
+    NotFound,
+}
+
+impl ModelResolution {
+    /// The row, or `None` for every non-found outcome.
+    pub(crate) fn found(self) -> Option<ModelRow> {
+        match self {
+            Self::Found(row) => Some(*row),
+            _ => None,
+        }
+    }
+}
+
+/// [`resolve_model`] for request handlers, failure classes kept apart:
+/// `Ok(Ok(row))` resolved; `Ok(Err(message))` the store answered and no
+/// unique row exists (a 404); `Err(message)` the store could not answer
+/// (a 503, never "model not found"). Store failures are counted and
+/// logged once per incident by [`AppState::read_store`].
+pub(crate) fn resolve_model_for_handler(
+    state: &AppState,
+    model: &str,
+) -> Result<Result<ModelRow, String>, String> {
+    // A store query failure is the closure's own error, so it lands on
+    // the OUTER `Err`; an unopened store arrives there as well (the
+    // helper's own "store unavailable"). The closure always hands back
+    // `Some`, so flattening never invents an answer.
+    state
+        .read_store("models.resolve", |s| {
+            resolve_model_typed(s, model).map(Some)
+        })
+        .map(|handed| handed.unwrap_or_else(|| Err("store unavailable".to_string())))
+}
+
+/// [`resolve_model_for_handler`] on the `OpenAI` error shape: the row, or
+/// the response to return (404 `MODEL_NOT_FOUND` for a ladder miss, 503
+/// for a store that could not answer).
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+pub(crate) fn resolve_model_openai(state: &AppState, model: &str) -> Result<ModelRow, Response> {
+    match resolve_model_for_handler(state, model) {
+        Ok(Ok(row)) => Ok(row),
+        Ok(Err(message)) => Err(openai_error_code(
+            crate::error_codes::BlazarCode::ModelNotFound,
+            &message,
+        )),
+        Err(message) => Err(openai_error(
+            503,
+            &format!(
+                "store could not resolve model {model:?} ({message}) - retry once the store recovers"
+            ),
+        )),
+    }
+}
+
+/// [`resolve_model`]'s ladder with the store error as its own outcome.
+pub(crate) fn resolve_model_checked(
+    store: &Store,
+    requested: &str,
+) -> Result<ModelResolution, blazar_core::CoreError> {
     let (base, _lora) = blazar_core::catalog::split_lora_suffix(requested);
     let canonical = store.resolve_model_name(&base.to_lowercase());
-    if let Ok(Some(m)) = store.get_model(&canonical) {
-        return Ok(m);
+    if let Some(m) = store.get_model(&canonical)? {
+        return Ok(ModelResolution::Found(Box::new(m)));
     }
     let colonless = base.split(':').next().unwrap_or(base).to_lowercase();
-    let models = store.list_models().map_err(|e| e.to_string())?;
+    let models = store.list_models()?;
     if let Some(m) = models.iter().find(|m| m.name == colonless) {
-        return Ok(m.clone());
+        return Ok(ModelResolution::Found(Box::new(m.clone())));
     }
     let prefixed: Vec<&ModelRow> = models
         .iter()
         .filter(|m| m.name.starts_with(&colonless))
         .collect();
     match prefixed.len() {
-        1 => return Ok(prefixed[0].clone()),
-        0 => {}
-        _ => {
-            let names: Vec<&str> = prefixed.iter().map(|m| m.name.as_str()).collect();
-            return Err(format!("model {requested:?} is ambiguous: {names:?}"));
-        }
+        1 => Ok(ModelResolution::Found(Box::new(prefixed[0].clone()))),
+        0 => Ok(ModelResolution::NotFound),
+        _ => Ok(ModelResolution::Ambiguous(
+            prefixed.iter().map(|m| m.name.clone()).collect(),
+        )),
     }
-    // Levenshtein-3 suggestion across names (hand-rolled in core catalog).
-    let near: Vec<&str> = models
-        .iter()
-        .filter(|m| blazar_core::catalog::levenshtein(&m.name, &colonless) <= 3)
-        .map(|m| m.name.as_str())
-        .collect();
-    if near.is_empty() {
-        Err(format!("model {requested:?} not found; try `blazar list`"))
-    } else {
-        Err(format!(
-            "model {requested:?} not found; did you mean: {}?",
-            near.join(", ")
-        ))
-    }
+}
+
+/// Resolve `model` for a request handler: `Ok(row)`, or the response to
+/// return instead - 404 with the ladder's own message for a genuinely
+/// unknown name, 503 when the store could not answer (the row may well
+/// exist; a 404 would send the user hunting for a model that is there).
+#[allow(clippy::result_large_err)] // Response is the handlers' currency here
+pub(crate) fn resolve_model_or_503(
+    state: &AppState,
+    model: &str,
+) -> Result<Option<ModelRow>, Response> {
+    state
+        .read_store("models.resolve", |s| {
+            resolve_model_checked(s, model).map(ModelResolution::found)
+        })
+        .map_err(|message| {
+            openai_error(
+                503,
+                &format!(
+                    "store could not resolve model {model:?} ({message}) - retry once the store recovers"
+                ),
+            )
+        })
 }
 
 pub struct ProxyOutcome {
@@ -328,18 +452,78 @@ pub async fn ensure_with_admission(
     no_evict: bool,
     generation: bool,
 ) -> Result<(EngineRef, u128), Box<Response>> {
+    ensure_admission_inner(
+        state,
+        model,
+        priority,
+        class,
+        prefix,
+        needs_vision,
+        allow_diffusion,
+        no_evict,
+        generation,
+    )
+    .await
+}
+
+/// The admission gate for a request that was cancelled by preemption:
+/// the same park as every other request at its own priority and class,
+/// never a preemptor (it already cost one cancel).
+pub(crate) async fn admission_gate_replay(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+    class: crate::queue::WorkClass,
+) -> Result<InFlightGuard, String> {
+    admission_gate_slo_opts(state, model, priority, class, None, 0, None, false, false)
+        .await
+        .map_err(|boxed| {
+            format!(
+                "re-admission was refused with HTTP {}",
+                boxed.status().as_u16()
+            )
+        })
+}
+
+/// Admission for a request that was cancelled by preemption and is
+/// queued again: same model, same lane, own priority and class, never a
+/// preemptor itself (it already cost one cancel).
+pub(crate) async fn ensure_replay_admission(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+    class: crate::queue::WorkClass,
+) -> Result<EngineRef, String> {
+    ensure_admission_inner(
+        state, model, priority, class, None, false, true, false, true,
+    )
+    .await
+    .map(|(engine, _)| engine)
+    .map_err(|refusal| {
+        format!(
+            "re-admission was refused with HTTP {}",
+            refusal.status().as_u16()
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors proxy_request: flat call params, one seam
+#[allow(clippy::fn_params_excessive_bools)]
+async fn ensure_admission_inner(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+    class: crate::queue::WorkClass,
+    prefix: Option<PrefixKey>,
+    needs_vision: bool,
+    allow_diffusion: bool,
+    no_evict: bool,
+    generation: bool,
+) -> Result<(EngineRef, u128), Box<Response>> {
     let started = Instant::now();
     // Model resolution is the only store need; it completes inside the
     // cached-connection visit (sync, guard never crosses an await).
-    let row = state
-        .with_store(|s| resolve_model(s, model))
-        .ok_or_else(|| Box::new(openai_error(500, "store unavailable")))?
-        .map_err(|e| match e.as_str() {
-            msg if msg.contains("not found") || msg.contains("ambiguous") => Box::new(
-                openai_error_code(crate::error_codes::BlazarCode::ModelNotFound, msg),
-            ),
-            msg => Box::new(openai_error(500, msg)),
-        })?;
+    let row = resolve_model_openai(state, model).map_err(Box::new)?;
     // Disk intelligence: stamp spawn activity so `blazar prune --unused`
     // ages models by real use. Only cold starts touch the store - a
     // resident model is fresh by definition, so the hot path never pays
@@ -801,9 +985,10 @@ pub(crate) fn constraint_chat_failure_teaching(
         return None; // cheap gate before any store round trip
     }
     let canonical = state
-        .with_store(|s| resolve_model(s, model).ok().map(|r| r.name))
-        .flatten()
-        .unwrap_or_else(|| model.to_string());
+        .read_store_or_absent("models.resolve", |s| {
+            resolve_model_checked(s, model).map(ModelResolution::found)
+        })
+        .map_or_else(|| model.to_string(), |r| r.name);
     constraint_chat_failure_text(
         engine_error,
         overlay_has_constraint(&state.cfg(), &canonical),
@@ -830,6 +1015,81 @@ fn teach_constraint_chat_failure(
     serde_json::to_vec(&v).ok().map(axum::body::Bytes::from)
 }
 
+/// Engine message llama.cpp answers with when a unified-KV child runs out
+/// of shared cache cells and cancels a queued task.
+const CONTEXT_POOL_EXHAUSTED: &str = "Context size has been exceeded";
+
+static CONTEXT_POOL_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[must_use]
+fn context_pool_failure_text(pool_tokens: u32, slots: u32) -> String {
+    let slots = slots.max(1);
+    let per_slot = pool_tokens / slots;
+    format!(
+        "the engine's shared KV pool is full ({pool_tokens} tokens shared by {slots} slots = {per_slot} tokens per slot at full occupancy): with kv_unified every running request draws from one pool, and llama.cpp cancels queued requests instead of waiting them out - raise ctx (config or [model_overrides] ctx), give this model fewer slots, or set kv_unified = false for hard per-slot limits"
+    )
+}
+
+/// `None` unless the model is resident under a shared pool larger than one
+/// slot's context: then this engine error is the pool-cancellation case.
+fn context_pool_failure_teaching(
+    state: &Arc<AppState>,
+    model: &str,
+    engine_message: &str,
+) -> Option<String> {
+    if !engine_message.contains(CONTEXT_POOL_EXHAUSTED) {
+        return None;
+    }
+    let pool_tokens = state.sup.prompt_ctx(model).filter(|ctx| *ctx > 0)?;
+    let slot_ctx = state
+        .sup
+        .ps()
+        .into_iter()
+        .find(|p| p.name == model && p.ctx > 0)
+        .map(|p| p.ctx)?;
+    if pool_tokens <= slot_ctx {
+        return None;
+    }
+    let slots = u32::try_from(state.sup.slot_cap(model)).unwrap_or(1).max(1);
+    Some(context_pool_failure_text(pool_tokens, slots))
+}
+
+/// Append the pool numbers and the remedies to the engine's own error body
+/// (`{"error":{"message": ...}}`). `None` = no rewrite; the caller relays
+/// the original bytes unchanged.
+fn teach_context_pool_failure(
+    state: &Arc<AppState>,
+    model: &str,
+    buf: &[u8],
+) -> Option<axum::body::Bytes> {
+    let mut v = serde_json::from_slice::<serde_json::Value>(buf).ok()?;
+    let msg = v
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let teach = context_pool_failure_teaching(state, model, &msg)?;
+    CONTEXT_POOL_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        target: "blazar::gateway",
+        model,
+        "engine cancelled a request because the shared KV pool is full - {teach}"
+    );
+    v["error"]["message"] = serde_json::Value::String(format!("{msg} - {teach}"));
+    serde_json::to_vec(&v).ok().map(axum::body::Bytes::from)
+}
+
+#[must_use]
+pub(crate) fn context_pool_failure_metrics() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "# HELP blazar_context_pool_failures_total Requests the engine cancelled because the shared KV pool was full.\n# TYPE blazar_context_pool_failures_total counter\nblazar_context_pool_failures_total {}",
+        CONTEXT_POOL_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    out
+}
+
 /// `GET /slots` body -> is any slot mid-generation? `None` when the shape
 /// is not a bare array of slot objects (unknown is not guessed as idle).
 fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
@@ -840,6 +1100,23 @@ fn slots_any_processing(body: &serde_json::Value) -> Option<bool> {
                 .unwrap_or(false)
         })
     })
+}
+
+#[cfg(test)]
+#[test]
+#[allow(non_snake_case)] // suite convention: unit__scenario__expected
+fn unit__context_pool_failure_text__names_the_pool_the_slots_and_the_remedies() {
+    let text = context_pool_failure_text(16_384, 8);
+    assert!(
+        text.contains("16384 tokens shared by 8 slots = 2048"),
+        "{text}"
+    );
+    assert!(text.contains("kv_unified = false"), "{text}");
+    let no_slots = context_pool_failure_text(8_192, 0);
+    assert!(
+        no_slots.contains("8192 tokens shared by 1 slots = 8192"),
+        "{no_slots}"
+    );
 }
 
 #[cfg(test)]
@@ -1237,6 +1514,19 @@ async fn repair_tool_args_500_retry(
     }
 }
 
+/// The same transport attempt for a request replayed after preemption:
+/// identical auth and header hygiene to the cancelled one.
+pub(crate) async fn forward_for_replay(
+    state: &Arc<AppState>,
+    engine: &EngineRef,
+    method: &axum::http::Method,
+    url: &str,
+    headers: &HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<reqwest::Response, ChildSendError> {
+    forward_once(state, engine, method, url, headers, body).await
+}
+
 /// One child-engine transport attempt: child auth, hop-by-hop header
 /// filtering, send. The hot path and the crash-window retry both ride
 /// it, so a retry carries identical auth and header hygiene.
@@ -1536,7 +1826,41 @@ pub async fn proxy_request(
         // below carries it to stream/buffered completion.
         crate::keys::LocalServiceStamp::new(std::sync::Arc::clone(&state.service_ewma_local), model)
     });
-    let upstream = forward_once(state, engine, method, &url, headers, body).await;
+    // Cancel-and-replay preemption (opt-in). A replay needs the child
+    // request as sent and the request's own queue class, both captured
+    // here, before `body` moves into the first send.
+    let replay = crate::preempt::ReplayPlan::new(
+        state,
+        model,
+        path_query,
+        method,
+        fwd_path,
+        headers,
+        &body_snapshot,
+        body_guard.is_some(),
+        recipe.is_none(),
+    )
+    .map(std::sync::Arc::new);
+    let (guard_slot, guard_cell) = match replay.as_ref() {
+        Some(_) => {
+            let (slot, cell) = crate::preempt::GuardSlot::shared(body_guard);
+            (slot, Some(cell))
+        }
+        None => (crate::preempt::GuardSlot::Fixed(body_guard), None),
+    };
+    let (upstream, preempt_ticket) = match replay.as_ref() {
+        Some(plan) => {
+            drop(body);
+            let ticket = state.preempt.register(plan.model(), plan.urgency());
+            let (result, ticket) =
+                crate::preempt::send_preemptable(plan, &guard_slot, engine, ticket).await;
+            (result, Some(ticket))
+        }
+        None => (
+            forward_once(state, engine, method, &url, headers, body).await,
+            None,
+        ),
+    };
     let mut resp = match upstream {
         Ok(r) => r,
         Err(e) => {
@@ -1736,6 +2060,14 @@ pub async fn proxy_request(
         && !sse
         && resp.content_length().is_some_and(|cl| cl <= 64 * 1024)
         && overlay_has_constraint(&state.cfg(), model);
+    // llama.cpp cancels a queued task with a bare one-line error once its
+    // shared KV pool is full: same bounded body, same relay rules. The
+    // recipe lane keeps its verbatim child-error contract.
+    let teach_pool = !status.is_success()
+        && !sse
+        && recipe.is_none()
+        && engine.kind == EngineKind::LlamaCpp
+        && resp.content_length().is_some_and(|cl| cl <= 64 * 1024);
     // Per-key token accounting: a bounded tail-sniffer constructed ONLY
     // when the requesting key carries tpm/daily budgets (everyone else
     // pays nothing - the zero-tax contract holds for unlimited keys).
@@ -1876,6 +2208,7 @@ pub async fn proxy_request(
         || (restamp && !sse)
         || json_fence
         || enrich_error
+        || teach_pool
         || (recipe.is_some() && !sse && status.is_success())
     {
         let ctx = if sentinel_active {
@@ -1938,6 +2271,8 @@ pub async fn proxy_request(
                 // same return path below.
                 let buf = if enrich_error {
                     teach_constraint_chat_failure(state, model, &buf).unwrap_or(buf)
+                } else if teach_pool {
+                    teach_context_pool_failure(state, model, &buf).unwrap_or(buf)
                 } else {
                     buf
                 };
@@ -2087,8 +2422,8 @@ pub async fn proxy_request(
                     &caller_model,
                 );
                 let stream = futures::stream::once(async move { Ok::<_, std::io::Error>(buf) })
-                    .chain(futures::stream::unfold(body_guard, |g| async {
-                        drop(g);
+                    .chain(futures::stream::unfold(guard_slot, |slot| async move {
+                        slot.finish();
                         None
                     }));
                 return builder
@@ -2189,6 +2524,24 @@ pub async fn proxy_request(
                 >,
         }
     };
+    // Preemption, body phase: bytes pass straight through; while none
+    // has passed a cancel swaps in the replay (the plan excludes recipe
+    // lanes, so a replayed upstream is the plain child stream).
+    let upstream = match (replay.as_ref(), preempt_ticket) {
+        (Some(plan), Some(ticket)) => {
+            let cell = guard_cell.expect("a replay plan always carries a shared guard slot");
+            Box::pin(crate::preempt::Preemptable::new(
+                std::sync::Arc::clone(plan),
+                ticket,
+                cell,
+                upstream,
+            ))
+                as std::pin::Pin<
+                    Box<dyn futures::Stream<Item = std::io::Result<axum::body::Bytes>> + Send>,
+                >
+        }
+        _ => upstream,
+    };
     let stream = upstream.flat_map(move |r| {
         match r {
             Ok(bytes) => {
@@ -2281,10 +2634,10 @@ pub async fn proxy_request(
     // Hold in-flight accounting for the body's lifetime: the guard drops
     // when the client drains (or aborts) the stream.
     let stream = stream.chain(futures::stream::unfold(
-        (body_guard, sf, cache_finisher),
-        move |(g, sf, cache_finisher)| {
+        (guard_slot, sf, cache_finisher),
+        move |(slot, sf, cache_finisher)| {
             async move {
-                drop(g);
+                slot.finish(); // in-flight lease of the current attempt
                 drop(cache_finisher); // classify at stream end (or abort)
                 drop(sf); // F31: Drop releases singleflight at stream end or abort
                 None
@@ -2390,7 +2743,7 @@ impl Drop for SingleFlight {
 
 /// Chat-family routes the sentinel observes (the only ones whose
 /// semantics the current detection set understands).
-fn is_chat_route(path_query: &str) -> bool {
+pub(crate) fn is_chat_route(path_query: &str) -> bool {
     let p = path_query.split('?').next().unwrap_or(path_query);
     p.ends_with("/chat/completions") || p.ends_with("/completions") || p.ends_with("/responses")
 }
@@ -2483,15 +2836,16 @@ pub(crate) fn routed_kind_for(
     // Ladder-resolve: gate callers feed the raw request name, and the
     // tags-rendered alias must pick the model's real lane (falling to
     // the global kind on a resolvable miss silently mis-gates).
-    let row = state
-        .with_store(|s| resolve_model(s, model).ok())
-        .flatten()?;
+    // A store that cannot answer reads as "no gate" here: the lane's
+    // own error then decides, and the failure is counted and logged.
+    let row = state.read_store_or_absent("models.resolve", |s| {
+        resolve_model_checked(s, model).map(ModelResolution::found)
+    })?;
     resolve_serving(state, model, &row.path)
         .map(|lane| lane.kind)
         .or_else(|| {
             state
-                .with_store(|s| s.active_engine().ok().flatten())
-                .flatten()
+                .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
                 .map(|e| e.kind)
         })
 }
@@ -2501,28 +2855,47 @@ pub(crate) fn resolve_serving(
     model_name: &str,
     model_path: &str,
 ) -> Option<LaneResolution> {
+    // A store that cannot answer means "nothing can serve" (the spawn
+    // path delivers the teaching error) - never a default lane picked
+    // from an engine list that merely failed to load.
+    let view = state.engine_view()?;
+    resolve_serving_with(state, &view, model_name, model_path)
+}
+
+/// [`resolve_serving`] against an already decoded engine view: callers
+/// that resolve many models (listings) decode the rows once.
+pub(crate) fn resolve_serving_with(
+    state: &Arc<AppState>,
+    view: &blazar_runtime::EngineView,
+    model_name: &str,
+    model_path: &str,
+) -> Option<LaneResolution> {
     use blazar_core::engine_kind::{self, EngineKind};
     // Names arriving from the header-extension gates may be the
     // tags-rendered alias (`m1:q4_k_m`) rather than the store key -
     // canonicalize through the shared ladder so overlays, arch probes,
     // and quant signals key on the same name the spawn will use.
     let canonical = state
-        .with_store(|s| resolve_model(s, model_name).ok().map(|r| r.name))
-        .flatten()
-        .unwrap_or_else(|| model_name.to_string());
+        .read_store_or_absent("models.resolve", |s| {
+            resolve_model_checked(s, model_name).map(ModelResolution::found)
+        })
+        .map_or_else(|| model_name.to_string(), |r| r.name);
     let overlay = state.cfg().overlay_for(&canonical);
-    state
-        .with_store(|s| {
-            let rows = s.list_engines().unwrap_or_default();
-            // Lane class carries fork provenance (core `serving_lane`
-            // prefers mainstream builds for overlapping formats).
-            #[allow(clippy::type_complexity)]
-            let installed: Vec<(String, EngineKind, engine_kind::LaneClass)> = rows
-                .iter()
-                .map(|r| (r.tag.clone(), r.kind, r.lane_class()))
-                .collect();
-            let global_row = s.active_engine().ok().flatten();
-            let global = global_row.as_ref().map_or(EngineKind::LlamaCpp, |r| r.kind);
+    state.read_store_or_absent("routing.resolve_lane", |s| {
+        fn lane(
+            s: &blazar_core::Store,
+            state: &AppState,
+            view: &blazar_runtime::EngineView,
+            model_path: &str,
+            canonical: &str,
+            overlay: &blazar_core::config::ModelOverride,
+        ) -> blazar_core::CoreResult<Option<LaneResolution>> {
+            // Lane classes, kinds and the global row come from the
+            // decoded view (fork provenance included: core
+            // `serving_lane` prefers mainstream builds for overlapping
+            // formats); only the model row is read per call.
+            let model_row = s.get_model(canonical)?;
+            let arch = model_row.as_ref().and_then(|r| r.arch.clone());
             // Capability-rescue preview: when the picked lane provably
             // cannot load the model's GGUF arch and another installed
             // lane advertises it, spawn re-routes after one bounded
@@ -2530,16 +2903,8 @@ pub(crate) fn resolve_serving(
             // routing can never disagree. Never fires under a user pin
             // (the spawn rescue has the same gate) or when the picked
             // lane's arch set is unknown (honest unknown).
-            let model_row = s.get_model(&canonical).ok().flatten();
-            let arch = model_row.as_ref().and_then(|r| r.arch.clone());
             let rescue_preview = |tag: &str, kind: EngineKind| -> Option<String> {
-                blazar_runtime::predicted_rescue_lane(
-                    &rows,
-                    arch.as_deref(),
-                    overlay.engine.as_deref(),
-                    tag,
-                    kind,
-                )
+                view.rescue_lane(arch.as_deref(), overlay.engine.as_deref(), tag, kind)
             };
             let shape = engine_kind::FormatShape {
                 diffusion: model_row
@@ -2551,47 +2916,49 @@ pub(crate) fn resolve_serving(
                 // rescue-path verdict on one axis.
                 shards: engine_kind::ShardFormat::detect(
                     std::path::Path::new(model_path).is_dir(),
-                    blazar_core::store::quantized_safetensors_signal(&canonical, "", model_path),
+                    blazar_core::store::quantized_safetensors_signal(canonical, "", model_path),
                     model_row
                         .as_ref()
                         .is_some_and(blazar_core::ModelRow::is_mlx),
                     model_path.to_ascii_lowercase().ends_with(".litertlm"),
                 ),
             };
+            let global = view.global().map_or(EngineKind::LlamaCpp, |(_, kind)| kind);
             let lane = engine_kind::serving_lane(
                 state.cfg().engine_routing.mode,
                 state.cfg().engine_routing.policy,
                 overlay.engine.as_deref(),
                 shape,
                 global,
-                &installed,
+                view.installed(),
             );
             match lane {
-                // Routed lane: its row is the answer, unless the
+                // Routed lane, its row is the answer, unless the
                 // rescue preview sees a provably-unservable arch.
-                Ok(Some((tag, kind))) => Some(LaneResolution {
+                Ok(Some((tag, kind))) => Ok(Some(LaneResolution {
                     tag: rescue_preview(&tag, kind).or(Some(tag)),
                     kind,
-                }),
+                })),
                 // Manual mode (or a pin resolving to the global engine): the
                 // GLOBAL engine serves - same contract the pre-routing
                 // daemon-lifetime cache had (rescue preview applies here
                 // too: spawn's re-route is not mode-gated).
                 Ok(None) => {
-                    let tag = global_row.as_ref().and_then(|g| {
-                        rescue_preview(&g.tag, g.kind).or_else(|| Some(g.tag.clone()))
+                    let tag = view.global().and_then(|(tag, kind)| {
+                        rescue_preview(tag, kind).or_else(|| Some(tag.to_string()))
                     });
-                    Some(LaneResolution { tag, kind: global })
+                    Ok(Some(LaneResolution { tag, kind: global }))
                 }
                 // Nothing can serve (or a bad pin): no tag to advertise; the
                 // spawn path delivers the teaching error on use.
-                Err(_) => Some(LaneResolution {
+                Err(_) => Ok(Some(LaneResolution {
                     tag: None,
                     kind: global,
-                }),
+                })),
             }
-        })
-        .flatten()
+        }
+        lane(s, state, view, model_path, &canonical, &overlay)
+    })
 }
 
 /// Pre-spawn prediction of [`child_model_stamp`] for sites that mutate
@@ -2813,18 +3180,16 @@ pub(crate) fn sglang_variant_stamp(
     // The base half may arrive in any spelling the resolver accepts
     // (tag alias, prefix); canonicalize before comparing to the
     // child's registered name so `m1:q4+ad` stamps `m1:ad`.
-    let canonical = state
-        .with_store(|s| resolve_model(s, base))
-        .and_then(std::result::Result::ok);
+    let canonical = state.read_store_or_absent("models.resolve", |s| {
+        resolve_model_checked(s, base).map(ModelResolution::found)
+    });
     if canonical
         .as_ref()
         .is_some_and(|row| row.name != engine.name)
     {
         return None;
     }
-    let rows = state
-        .with_store(|s| s.list_loras(Some(&engine.name)))
-        .and_then(std::result::Result::ok)?;
+    let rows = state.read_store_list_or_empty("loras.list", |s| s.list_loras(Some(&engine.name)));
     let registered = blazar_core::catalog::lora_registered_name(&rows, stem)?;
     Some(format!("{}:{registered}", engine.name))
 }
@@ -2858,18 +3223,16 @@ pub(crate) async fn llamacpp_variant_lora(
     // The base half may arrive in any spelling the resolver accepts;
     // canonicalize before comparing to the child's registered name so
     // `m1:q4+ad` rides the `m1` child.
-    let canonical = state
-        .with_store(|s| resolve_model(s, base))
-        .and_then(std::result::Result::ok);
+    let canonical = state.read_store_or_absent("models.resolve", |s| {
+        resolve_model_checked(s, base).map(ModelResolution::found)
+    });
     if canonical
         .as_ref()
         .is_some_and(|row| row.name != engine.name)
     {
         return None;
     }
-    let rows = state
-        .with_store(|s| s.list_loras(Some(&engine.name)))
-        .and_then(std::result::Result::ok)?;
+    let rows = state.read_store_list_or_empty("loras.list", |s| s.list_loras(Some(&engine.name)));
     let registered = blazar_core::catalog::lora_registered_name(&rows, stem)?;
     let row = rows.iter().find(|l| {
         let p = std::path::Path::new(&l.path);
@@ -3589,34 +3952,111 @@ pub async fn admission_gate_slo(
     wfq: Option<(&str, u32)>,
     exclusive: bool,
 ) -> Result<InFlightGuard, Box<Response>> {
-    let max_inflight: i64 = state.sup.slot_cap(model);
-    // Predictive early-reject (#28): an explicit deadline that measured
-    // TTFT p90 says we cannot possibly meet -> fail fast with numbers.
-    if let Some(ms) = deadline_ms {
-        let warm = (
-            state.obs.ttft_warm.quantile(0.9) * 1e3,
-            state.obs.ttft_warm.count(),
-        );
-        let cold = (
-            state.obs.ttft_cold.quantile(0.9) * 1e3,
-            state.obs.ttft_cold.count(),
-        );
-        if let Some(retry) = predictive_retry(ms, Some(warm), Some(cold)) {
-            let mut resp = openai_error(
-                429,
-                &format!(
-                    "predicted TTFT p90 ~{retry}s exceeds 2x your explicit \
-                     deadline {ms}ms; retry after the hint or raise the deadline"
-                ),
-            );
-            resp.headers_mut().insert(
-                "retry-after",
-                axum::http::HeaderValue::from_str(&retry.to_string())
-                    .unwrap_or(axum::http::HeaderValue::from_static("1")),
-            );
-            return Err(Box::new(resp));
-        }
+    admission_gate_slo_opts(
+        state,
+        model,
+        priority,
+        class,
+        deadline_ms,
+        body_len,
+        wfq,
+        exclusive,
+        true,
+    )
+    .await
+}
+
+/// How a parked request left the real same-model park.
+enum ParkOutcome {
+    /// The queue admitted it: a slot was released, a reshape landed, or
+    /// the wait timed out.
+    Queued(Result<(), String>),
+    /// A request cancelled for this one handed its lease over; `None`
+    /// means the attempt ended without a lease.
+    Handed(Option<InFlightGuard>),
+}
+
+/// Predictive early-reject (#28): an explicit deadline that measured TTFT
+/// p90 says we cannot possibly meet fails fast, with the numbers.
+fn predictive_deadline_refusal(
+    state: &Arc<AppState>,
+    deadline_ms: Option<u64>,
+) -> Option<Box<Response>> {
+    let ms = deadline_ms?;
+    let warm = (
+        state.obs.ttft_warm.quantile(0.9) * 1e3,
+        state.obs.ttft_warm.count(),
+    );
+    let cold = (
+        state.obs.ttft_cold.quantile(0.9) * 1e3,
+        state.obs.ttft_cold.count(),
+    );
+    let retry = predictive_retry(ms, Some(warm), Some(cold))?;
+    let mut resp = openai_error(
+        429,
+        &format!(
+            "predicted TTFT p90 ~{retry}s exceeds 2x your explicit \
+             deadline {ms}ms; retry after the hint or raise the deadline"
+        ),
+    );
+    resp.headers_mut().insert(
+        "retry-after",
+        axum::http::HeaderValue::from_str(&retry.to_string())
+            .unwrap_or(axum::http::HeaderValue::from_static("1")),
+    );
+    Some(Box::new(resp))
+}
+
+/// One bounded wait on the admission queue, bracketed by the slot-pressure
+/// gauge so the adaptive reshaper sees parked demand on every reaper tick.
+#[allow(clippy::too_many_arguments)]
+async fn park_on_queue(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+    class: crate::queue::WorkClass,
+    deadline_ms: Option<u64>,
+    body_len: usize,
+    wfq: Option<(&str, u32)>,
+) -> Result<(), String> {
+    state.sup.note_slot_pressure(model);
+    let waited = state
+        .queue
+        .wait(
+            model,
+            priority,
+            class,
+            deadline_ms,
+            body_len,
+            std::time::Duration::from_mins(2),
+            wfq,
+        )
+        .await;
+    state.sup.note_slot_pressure_release(model);
+    waited
+}
+
+/// [`admission_gate_slo`] with the preemptor switch: a replayed request
+/// queues like any other but never cancels for a second time.
+#[allow(clippy::too_many_arguments)]
+async fn admission_gate_slo_opts(
+    state: &Arc<AppState>,
+    model: &str,
+    priority: Priority,
+    class: crate::queue::WorkClass,
+    deadline_ms: Option<u64>,
+    body_len: usize,
+    wfq: Option<(&str, u32)>,
+    exclusive: bool,
+    may_preempt: bool,
+) -> Result<InFlightGuard, Box<Response>> {
+    // `replicas x slots`: in-flight demand is summed over every child of
+    // the model, so the ceiling has to count them all.
+    let max_inflight: i64 = state.sup.admission_ceiling(model);
+    if let Some(refusal) = predictive_deadline_refusal(state, deadline_ms) {
+        return Err(refusal);
     }
+    let mut preempt_armed = may_preempt;
     loop {
         // Canonical load read: live replicas + requests admitted during
         // the cold-spawn window (a ps() row cannot express the latter -
@@ -3652,21 +4092,9 @@ pub async fn admission_gate_slo(
             // Parks ride the same queue/pressure machinery as a full
             // ceiling; the SlotsReshaped event wakes every waiter.
             if state.sup.is_reshaping(model) {
-                state.sup.note_slot_pressure(model);
-                let waited = state
-                    .queue
-                    .wait(
-                        model,
-                        priority,
-                        class,
-                        deadline_ms,
-                        body_len,
-                        std::time::Duration::from_mins(2),
-                        wfq,
-                    )
-                    .await;
-                state.sup.note_slot_pressure_release(model);
-                waited.map_err(|e| Box::new(openai_error(503, &e)))?;
+                park_on_queue(state, model, priority, class, deadline_ms, body_len, wfq)
+                    .await
+                    .map_err(|e| Box::new(openai_error(503, &e)))?;
                 continue;
             }
             return Ok(begin_accounting(state, model));
@@ -3680,10 +4108,29 @@ pub async fn admission_gate_slo(
         // covers multi-model spawn contention - live-proven 2026-09-12:
         // 12 streams on one loaded model queued here for 37s with the
         // gauge reading zero the whole time).
-        state.sup.note_slot_pressure(model);
-        let waited = state
-            .queue
-            .wait(
+        //
+        // Cancel-and-replay preemption (opt-in): once this request has
+        // waited `preempt_after_ms`, cancel a less urgent running request
+        // of the same model. That request hands its in-flight lease
+        // straight over, so nobody else can take the slot and the
+        // cancelled request queues again behind this one. One attempt per
+        // park: a request that found nothing to cancel keeps waiting in
+        // FIFO order. An exclusive waiter needs every other request gone,
+        // so a hand-over could never give it quiescence.
+        let preemptor = preempt_armed
+            .then(|| {
+                crate::preempt::arm(
+                    state,
+                    model,
+                    crate::preempt::Urgency::new(priority, class),
+                    !exclusive,
+                )
+            })
+            .flatten();
+        preempt_armed = false;
+        let outcome = if let Some(preemptor) = preemptor.as_ref() {
+            state.sup.note_slot_pressure(model);
+            let wait = state.queue.wait(
                 model,
                 priority,
                 class,
@@ -3691,10 +4138,26 @@ pub async fn admission_gate_slo(
                 body_len,
                 std::time::Duration::from_mins(2),
                 wfq,
+            );
+            let outcome = tokio::select! {
+                waited = wait => ParkOutcome::Queued(waited),
+                lease = std::sync::Arc::clone(preemptor).wait_grant() => ParkOutcome::Handed(lease),
+            };
+            state.sup.note_slot_pressure_release(model);
+            outcome
+        } else {
+            ParkOutcome::Queued(
+                park_on_queue(state, model, priority, class, deadline_ms, body_len, wfq).await,
             )
-            .await;
-        state.sup.note_slot_pressure_release(model);
-        waited.map_err(|e| Box::new(openai_error(503, &e)))?;
+        };
+        drop(preemptor);
+        match outcome {
+            ParkOutcome::Handed(Some(lease)) => return Ok(lease),
+            ParkOutcome::Handed(None) => {}
+            ParkOutcome::Queued(waited) => {
+                waited.map_err(|e| Box::new(openai_error(503, &e)))?;
+            }
+        }
     }
 }
 
@@ -5191,6 +5654,8 @@ mod resolve_model_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -5205,6 +5670,26 @@ mod resolve_model_tests {
             store.upsert_model(&row(n)).unwrap();
         }
         (tmp, store)
+    }
+
+    #[test]
+    fn unit__resolve_model_typed__separates_ladder_miss_from_store_failure() {
+        // A healthy store that finds no unique row answers on the INNER
+        // `Err` (a 404). A store whose query fails answers on the OUTER
+        // `Err` (a 503). Folding the two is what made a broken store
+        // report "model not found" for every request.
+        let (_tmp, store) = store_with(&["m1"]);
+        let miss = resolve_model_typed(&store, "nope").expect("store is healthy");
+        let message = miss.expect_err("an unknown name is a ladder miss");
+        assert!(message.contains("not found"), "{message}");
+
+        store
+            .conn()
+            .execute_batch("DROP TABLE models;")
+            .expect("drop the models table through a raw handle");
+        let failed = resolve_model_typed(&store, "m1");
+        let error = failed.expect_err("an unreadable models table is a store failure");
+        assert!(error.to_string().contains("models"), "{error}");
     }
 
     #[test]

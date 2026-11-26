@@ -97,7 +97,8 @@ pub fn manifest_path(session_file: &Path) -> PathBuf {
 pub fn build(dirs: &BlazarDirs, config: &Config, model: &str) -> Option<SessionIdentity> {
     let store = Store::open(dirs).ok()?;
     let engine = store.active_engine().ok()??;
-    let model_sha = store.get_model(model).ok().flatten().and_then(|m| m.sha256);
+    let model_sha =
+        crate::store::row_or_warn("models.get", store.get_model(model))?.and_then(|m| m.sha256);
     let adapters = adapter_bindings(&store, model);
     Some(SessionIdentity {
         blazar_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -453,6 +454,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .expect("model");
         let cfg = Config {
@@ -613,6 +616,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .expect("model");
         let cfg = Config::default();
@@ -655,6 +660,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .expect("raw model");
         assert!(build_for_instance(&dirs, &cfg, "raw", "b4091", kind, 8, 1).is_none());
@@ -800,6 +807,8 @@ mod tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .expect("model");
         // Insert OUT of path order: the identity must come back sorted

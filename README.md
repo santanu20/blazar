@@ -179,14 +179,14 @@ Blazar ships these 10 engine lanes:
 | **mistral.rs** | Alternative text runtime | Supported GGUF and safetensors models |
 | **SGLang** | Safetensors-oriented serving | AWQ, GPTQ and FP8 safetensors models |
 | **vLLM** | Throughput-first OpenAI-native serving | Hugging Face safetensors directories |
-| **MLX** | Apple-Silicon and CUDA-backed serving | MLX quantized model directories |
+| **MLX** | Apple-Silicon and CUDA-backed serving (Apple Silicon: experimental, no live receipt yet) | MLX quantized model directories |
 | **stable-diffusion.cpp** | Media generation | Diffusion images and video |
 | **whisper.cpp** | Speech recognition | Transcription and translation |
 | **Piper** | Offline speech synthesis | Local TTS voices |
 | **Kokoro** | Neural speech synthesis | Kokoro-82M ONNX voices |
 | **LiteRT-LM** (`openaihost`) | Edge-optimized text serving | `.litertlm` bundles |
 
-Full lane inventory and channel policy: [`docs/engines.md`](https://github.com/santanu20/blazar/blob/main/docs/engines.md).
+Full lane inventory and channel policy: [`docs/engines.md`](https://github.com/santanu20/blazar/blob/main/docs/engines.md). The same doc lists, per lane and GPU backend, which hardware class has a live receipt; a lane without one on your hardware class is experimental there, and `blazar doctor` flags it.
 
 Routing follows model format and engine capability. The default preserves single-active-engine behavior; per-model engine pins provide deterministic placement. Curated capability lanes cover GGUF architectures not yet supported by the mainstream llama.cpp lane.
 

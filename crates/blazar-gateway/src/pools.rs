@@ -629,13 +629,28 @@ pub fn affinity_keys_dropping_for(
 pub fn on_model_evicted(state: &crate::state::AppState, row: &str) {
     let candidates = local_member_strings(&state.cfg().model_pools);
     let owned: Vec<String> = state
-        .with_store(|s| {
-            candidates
-                .iter()
-                .filter(|m| crate::proxy::resolve_model(s, m).is_ok_and(|r| r.name == row))
-                .cloned()
-                .collect()
-        })
+        .read_store(
+            "pools.eviction_candidates",
+            |s| -> blazar_core::CoreResult<Option<_>> {
+                let flags = candidates
+                    .iter()
+                    .map(|m| {
+                        crate::proxy::resolve_model_checked(s, m)
+                            .map(|found| found.found().is_some_and(|r| r.name == row))
+                    })
+                    .collect::<blazar_core::CoreResult<Vec<_>>>()?;
+                Ok(Some(
+                    candidates
+                        .iter()
+                        .zip(flags)
+                        .filter(|(_, is_owned)| *is_owned)
+                        .map(|(m, _)| m.clone())
+                        .collect(),
+                ))
+            },
+        )
+        .ok()
+        .flatten()
         .unwrap_or_default();
     if owned.is_empty() {
         return;
@@ -843,13 +858,11 @@ pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberSco
         .filter(|m| m.peer == "local")
         .map(|m| {
             let row_name = state
-                .with_store(|s| {
-                    crate::proxy::resolve_model(s, &m.model)
-                        .ok()
-                        .map(|row| row.name)
+                .read_store_or_absent("models.resolve", |s| {
+                    crate::proxy::resolve_model_checked(s, &m.model)
+                        .map(crate::proxy::ModelResolution::found)
                 })
-                .flatten()
-                .unwrap_or_else(|| m.model.clone());
+                .map_or_else(|| m.model.clone(), |row| row.name);
             (m.model.clone(), row_name)
         })
         .collect();
@@ -1348,9 +1361,10 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
 /// pool.
 pub fn validate_boot(state: &AppState) -> Result<(), String> {
     for pool in &state.cfg().model_pools {
-        let collision = state
-            .with_store(|s| crate::proxy::resolve_model(s, &pool.name).ok())
-            .flatten();
+        let collision = state.read_store_or_absent("pools.boot_name_collision", |s| {
+            crate::proxy::resolve_model_checked(s, &pool.name)
+                .map(crate::proxy::ModelResolution::found)
+        });
         if collision.is_some() {
             return Err(format!(
                 "model pool name '{}' collides with a local model row - rename the pool; pool names and model names share one request namespace",

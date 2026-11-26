@@ -1,17 +1,18 @@
 # Blazar inference benchmark
 
-_Rendered 2026-11-22-postfix-full; blazar 0.34.3; power state of gateway rows: ac._
+_Rendered 2026-11-22-postfix-full; blazar 0.34.3; power state of gateway rows: ac. Greedy gateway rows re-measured 2026-11-23 (schema-2 transparency cell, same engine and model); other lanes are from the 2026-11-22 campaign._
 
 ## Executive summary
 
 - v0.9.5 prompt-cache prefill 20556 vs 20690 t/s cold
 - b12606-cuda sweep C=4: C4: 493.9 t/s system (2x32768)
-- ITL p99 5.48 ms vs ollama 3.99 ms (0.7x tighter)
+- ITL p99 5.48 ms vs ollama 3.99 ms (1.4x looser - ollama wins the inter-token tail on this lane)
 - tool-call TTFT p50 14 ms vs ollama 284 ms (20.5x)
 - adaptive reshape under sustained load: slots 2->16, 868.2->1831.0 t/s while serving, zero failed requests
-- greedy determinism: direct 20/20 exact, gateway transparency 5/20 exact at temp 0 (divergence = multi-slot batching numerics, not translation drift)
+- greedy determinism: direct 20/20 exact, gateway transparency 20/20 exact at temp 0 vs the same child replayed with its captured argv
+- managed child vs bare engine spawn: 5/20 exact (engine-flag numerics, no gateway; largest single-flag effect: no-kv-unified 18/20 exact vs bare)
 - gateway cold boot 0.52 s
-- cold TTFT 2079 ms vs ollama 1979 ms (1.0x)
+- cold TTFT 2079 ms vs ollama 1979 ms (5% slower cold; idle wake is where blazar wins: 27 ms vs 1753 ms)
 - idle wake 27 ms (sleep) vs ollama 1753 ms (full reload)
 - evict-ladder wake 1573 ms (full respawn still beats ollama's reload)
 
@@ -87,7 +88,7 @@ _Engine selection policy: latest installed version per engine kind._
 - Concurrency: N parallel streams x 128 generated tokens each (levels via --conc-sweep, per-row `C` column); system t/s = total tokens / wall clock; sum-stream t/s = sum of per-stream rates (sum >> system indicates serialization).
 - Greedy parity: 20 fixed prompts, greedy sampling, 256 tokens; exact-match count and text-similarity ratio vs a same-engine reference run.
 - Tool calls: 6 single-turn scenarios (3-tool set: weather/calculate/flights), temperature 0, max 192 tokens (call JSON must complete); scored on well-formed calls, correct function selection, valid JSON arguments with required keys, and a no-tool control for false positives; stream deltas accumulated per OpenAI spec.
-- Gateway transparency: a second greedy lane through the blazar gateway with identical sampling; any divergence vs the direct lane isolates translation overhead.
+- Gateway transparency: a second greedy lane through the blazar gateway with identical sampling, compared with the same engine child replayed under its captured argv (divergence there is a translation defect). The child is also replayed against the bare spawn with one flag family removed at a time to attribute engine-flag numerics.
 - Perplexity: llama-perplexity on an offline ASCII corpus, ctx 2048.
 - Cold-start parity: the model file's page cache is dropped (posix_fadvise DONTNEED) and the GPU asserted idle (<512 MiB) before every cold probe on every runtime - a cold load is disk-cold, not memory-warm.
 - Cold TTFT = first-token latency of the cold probe itself (max_tokens 4, aligned num_ctx 16384 on both runtimes).
@@ -245,10 +246,23 @@ _Peak GPU board power per concurrency level - the energy price of keeping the de
 |---|---:|---:|---:|
 | llama.cpp b12606-cuda vs same-engine reference (direct) | 20/20 | 1.000 | 1.000 |
 | mistral.rs v0.9.5 vs same-engine reference (direct) | 2/20 | 0.193 | 0.001 |
-| llama.cpp b12606-cuda through blazar gateway vs direct | 5/20 | 0.485 | 0.027 |
+| llama.cpp b12606-cuda through blazar gateway vs same child replayed | 20/20 | 1.000 | 1.000 |
+| llama.cpp b12606-cuda managed child (blazar-compiled flags) vs bare engine spawn | 5/20 | 0.485 | 0.027 |
 | ollama (qwen2.5:0.5b) run-to-run, temp 0 | 15/20 | 0.846 | 0.105 |
 
-_Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift; bit-parity across runs requires single-slot decoding (blazar `deterministic = true` pins it)._
+_Exact-match divergence across GPU backends is expected float nondeterminism (batch shape and backend kernels), not translation drift. The managed child carries the flags blazar compiles, so the gateway is compared with its own child replayed with the captured argv; the managed-vs-bare lane is engine numerics under those flags (attribution below)._
+
+- expectation for the gateway lane: 20/20 exact, ratio 1.0 against its OWN child replayed with the captured argv (same flags, model and sandbox state). A miss there is a gateway translation defect (sampler remap / template drift / truncation).
+- the managed child differs from the bare reference spawn by the flags blazar compiles (context size, slots, speculative decoding, unified KV cache, prompt-cache state), so that lane measures engine numerics under those flags, not gateway drift. The table below replays the child with one flag family removed at a time.
+
+flag attribution for `b12606-cuda`:
+
+| flag family removed | exact vs managed child | exact vs bare spawn |
+|---|---:|---:|
+| no-kv-unified | 6/20 | 18/20 |
+| no-speculative | 16/20 | 6/20 |
+| slots-1 | 20/20 | 5/20 |
+| ctx-4096 | 20/20 | 5/20 |
 
 </details>
 
@@ -426,7 +440,7 @@ _Media cells run through the same sandboxed gateway as text lanes but do not ass
 
 ## Findings (this campaign)
 
-1. **Gateway overhead vs direct spawn: within measurement noise.** b12606-cuda decode 331.9 t/s through the gateway vs 338.0 t/s direct (-1.8%), greedy parity through the gateway 5/20 exact.
+1. **Gateway overhead vs direct spawn: within measurement noise.** b12606-cuda decode 331.9 t/s through the gateway vs 338.0 t/s direct (-1.8%), greedy transparency through the gateway 20/20 exact vs the same child replayed.
 2. **Capacity-aware slot auto-sizing observed in argv.** Distinct engine shapes this campaign: 1x16384, 2x32768 - slots follow the live hardware census, each row's child_argv carries the receipt.
 3. **Concurrency scaling per engine.** b12606-cuda (C=4): peak 493.9 t/s at C=4; serialization behavior per level in the frontier table below.
 4. **Prompt cache pays 3.9x on prefill** (73216 cached vs 18889 t/s cold).

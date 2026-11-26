@@ -1590,6 +1590,8 @@ mod tests {
             ctx_train: None,
             pulled_at: 1,
             last_used_at: 1,
+
+            license: None,
         }
     }
 
@@ -1819,6 +1821,8 @@ mod tests {
                 gguf("LowNoise/Wan2.2-T2V-A14B-LowNoise-Q8_0.gguf"),
             ],
             gguf: None,
+
+            card_data: None,
         };
         let plan = standalone_file_plan(&info, family).unwrap();
         assert_eq!(plan.filename, "LowNoise/Wan2.2-T2V-A14B-LowNoise-Q2_K.gguf");
@@ -1854,6 +1858,8 @@ mod tests {
                 }),
             }],
             gguf: None,
+
+            card_data: None,
         };
         assert_eq!(
             component_plan(&vae_info, &vae.source, "Q4_K_M")
@@ -1885,6 +1891,8 @@ mod tests {
                 },
             ],
             gguf: None,
+
+            card_data: None,
         };
         let plan = standalone_file_plan(&info, sdxl).unwrap();
         assert_eq!(plan.filename, "sd_xl_base_1.0.safetensors");
@@ -1901,6 +1909,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         assert_eq!(
             standalone_file_plan(&info2, sd15).unwrap().filename,
@@ -1927,6 +1937,8 @@ mod tests {
             id: "x/y".into(),
             siblings: vec![],
             gguf: None,
+
+            card_data: None,
         }
     }
 
@@ -2047,6 +2059,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         let plan = component_plan(&info, &tok.source, "Q4_K_M").unwrap();
         assert_eq!(plan.filename, "tokenizer/tokenizer.json");
@@ -2074,6 +2088,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         let plan = component_plan(&info2, &llm.source, "Q8_0").unwrap();
         assert_eq!(plan.filename, "gpt-oss-20b-Q4_K_M.gguf");
@@ -2107,6 +2123,8 @@ mod tests {
                 },
             ],
             gguf: None,
+
+            card_data: None,
         };
         let plan = component_plan(&info, &connectors.source, "Q4_K_M").unwrap();
         assert_eq!(plan.filename, "llada-image-connectors.safetensors");
@@ -2145,6 +2163,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         let t5_plan = component_plan(&t5_info, &t5.source, "Q4_K_M").unwrap();
         assert_eq!(t5_plan.filename, "model.safetensors");
@@ -2176,6 +2196,8 @@ mod tests {
                 },
             ],
             gguf: None,
+
+            card_data: None,
         };
         let plan = standalone_file_plan(&info, iris).unwrap();
         assert_eq!(plan.filename, "model.safetensors");
@@ -2198,6 +2220,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         assert_eq!(
             standalone_housing(&gguf_info, moss),
@@ -2213,6 +2237,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         assert_eq!(
             standalone_housing(&comfy_info, moss),
@@ -2227,6 +2253,8 @@ mod tests {
                 lfs: None,
             }],
             gguf: None,
+
+            card_data: None,
         };
         let sd3 = diffusion_family("stabilityai/stable-diffusion-3.5-large").unwrap();
         assert_eq!(

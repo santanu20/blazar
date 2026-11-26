@@ -396,9 +396,10 @@ pub async fn audio_speech(
     // store row is speech-model intent, not a piper voice id. A resolve
     // miss (the piper-voice case) or any other lane falls through to
     // the piper paths below byte-identically.
-    if let Some(Ok(row)) = state.with_store(|s| crate::proxy::resolve_model(s, voice))
-        && crate::proxy::routed_kind_for(&state, voice)
-            == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
+    if let Some(row) = state.read_store_or_absent("models.resolve", |s| {
+        crate::proxy::resolve_model_checked(s, voice).map(crate::proxy::ModelResolution::found)
+    }) && crate::proxy::routed_kind_for(&state, voice)
+        == Some(blazar_core::engine_kind::EngineKind::LlamaCpp)
     {
         // Collision guard: a piper voice id is protocol-shaped
         // (`<locale>-<name>-<quality>`), so a store row with that exact
@@ -820,10 +821,8 @@ async fn llamacpp_tts_lane(
     if engine_tts_has_piper_opts(req) {
         return openai_error(400, TTS_ENGINE_PIPER_OPTS_TEACH);
     }
-    let cached_modalities = state
-        .with_store(|s| s.model_modalities(&row.name))
-        .and_then(Result::ok)
-        .flatten();
+    let cached_modalities =
+        state.read_store_or_absent("models.modalities", |s| s.model_modalities(&row.name));
     if let Some(teach) = engine_tts_gate(&row.name, cached_modalities.as_ref()) {
         return openai_error(400, &teach);
     }
@@ -1004,8 +1003,7 @@ const VOICES_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub fn speech_capabilities(state: &AppState) -> Value {
     let piper_installed = blazar_runtime::piper::server_bin(&state.dirs).is_some();
     let llamacpp = state
-        .with_store(|s| s.active_engine().ok().flatten())
-        .flatten()
+        .read_store_or_absent("engines.active", blazar_core::Store::active_engine)
         .is_some_and(|row| row.kind == blazar_core::engine_kind::EngineKind::LlamaCpp);
     // Same cached-handle lane presence check the speech dispatch uses.
     let kokoro_installed = state
@@ -1307,19 +1305,15 @@ async fn engine_voices(state: &AppState) -> Vec<Value> {
         // store only knows the bare model name.
         let model = blazar_runtime::supervisor::model_of_key(&eng.key).to_string();
         let speech = state
-            .with_store(|s| match s.get_model(&model) {
-                Ok(Some(row)) => {
-                    row.arch
-                        .as_deref()
-                        .is_some_and(blazar_core::profile::speech_generation_arch)
-                        || s.model_modalities(&model)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|m| m.iter().any(|x| x == "audio"))
-                }
-                _ => false,
-            })
-            .unwrap_or(false);
+            .read_store_or_absent("models.get", |s| s.get_model(&model))
+            .is_some_and(|row| {
+                row.arch
+                    .as_deref()
+                    .is_some_and(blazar_core::profile::speech_generation_arch)
+                    || state
+                        .read_store_or_absent("models.modalities", |s| s.model_modalities(&model))
+                        .is_some_and(|m| m.iter().any(|x| x == "audio"))
+            });
         if !speech {
             tracing::debug!(key = %eng.key, "voices: skip non-speech child");
             continue;

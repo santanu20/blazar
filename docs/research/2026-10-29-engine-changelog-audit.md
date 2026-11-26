@@ -43,6 +43,7 @@ not required; upstream assets consumed directly since b10969.
 ## 3. mistral.rs - pin analysis re-validated
 
 - v0.9.5 remains latest **release**; our v0.9.3 pin is still the correct call
+_Correction (2026-11-23): the mistral.rs lane runs v0.9.5 on this host (installed engine tag `v0.9.5`; the 2026-11-22 benchmark campaign ran it), so the v0.9.3-pin statement above is stale. Re-check the upstream #2502 concern against the installed build before citing it._
   (v0.9.5 = upstream #2502 eternal-503 on 8GB cards).
 - **#2503 "fix runtime activation overestimation" merged to master 2026-10-21,
   still unreleased.** master = v0.9.5 + 8 commits. Watch trigger stays armed
@@ -110,6 +111,8 @@ llama.cpp's native /v1/responses for cross-engine contract).
 ## Posture decisions (2026-10-29 evening wave - live-verified on b11982)
 
 ### `POST /tts` (llama.cpp child TTS) - WATCH, not adopt
+
+_Superseded (2026-11-23): G1 was closed 2026-11-02 - `/tts` is shipped (docs/research/2026-11-02-universal-architecture-coverage.md)._
 
 Route IS registered in b11982 (`ctx_http.post("/tts", routes.post_tts)`,
 llama_server.cpp route table; `tts_ctx` initializes per-slot under

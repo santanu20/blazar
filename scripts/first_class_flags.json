@@ -1191,6 +1191,7 @@
       "--enable-memory-saver",
       "--enable-metrics",
       "--enable-mixed-chunk",
+      "--enable-paged-experts",
       "--enable-priority-scheduling",
       "--enable-session-radix-cache",
       "--enable-tf32-matmul",
@@ -1212,6 +1213,7 @@
       "--mm-attention-backend",
       "--model-path",
       "--page-size",
+      "--paged-experts-num-resident",
       "--port",
       "--pp-size",
       "--quantization",
@@ -1253,6 +1255,8 @@
       "--max-num-seqs",
       "--port",
       "--served-model-name",
+      "--spec-method",
+      "--spec-tokens",
       "--tool-call-parser"
     ],
     "whisper": [

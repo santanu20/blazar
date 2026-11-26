@@ -61,7 +61,11 @@ fn pin_target(
                 .filter(|m| !m.is_empty())
                 .map(str::to_string)
         })?;
-    let row = crate::proxy::resolve_model(store, &model).ok()?;
+    // A store that could not answer pins nothing, exactly like an
+    // unresolvable model - the request passes through untouched.
+    let Ok(Ok(row)) = crate::proxy::resolve_model_typed(store, &model) else {
+        return None;
+    };
     Some((session.to_string(), row.name))
 }
 
@@ -108,17 +112,17 @@ pub async fn pin_mw(
     // typos) never pin - the request passes through untouched. The
     // cached-connection visit is fully synchronous (guard never crosses
     // the `next.run` await below).
-    if let Some((session, model)) = state
-        .with_store(|s| {
-            pin_target(
+    if let Some((session, model)) = state.read_store_or_absent(
+        "sessions.pin_target",
+        |s| -> Result<_, std::convert::Infallible> {
+            Ok(pin_target(
                 state.cfg().session_keep_secs,
                 raw_session.as_deref(),
                 &bytes,
                 s,
-            )
-        })
-        .flatten()
-    {
+            ))
+        },
+    ) {
         state.sup.sessions.touch(&session, &model);
     }
     next.run(Request::from_parts(parts, Body::from(bytes)))
@@ -181,6 +185,8 @@ mod tests {
                     ctx_train: None,
                     pulled_at: 1,
                     last_used_at: 1,
+
+                    license: None,
                 })
                 .unwrap();
             (tmp, store)

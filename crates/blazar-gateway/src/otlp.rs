@@ -13,6 +13,12 @@ use blazar_core::Config;
 pub struct OtlpSpan {
     pub trace_id_hex: String,
     pub span_id_hex: String,
+    /// The caller's operation when the request continued a trace.
+    pub parent_span_id_hex: Option<String>,
+    /// W3C `tracestate` that traveled with the request.
+    pub trace_state: Option<String>,
+    /// W3C trace flags of the continued trace; 0 for a new one.
+    pub trace_flags: u8,
     pub name: String,
     pub start_unix_nano: u128,
     pub end_unix_nano: u128,
@@ -130,7 +136,7 @@ impl Otlp {
             .iter()
             .map(|s| {
                 let error = (400..600).contains(&s.http_status);
-                serde_json::json!({
+                let mut span = serde_json::json!({
                     "traceId": s.trace_id_hex,
                     "spanId": s.span_id_hex,
                     "name": s.name,
@@ -145,7 +151,19 @@ impl Otlp {
                     "attributes": s.attributes.iter().map(|(k, v)| serde_json::json!({
                         "key": k, "value": {"stringValue": v}
                     })).collect::<Vec<_>>(),
-                })
+                });
+                // Only a continued trace carries these: a fresh trace
+                // exports the same shape it always did.
+                if let Some(parent) = &s.parent_span_id_hex {
+                    span["parentSpanId"] = serde_json::json!(parent);
+                }
+                if let Some(state) = &s.trace_state {
+                    span["traceState"] = serde_json::json!(state);
+                }
+                if s.trace_flags != 0 {
+                    span["flags"] = serde_json::json!(s.trace_flags);
+                }
+                span
             })
             .collect();
         serde_json::json!({
@@ -247,6 +265,9 @@ mod tests {
         OtlpSpan {
             trace_id_hex: "a".repeat(32),
             span_id_hex: "b".repeat(16),
+            parent_span_id_hex: None,
+            trace_state: None,
+            trace_flags: 0,
             name: "POST /v1/chat/completions".into(),
             start_unix_nano: 1,
             end_unix_nano: 5_000_000,
@@ -273,6 +294,28 @@ mod tests {
         assert_eq!(sp[0]["spanId"].as_str().unwrap().len(), 16);
         let svc = &v["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"];
         assert_eq!(svc, "blazar");
+        for absent in ["parentSpanId", "traceState", "flags"] {
+            assert!(
+                sp[0].get(absent).is_none(),
+                "a fresh trace exports no {absent}"
+            );
+        }
+    }
+
+    #[test]
+    fn unit__encode__a_continued_trace_names_its_parent_state_and_flags() {
+        let otlp = Otlp::new(&Config::default());
+        let continued = OtlpSpan {
+            parent_span_id_hex: Some("c".repeat(16)),
+            trace_state: Some("vendor=value".into()),
+            trace_flags: 1,
+            ..span(200)
+        };
+        let v = otlp.encode(&[continued]);
+        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["parentSpanId"], "c".repeat(16));
+        assert_eq!(span["traceState"], "vendor=value");
+        assert_eq!(span["flags"], 1);
     }
 
     #[tokio::test]

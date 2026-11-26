@@ -41,6 +41,8 @@ These are the **sensor errors** - every downstream automated decision reads this
 | F4 | Auto-draft pairing is lane-blind (sglang base + GGUF draft; self-pairing) | wasted arms, warn noise, misleading dense-fallback receipts |
 | F6 | KV quant measured FASTER than f16 (+11-15% pp) yet only engaged under VRAM pressure | free throughput left on the table by default |
 
+_Counter-evidence (2026-11-23): the 2026-11-22 campaign measured q8_0 KV decode 9% slower than dense on qwen2.5-0.5b-instruct (BENCHMARK.md), so the +11-15% prefill gain is model-class dependent; adoption stays receipt-gated per model._
+
 Plus (MEMORY.md, 2026-10-31 validate run): CONFIG COVERAGE phase gate misses 110 knob rows; P1 posture: store-error==absent at 44 sites.
 
 ### 1.3 The structural insight
@@ -189,6 +191,10 @@ An independent feasibility review of this doc was fact-checked against `main @ c
 ### 7.2 Claim CORRECTED (stale evidence)
 
 **"Gateway overhead 0.547 @C8 = top optimization target"** - that was the PRE-FIX number. Root cause (single-flight coalescing serializing parallel duplicates behind the leader's full generation) was found and fixed same night in `299bf5a` (default off). After-fix receipt (`gateway-overhead-ladder-after-fix.json`): **C1 1.135, C4 1.017, C8 0.986, p99 parity @C8 (0.869 vs 0.864)** - gateway is at aggregate parity with the direct engine. Residual: **C2 = 0.792** (below parity while C1/C4 are above - unexplained boundary anomaly, worth one bounded pass; suspects: -np 2 slot/concurrency interplay at the 2-slot boundary). Gateway-overhead as a P0 workstream is therefore mostly closed; remaining scope is the C2 dip, not the ladder.
+
+_Later evidence (2026-11-23): after the single-flight fix the saturation ratios were C1 1.135 / C4 1.017 / C8 0.986 with C2 at 0.792 (section 7.2); docs/issues/009 then measured saturation as the largest remaining gap, and the 2026-11-22 campaign closed C=4 pacing as not a defect (C=1..16 ratios 1.204 / 0.970 / 1.051 / 0.999 / 0.943, BENCHMARK.md). Read "mostly closed" as: single-digit percent, C2 still unexplained._
+
+_Root cause closed (2026-11-23, F2): the C2 dip is not a gateway relay cost. (1) The saturation harness compares two children whose engine state diverges, so in the natural-length mode the two legs finish at different output lengths and the shorter leg loses tokens per wall-second (the receipts carry different `gen_tokens` per leg). Re-measured with a forced equal output length the C=2 ratio is 0.89-0.95 and the per-round spread is about 10 % (speculative-acceptance variance: 328-1909 decode tok/s per round). (2) A three-lane run (gateway vs two direct children started with the gateway child's exact argv, all resident, prompts and lane order rotated) measures the relay cost at zero within noise: gateway/direct 1.034 and 1.016 at C=1, 1.039 and 1.000 at C=2. (3) The gateway-side cost that did exist was CPU before dispatch: every request re-decoded all engine manifests (`EngineRow::lane_class`, `predicted_rescue_lane`), 19.35 ms CPU per `GET /v1/models` and 4.55 ms CPU per chat request. A decoded engine view cached on the gateway (counter `blazar_engine_view_builds_total`) cut that to 1.10 ms and 1.45 ms CPU per request and the pre-dispatch stage from 2.2 ms to 0.48 ms at C=1. (4) The harness direct leg now keeps the slot-bank and lookup-cache flags on private paths, so both legs run the same engine configuration (split lanes showed neither flag has a reproducible decode cost). Honest remainder: the single-digit-percent gateway deficit at C=1-2 in the harness lies inside its run noise and is not a measured relay cost._
 
 ### 7.3 Amendments ACCEPTED into the architecture
 

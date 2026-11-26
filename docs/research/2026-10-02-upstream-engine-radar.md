@@ -209,6 +209,7 @@ flash-attn-by-default (PR 1186). mistral.rs: KBNF grammar (815), Flux.2-klein
    API-spec entry pending.
 5. **VAD-on-GPU** knob - DONE (wave1).
 6. sglang **native `/generate`** - RESOLVED NO-OP (router-only, 2026-10-03).
+   _Superseded (2026-11-23): the native sglang `/generate` route shipped in 0.32.0 once the router became supervised (CHANGELOG, "Native sglang `/generate` route")._
 7. **Diffusion-LLM readiness** - DONE (2026-10-03): paradigm guard shipped,
    design review + streaming-tolerance checklist in
    `2026-10-03-diffusion-llm-readiness.md`.

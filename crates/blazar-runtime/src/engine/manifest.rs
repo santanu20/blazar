@@ -11,6 +11,7 @@ use std::process::Command;
 use std::process::Output;
 
 use anyhow::{Context, Result, anyhow};
+use blazar_core::engine_kind::{EngineKind, LaneClass};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +60,18 @@ impl Vendor {
             Self::Amd => "amd",
             Self::Intel => "intel",
             Self::Other => "other",
+        }
+    }
+
+    /// The vendor behind a PCI vendor id. An id outside the three GPU
+    /// vendors Blazar ships builds for reads as `None`.
+    #[must_use]
+    pub fn from_pci_vendor(id: u32) -> Option<Self> {
+        match id {
+            0x10de => Some(Self::Nvidia),
+            0x1002 => Some(Self::Amd),
+            0x8086 => Some(Self::Intel),
+            _ => None,
         }
     }
 }
@@ -265,6 +278,104 @@ pub const MANIFEST_PROBE_VERSION: u32 = 4;
 /// for non-llama.cpp picked kinds, or when the picked lane's arch set
 /// is unknown (honest unknown - the crash-time rescue still fires at
 /// spawn, it just cannot be predicted here).
+/// Decoded routing view of the installed engine rows. Routing needs,
+/// per request, every row's kind and lane class and - for the rescue
+/// preview - each llama.cpp row's advertised architectures. Decoding
+/// each manifest to get there costs more than the rest of the request
+/// path combined on a real store, so request paths decode once per
+/// engine-row change and reuse the view (`AppState::engine_view` in the
+/// gateway); cold callers keep [`predicted_rescue_lane`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EngineView {
+    installed: Vec<(
+        String,
+        blazar_core::engine_kind::EngineKind,
+        blazar_core::engine_kind::LaneClass,
+    )>,
+    /// Decodable llama.cpp rows only: `(tag, lane class, advertised
+    /// architectures)`.
+    lanes: Vec<(
+        String,
+        blazar_core::engine_kind::LaneClass,
+        Option<BTreeSet<String>>,
+    )>,
+    global: Option<(String, blazar_core::engine_kind::EngineKind)>,
+}
+
+impl EngineView {
+    /// Decode `engine_rows` plus the active row (when one is set).
+    #[must_use]
+    pub fn build(
+        engine_rows: &[blazar_core::EngineRow],
+        active: Option<&blazar_core::EngineRow>,
+    ) -> Self {
+        let mut lanes = Vec::new();
+        let installed: Vec<(String, EngineKind, LaneClass)> = engine_rows
+            .iter()
+            .map(|row| {
+                let class = row.lane_class();
+                if row.kind == EngineKind::LlamaCpp
+                    && let Ok(manifest) = serde_json::from_str::<Manifest>(&row.manifest)
+                {
+                    lanes.push((row.tag.clone(), class, manifest.advertised_archs().cloned()));
+                }
+                (row.tag.clone(), row.kind, class)
+            })
+            .collect();
+        Self {
+            installed,
+            lanes,
+            global: active.map(|row| (row.tag.clone(), row.kind)),
+        }
+    }
+
+    /// `(tag, kind, lane class)` of every installed row, store order.
+    #[must_use]
+    pub fn installed(&self) -> &[(String, EngineKind, LaneClass)] {
+        &self.installed
+    }
+
+    /// `(tag, kind)` of the global engine. No active row means the
+    /// router's llama.cpp fallback, exactly as before the view existed.
+    #[must_use]
+    pub fn global(&self) -> Option<(&str, EngineKind)> {
+        self.global
+            .as_ref()
+            .map(|(tag, kind)| (tag.as_str(), *kind))
+    }
+
+    /// Same verdict as [`predicted_rescue_lane`] for a picked lane, read
+    /// off the decoded rows.
+    #[must_use]
+    pub fn rescue_lane(
+        &self,
+        arch: Option<&str>,
+        pin: Option<&str>,
+        picked_tag: &str,
+        picked_kind: EngineKind,
+    ) -> Option<String> {
+        let arch = arch?;
+        if pin.is_some() || picked_kind != EngineKind::LlamaCpp {
+            return None;
+        }
+        let lanes: Vec<blazar_core::engine_kind::LaneArchView<'_>> = self
+            .lanes
+            .iter()
+            .map(|(tag, class, archs)| (tag.as_str(), *class, archs.as_ref()))
+            .collect();
+        let picked_lacks = lanes
+            .iter()
+            .find(|(tag, _, _)| *tag == picked_tag)
+            .is_some_and(|(_, _, set)| set.is_some_and(|s| !s.contains(arch)));
+        if !picked_lacks {
+            return None;
+        }
+        blazar_core::engine_kind::advertising_lanes(arch, Some(picked_tag), &lanes)
+            .first()
+            .map(|tag| (*tag).to_string())
+    }
+}
+
 #[must_use]
 pub fn predicted_rescue_lane(
     engine_rows: &[blazar_core::EngineRow],
@@ -273,34 +384,7 @@ pub fn predicted_rescue_lane(
     picked_tag: &str,
     picked_kind: blazar_core::engine_kind::EngineKind,
 ) -> Option<String> {
-    let arch = arch?;
-    if pin.is_some() || picked_kind != blazar_core::engine_kind::EngineKind::LlamaCpp {
-        return None;
-    }
-    // Decoded manifests must outlive the borrowed lane views below.
-    let decoded: Vec<(&blazar_core::EngineRow, Manifest)> = engine_rows
-        .iter()
-        .filter(|r| r.kind == blazar_core::engine_kind::EngineKind::LlamaCpp)
-        .filter_map(|r| {
-            serde_json::from_str::<Manifest>(&r.manifest)
-                .ok()
-                .map(|m| (r, m))
-        })
-        .collect();
-    let lanes: Vec<blazar_core::engine_kind::LaneArchView> = decoded
-        .iter()
-        .map(|(r, m)| (r.tag.as_str(), r.lane_class(), m.advertised_archs()))
-        .collect();
-    let picked_lacks = lanes
-        .iter()
-        .find(|(t, _, _)| *t == picked_tag)
-        .is_some_and(|(_, _, set)| set.is_some_and(|s| !s.contains(arch)));
-    if !picked_lacks {
-        return None;
-    }
-    blazar_core::engine_kind::advertising_lanes(arch, Some(picked_tag), &lanes)
-        .first()
-        .map(|t| (*t).to_string())
+    EngineView::build(engine_rows, None).rescue_lane(arch, pin, picked_tag, picked_kind)
 }
 
 impl Manifest {
@@ -652,10 +736,14 @@ pub fn probe_with_env(
     )
     .with_context(|| format!("run {server} --version (timed out or failed to spawn)"))?;
     if !out.status.success() {
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        let detail = match loader_failure_hint(&stderr_text) {
+            Some(hint) => format!("{} ({hint})", stderr_text.trim()),
+            None => stderr_text.into_owned(),
+        };
         return Err(anyhow!(
-            "{server} --version exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+            "{server} --version exited {}: {detail}",
+            out.status
         ));
     }
     // Upstream prints the version banner to STDERR (verified b10816);
@@ -1271,10 +1359,11 @@ fn probe_openaihost(server_path: &Path, tag: &str) -> Result<Manifest> {
 ///   dynamic loader is the common culprit - a prebuilt linked against
 ///   a newer distro's libc (e.g. an Ubuntu 26.04 asset needing
 ///   `GLIBC_2.43`) exits 127 with `error while loading shared
+/// `libraries: ... exit 127 with `error while loading shared
 ///   libraries: ...` on stderr and prints NOTHING to stdout, which
 ///   used to masquerade as an upstream format change. Report the exit
-///   code plus the first stderr line verbatim, with a libc teaching
-///   when the loader signature is present.
+///   code plus the first stderr line verbatim, with the teaching
+///   [`loader_failure_hint`] reads off the library the loader names.
 /// - exit 0 with no parseable flags: genuinely an upstream usage
 ///   format change (or an unknown regression) - keep the original
 ///   message with a usage preview.
@@ -1290,22 +1379,75 @@ fn zero_flag_help_error(binary: &str, out: &Output, preview: &str) -> anyhow::Er
             .map(str::trim)
             .find(|l| !l.is_empty())
             .unwrap_or("<no stderr output>");
-        let loader_signature = [
-            "error while loading shared libraries",
-            "GLIBC_",
-            "cannot open shared object",
-        ]
-        .iter()
-        .any(|needle| stderr_text.contains(needle));
         let mut msg = format!("{binary} --help exited {code}: {first_nonempty}");
-        if loader_signature {
-            msg.push_str(
-                " (prebuilt targets a newer libc than this host - check the asset distro)",
-            );
+        if let Some(hint) = loader_failure_hint(&stderr_text) {
+            msg.push_str(" (");
+            msg.push_str(hint);
+            msg.push(')');
         }
         return anyhow!("{msg}");
     }
     anyhow!("{binary} --help parsed to zero flags (output format changed upstream?): {preview}")
+}
+
+/// What a dynamic-loader failure of a prebuilt means. The loader names
+/// one library at a time, so the first name tells the story: a glibc
+/// version tag is a distro mismatch, a vendor runtime library means
+/// the host lacks that runtime, anything else is a library the asset
+/// was expected to carry. The vendor lists are the libraries the
+/// current llama.cpp prebuits link (readelf on b12686): the SYCL build
+/// needs twelve oneAPI libraries it does not ship, the CUDA build the
+/// driver's `libcuda.so`, the `ROCm` build its own runtime.
+fn loader_failure_hint(stderr: &str) -> Option<&'static str> {
+    const LOADER_SIGNATURES: [&str; 3] = [
+        "error while loading shared libraries",
+        "GLIBC_",
+        "cannot open shared object",
+    ];
+    if !LOADER_SIGNATURES
+        .iter()
+        .any(|needle| stderr.contains(needle))
+    {
+        return None;
+    }
+    if stderr.contains("GLIBC_") {
+        return Some("prebuilt targets a newer libc than this host - check the asset distro");
+    }
+    let vendor_runtimes: [(&[&str], &str); 3] = [
+        (
+            &[
+                "libsycl.so",
+                "libsvml.so",
+                "libimf.so",
+                "libirng.so",
+                "libiomp5.so",
+                "libintlc.so",
+                "libmkl_",
+                "libdnnl.so",
+                "libze_loader.so",
+            ],
+            "this build loads the Intel oneAPI runtime at start (SYCL, SVML, oneMKL, oneDNN, the \
+             Level Zero loader) and ships none of it: install the oneAPI runtime, or choose a \
+             build for a runtime this host has",
+        ),
+        (
+            &["libcuda.so"],
+            "this build loads the NVIDIA driver library at start: install the NVIDIA driver, or \
+             choose a build for a runtime this host has",
+        ),
+        (
+            &["libamdhip64.so", "libhipblas.so", "librocblas.so"],
+            "this build loads the AMD ROCm runtime at start: install ROCm, or choose a build for \
+             a runtime this host has",
+        ),
+    ];
+    vendor_runtimes
+        .iter()
+        .find(|(libraries, _)| libraries.iter().any(|library| stderr.contains(library)))
+        .map(|(_, hint)| *hint)
+        .or(Some(
+            "a library this prebuilt needs is missing on this host - check the asset distro",
+        ))
 }
 
 /// Probe an sd.cpp `sd-server` binary. Divergences from llama-server
@@ -1853,10 +1995,36 @@ mod tests {
             err.contains("error while loading shared libraries"),
             "{err}"
         );
+        // The loader named a library the asset was expected to carry,
+        // not a glibc version tag: the teaching points at the asset.
         assert!(
-            err.contains("newer libc than this host"),
+            err.contains("missing on this host"),
             "missing the distro teaching: {err}"
         );
+        assert!(err.contains("check the asset distro"), "{err}");
+    }
+
+    #[test]
+    fn unit__loader_failure_hint__names_the_runtime_by_the_missing_library() {
+        let cuda = loader_failure_hint(
+            "llama-server: error while loading shared libraries: libcuda.so.1: cannot open \
+             shared object file: No such file or directory",
+        )
+        .expect("a driver library is a known runtime");
+        assert!(cuda.contains("NVIDIA driver library"), "{cuda}");
+        let rocm = loader_failure_hint(
+            "llama-server: error while loading shared libraries: libamdhip64.so.7: cannot \
+             open shared object file",
+        )
+        .expect("the ROCm runtime is a known runtime");
+        assert!(rocm.contains("AMD ROCm runtime"), "{rocm}");
+        let oneapi = loader_failure_hint(
+            "llama-server: error while loading shared libraries: libze_loader.so.1: cannot \
+             open shared object file",
+        )
+        .expect("a oneAPI library is a known runtime");
+        assert!(oneapi.contains("Intel oneAPI runtime"), "{oneapi}");
+        assert_eq!(loader_failure_hint("unknown flag --help"), None);
     }
 
     #[test]
@@ -1866,6 +2034,62 @@ mod tests {
         assert!(err.contains("exited 2"), "{err}");
         assert!(err.contains("unknown flag --help"), "{err}");
         assert!(!err.contains("libc"), "{err}");
+    }
+
+    #[test]
+    fn unit__zero_flag_help_error__glibc_version_mismatch_keeps_the_libc_teaching() {
+        let out = help_output(
+            127,
+            "",
+            "llama-server: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.43' not found \
+             (required by ./libllama.so.1)\n",
+        );
+        let err = zero_flag_help_error("llama-server", &out, "").to_string();
+        assert!(err.contains("GLIBC_2.43"), "{err}");
+        assert!(err.contains("newer libc than this host"), "{err}");
+    }
+
+    #[test]
+    fn unit__zero_flag_help_error__missing_intel_runtime_is_not_blamed_on_libc() {
+        // Captured on an NVIDIA host without oneAPI: llama.cpp b12686
+        // ubuntu-sycl-fp16-x64 exits 127 naming the first Intel runtime
+        // library it lacks.
+        let out = help_output(
+            127,
+            "",
+            "llama-server: error while loading shared libraries: libsvml.so: cannot open \
+             shared object file: No such file or directory\n",
+        );
+        let err = zero_flag_help_error("llama-server", &out, "").to_string();
+        assert!(err.contains("exited 127"), "{err}");
+        assert!(err.contains("Intel oneAPI runtime"), "{err}");
+        assert!(
+            !err.contains("libc"),
+            "a missing vendor runtime is not a libc story: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unit__probe_with_env__version_failure_names_the_missing_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("llama-server");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'llama-server: error while loading shared libraries: libsvml.so: \
+             cannot open shared object file: No such file or directory' >&2\nexit 127\n",
+        )
+        .expect("write script");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+        }
+        let err = probe_with_env(&script, "b12686", &[])
+            .expect_err("a binary that cannot load has no version");
+        let err = err.to_string();
+        assert!(err.contains("libsvml.so"), "{err}");
+        assert!(err.contains("Intel oneAPI runtime"), "{err}");
     }
 
     #[test]
@@ -2141,22 +2365,80 @@ mod tests {
         assert_eq!(m.server_path, "");
     }
 
+    // Every llama.cpp build prints `--list-devices` as
+    // `<device name>: <description> (<total> MiB, <free> MiB free)`. The
+    // device name is the backend prefix plus the index (CUDA, ROCm, SYCL,
+    // Vulkan) and is the token `--device` accepts.
+    const CENSUS_HEADER: &str = "Available devices:\n";
+
+    fn census_device(line: &str) -> DeviceDesc {
+        let devices = parse_devices(&format!("{CENSUS_HEADER}{line}\n"));
+        assert_eq!(devices.len(), 1, "one census line reads as one device");
+        devices.into_iter().next().unwrap()
+    }
+
     #[test]
-    fn unit__parse_devices__upstream_shape() {
-        let text = "Available devices:\n  NVIDIA GeForce RTX 4070: NVIDIA CUDA (8188 MiB, 7000 MiB free)\n  Intel iGPU: Vulkan (32768 MiB, 24000 MiB free)\n";
-        let d = parse_devices(text);
-        assert_eq!(d.len(), 2);
-        assert_eq!(d[0].name, "NVIDIA GeForce RTX 4070");
-        assert_eq!(d[0].description, "NVIDIA CUDA");
-        assert_eq!((d[0].total_mib, d[0].free_mib), (8188, 7000));
-        assert_eq!(d[0].vendor(), Vendor::Nvidia);
-        assert_eq!(d[1].vendor(), Vendor::Intel);
+    fn unit__parse_devices__cuda_build_census() {
+        // Captured from a CUDA build of llama-server.
+        let device =
+            census_device("  CUDA0: NVIDIA GeForce RTX 4070 Laptop GPU (7807 MiB, 6709 MiB free)");
+        assert_eq!(device.name, "CUDA0");
+        assert_eq!(device.description, "NVIDIA GeForce RTX 4070 Laptop GPU");
+        assert_eq!((device.total_mib, device.free_mib), (7807, 6709));
+        assert_eq!(device.vendor(), Vendor::Nvidia);
+    }
+
+    #[test]
+    fn unit__parse_devices__vulkan_build_census_lists_an_igpu_and_a_card() {
+        // Captured from a Vulkan build of llama-server.
+        let text = "Available devices:\n  Vulkan0: Intel(R) Graphics (RPL-S) (10256 MiB, 4402 MiB free)\n  Vulkan1: NVIDIA GeForce RTX 4070 Laptop GPU (8188 MiB, 6732 MiB free)\n";
+        let devices = parse_devices(text);
+        let listed: Vec<(&str, u64, u64, Vendor)> = devices
+            .iter()
+            .map(|d| (d.name.as_str(), d.total_mib, d.free_mib, d.vendor()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("Vulkan0", 10256, 4402, Vendor::Intel),
+                ("Vulkan1", 8188, 6732, Vendor::Nvidia),
+            ]
+        );
+        assert_eq!(devices[0].description, "Intel(R) Graphics (RPL-S)");
+    }
+
+    // The ROCm and SYCL device names come from the backend headers
+    // (`GGML_CUDA_NAME "ROCm"` under GGML_USE_HIP, `GGML_SYCL_NAME "SYCL"`).
+    // No AMD or Intel card with that runtime was at hand, so the product
+    // strings below are illustrative: each runtime reports its own.
+    #[test]
+    fn unit__parse_devices__rocm_build_census_names_carry_the_vendor() {
+        let device = census_device("  ROCm0: Radeon RX 7900 XTX (24564 MiB, 24000 MiB free)");
+        assert_eq!(device.name, "ROCm0");
+        assert_eq!((device.total_mib, device.free_mib), (24564, 24000));
+        assert_eq!(device.vendor(), Vendor::Amd);
+    }
+
+    #[test]
+    fn unit__parse_devices__sycl_build_census_names_carry_the_vendor() {
+        let device = census_device("  SYCL0: Arc A770 Graphics (16268 MiB, 16000 MiB free)");
+        assert_eq!(device.name, "SYCL0");
+        assert_eq!((device.total_mib, device.free_mib), (16268, 16000));
+        assert_eq!(device.vendor(), Vendor::Intel);
     }
 
     #[test]
     fn unit__parse_devices__none_case() {
         let d = parse_devices("Available devices:\n  (none)\n");
         assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn unit__from_pci_vendor__reads_the_pci_sig_ids() {
+        assert_eq!(Vendor::from_pci_vendor(0x10de), Some(Vendor::Nvidia));
+        assert_eq!(Vendor::from_pci_vendor(0x1002), Some(Vendor::Amd));
+        assert_eq!(Vendor::from_pci_vendor(0x8086), Some(Vendor::Intel));
+        assert_eq!(Vendor::from_pci_vendor(0x106b), None);
     }
 
     #[test]
@@ -2726,6 +3008,86 @@ options:
             msg.contains("model") && msg.contains("kokoro.onnx"),
             "{msg}"
         );
+    }
+
+    #[test]
+    #[allow(non_snake_case)] // suite convention: unit__scenario__expected
+    fn unit__engine_view__classifies_every_row_and_matches_the_row_rescue() {
+        use blazar_core::engine_kind::{EngineKind, LaneClass};
+        let llama = EngineKind::LlamaCpp;
+        let rows = vec![
+            rescue_row("b-main", &["qwen2"]),
+            rescue_row("b-adv", &["instella-moe"]),
+            blazar_core::EngineRow {
+                kind: EngineKind::Sglang,
+                ..rescue_row("sglang-t", &["qwen2"])
+            },
+            blazar_core::EngineRow {
+                manifest: "not json".to_string(),
+                ..rescue_row("b-broken", &["qwen2"])
+            },
+            blazar_core::EngineRow {
+                manifest: serde_json::json!({
+                    "tag": "b-fork",
+                    "source": "fork",
+                    "architectures": ["qwen2"],
+                })
+                .to_string(),
+                ..rescue_row("b-fork", &["qwen2"])
+            },
+        ];
+        let view = EngineView::build(&rows, rows.first());
+        // Every row keeps its routing class (fork provenance included)
+        // and the global row is the active one.
+        let installed: Vec<(&str, EngineKind, LaneClass)> = view
+            .installed()
+            .iter()
+            .map(|(tag, kind, class)| (tag.as_str(), *kind, *class))
+            .collect();
+        assert_eq!(
+            installed,
+            vec![
+                ("b-main", llama, LaneClass::Mainstream),
+                ("b-adv", llama, LaneClass::Mainstream),
+                ("sglang-t", EngineKind::Sglang, LaneClass::Mainstream),
+                ("b-broken", llama, LaneClass::Mainstream),
+                ("b-fork", llama, LaneClass::Fork),
+            ]
+        );
+        assert_eq!(view.global(), Some(("b-main", llama)));
+        assert_eq!(EngineView::build(&rows, None).global(), None);
+        // The rescue verdict equals the per-call row implementation on
+        // every gate: provable lack with an advertiser, no lack, user
+        // pin, unknown arch, unknown model arch, a non-llama.cpp kind, an
+        // undecodable picked manifest, and a fork advertiser.
+        for (arch, pin, picked, kind) in [
+            (Some("instella-moe"), None, "b-main", llama),
+            (Some("qwen2"), None, "b-main", llama),
+            (Some("instella-moe"), Some("b-main"), "b-main", llama),
+            (Some("mystery"), None, "b-main", llama),
+            (None, None, "b-main", llama),
+            (Some("qwen2"), None, "sglang-t", EngineKind::Sglang),
+            (Some("qwen2"), None, "b-broken", llama),
+            (Some("qwen2"), None, "b-fork", llama),
+            (Some("instella-moe"), None, "b-fork", llama),
+        ] {
+            assert_eq!(
+                view.rescue_lane(arch, pin, picked, kind),
+                predicted_rescue_lane(&rows, arch, pin, picked, kind),
+                "arch {arch:?} pin {pin:?} picked {picked}"
+            );
+        }
+        // A changed row set is a new view: nothing from the old decode
+        // survives into it.
+        let mut changed = rows.clone();
+        changed[0].manifest = "not json".to_string();
+        let rebuilt = EngineView::build(&changed, None);
+        assert_eq!(
+            rebuilt.rescue_lane(Some("instella-moe"), None, "b-main", llama),
+            None,
+            "a picked lane whose manifest no longer decodes cannot be proven to lack the arch"
+        );
+        assert_ne!(rebuilt, view);
     }
 }
 

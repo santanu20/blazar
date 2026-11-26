@@ -87,7 +87,9 @@ pub fn resolve_draft_path(store: &Store, model: &str, spec_mode: &str) -> Option
             file => Some(file),
         },
     );
-    store.get_model(&draft_name).ok().flatten().map(|r| r.path)
+    blazar_core::store::row_or_warn("models.draft_path", store.get_model(&draft_name))
+        .flatten()
+        .map(|r| r.path)
 }
 
 /// Which on-disk shape an engine lane can actually load as a speculative
@@ -153,6 +155,32 @@ pub fn pick_draft(
     } else {
         DraftPick::IncompatibleLane(path)
     }
+}
+
+/// Device-side bytes of the speculative draft a spawn will arm: the draft
+/// is a second set of weights on the GPU, so admission charges it like
+/// the main model (the sglang branch of the capacity gate already does).
+/// Zero when there is no draft, when the draft is pinned off the GPU
+/// (`cpu` / `none`), or when its file cannot be read - a missing charge
+/// degrades to the dense-only floor, never to a refused spawn.
+fn draft_device_bytes(draft_path: Option<&str>, draft_device: &str) -> u64 {
+    let Some(path) = draft_path else {
+        return 0;
+    };
+    let off_gpu = draft_device.trim();
+    if off_gpu.eq_ignore_ascii_case("cpu") || off_gpu.eq_ignore_ascii_case("none") {
+        return 0;
+    }
+    std::fs::metadata(path).map_or_else(
+        |e| {
+            tracing::warn!(
+                draft = path,
+                "draft file unreadable at admission - charging dense-only: {e}"
+            );
+            0
+        },
+        |m| m.len(),
+    )
 }
 
 /// One warn, the teaching text mirroring compile's wording, so a lane
@@ -1468,15 +1496,10 @@ fn pick_gpu(gpus: &[blazar_core::GpuInfo]) -> Option<(usize, bool)> {
     }
 }
 
-/// sdcpp twin of [`pick_gpu`]: choose the card from the ENGINE's own
-/// device census (registration-time `--list-devices`) and return its
-/// `--backend` token plus the display description. The CPU entry the
-/// census lists is not a placement candidate; `None` (empty census,
-/// CPU-only) leaves the profile on the blanket offload posture.
-fn pick_sd_backend_device(
-    devices: &[crate::engine::manifest::DeviceDesc],
-) -> Option<(String, String)> {
-    let gpus: Vec<blazar_core::GpuInfo> = devices
+/// The accelerator rows of an engine's own `--list-devices` census. The
+/// CPU entry the census lists is not a placement candidate.
+fn accelerator_rows(devices: &[crate::engine::manifest::DeviceDesc]) -> Vec<blazar_core::GpuInfo> {
+    devices
         .iter()
         .filter(|d| !d.name.eq_ignore_ascii_case("cpu"))
         .map(|d| blazar_core::GpuInfo {
@@ -1485,7 +1508,26 @@ fn pick_sd_backend_device(
             total_mib: d.total_mib,
             free_mib: d.free_mib,
         })
-        .collect();
+        .collect()
+}
+
+/// Whether an engine's device census is the llama.cpp `OpenVINO` build's.
+/// That build lists EVERY `OpenVINO` device as `OPENVINO<n>` - the CPU
+/// included, with the host RAM as its memory - and takes its device only
+/// from `GGML_OPENVINO_DEVICE`. Its rows name that variable's values: a
+/// `--device` token for any row but the selected one aborts the spawn.
+fn takes_device_from_env(devices: &[crate::engine::manifest::DeviceDesc]) -> bool {
+    !devices.is_empty() && devices.iter().all(|d| d.name.starts_with("OPENVINO"))
+}
+
+/// sdcpp twin of [`pick_gpu`]: choose the card from the ENGINE's own
+/// device census (registration-time `--list-devices`) and return its
+/// `--backend` token plus the display description. `None` (empty census,
+/// CPU-only) leaves the profile on the blanket offload posture.
+fn pick_sd_backend_device(
+    devices: &[crate::engine::manifest::DeviceDesc],
+) -> Option<(String, String)> {
+    let gpus = accelerator_rows(devices);
     let (idx, _) = pick_gpu(&gpus)?;
     Some((gpus[idx].name.clone(), gpus[idx].description.clone()))
 }
@@ -1735,24 +1777,31 @@ fn settle_report(
     post: &blazar_core::Hardware,
     device: Option<&str>,
 ) -> Option<(String, u64, u64)> {
-    let pre_free_of = |name: &str| {
+    // Only a card present in BOTH snapshots carries a delta. One the
+    // baseline never named has no "before" reading, and a zero delta
+    // would read as a child that holds no VRAM.
+    let baseline_free_of = |card: &blazar_core::GpuInfo| {
         pre.gpus
             .iter()
-            .find(|g| g.name == name)
-            .map_or(0, |g| g.free_mib)
+            .find(|g| g.name == card.name)
+            .map(|g| g.free_mib)
     };
-    // A named pick must exist in the AFTER snapshot (a card that vanished
-    // from the census reports garbage, not zero). Without a pick, report
-    // the card whose free VRAM dropped the most - the card the spawn
-    // plausibly landed on.
+    let matched: Vec<&blazar_core::GpuInfo> = post
+        .gpus
+        .iter()
+        .filter(|g| baseline_free_of(g).is_some())
+        .collect();
+    // A named pick must be among them (a card that vanished from the
+    // census reports garbage, not zero). Without a pick, report the card
+    // whose free VRAM dropped the most - the card the spawn plausibly
+    // landed on.
     let card = match device {
-        Some(name) => post.gpus.iter().find(|g| g.name == name)?,
-        None => post
-            .gpus
-            .iter()
-            .max_by_key(|g| pre_free_of(&g.name).saturating_sub(g.free_mib))?,
+        Some(name) => matched.into_iter().find(|g| g.name == name)?,
+        None => matched
+            .into_iter()
+            .max_by_key(|g| baseline_free_of(g).unwrap_or(0).saturating_sub(g.free_mib))?,
     };
-    let pre_free = pre_free_of(&card.name);
+    let pre_free = baseline_free_of(card)?;
     let taken = pre_free.saturating_sub(card.free_mib);
     let used_pct = ((card.total_mib.saturating_sub(card.free_mib)) * 100)
         .checked_div(card.total_mib)
@@ -2375,6 +2424,31 @@ fn argv_np(argv: &[String]) -> Option<u32> {
     argv.windows(2)
         .find(|w| w[0] == "-np" || w[0] == "--parallel")
         .and_then(|w| w[1].parse::<u32>().ok())
+}
+
+/// Value of a two-element flag (`--flag N`) in a child argv.
+fn argv_flag_u32(argv: &[String], flag: &str) -> Option<u32> {
+    argv.windows(2)
+        .find(|w| w[0] == flag)
+        .and_then(|w| w[1].parse::<u32>().ok())
+}
+
+/// Largest prompt, in tokens, one request may hand a child compiled with
+/// `argv`. A child with per-slot KV buffers bounds every request by
+/// `per_slot_ctx` (its ctx split over `-np`). A `--kv-unified` child
+/// keeps ONE buffer for all sequences, so a single prompt may use the
+/// whole pool (`--ctx-size`) unless `--kv-unified-per-slot` caps it
+/// (measured live on llama.cpp b12606: one 40k-token prompt is refused
+/// against a 32768 pool, two concurrent 20k prompts are both served).
+fn prompt_ctx_for(argv: &[String], per_slot_ctx: u32) -> u32 {
+    if !argv.iter().any(|a| a == "--kv-unified") {
+        return per_slot_ctx;
+    }
+    let pool = argv_flag_u32(argv, "--ctx-size").or_else(|| argv_flag_u32(argv, "-c"));
+    argv_flag_u32(argv, "--kv-unified-per-slot")
+        .or(pool)
+        .filter(|n| *n > 0)
+        .unwrap_or(per_slot_ctx)
 }
 
 /// Row for `blazar ps` / `/api/ps`.
@@ -3291,6 +3365,34 @@ impl Supervisor {
         )
     }
 
+    /// J3 refusal text for a paged-experts spawn: the pinned store is
+    /// the memory that actually has to exist (upstream page-locks ALL
+    /// routed experts in host RAM), so the floor is named for it. K
+    /// does not shrink this number - only the quant, the rollback, or
+    /// freed RAM do - and the text says so instead of pointing at the
+    /// resident-K knob.
+    fn paged_host_refusal_teaching(
+        name: &str,
+        model_mib: u64,
+        avail_mib: u64,
+        committed_mib: u64,
+        need_mib: u64,
+        expert_mib: u64,
+    ) -> String {
+        format!(
+            "insufficient memory to load {name:?}: MemAvailable {avail_mib} MiB - {committed} \
+             MiB held by resident/in-flight loads = {effective} MiB effective, below the \
+             {need_mib} MiB floor (model {model_mib} MiB + a {expert_mib} MiB page-locked \
+             expert store - upstream pins ALL routed experts in host RAM regardless of the \
+             resident K). Use a smaller quant, free RAM (blazar ps / ollama stop), or roll the \
+             model back to the dense plan with paged_experts = false; disable this guard with \
+             spawn_mem_guard = false. This per-spawn host check precedes VRAM admission, so a \
+             starved box refuses here before any pair-fit verdict",
+            effective = avail_mib.saturating_sub(committed_mib),
+            committed = committed_mib,
+        )
+    }
+
     /// Capacity-eviction victim: the coldest evictable instance - zero
     /// in-flight, not the incoming key, and not pinned (overlay
     /// `pin = true`, A13). Ordering: session-pinned models LAST (R3 -
@@ -3838,6 +3940,8 @@ impl Supervisor {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         }
     }
 
@@ -4093,8 +4197,24 @@ impl Supervisor {
             _ => name,
         };
 
-        let key = self.replica_key(name, prefix);
-        let result = self.ensure_key_opts(&key, captive).await;
+        let mut key = self.replica_key(name, prefix);
+        let mut result = self.ensure_key_opts(&key, captive).await;
+        // A spilled request can land on a replica that cannot start (card
+        // full, crash loop). That must not fail a request the live first
+        // child can serve, so a later copy's failure retries on the base.
+        if let Err(error) = &result
+            && let Some(base) = Self::base_replica_key(&key)
+            && Self::replica_may_fall_back(error)
+            && self.instances.contains_key(&base)
+        {
+            tracing::warn!(
+                replica = %key,
+                error = %error,
+                "replica could not serve - falling back to the base replica"
+            );
+            key = base;
+            result = self.ensure_key_opts(&key, captive).await;
+        }
         // Best-effort affinity record: pin this prefix to the replica
         // that served it, so the next turn hits its warm cache.
         if let Some(pk) = prefix
@@ -4895,7 +5015,12 @@ impl Supervisor {
         }
         // (a2) Cache-aware coalesce: same system-prompt class, new
         // conversation -> the replica holding that prefix absorbs it
-        // instead of growing a cold child.
+        // instead of growing a cold child - also when its slots are busy:
+        // queueing on the warm holder beat spilling to a cold sibling in
+        // both regimes measured live on 2026-11-24 (an 8-deep burst: 0.84 s
+        // vs 1.9 s wall; a 24-deep burst: 1.51 s vs 2.58 s) because the
+        // sibling pays the model load plus an uncached prefill and then
+        // shares the same GPU.
         if let Some((key, _)) = scored {
             return key;
         }
@@ -4944,6 +5069,26 @@ impl Supervisor {
             }
         }
         least.map_or_else(|| format!("{name}#1"), |(key, _)| key)
+    }
+
+    /// The first copy of a replicated model (`m#2` and later -> `m#1`);
+    /// `None` for the base copy itself and for unreplicated keys, which
+    /// have nothing to fall back to.
+    fn base_replica_key(key: &str) -> Option<String> {
+        let (model, idx) = split_replica(key)?;
+        (idx >= 2).then(|| format!("{model}#1"))
+    }
+
+    /// Errors a spilled request can retry on the base replica. Identity
+    /// errors (model unknown, unsupported, fleet unreachable) would fail
+    /// there too, so they surface unchanged.
+    fn replica_may_fall_back(error: &SupervisionError) -> bool {
+        !matches!(
+            error,
+            SupervisionError::ModelNotFound(_)
+                | SupervisionError::UnsupportedModel(_)
+                | SupervisionError::RpcEndpointsUnreachable(_)
+        )
     }
 
     /// Load/wait core, keyed by INSTANCE key (model or model#N).
@@ -5447,6 +5592,8 @@ impl Supervisor {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
 
         let mut auth_keyfile: Option<std::path::PathBuf> = None;
@@ -5719,6 +5866,8 @@ impl Supervisor {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         let profile = blazar_core::Profile {
             argv: Vec::new(),
@@ -6517,7 +6666,10 @@ impl Supervisor {
         // immune, and without receipts the planner chain is unchanged.
         // Lane-aware draft classification needs the main model's own
         // path (self-pair detection) - one cheap store read.
-        let main_path: Option<String> = store.get_model(name).ok().flatten().map(|r| r.path);
+        let main_path: Option<String> =
+            blazar_core::store::row_or_warn("models.get", store.get_model(name))
+                .flatten()
+                .map(|r| r.path);
         if spec_mode == "auto" {
             let caps = engine.capabilities();
             if let Ok(receipts) = store.list_spec_receipts(name, &caps.tag) {
@@ -6640,76 +6792,132 @@ impl Supervisor {
             .and_then(|p| std::fs::metadata(p).ok())
             .map_or(0, |m| m.len());
         let row_weights = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX);
-        let (incoming_bytes, sglang_offload_bytes, j3_draft_bytes) = if sglang_lane {
-            let manifest = engine.capabilities();
-            let (draft_dir, spec_engaged) = sglang_engaged_draft(
-                &tun_probe,
-                draft_path.as_deref(),
-                manifest.flags.contains("--speculative-algorithm"),
-                manifest.flags.contains("--speculative-draft-model-path"),
-            );
-            let draft_bytes = draft_dir.map_or(0, |p| {
-                blazar_core::hfmeta::root_safetensors_bytes(std::path::Path::new(p)).unwrap_or_else(
-                    || {
-                        tracing::warn!(
-                            draft = p,
-                            "sglang draft dir unreadable at admission - charging dense-only"
-                        );
-                        0
-                    },
-                )
-            });
-            // Same spec-chain reserve the compile-side ladder deducts
-            // (verify graphs + prewarm sampling live in the dynamic
-            // pool); charged here as spawn demand so the gate agrees
-            // with what actually launches.
-            let reserve_bytes = u64::from(spec_engaged).saturating_mul(
-                blazar_core::profile::SGLANG_SPEC_DYNAMIC_RESERVE_MIB * 1024 * 1024,
-            );
-            let standing = blazar_core::profile::admission_floor_bytes(row_weights, mmproj_bytes)
-                .saturating_add(draft_bytes)
-                .saturating_add(reserve_bytes);
-            let largest_budget = self
-                .admission_candidates(name)
-                .iter()
-                .filter_map(|c| self.device_budget_bytes(c))
-                .max()
-                .unwrap_or(0);
-            // Live-RAM clamp shared with the compile-side ladder
-            // (sglang_clamp_offload_to_live_ram): a pin sized against
-            // total RAM would trip the J3 host floor at spawn. Clamp
-            // the pin to what the kernel can actually allocate so the
-            // guard and the argv agree on one number.
-            let cpu_offload_gb = tun_probe.cpu_offload_gb.map(|pin| {
-                let requested_whole = pin.ceil();
-                let clamped = blazar_core::profile::sglang_clamp_offload_to_live_ram(
-                    requested_whole,
-                    row_weights,
-                    crate::probe::mem_available_mib(),
+        let (incoming_bytes, sglang_offload_bytes, j3_draft_bytes, paged_host_pinned_bytes) =
+            if sglang_lane {
+                let manifest = engine.capabilities();
+                let (draft_dir, spec_engaged) = sglang_engaged_draft(
+                    &tun_probe,
+                    draft_path.as_deref(),
+                    manifest.flags.contains("--speculative-algorithm"),
+                    manifest.flags.contains("--speculative-draft-model-path"),
                 );
-                if clamped + 1e-3 < requested_whole {
-                    tracing::warn!(
-                        "sglang cpu_offload_gb {pin} reduced to {clamped} - \
+                let draft_bytes = draft_dir.map_or(0, |p| {
+                    blazar_core::hfmeta::root_safetensors_bytes(std::path::Path::new(p))
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                draft = p,
+                                "sglang draft dir unreadable at admission - charging dense-only"
+                            );
+                            0
+                        })
+                });
+                // Same spec-chain reserve the compile-side ladder deducts
+                // (verify graphs + prewarm sampling live in the dynamic
+                // pool); charged here as spawn demand so the gate agrees
+                // with what actually launches.
+                let reserve_bytes = u64::from(spec_engaged).saturating_mul(
+                    blazar_core::profile::SGLANG_SPEC_DYNAMIC_RESERVE_MIB * 1024 * 1024,
+                );
+                let standing =
+                    blazar_core::profile::admission_floor_bytes(row_weights, mmproj_bytes)
+                        .saturating_add(draft_bytes)
+                        .saturating_add(reserve_bytes);
+                let largest_budget = self
+                    .admission_candidates(name)
+                    .iter()
+                    .filter_map(|c| self.device_budget_bytes(c))
+                    .max()
+                    .unwrap_or(0);
+                // Live-RAM clamp shared with the compile-side ladder
+                // (sglang_clamp_offload_to_live_ram): a pin sized against
+                // total RAM would trip the J3 host floor at spawn. Clamp
+                // the pin to what the kernel can actually allocate so the
+                // guard and the argv agree on one number.
+                let cpu_offload_gb = tun_probe.cpu_offload_gb.map(|pin| {
+                    let requested_whole = pin.ceil();
+                    let clamped = blazar_core::profile::sglang_clamp_offload_to_live_ram(
+                        requested_whole,
+                        row_weights,
+                        crate::probe::mem_available_mib(),
+                    );
+                    if clamped + 1e-3 < requested_whole {
+                        tracing::warn!(
+                            "sglang cpu_offload_gb {pin} reduced to {clamped} - \
                          MemAvailable cannot carry the requested offload; \
                          keeping the spawn viable instead of refusing at the \
                          memory guard"
+                        );
+                    }
+                    clamped
+                });
+                let offload = blazar_core::profile::sglang_effective_offload_bytes(
+                    standing,
+                    largest_budget,
+                    cpu_offload_gb,
+                );
+                // E1 paged-experts mirror, geometry-level only. Admission
+                // itself stays EXACTLY classic: the offload derive above
+                // never refuses these spawns and the fit ladder owns K, so
+                // duplicating the split math here would only diverge. What
+                // the J3 host guard needs is the one number the classic
+                // posture never charges - the page-locked expert store a
+                // paged spawn pins (ALL routed experts, resident K or not).
+                // Engagement: manual `paged_experts = true` (the config
+                // layer already refused the invalid pairings) or the coarse
+                // auto mirror - standing over the full admission budget
+                // implies the tighter ceiling pool the ladder pages on.
+                // False negatives undercharge exactly as pre-feature;
+                // false positives overcharge conservatively.
+                let paged_host_pinned_bytes = {
+                    let geom = blazar_core::hfmeta::moe_geometry(std::path::Path::new(&model.path));
+                    let eligible = geom.is_some()
+                        && manifest.flags.contains("--enable-paged-experts")
+                        && manifest.flags.contains("--paged-experts-num-resident")
+                        && tun_probe.paged_experts != Some(false)
+                        && cpu_offload_gb.is_none_or(|gb| gb == 0.0)
+                        && !spec_engaged
+                        && tun_probe.tp_size.as_ref().is_none_or(|n| *n <= 1)
+                        && geom.as_ref().is_none_or(|g| {
+                            g.quant_method.as_deref().is_none_or(|m| {
+                                blazar_core::profile::SGLANG_PAGED_QUANT_METHODS.contains(&m)
+                            })
+                        });
+                    if eligible
+                        && (tun_probe.paged_experts == Some(true) || standing > largest_budget)
+                    {
+                        geom.map_or(0, |g| g.expert_weights_bytes)
+                    } else {
+                        0
+                    }
+                };
+                (
+                    standing.saturating_sub(offload),
+                    offload,
+                    draft_bytes,
+                    paged_host_pinned_bytes,
+                )
+            } else {
+                // Without this a spec pair is admitted as if it were dense:
+                // live receipt 2026-11-24, a 4B model with a 0.6B draft
+                // settled at 5970 MiB against a 3593 MiB floor.
+                let draft_bytes =
+                    draft_device_bytes(draft_path.as_deref(), &self.cfg().spec_draft_device);
+                if draft_bytes > 0 {
+                    tracing::info!(
+                        model = name,
+                        draft = draft_path.as_deref().unwrap_or_default(),
+                        draft_mib = draft_bytes / (1024 * 1024),
+                        "admission floor includes the speculative draft weights"
                     );
                 }
-                clamped
-            });
-            let offload = blazar_core::profile::sglang_effective_offload_bytes(
-                standing,
-                largest_budget,
-                cpu_offload_gb,
-            );
-            (standing.saturating_sub(offload), offload, draft_bytes)
-        } else {
-            (
-                blazar_core::profile::admission_floor_bytes(row_weights, mmproj_bytes),
-                0,
-                0,
-            )
-        };
+                (
+                    blazar_core::profile::admission_floor_bytes(row_weights, mmproj_bytes)
+                        .saturating_add(draft_bytes),
+                    0,
+                    draft_bytes,
+                    0,
+                )
+            };
         // PD pair atomic admission: the unit being admitted is BOTH
         // roles, not this child (live receipt 2026-11-14: per-role
         // charging let each role pass its solo floor check and the
@@ -6972,11 +7180,32 @@ impl Supervisor {
             });
             let model_mib = u64::try_from(model.bytes.max(0)).unwrap_or(u64::MAX) / (1024 * 1024);
             let offload_mib = sglang_offload_bytes / (1024 * 1024);
-            let need = blazar_core::profile::host_floor_mib(model_mib, offload_mib);
+            let expert_mib = paged_host_pinned_bytes / (1024 * 1024);
+            // Paged spawns charge the HIGHER of the classic and paged
+            // floors: never below the pre-feature floor (the classic
+            // posture may still be what the ladder picks), never blind
+            // to the page-locked store (the pinned bytes persist for
+            // the child's whole life; the dense slice streams).
+            let need = if expert_mib > 0 {
+                blazar_core::profile::host_floor_mib(model_mib, offload_mib).max(
+                    blazar_core::profile::paged_host_floor_mib(model_mib, expert_mib),
+                )
+            } else {
+                blazar_core::profile::host_floor_mib(model_mib, offload_mib)
+            };
             let committed_mib = self.host_committed_bytes() / (1024 * 1024);
             let effective = avail.saturating_sub(committed_mib);
             if effective < need {
-                return Err(SupervisionError::InsufficientMemory(
+                return Err(SupervisionError::InsufficientMemory(if expert_mib > 0 {
+                    Self::paged_host_refusal_teaching(
+                        name,
+                        model_mib,
+                        avail,
+                        committed_mib,
+                        need,
+                        expert_mib,
+                    )
+                } else {
                     Self::host_refusal_teaching(
                         name,
                         model_mib,
@@ -6984,8 +7213,8 @@ impl Supervisor {
                         committed_mib,
                         need,
                         offload_mib,
-                    ),
-                ));
+                    )
+                }));
             }
             // Pressure teach (P1 controller): once the reaper's pressure
             // state machine has armed, new spawns stop adding load while
@@ -7022,13 +7251,52 @@ impl Supervisor {
         // One fresh hardware probe serves both spawn-time decisions: the
         // J3 VRAM preflight and the LC2 auto GPU pick. The boot-time
         // snapshot can be stale (other engines came and went).
-        let wants_pick = self.cfg().effective_devices(name).is_empty()
+        let pick_candidates = self.cfg().effective_devices(name).is_empty()
             && self.hardware.gpus.len() > 1
             && manifest.flags.contains("--device");
+        let env_driven = takes_device_from_env(&manifest.devices);
+        let wants_pick = pick_candidates && !env_driven;
+        if pick_candidates && env_driven {
+            tracing::info!(
+                model = name,
+                "auto GPU pick skipped: this engine takes its device from GGML_OPENVINO_DEVICE, so its census rows are not --device targets"
+            );
+        }
+        // A `--device` token must be a name the ROUTED engine answers to.
+        // The planner census below is the global engine's view: a
+        // census-less lane falls back to system rows carrying vendor
+        // product strings, which llama.cpp aborts with "invalid device".
+        // So ask the routed engine itself, in its serving environment,
+        // and never guess a token for a lane that lists nothing.
+        let routed_devices: Option<Vec<crate::engine::manifest::DeviceDesc>> =
+            if wants_pick && routed_tag.is_some() {
+                match engine.enumerate_devices().await {
+                    Ok(listed) => Some(listed.unwrap_or_default()),
+                    Err(err) => {
+                        tracing::info!(
+                            model = name,
+                            error = %err,
+                            "auto GPU pick skipped: the routed engine device listing failed"
+                        );
+                        Some(Vec::new())
+                    }
+                }
+            } else {
+                None
+            };
         let fresh = if self.cfg().spawn_mem_guard && self.hardware.has_gpu() || wants_pick {
             Some(self.live_hardware())
         } else {
             None
+        };
+        // The settle report is a free-VRAM delta, so its baseline must
+        // come from the same census as the after-snapshot: the routed
+        // engine's. The planner snapshot above is taken with the daemon's
+        // global engine, which can name the cards differently.
+        let settle_base = match &fresh {
+            Some(pre) if self.engine.kind() == engine.kind() => Some(pre.clone()),
+            Some(_) => Some(Self::live_hardware_with(&engine)),
+            None => None,
         };
         // Spawn-time VRAM preflight (J3): warn when even the weights
         // the spawn keeps ON the GPU exceed free VRAM - for the sglang
@@ -7212,7 +7480,16 @@ impl Supervisor {
         // Spanning spawns cover every card by construction - a single
         // -card pick would scope every downstream estimate wrongly.
         if wants_pick && !spanning {
-            let hw = fresh.as_ref().unwrap_or(&self.hardware);
+            let system_hw = fresh.as_ref().unwrap_or(&self.hardware);
+            let routed_pool = routed_devices.as_ref().map(|listed| {
+                let mut pool = system_hw.clone();
+                pool.gpus = accelerator_rows(listed)
+                    .into_iter()
+                    .filter(|g| g.total_mib > 0)
+                    .collect();
+                pool
+            });
+            let hw = routed_pool.as_ref().unwrap_or(system_hw);
             if let Some((idx, skipped_integrated)) = pick_gpu(&hw.gpus) {
                 let best = &hw.gpus[idx];
                 let mut scoped = hw.clone();
@@ -7247,6 +7524,11 @@ impl Supervisor {
                         "integrated GPU {igpu} reported more free memory but was skipped (shared-RAM bandwidth); pin it explicitly with `devices` if intended"
                     );
                 }
+            } else if routed_devices.is_some() {
+                tracing::info!(
+                    model = name,
+                    "auto GPU pick skipped: the routed engine lists no accelerator of its own"
+                );
             }
         }
         // sdcpp placement vocabulary: sd-server has no --device flag -
@@ -7910,7 +8192,7 @@ impl Supervisor {
                     // number, the bytes admission charges the
                     // weights-sum floor (the same pre-settle state that
                     // exists today).
-                    if let Some(pre) = fresh {
+                    if let Some(pre) = settle_base {
                         // Census with the spawn's (routed) engine: the
                         // settle report must probe the lane that actually
                         // serves, not the daemon's global one.
@@ -7946,6 +8228,11 @@ impl Supervisor {
                                         "card is over 95% committed after this load - expect KV pressure; consider kv quantization, a smaller quant (blazar fit), or freeing co-resident engines (blazar ps)"
                                     );
                                 }
+                            } else {
+                                tracing::warn!(
+                                    model = %model_name,
+                                    "spawn settle skipped: no card of the pre-spawn census matches the post-load one - admission keeps charging this child its weights floor"
+                                );
                             }
                         });
                     }
@@ -11294,6 +11581,23 @@ drop them from rpc_servers in config.toml",
             .unwrap_or(4)
     }
 
+    /// In-flight ceiling for the gateway's admission gate. The gate parks
+    /// a request before routing it, so a model configured with `replicas`
+    /// children must be admitted up to `replicas x slot_cap`: with a
+    /// per-child ceiling the requests that would have reached the second
+    /// child never leave the queue.
+    #[must_use]
+    pub fn admission_ceiling(&self, model: &str) -> i64 {
+        let model = model_of_key(model);
+        let replicas = self
+            .cfg()
+            .overlay_for(model)
+            .replicas
+            .unwrap_or(1)
+            .clamp(1, MAX_REPLICAS);
+        self.slot_cap(model).saturating_mul(i64::from(replicas))
+    }
+
     /// Effective `deterministic_isolate` for a model (per-model override
     /// wins, else the global knob). The gateway consults this before
     /// deciding whether a temp-0 + seeded request takes the child
@@ -11451,6 +11755,18 @@ drop them from rpc_servers in config.toml",
     #[must_use]
     pub fn effective_config_for(&self, model: &str) -> Option<EffectiveCfgSnapshot> {
         self.effective_cfg.get(model).map(|s| s.clone())
+    }
+
+    /// Prompt limit (tokens) of the instance serving `model`: its live
+    /// slot ctx adjusted for the child's KV layout (`prompt_ctx_for`).
+    /// `None` while no compiled instance serves the model.
+    #[must_use]
+    pub fn prompt_ctx(&self, model: &str) -> Option<u32> {
+        self.instances.iter().find_map(|entry| {
+            let instance = entry.value();
+            (display_name_of_key(&instance.name) == model && instance.profile_ctx > 0)
+                .then(|| prompt_ctx_for(&instance.argv, instance.profile_ctx))
+        })
     }
 
     /// ps rows for CLI/API.
@@ -11891,6 +12207,23 @@ mod routing_tests {
     use super::*;
     use crate::engine::manifest::Manifest;
     use blazar_core::{GpuInfo, ModelOverride, Profile};
+
+    #[test]
+    fn unit__draft_device_bytes__charges_the_file_only_when_it_sits_on_a_device() {
+        // The draft is a second set of weights on the GPU; admission
+        // charges its file unless it is pinned off the GPU or missing.
+        let tmp = tempfile::tempdir().unwrap();
+        let draft = tmp.path().join("draft.gguf");
+        std::fs::write(&draft, vec![0u8; 4096]).unwrap();
+        let path = draft.to_string_lossy().into_owned();
+        assert_eq!(draft_device_bytes(Some(&path), ""), 4096);
+        assert_eq!(draft_device_bytes(Some(&path), "cuda:1"), 4096);
+        assert_eq!(draft_device_bytes(Some(&path), " CPU "), 0);
+        assert_eq!(draft_device_bytes(None, ""), 0);
+        let missing = tmp.path().join("absent.gguf");
+        let missing = missing.to_string_lossy().into_owned();
+        assert_eq!(draft_device_bytes(Some(&missing), ""), 0);
+    }
 
     #[test]
     fn unit__pick_draft__lane_aware_and_self_paired() {
@@ -12913,6 +13246,8 @@ mod routing_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         store
             .upsert_model(&row("tower-model", tower_dir.to_str().unwrap(), None))
@@ -12975,6 +13310,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             })
             .unwrap();
         let cfg = Config {
@@ -13118,6 +13455,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             },
             profile_ctx: 8,
             capacity: blazar_core::profile::CapacityStatus::Compiled,
@@ -13513,6 +13852,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             })
             .unwrap();
         // No engines installed: routing stays global/indeterminate -
@@ -13629,6 +13970,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             })
             .unwrap();
         // No engines installed: routing stays global/indeterminate -
@@ -14204,6 +14547,68 @@ mod routing_tests {
         }];
         assert!(pick_sd_backend_device(&cpu_only).is_none());
         assert!(pick_sd_backend_device(&[]).is_none());
+    }
+
+    /// The rows a `--device` pick may draw from: every accelerator the
+    /// engine's census names, with its memory numbers untouched, and no
+    /// CPU entry (llama.cpp rejects `--device CPU` outright).
+    #[test]
+    fn unit__accelerator_rows__cpu_row_is_not_an_accelerator() {
+        let devs = vec![
+            crate::engine::manifest::DeviceDesc {
+                name: "cpu".into(),
+                description: "STUB CPU".into(),
+                total_mib: 64_000,
+                free_mib: 60_000,
+            },
+            crate::engine::manifest::DeviceDesc {
+                name: "CUDA1".into(),
+                description: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                total_mib: 7_807,
+                free_mib: 6_709,
+            },
+        ];
+        let rows = accelerator_rows(&devs);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "CUDA1");
+        assert_eq!(rows[0].description, "NVIDIA GeForce RTX 4070 Laptop GPU");
+        assert_eq!((rows[0].total_mib, rows[0].free_mib), (7_807, 6_709));
+        assert!(accelerator_rows(&[]).is_empty());
+    }
+
+    /// The `OpenVINO` build is the one engine whose device comes from an
+    /// environment variable: its census rows are the menu for that
+    /// variable, not `--device` targets.
+    #[test]
+    fn unit__takes_device_from_env__only_an_all_openvino_census() {
+        let row = |name: &str, description: &str| crate::engine::manifest::DeviceDesc {
+            name: name.into(),
+            description: description.into(),
+            total_mib: 1,
+            free_mib: 1,
+        };
+        let openvino = vec![
+            row(
+                "OPENVINO0",
+                "GGML_OPENVINO_DEVICE=CPU (selected) - stub cpu",
+            ),
+            row("OPENVINO1", "GGML_OPENVINO_DEVICE=GPU - stub gpu"),
+        ];
+        assert!(takes_device_from_env(&openvino));
+        assert!(!takes_device_from_env(&[
+            row("CUDA0", "NVIDIA GeForce RTX 4070 Laptop GPU"),
+            row("CUDA1", "NVIDIA GeForce RTX 4090"),
+        ]));
+        assert!(!takes_device_from_env(&[
+            row("Vulkan0", "stub igpu"),
+            row("Vulkan1", "stub dgpu"),
+        ]));
+        // A mixed census is not that build: its tokens must still be placed.
+        assert!(!takes_device_from_env(&[
+            row("OPENVINO0", "stub"),
+            row("CUDA0", "stub"),
+        ]));
+        assert!(!takes_device_from_env(&[]));
     }
 
     fn dual_gpu_sup() -> (Supervisor, tempfile::TempDir) {
@@ -14802,6 +15207,30 @@ mod routing_tests {
 
     #[tokio::test]
     #[allow(non_snake_case)]
+    async fn unit__paged_host_refusal_teaching__names_the_pinned_expert_store() {
+        // A paged-experts refusal names the page-locked store (the
+        // memory the spawn actually pins) and the knobs that shrink it -
+        // lowering K helps VRAM, not the pinned store, so the honest
+        // levers are the quant, the rollback, and freeing RAM.
+        let t = Supervisor::paged_host_refusal_teaching(
+            "qwen3-30b-a3b",
+            15_500,
+            3_000,
+            500,
+            6_512,
+            7_800,
+        );
+        assert!(t.contains("MemAvailable 3000 MiB"));
+        assert!(t.contains("500 MiB held by resident/in-flight loads"));
+        assert!(t.contains("2500 MiB effective"));
+        assert!(t.contains("6512 MiB floor"));
+        assert!(t.contains("7800 MiB page-locked expert store"));
+        assert!(t.contains("paged_experts = false"));
+        assert!(t.contains("spawn_mem_guard = false"));
+    }
+
+    #[tokio::test]
+    #[allow(non_snake_case)]
     async fn unit__coresidency__counts_resident_by_backend_id_not_label() {
         let mib = |m: u64| m * 1024 * 1024;
         let (sup, _root) = dual_gpu_sup();
@@ -14935,6 +15364,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             },
             profile_ctx: 8,
             capacity: blazar_core::profile::CapacityStatus::Compiled,
@@ -15243,6 +15674,8 @@ mod routing_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         // Dir row with a stale frozen size: planning sees the disk truth.
         let dir_row = row("stale.d", root.display().to_string(), 1024);
@@ -15319,6 +15752,8 @@ mod routing_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         store
             .upsert_model(&row("qwen3-0.6b", "/models/qwen3-0.6b-q4_0.gguf"))
@@ -15765,6 +16200,8 @@ mod routing_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         let overlay = blazar_core::config::ModelOverride::default();
 
@@ -15834,6 +16271,8 @@ mod routing_tests {
             ctx_train: None,
             pulled_at: 0,
             last_used_at: 0,
+
+            license: None,
         };
         sup.capability_pins
             .lock()
@@ -16306,6 +16745,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             })
             .unwrap();
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 2);
@@ -16860,6 +17301,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             })
             .unwrap();
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
@@ -16940,6 +17383,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 0,
                 last_used_at: 0,
+
+                license: None,
             })
             .unwrap();
         let (mut inst, ph) = fake_instance("m", InstanceState::Ready, 0);
@@ -17605,6 +18050,143 @@ mod routing_tests {
         kill_all(&[pa, pb]);
     }
 
+    #[tokio::test]
+    async fn unit__replica_key__full_class_holder__still_takes_the_class() {
+        let sup = routing_sup(3);
+        let (a, pa) = fake_instance("m#1", InstanceState::Ready, 1);
+        let (b, pb) = fake_instance("m#2", InstanceState::Ready, 0);
+        sup.instances.insert("m#1".into(), a);
+        sup.instances.insert("m#2".into(), b);
+        sup.sys_rings
+            .entry("m#1".to_string())
+            .or_default()
+            .push_back(100);
+        // The class holder's one decode slot is taken and a sibling idles,
+        // yet the conversation stays with the warm holder: measured live
+        // on 2026-11-24, the cold sibling's load and uncached prefill cost
+        // more than queueing here.
+        assert_eq!(
+            sup.replica_key(
+                "m",
+                Some(PrefixKey {
+                    sys: 100,
+                    convo: 999
+                })
+            ),
+            "m#1"
+        );
+        kill_all(&[pa, pb]);
+    }
+
+    #[tokio::test]
+    async fn unit__replica_key__full_class_holder__does_not_grow_a_cold_sibling() {
+        let sup = routing_sup(3);
+        let (a, pa) = fake_instance("m#1", InstanceState::Ready, 1);
+        sup.instances.insert("m#1".into(), a);
+        sup.sys_rings
+            .entry("m#1".to_string())
+            .or_default()
+            .push_back(100);
+        assert_eq!(
+            sup.replica_key(
+                "m",
+                Some(PrefixKey {
+                    sys: 100,
+                    convo: 999
+                })
+            ),
+            "m#1"
+        );
+        kill_all(&[pa]);
+    }
+
+    #[tokio::test]
+    async fn unit__replica_key__every_replica_full__joins_the_class_holder() {
+        let sup = routing_sup(2);
+        let (a, pa) = fake_instance("m#1", InstanceState::Ready, 1);
+        let (b, pb) = fake_instance("m#2", InstanceState::Ready, 1);
+        sup.instances.insert("m#1".into(), a);
+        sup.instances.insert("m#2".into(), b);
+        sup.sys_rings
+            .entry("m#1".to_string())
+            .or_default()
+            .push_back(100);
+        assert_eq!(
+            sup.replica_key(
+                "m",
+                Some(PrefixKey {
+                    sys: 100,
+                    convo: 999
+                })
+            ),
+            "m#1"
+        );
+        kill_all(&[pa, pb]);
+    }
+
+    #[tokio::test]
+    async fn unit__replica_key__holder_room_follows_the_child_slot_count() {
+        let sup = routing_sup(2);
+        let (mut a, pa) = fake_instance("m#1", InstanceState::Ready, 1);
+        Arc::get_mut(&mut a).expect("unique instance handle").argv =
+            vec!["llama-server".into(), "-np".into(), "2".into()];
+        let (b, pb) = fake_instance("m#2", InstanceState::Ready, 0);
+        sup.instances.insert("m#1".into(), a);
+        sup.instances.insert("m#2".into(), b);
+        sup.sys_rings
+            .entry("m#1".to_string())
+            .or_default()
+            .push_back(100);
+        // One of two decode slots busy: the warm system prompt still wins.
+        assert_eq!(
+            sup.replica_key(
+                "m",
+                Some(PrefixKey {
+                    sys: 100,
+                    convo: 999
+                })
+            ),
+            "m#1"
+        );
+        kill_all(&[pa, pb]);
+    }
+
+    #[tokio::test]
+    async fn unit__admission_ceiling__single_child_keeps_slot_cap() {
+        let sup = routing_sup(1);
+        assert_eq!(sup.admission_ceiling("m"), sup.slot_cap("m"));
+        kill_all(&[]);
+    }
+
+    #[tokio::test]
+    async fn unit__admission_ceiling__replicas_multiply_the_ceiling() {
+        let sup = routing_sup(2);
+        assert_eq!(sup.admission_ceiling("m"), sup.slot_cap("m") * 2);
+        assert_eq!(sup.admission_ceiling("m#1"), sup.slot_cap("m") * 2);
+        kill_all(&[]);
+    }
+
+    #[test]
+    fn unit__replica_fallback__only_non_base_replicas_fall_back() {
+        assert_eq!(Supervisor::base_replica_key("m#2").as_deref(), Some("m#1"));
+        assert_eq!(Supervisor::base_replica_key("m#1"), None);
+        assert_eq!(Supervisor::base_replica_key("m"), None);
+        for retryable in [
+            SupervisionError::ModelTooLarge("card full".into()),
+            SupervisionError::AllSlotsBusy,
+            SupervisionError::ModelLoadTimeout("m#2".into()),
+        ] {
+            assert!(Supervisor::replica_may_fall_back(&retryable));
+        }
+        for identity in [
+            SupervisionError::ModelNotFound("m".into()),
+            SupervisionError::UnsupportedModel("m".into()),
+            SupervisionError::RpcEndpointsUnreachable("worker".into()),
+        ] {
+            assert!(!Supervisor::replica_may_fall_back(&identity));
+        }
+    }
+
     // ---- LC2 discrete-first auto pick + card-scoped pressure ----------
 
     const MIB: u64 = 1024 * 1024;
@@ -17801,6 +18383,29 @@ mod routing_tests {
         let pre = hw_of(vec![gpu("dg", "NVIDIA A", 8_000, 7_000)]);
         let post = hw_of(Vec::new());
         assert!(settle_report(&pre, &post, Some("dg")).is_none());
+    }
+
+    #[test]
+    fn unit__settle_report__card_missing_from_the_baseline_is_none() {
+        // The baseline comes from one census and the after-snapshot from
+        // another, and the two may name the same card differently (driver
+        // name vs index label). A card the baseline never saw has no
+        // free-VRAM delta: reporting zero would read as "this child holds
+        // no VRAM" and let the capacity gate over-admit.
+        let pre = hw_of(vec![gpu(
+            "NVIDIA GeForce RTX 4070 Laptop GPU",
+            "NVIDIA GeForce RTX 4070 Laptop GPU",
+            8_188,
+            6_000,
+        )]);
+        let post = hw_of(vec![gpu(
+            "CUDA0",
+            "NVIDIA GeForce RTX 4070 Laptop GPU",
+            8_188,
+            1_000,
+        )]);
+        assert!(settle_report(&pre, &post, Some("CUDA0")).is_none());
+        assert!(settle_report(&pre, &post, None).is_none());
     }
 
     #[test]
@@ -18956,6 +19561,8 @@ mod routing_tests {
                 ctx_train: None,
                 pulled_at: 1,
                 last_used_at: 1,
+
+                license: None,
             })
             .expect("model row");
         drop(store);
@@ -19050,5 +19657,51 @@ mod spawn_failure_tests {
             .to_string();
         assert!(msg.contains("load cancelled"), "{msg}");
         assert!(msg.contains("(from m1)"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+mod prompt_ctx_tests {
+    use super::{argv_flag_u32, prompt_ctx_for};
+
+    fn argv(flags: impl IntoIterator<Item = &'static str>) -> Vec<String> {
+        flags.into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn unit__prompt_ctx_for__per_slot_children_keep_the_slot_ctx() {
+        let split = argv(["-m", "x.gguf", "-c", "32768", "-np", "2"]);
+        assert_eq!(prompt_ctx_for(&split, 16384), 16384);
+        // The explicit opt-out flag is not the unified layout.
+        let opted_out = argv(["-c", "32768", "--no-kv-unified"]);
+        assert_eq!(prompt_ctx_for(&opted_out, 16384), 16384);
+    }
+
+    #[test]
+    fn unit__prompt_ctx_for__unified_children_bound_a_prompt_by_the_pool() {
+        let unified = argv(["--ctx-size", "32768", "-np", "2", "--kv-unified"]);
+        assert_eq!(prompt_ctx_for(&unified, 16384), 32768);
+        let short_form = argv(["-c", "8192", "--kv-unified"]);
+        assert_eq!(prompt_ctx_for(&short_form, 4096), 8192);
+    }
+
+    #[test]
+    fn unit__prompt_ctx_for__per_slot_cap_and_unusable_pool_values() {
+        let capped = argv([
+            "--ctx-size",
+            "65536",
+            "--kv-unified",
+            "--kv-unified-per-slot",
+            "16384",
+        ]);
+        assert_eq!(prompt_ctx_for(&capped, 16384), 16384);
+        // A pool value that names nothing falls back to the compiled ctx.
+        let unusable = argv(["--ctx-size", "0", "--kv-unified"]);
+        assert_eq!(prompt_ctx_for(&unusable, 16384), 16384);
+        let unparsed = argv(["-c", "abc", "--kv-unified"]);
+        assert_eq!(prompt_ctx_for(&unparsed, 16384), 16384);
+        assert_eq!(argv_flag_u32(&argv(["-np", "4"]), "-np"), Some(4));
+        assert_eq!(argv_flag_u32(&argv(["--parallel", "2"]), "-np"), None);
     }
 }

@@ -46,6 +46,10 @@ pkg-fmt = "zip"
 [features]
 default = []
 test-util = []
+# Opt-in allocator swap for the binary (`--features mimalloc`). Off by
+# default so the default build carries no C build dependency; the swap is
+# meant to be adopted per deployment on the strength of a measured receipt.
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 blazar-core = { workspace = true }
@@ -73,6 +77,9 @@ libc = { workspace = true }
 
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+# optional: pulled in by the `mimalloc` feature only
+mimalloc = { version = "0.1.52", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"
