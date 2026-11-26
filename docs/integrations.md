@@ -1,20 +1,21 @@
 ---
 layout: doc
 title: Integrations
-description: Point any OpenAI, Ollama, or Anthropic client at Blazar - and let blazar connect wire Codex, Claude Code, Continue, Cline, and Open WebUI for you.
+description: Point any OpenAI, Ollama, Anthropic, or Gemini client at Blazar - and let blazar connect wire Codex, Claude Code, Continue, Cline, and Open WebUI for you.
 doc_kind: Documentation
 ---
-## Three API dialects, one endpoint
+## Four API dialects, one endpoint
 
 The gateway listens on `http://127.0.0.1:11435` and speaks the OpenAI,
-Ollama, and Anthropic wire protocols natively. Most clients need nothing but
-a base-URL change:
+Ollama, Anthropic, and (behind a flag) Gemini wire protocols natively. Most
+clients need nothing but a base-URL change:
 
 | Client family | Point it at | Surface |
 |---|---|---|
 | **OpenAI SDK** | `http://127.0.0.1:11435/v1` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/batches`, `/v1/files`, `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*` |
 | **Ollama clients** | `OLLAMA_HOST=http://127.0.0.1:11435` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/embeddings`, `/api/embed`, `/api/rerank` |
 | **Anthropic SDK** | `http://127.0.0.1:11435` | `/v1/messages`, `/v1/messages/batches` |
+| **Gemini clients** | `http://127.0.0.1:11435` | `POST /v1beta/models/{model}:generateContent` and `:streamGenerateContent` (flag-gated lane - see SETUP) |
 | **Blazar Python SDK** | `BLAZAR_URL=http://127.0.0.1:11435` | chat + streaming + `best_of`/`mcp` tools, `ps`, `explain`, `failover` - zero dependencies (`sdk/python`) |
 
 Blazar-only surfaces any dialect client can still reach: `/v1/realtime`
