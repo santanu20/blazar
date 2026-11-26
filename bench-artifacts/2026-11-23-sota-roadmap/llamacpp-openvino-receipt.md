@@ -51,7 +51,7 @@ The listing reports the CPU with the host RAM as device memory and the NVIDIA ca
   `error while handling argument "--list-devices": Exception from src/inference/src/cpp/core.cpp:312:`
   `Exception from src/inference/src/dev/plugin.cpp:94:`
 - `GGML_OPENVINO_DEVICE=NPU`: exit by signal 6 --
-  `/home/runner/work/llama.cpp/llama.cpp/ggml/src/ggml-openvino/ggml-openvino-extra.cpp:98: GGML OpenVINO Backend: GGML_OPENVINO_DEVICE=NPU is not available. Set it to one of the available OpenVINO devices:`
+  `<upstream-build>/ggml/src/ggml-openvino/ggml-openvino-extra.cpp:98: GGML OpenVINO Backend: GGML_OPENVINO_DEVICE=NPU is not available. Set it to one of the available OpenVINO devices:`
   `  CPU: Intel(R) Core(TM) i7-14650HX`
   `  GPU: NVIDIA GeForce RTX 4070 Laptop GPU (dGPU)`
 
