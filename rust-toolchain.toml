@@ -1,9 +1,14 @@
 [toolchain]
-# Pinned to the known-good stable the edition-2024 migration was validated
-# on (suite 1786/1786). CI intentionally runs @stable as the forward-drift
-# canary; bump this pin deliberately when adopting a new stable. The hard
-# floor for older toolchains is rust-version = "1.95" in Cargo.toml
-# (sysinfo 0.39 requirement).
+# Pinned to a known-good stable: the edition-2024 migration was validated on
+# it and the full suite passes on it. This file is the one toolchain
+# everything runs on - a checkout's rust-toolchain.toml outranks the default
+# toolchain rustup sets, so CI, the release builds and a local `cargo` all
+# use this exact release (the workflows' `toolchain: stable` inputs install a
+# stable toolchain that this file then overrides). Drift against the current
+# stable is reported, never gated, by the stable-canary job in ci.yml; bump
+# this pin deliberately when adopting a new stable. The hard floor for older
+# toolchains is rust-version = "1.95" in Cargo.toml (sysinfo 0.39
+# requirement).
 channel = "1.98.1"
 # Ride the pin: without these, a rustup-resolved pinned toolchain has no
 # rustfmt/clippy (the CI action installs components under `stable`), and
