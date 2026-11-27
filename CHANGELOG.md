@@ -42,6 +42,10 @@ tracked here.
 
 ### Changed
 
+- **The toolchain pin moves to 1.100.0.** `rust-toolchain.toml` now pins the
+  current stable, adopted after the 1.100 clippy lints; the stable canary goes
+  back to green and an existing target directory recompiles once under the new
+  toolchain.
 - **The toolchain pin is the whole story.** `rust-toolchain.toml` is what CI and the release builds actually run (a checkout's pin outranks the default toolchain the CI action sets); its header and `docs/7.SETUP.md` now say so instead of calling CI a stable canary.
 - **A non-blocking stable canary job.** `ci.yml` runs the fmt, clippy and test gates on the current stable with `cargo +stable` and lets that job fail without failing the run, so toolchain drift is visible on every run instead of arriving all at once when the pin is bumped.
 - **Text files check out with LF on every platform.** A root `.gitattributes` sets `* text=auto eol=lf` (and marks the two image assets binary), so a Windows checkout with `core.autocrlf` can no longer turn tracked docs and scripts into CRLF behind tests that compare them line for line. The index was already 100% LF, so the policy renormalizes nothing.
