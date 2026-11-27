@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,7 +104,18 @@ pub async fn start(config: Config) -> TestServer {
 /// `start` with extra env stamped onto every spawned stub child - the
 /// sentinel suite's `engine.child_env` pattern, factored for tests that
 /// need marker modes (`STUB_TOOL_CALL`, `STUB_EMPTY`, ...).
-pub async fn start_env(config: Config, stub_env: &[(&str, &str)]) -> TestServer {
+///
+/// Returns a pinned box: the spawn sequence inside is large enough to push
+/// every caller past clippy's 16 KiB `large_futures` line on Windows, and
+/// boxing here keeps all callers unchanged.
+pub fn start_env<'a>(
+    config: Config,
+    stub_env: &'a [(&'a str, &'a str)],
+) -> Pin<Box<dyn Future<Output = TestServer> + Send + 'a>> {
+    Box::pin(start_env_inner(config, stub_env))
+}
+
+async fn start_env_inner(config: Config, stub_env: &[(&str, &str)]) -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let dirs = BlazarDirs {
         config_dir: tmp.path().join("c"),

@@ -63,9 +63,9 @@ os.environ.setdefault("BLAZAR_VALIDATE_MEM_FLOOR_MIB", "2048")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
 sys.path.insert(0, str(REPO / "scripts"))
-import validate as V  # noqa: E402
-import bench_saturation as BS  # noqa: E402
 import bench_charts as BC  # noqa: E402
+import bench_saturation as BS  # noqa: E402
+import validate as V  # noqa: E402
 
 OLLAMA_BASE = os.environ.get("M1_OLLAMA_BASE", "http://127.0.0.1:11434")
 OLLAMA_MODEL = "qwen2.5:0.5b"
@@ -128,6 +128,7 @@ def gpu_snapshot() -> dict | None:
             ],
             capture_output=True,
             text=True,
+            check=False,
             timeout=10,
         )
         if out.returncode != 0:
@@ -285,17 +286,15 @@ class Jsonl:
     def __init__(self, lane: str) -> None:
         RAW_DIR.mkdir(parents=True, exist_ok=True)
         self.path = RAW_DIR / f"{lane}.jsonl"
-        self._fh = open(self.path, "a", encoding="utf-8")
         self._lock = threading.Lock()
 
     def write(self, rec: dict) -> None:
         rec.setdefault("ts", now_iso())
-        with self._lock:
-            self._fh.write(json.dumps(rec, sort_keys=True) + "\n")
-            self._fh.flush()
-
-    def close(self) -> None:
-        self._fh.close()
+        line = json.dumps(rec, sort_keys=True) + "\n"
+        # One append per record: every observation lands on disk as it is
+        # taken, so a lane that dies mid-run keeps everything before it.
+        with self._lock, open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(line)
 
 
 # ------------------------------------------------------------ perf prompts
@@ -473,6 +472,7 @@ def lane_pilot() -> int:
             cwd=REPO,
             capture_output=True,
             text=True,
+            check=False,
             timeout=10,
         )
         env["worktree_head"] = head.stdout.strip()
@@ -482,6 +482,7 @@ def lane_pilot() -> int:
                 cwd=REPO,
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=30,
             ).stdout.strip()
         )
@@ -493,7 +494,10 @@ def lane_pilot() -> int:
             os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1048576
         ),
         "available": int(
-            open("/proc/meminfo").read().split("MemAvailable:")[1].split()[0]
+            Path("/proc/meminfo")
+            .read_text()
+            .split("MemAvailable:")[1]
+            .split()[0]
         )
         / 1024,
     }
@@ -572,6 +576,7 @@ def lane_pilot() -> int:
                 [str(BLAZAR_BIN), "engine", "list"],
                 capture_output=True,
                 text=True,
+                check=False,
                 timeout=60,
                 env=sb_env,
             )
@@ -582,7 +587,6 @@ def lane_pilot() -> int:
         log.write(env2)
     finally:
         lane.stop()
-    log.close()
     return 0 if dialect.get("ok") else 3
 
 
@@ -602,7 +606,6 @@ def lane_warm() -> int:
                 drive_level(BLZ_BASE, MODEL_FULL, "blazar", mode, c, N_PER_LEVEL, log)
     finally:
         lane.stop()
-    log.close()
     return 0
 
 
@@ -688,14 +691,13 @@ def lane_cold() -> int:
         log.write({"type": "cold_request", "product": "blazar", **out})
     finally:
         lane.stop()
-    log.close()
     return 0
 
 
 def lane_overhead() -> int:
     log = Jsonl("overhead")
     print(
-        "overhead lane: blazar gateway vs matched direct child (C=1, N=%d)" % OVERHEAD_N
+        f"overhead lane: blazar gateway vs matched direct child (C=1, N={OVERHEAD_N})"
     )
     lane = BlazarLane()
     direct_proc = None
@@ -748,7 +750,9 @@ def lane_overhead() -> int:
         lane.stop()
         time.sleep(2.0)
 
-        direct_log = open(RAW_DIR / "direct_child.log", "w")
+        # The handle is the direct child's stdout and must outlive this block:
+        # the finally below closes it once the child is gone.
+        direct_log = open(RAW_DIR / "direct_child.log", "w")  # noqa: SIM115
         direct_proc = subprocess.Popen(
             dargv, stdout=direct_log, stderr=subprocess.STDOUT, env=env, cwd=str(REPO)
         )
@@ -783,8 +787,7 @@ def lane_overhead() -> int:
             )
         log.write({"type": "gpu", "phase": "after", "snap": gpu_snapshot()})
         print(
-            "  overhead legs done (gateway, then direct alone, %d requests each)"
-            % OVERHEAD_N
+            f"  overhead legs done (gateway, then direct alone, {OVERHEAD_N} requests each)"
         )
     finally:
         if direct_proc is not None:
@@ -797,14 +800,13 @@ def lane_overhead() -> int:
         if direct_log is not None:
             direct_log.close()
         lane.stop()
-    log.close()
     return 0
 
 
 def lane_quality() -> int:
     log = Jsonl("quality")
     print(
-        "quality lane: %d-prompt temp-0 battery, both products" % len(QUALITY_BATTERY)
+        f"quality lane: {len(QUALITY_BATTERY)}-prompt temp-0 battery, both products"
     )
     print("  ollama ...")
     for i, prompt in enumerate(QUALITY_BATTERY):
@@ -846,7 +848,6 @@ def lane_quality() -> int:
             )
     finally:
         lane.stop()
-    log.close()
     return 0
 
 
@@ -979,7 +980,9 @@ def summarize_quality(recs: list[dict]) -> dict:
         if not a and not b:
             tok_agree.append(1.0)
             continue
-        common = sum(1 for x, y in zip(a, b) if x == y)
+        # The two answers tokenize to different lengths: compare positionally
+        # up to the shorter one; the denominator below is the longer.
+        common = sum(1 for x, y in zip(a, b, strict=False) if x == y)
         tok_agree.append(common / max(len(a), len(b)))
     return {
         "prompts": len(pairs),
@@ -1006,7 +1009,6 @@ def lane_receipt() -> int:
     cold = load_lane("cold")
     overhead = load_lane("overhead")
     quality = load_lane("quality")
-    pilot = load_lane("pilot")
     env = {}
     env_path = RAW_DIR / "m1_env.json"
     if env_path.exists():
@@ -1083,13 +1085,13 @@ def lane_receipt() -> int:
     ]
     with open(ARTIFACT_DIR / "m1-warm-ladder.csv", "w", newline="") as f:
         f.write(",".join(cols) + "\n")
-        for row in warm_rows:
-            f.write(
-                ",".join(
-                    str(row.get(c) if row.get(c) is not None else "") for c in cols
-                )
-                + "\n"
+        f.writelines(
+            ",".join(
+                str(row.get(c) if row.get(c) is not None else "") for c in cols
             )
+            + "\n"
+            for row in warm_rows
+        )
 
     # Charts (deterministic house SVG).
     charts_dir = ARTIFACT_DIR / "m1-charts"
@@ -1151,8 +1153,7 @@ def lane_receipt() -> int:
         (charts_dir / "m1-overhead-us.svg").write_text(
             BC.hbar_svg(
                 "Blazar per-request gateway overhead (C=1, non-stream, max_tokens=16)",
-                "wall-latency delta vs matched direct child, N=%d"
-                % overhead_sum["pairs"],
+                f"wall-latency delta vs matched direct child, N={overhead_sum['pairs']}",
                 rows,
                 "us",
                 footnote="positive = gateway costs that many microseconds",
@@ -1287,7 +1288,7 @@ def lane_receipt() -> int:
     md3 = "python3 m1_head_to_head.py --lane quality && python3 m1_head_to_head.py --lane receipt\n"
     md.append(md3)
     md.append("```\n")
-    md.append("Raw JSONL (every request incl. failures): `{}`.\n".format(str(RAW_DIR)))
+    md.append(f"Raw JSONL (every request incl. failures): `{RAW_DIR!s}`.\n")
 
     (ARTIFACT_DIR / "m1-ollama-head-to-head-receipt.md").write_text(
         "\n".join(part.rstrip("\n") for part in md) + "\n"

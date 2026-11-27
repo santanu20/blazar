@@ -479,7 +479,7 @@ mod plan_tests {
 
     use super::{
         HOST_LIBC, InstallPlan, MLX_CUDA_NVCC_PIN, MLX_CUDA_PIN, MLX_CUDA_RUNTIME_PIN, MlxBackend,
-        glibc_version, install_plan, parse_glibc_version,
+        install_plan, parse_glibc_version,
     };
 
     fn refusal(plan: Result<InstallPlan>) -> String {
@@ -567,7 +567,7 @@ mod plan_tests {
     #[test]
     fn unit__glibc_version__reads_this_host() {
         let (major, minor) =
-            glibc_version().expect("getconf GNU_LIBC_VERSION answers on a glibc host");
+            super::glibc_version().expect("getconf GNU_LIBC_VERSION answers on a glibc host");
         assert!(major >= 2, "read glibc {major}.{minor}");
     }
 }

@@ -130,10 +130,15 @@ static FILE_REOPENED: AtomicU64 = AtomicU64::new(0);
 /// Set by the first file-arm failure of an incident, cleared by the
 /// next successful write: one marker per incident, not one per line.
 static FILE_FAIL_WARNED: AtomicBool = AtomicBool::new(false);
+/// Only the inode compare below reads this, and that check is unix-only.
+#[cfg(unix)]
 static REOPEN_FAIL_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// The live file arm, so the daemon's health tick can swap the handle
 /// when the path on disk no longer names the file being written.
+/// The fields are read only by that unix-only swap; other platforms still
+/// arm the sink so `file_sink_armed` keeps reporting it.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct FileSink {
     path: PathBuf,
     file: Arc<Mutex<std::fs::File>>,
@@ -196,7 +201,8 @@ pub fn file_sink_armed() -> bool {
 /// file the daemon holds (rotated, replaced, deleted by something else
 /// while the daemon kept writing to the old inode). Returns true when
 /// the handle was swapped. Unix compares inode numbers; elsewhere the
-/// check is a no-op.
+/// check is a no-op that exists so callers compile unchanged everywhere.
+#[cfg_attr(not(unix), allow(clippy::must_use_candidate))]
 pub fn reopen_file_if_replaced() -> bool {
     #[cfg(unix)]
     {

@@ -1998,7 +1998,7 @@ with tempfile.TemporaryDirectory() as td:
     _cold_md = bm.coldstart_table([_oc_warm])
     assert "page cache not dropped" in _cold_md, "cold table names the warm load"
     assert "daemon left warm" in _cold_md, "cold table names the warm daemon"
-    _idle_row = [
+    _idle_row = next(
         line
         for line in bm.idle_wake_table(
             [
@@ -2011,7 +2011,7 @@ with tempfile.TemporaryDirectory() as td:
             ]
         ).splitlines()
         if "ollama -" in line
-    ][0]
+    )
     assert "page cache not dropped" in _idle_row, "idle table carries the caveat"
     _ex_warm = "\n".join(
         bm.executive_summary([rec("blazar", {}, cold_ttft_ms=1800.0), _oc_warm])
