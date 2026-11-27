@@ -5371,6 +5371,8 @@ impl Supervisor {
         let path = self.dirs.run_dir().join(format!("{key}.apikey"));
         std::fs::write(&path, &secret)
             .map_err(|e| SupervisionError::Internal(anyhow!("write {}: {e}", path.display())))?;
+        // Owner-only bits are a unix concept; elsewhere the file keeps the
+        // ACL it inherited from the run directory.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

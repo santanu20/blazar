@@ -94,6 +94,10 @@ tracked here.
 - **`url` is updated to 2.5.9** (RUSTSEC-2026-0592): `Url::origin()` could overflow the stack on nested `blob:` URLs. The advisory was failing `cargo audit`, which is clean again; `form_urlencoded` moves to 1.2.3 as its requirement.
 - **The process-group RSS test only runs where `/proc` exists.** `pgid_rss_mib` answers `None` off Linux by design, but its test read `/proc/self/stat` unconditionally, so the workspace tests failed on macOS and Windows; the Linux assertion is now gated and a non-Linux test pins the `None` contract.
 
+- **Windows imports install the file.** `blazar import` linked the model only on unix: the link sat behind a unix-only `cfg` with no other-platform branch, so on Windows it wrote a row over a file that never existed and still printed "zero extra disk used". The install helper now reports kept, linked or copied on every platform (unix keeps the hard link and its symlink fallback; elsewhere a refused hard link falls back to a copy and says so), and the zero-disk line prints only when nothing was copied, which also stops it from lying under `--copy`.
+- **Platform-gated hardening no longer vanishes silently.** An audit of every unix-only `cfg` site in product code: the registry signing-key permission gate now says on other platforms that the key went unchecked (naming the file and the ACL that stands in for the check) instead of passing in silence; the config-dir and api-key owner-only permission bits carry a note that Windows leans on the ACLs those directories hand down; and the generation REPLs print under their banner that Ctrl-C exits there, because the Ctrl-C nudge handler is unix-only.
+- **CI is green on every platform again.** The Windows and macOS clippy jobs flagged a unix-only telemetry static and a Linux-only test import, and behind that the Windows test run had never been seen: the doc-table test read a CRLF checkout byte for byte, and the TLS stream tests timed a cold engine spawn inside their first-chunk window (0.7 s on Linux, 1.27 s on Windows, against a 1200 ms bound). Each is fixed at its cause; no assertion was loosened.
+
 ## [0.34.3] - 2026-11-21
 
 ### Fixed

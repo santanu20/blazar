@@ -103,7 +103,9 @@ impl BlazarDirs {
         // The config dir holds the persisted `[[keys]]` bearer secrets:
         // pin it owner-only so a permissive umask or a pre-existing
         // loose mode never exposes them to other local users (BLZ-4).
-        // Runs on every boot, so old installs heal on upgrade.
+        // Runs on every boot, so old installs heal on upgrade. No mode
+        // bits off unix: Windows leans on the ACLs the profile directory
+        // hands down to everything created under it.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

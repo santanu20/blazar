@@ -20033,8 +20033,16 @@ extern "C" fn stash_sigint(_sig: libc::c_int) {
     STREAM_INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The sigaction nudge handler below is unix-only. Off unix there is
+/// nothing to install, so Ctrl-C keeps its default disposition and ends
+/// the process; the generation loops print this line under their banner
+/// instead of promising a nudge they cannot deliver.
+#[cfg(not(unix))]
+const REPL_CTRL_C_NOTE: &str = "note: Ctrl-C exits this session (the Ctrl-C nudge is unix-only)";
+
 /// Install the REPL's SIGINT flag-handler, remembering the previous
-/// disposition so REPL exit restores the process-wide state.
+/// disposition so REPL exit restores the process-wide state. Off unix the
+/// loops print `REPL_CTRL_C_NOTE` instead and Ctrl-C keeps its default exit.
 #[cfg(unix)]
 #[allow(unsafe_code)] // one-time signal install; no pointers escape
 fn install_repl_sigint() {
@@ -20399,6 +20407,8 @@ async fn run_repl(model: &str, no_draft: bool, priority: Option<&str>) -> Result
         "blazar REPL - {model} {} - /help for commands",
         repl_lane_suffix(&model)?
     );
+    #[cfg(not(unix))]
+    println!("{REPL_CTRL_C_NOTE}");
     if let Some(p) = priority {
         println!("queue priority: {p} (session-wide, via --intent)");
     }
@@ -20748,6 +20758,8 @@ async fn image_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar image REPL - {model} (a prompt generates; /help; /exit)");
+    #[cfg(not(unix))]
+    println!("{REPL_CTRL_C_NOTE}");
     while let Some(line) = gen_line(&mut rl, "img> ") {
         if line.is_empty() {
             continue;
@@ -21008,6 +21020,8 @@ async fn video_repl(base: &str, model: &str, inline: Option<&str>) -> Result<()>
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar video REPL - {model} (a prompt renders a clip; /help; /exit)");
+    #[cfg(not(unix))]
+    println!("{REPL_CTRL_C_NOTE}");
     while let Some(line) = gen_line(&mut rl, "vid> ") {
         if line.is_empty() {
             continue;
@@ -21171,6 +21185,8 @@ async fn tts_repl(base: &str, voice: &str, inline: Option<&str>) -> Result<()> {
     #[cfg(unix)]
     install_repl_sigint();
     println!("blazar speech REPL - {voice} (a line writes a WAV; /help; /exit)");
+    #[cfg(not(unix))]
+    println!("{REPL_CTRL_C_NOTE}");
     while let Some(line) = gen_line(&mut rl, "tts> ") {
         if line.is_empty() {
             continue;
@@ -26429,7 +26445,24 @@ fn resolve_signing_key(
             ));
         }
     }
+    #[cfg(not(unix))]
+    note_signing_key_permissions_unchecked(path);
     Ok(key.trim().to_string())
+}
+
+/// Off unix there are no mode bits to read (Windows guards a file with
+/// ACLs), so the group/world gate above cannot run. Say that the key went
+/// unchecked - naming the file and the ACL that stands in for the check -
+/// rather than letting a loose key pass in silence: a signing key gates what
+/// auto-install compiles and runs. Returns the line it printed.
+#[cfg(not(unix))]
+fn note_signing_key_permissions_unchecked(path: &std::path::Path) -> String {
+    let note = warn_line(&format!(
+        "cannot check {} for group/world access on this platform - restrict it with its file ACL",
+        path.display()
+    ));
+    eprintln!("{note}");
+    note
 }
 
 fn registry_cmd(cmd: RegistryCmd) -> Result<()> {
@@ -36248,6 +36281,35 @@ mod config_get_map_tests {
             assert!(err.contains("group/world-readable"), "{err}");
             assert!(err.contains("chmod 600"), "{err}");
         }
+    }
+
+    /// Off unix the mode gate cannot run (no mode bits), so the file leg
+    /// has to say that it did not check - naming the key and the ACL that
+    /// stands in for the check - instead of passing in silence.
+    #[cfg(not(unix))]
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__signing_key_permissions__note_names_the_key_and_the_acl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("signing-key");
+        let note = note_signing_key_permissions_unchecked(&key);
+        assert!(
+            note.contains(&key.display().to_string()),
+            "note must name the key: {note}"
+        );
+        assert!(note.contains("ACL"), "note must point at the ACL: {note}");
+    }
+
+    /// The generation loops promise a Ctrl-C nudge that only the unix
+    /// handler delivers; elsewhere the banner has to say Ctrl-C exits.
+    #[cfg(not(unix))]
+    #[test]
+    // suite convention: unit__scenario__expected (6b)
+    #[allow(non_snake_case)]
+    fn unit__repl_ctrl_c_note__states_that_ctrl_c_exits() {
+        assert!(REPL_CTRL_C_NOTE.contains("Ctrl-C"), "{REPL_CTRL_C_NOTE}");
+        assert!(REPL_CTRL_C_NOTE.contains("exits"), "{REPL_CTRL_C_NOTE}");
     }
 
     fn card_test_dirs(root: &std::path::Path) -> BlazarDirs {
