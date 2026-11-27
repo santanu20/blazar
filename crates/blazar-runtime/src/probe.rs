@@ -32,20 +32,23 @@ const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// attempt one so the loud error is not delayed.
 fn is_transient_spawn_err(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
-    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        matches!(
-            e.raw_os_error(),
-            Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::ETXTBSY)
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) || spawn_err_os_class(e)
+}
+
+/// The os-error classes a spawn hits when the host is briefly out of
+/// resources. Unix names them through `raw_os_error`; other platforms have
+/// no equivalent classes to classify here.
+#[cfg(unix)]
+fn spawn_err_os_class(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::ETXTBSY)
+    )
+}
+
+#[cfg(not(unix))]
+fn spawn_err_os_class(_e: &std::io::Error) -> bool {
+    false
 }
 
 /// Run a spawn-class operation under the bounded transient-retry policy
