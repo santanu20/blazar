@@ -394,7 +394,9 @@ mod tests {
 
     #[test]
     fn unit__doc_table__engines_doc_prints_the_current_table() {
-        let docs = include_str!("../../../docs/engines.md");
+        // `include_str!` sees the checked-out bytes and git's autocrlf hands
+        // Windows CRLF: the table is compared line for line, not byte for byte.
+        let docs = include_str!("../../../docs/engines.md").replace("\r\n", "\n");
         let table = doc_table();
         assert!(
             docs.contains(&table),

@@ -12845,32 +12845,58 @@ fn humansize(bytes: i64) -> String {
     }
 }
 
+/// What `install_model_file` left at `dest`: an existing file untouched, a
+/// link (zero extra bytes), or a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileInstall {
+    Kept,
+    Linked,
+    Copied,
+}
+
 /// Install a model-side file (GGUF or mmproj) into the store: copy, or the
-/// unix default of hardlink with symlink fallback (zero bytes, survives
-/// either store being wiped; `protected_hardlinks` blocks linking files we
-/// do not own, e.g. ollama's system blobs).
-fn install_model_file(path: &std::path::Path, dest: &std::path::Path, copy: bool) -> Result<()> {
+/// default of a hard link (zero bytes, survives either store being wiped;
+/// `protected_hardlinks` blocks linking files we do not own, e.g. ollama's
+/// system blobs). Every platform links the same way; unix falls back to a
+/// symlink when the link is refused, elsewhere to a copy, since symlinks
+/// need a privilege there. Nothing is ever left uninstalled silently.
+fn install_model_file(
+    path: &std::path::Path,
+    dest: &std::path::Path,
+    copy: bool,
+) -> Result<FileInstall> {
     if dest.exists() {
-        return Ok(());
+        return Ok(FileInstall::Kept);
     }
     if copy {
         std::fs::copy(path, dest).with_context(|| format!("copy to {}", dest.display()))?;
-        return Ok(());
+        return Ok(FileInstall::Copied);
+    }
+    if std::fs::hard_link(path, dest).is_ok() {
+        return Ok(FileInstall::Linked);
     }
     #[cfg(unix)]
-    {
-        if std::fs::hard_link(path, dest).is_err() {
-            std::os::unix::fs::symlink(path, dest)
-                .with_context(|| format!("symlink {}", dest.display()))?;
-            println!(
-                "{}",
-                dim_line(
-                    "note: used symlink (hardlink blocked); if the source store deletes the blob, re-import"
-                )
-            );
-        }
-    }
-    Ok(())
+    let installed = {
+        std::os::unix::fs::symlink(path, dest)
+            .with_context(|| format!("symlink {}", dest.display()))?;
+        println!(
+            "{}",
+            dim_line(
+                "note: used symlink (hardlink blocked); if the source store deletes the blob, re-import"
+            )
+        );
+        FileInstall::Linked
+    };
+    #[cfg(not(unix))]
+    let installed = {
+        std::fs::copy(path, dest).with_context(|| format!("copy to {}", dest.display()))?;
+        println!(
+            "{}",
+            dim_line("note: hard link refused here, copied instead")
+        );
+        FileInstall::Copied
+    };
+    Ok(installed)
 }
 
 fn mmproj_cmd(model: &str, path: &std::path::Path) -> Result<()> {
@@ -12977,6 +13003,7 @@ fn import_model(
     // every leaf under the same `{model}-{quant}` stem plus its marker,
     // which is the naming convention llama-server keys on to discover
     // the siblings.
+    let mut copied = false;
     let (dest, set_bytes, set_shards) = if let Some((count, _, leaves)) = &shard_set {
         let mut leaf_dests = Vec::with_capacity(leaves.len());
         for (i, leaf) in leaves.iter().enumerate() {
@@ -12985,7 +13012,10 @@ fn import_model(
                 "{model_name}-{}-{leaf_no:05}-of-{count:05}.gguf",
                 derived_quant.to_lowercase()
             ));
-            install_model_file(leaf, &leaf_dest, copy)?;
+            copied |= matches!(
+                install_model_file(leaf, &leaf_dest, copy)?,
+                FileInstall::Copied
+            );
             leaf_dests.push(leaf_dest);
         }
         let total: u64 = leaves
@@ -12998,7 +13028,7 @@ fn import_model(
             "{model_name}-{}.gguf",
             derived_quant.to_lowercase()
         ));
-        install_model_file(path, &dest, copy)?;
+        copied = matches!(install_model_file(path, &dest, copy)?, FileInstall::Copied);
         (dest, size, 1)
     };
     // Optional vision projector: validated loudly, installed alongside.
@@ -13015,7 +13045,10 @@ fn import_model(
                 ));
             }
             let mdest = d.models_dir().join(format!("{model_name}-mmproj.gguf"));
-            install_model_file(p.as_path(), &mdest, copy)?;
+            copied |= matches!(
+                install_model_file(p.as_path(), &mdest, copy)?,
+                FileInstall::Copied
+            );
             Ok::<_, anyhow::Error>(mdest)
         })
         .transpose()?;
@@ -13064,12 +13097,12 @@ fn import_model(
         meta.context_length,
         dest.display()
     );
+    // The link note only holds when nothing was copied: `--copy` moves real
+    // bytes, and so does the copy fallback where the link was refused.
+    if !copied {
+        println!("{}", ok_line("zero extra disk used (link, not copy)"));
+    }
     if shard_set.is_some() {
-        // The link note only holds when nothing was copied; a split set
-        // pulled in with `--copy` moves real bytes.
-        if !copy {
-            println!("{}", ok_line("zero extra disk used (link, not copy)"));
-        }
         println!(
             "{}",
             ok_line(&format!(
@@ -13077,8 +13110,6 @@ fn import_model(
                  leaf 1, the engine discovers the rest by naming convention"
             ))
         );
-    } else {
-        println!("{}", ok_line("zero extra disk used (link, not copy)"));
     }
     Ok(())
 }
@@ -29932,6 +29963,34 @@ mod tests {
             config_dir: tmp.path().join("cfg"),
             data_dir: tmp.path().join("data"),
         }
+    }
+
+    #[test]
+    fn unit__install_model_file__links_copies_and_keeps_truthfully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.gguf");
+        e5_gguf(&src, None);
+        let dest = tmp.path().join("linked.gguf");
+        // Default is a real file at `dest` on every platform - a Windows
+        // import once recorded a row over nothing here.
+        assert_eq!(
+            install_model_file(&src, &dest, false).unwrap(),
+            FileInstall::Linked
+        );
+        assert!(dest.is_file());
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&src).unwrap());
+        // An existing destination is left alone, never re-linked or clobbered.
+        assert_eq!(
+            install_model_file(&src, &dest, true).unwrap(),
+            FileInstall::Kept
+        );
+        let copy = tmp.path().join("copied.gguf");
+        assert_eq!(
+            install_model_file(&src, &copy, true).unwrap(),
+            FileInstall::Copied
+        );
+        assert!(copy.is_file());
+        assert_eq!(std::fs::read(&copy).unwrap(), std::fs::read(&src).unwrap());
     }
 
     #[test]
