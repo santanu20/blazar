@@ -1276,17 +1276,19 @@ def lane_receipt() -> int:
         "m1-charts/m1-overhead-us.svg.\n"
     )
     md.append("\n## Reproduction\n")
-    md.append("The campaign runs through the repository validation harness "
-              "(scripts/validate.py Sandbox/Daemon) and the matched-argv machinery of "
-              "scripts/bench_saturation.py against the release binary; charts render via "
-              "scripts/bench_charts.py.\n")
+    harness = "scripts/bench_ollama_head_to_head.py"
+    md.append(
+        f"The campaign harness is {harness} (repo): it drives the repository "
+        "validation harness (scripts/validate.py Sandbox/Daemon) and the matched-argv "
+        "machinery of scripts/bench_saturation.py against the release binary; charts "
+        "render via scripts/bench_charts.py.\n"
+    )
     md.append("```bash\n")
-    md.append("python3 m1_head_to_head.py --lane pilot   # env evidence + probes\n")
-    md.append("python3 m1_head_to_head.py --lane warm\n")
-    md.append("python3 m1_head_to_head.py --lane cold\n")
-    md.append("python3 m1_head_to_head.py --lane overhead\n")
-    md3 = "python3 m1_head_to_head.py --lane quality && python3 m1_head_to_head.py --lane receipt\n"
-    md.append(md3)
+    md.append(f"python3 {harness} --lane pilot   # env evidence + probes\n")
+    md.append(f"python3 {harness} --lane warm\n")
+    md.append(f"python3 {harness} --lane cold\n")
+    md.append(f"python3 {harness} --lane overhead\n")
+    md.append(f"python3 {harness} --lane quality && \\\n  python3 {harness} --lane receipt\n")
     md.append("```\n")
     md.append(f"Raw JSONL (every request incl. failures): `{RAW_DIR!s}`.\n")
 
