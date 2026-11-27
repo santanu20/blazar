@@ -42,6 +42,7 @@ tracked here.
 
 ### Changed
 
+- **A non-blocking stable canary job.** `ci.yml` runs the fmt, clippy and test gates on the current stable with `cargo +stable` and lets that job fail without failing the run, so toolchain drift is visible on every run instead of arriving all at once when the pin is bumped.
 - **Text files check out with LF on every platform.** A root `.gitattributes` sets `* text=auto eol=lf` (and marks the two image assets binary), so a Windows checkout with `core.autocrlf` can no longer turn tracked docs and scripts into CRLF behind tests that compare them line for line. The index was already 100% LF, so the policy renormalizes nothing.
 - **One overhead number, one place.** The gateway-overhead headline is stated once and linked from the other docs; the 1-3% and 5-6% claims carried in the October notes are reconciled to it.
 - **Admission enforces a host-RAM ledger with pressure relief** - spawn admission now accounts host RAM across resident engines and relieves pressure instead of admitting into swap.

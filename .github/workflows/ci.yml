@@ -66,6 +66,55 @@ jobs:
           path: test.log
           if-no-files-found: ignore
 
+  stable-canary:
+    name: stable canary, non-blocking (fmt + clippy + tests on @stable)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    # Every other job runs whatever rust-toolchain.toml pins: a checkout's pin
+    # file outranks the default toolchain the rust-toolchain action sets, so
+    # the gating jobs never see the current stable. This job is the
+    # forward-drift report. It runs the same fmt, clippy and test gates on
+    # @stable and is allowed to fail, so new lints, rustfmt churn or
+    # breakage show up run after run instead of all at once when the pin is
+    # bumped. Red here means the next deliberate bump has work in it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
+        with:
+          # SHA pinning defeats the action's branch-name toolchain
+          # inference, so the input has to name it explicitly.
+          toolchain: stable
+          components: clippy, rustfmt
+      # The job is expected to be red until the pin is bumped, so its build
+      # cache is saved on failure too; the job id is part of the cache key,
+      # which keeps it apart from the pinned-toolchain caches.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      # !cancelled() keeps every gate running when an earlier one fails, so
+      # one run lists the whole drift; the job still fails if any did.
+      - run: cargo +stable fmt --check
+        if: ${{ !cancelled() }}
+      - run: cargo +stable clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee clippy-canary.log
+        if: ${{ !cancelled() }}
+        shell: bash
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        if: ${{ !cancelled() }}
+        with:
+          tool: cargo-nextest
+      - run: cargo +stable nextest run --workspace --no-fail-fast 2>&1 | tee test-canary.log
+        if: ${{ !cancelled() }}
+        shell: bash
+      - name: upload canary logs (always, for diagnosis)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stable-canary
+          path: |
+            clippy-canary.log
+            test-canary.log
+          if-no-files-found: ignore
   msrv:
     name: MSRV floor (rust-version from Cargo.toml)
     runs-on: ubuntu-latest
