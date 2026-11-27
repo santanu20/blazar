@@ -2681,6 +2681,26 @@ fn assert_incremental(first: Duration, total: Duration, frames: usize) {
     assert!(frames >= 4, "body frames: {frames}");
 }
 
+/// One non-streaming request to bring the engine child up. The first
+/// inference request spawns it and polls until it answers, and process
+/// creation is slow enough on Windows (CI measured the cold first chunk at
+/// ~1.27 s there, ~0.7 s on Linux, against the 1200 ms bound) to push a
+/// cold start past it. Warming first keeps the timed request measuring
+/// the relay, not the spawn.
+async fn warm_engine(client: &reqwest::Client, base: &str) {
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "warm the engine"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.bytes().await.unwrap();
+}
+
 #[tokio::test]
 #[allow(non_snake_case)]
 async fn e2e__tls_negotiates_http2_and_streams_sse() {
@@ -2704,6 +2724,7 @@ async fn e2e__tls_negotiates_http2_and_streams_sse() {
         "ALPN must select h2 when the client offers it"
     );
     assert_eq!(health.status(), 200);
+    warm_engine(&c, &base).await;
     let (version, first, total, frames) = timed_sse(c, &base).await;
     assert_eq!(version, reqwest::Version::HTTP_2);
     assert_incremental(first, total, frames);
@@ -2729,6 +2750,7 @@ async fn e2e__tls_http1_client_streams_sse_incrementally() {
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
+    warm_engine(&c, &base).await;
     let (version, first, total, frames) = timed_sse(c, &base).await;
     assert_eq!(version, reqwest::Version::HTTP_11);
     assert_incremental(first, total, frames);
