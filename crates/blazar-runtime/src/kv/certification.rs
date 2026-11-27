@@ -282,7 +282,10 @@ mod tests {
         // the compatibility policy reports the gap with the opt-in
         // teaching instead of a silent maybe.
         assert!(!TranslationSection::default().enabled);
-        assert!(admitted_pairs(&TranslationSection::default()).is_empty());
+        assert_eq!(
+            admitted_pairs(&TranslationSection::default()),
+            [] as [crate::kv::interchange::CodecLane; 0]
+        );
         assert!(migration_off_by_default());
     }
 

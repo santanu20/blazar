@@ -6645,7 +6645,10 @@ mod retire_containment_tests {
             ))
             .unwrap();
 
-        assert!(backfill_sglang_quant_facts(&dirs).is_empty());
+        assert_eq!(
+            backfill_sglang_quant_facts(&dirs),
+            [] as [std::string::String; 0]
+        );
 
         let row = store.list_engines().unwrap().remove(0);
         assert_eq!(

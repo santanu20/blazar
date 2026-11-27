@@ -1288,7 +1288,7 @@ impl Sentinel {
                         "prompt {:?} + completion {:?} tokens hit the ctx ceiling{}",
                         acc.usage_prompt,
                         acc.usage_completion,
-                        window.map(|c| format!(" ({c})")).unwrap_or_default()
+                        window.map_or_default(|c| format!(" ({c})"))
                     ),
                 });
             }

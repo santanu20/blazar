@@ -54,8 +54,7 @@ fn next_job_id() -> String {
     let boot = *BOOT_NANOS.get_or_init(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
+            .map_or_default(|d| d.as_nanos())
     });
     format!("doc_{boot:x}_{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }

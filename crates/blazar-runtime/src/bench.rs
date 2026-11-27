@@ -590,18 +590,16 @@ impl Tuner<'_> {
             // Quote the child's own stderr (captured per-port): an
             // early death is usually OOM or a rejected flag, and the
             // child's words beat a generic readiness timeout.
-            let tail: String = std::fs::read_to_string(&err_log)
-                .map(|s| {
-                    s.lines()
-                        .rev()
-                        .take(8)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
+            let tail: String = std::fs::read_to_string(&err_log).map_or_default(|s| {
+                s.lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
             anyhow::bail!(
                 "spec race: server in mode {mode} never became ready or served; \
                  child stderr tail:\n{tail}"
@@ -1593,18 +1591,16 @@ pub fn sglang_spec_mode_race(
             // the llamacpp race lane: an early death is usually OOM or a
             // rejected flag, and the child's words beat a generic
             // readiness timeout.
-            let tail: String = std::fs::read_to_string(&err_log)
-                .map(|s| {
-                    s.lines()
-                        .rev()
-                        .take(8)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
+            let tail: String = std::fs::read_to_string(&err_log).map_or_default(|s| {
+                s.lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
             anyhow::bail!(
                 "sglang spec race: server in mode {mode} never became ready or served; \
                  child stderr tail:\n{tail}"

@@ -937,14 +937,11 @@ async fn expand_openaihost_ps(state: &Arc<AppState>, rows: Vec<Value>) -> Vec<Va
         .await
     {
         Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(v) => v["data"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|m| m["id"].as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Ok(v) => v["data"].as_array().map_or_default(|a| {
+                a.iter()
+                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .collect()
+            }),
             Err(_) => return rows,
         },
         _ => return rows,
@@ -1626,8 +1623,7 @@ pub async fn chat(
         "api/chat",
         &trace_ext
             .as_ref()
-            .map(|Extension(t)| t.0.clone())
-            .unwrap_or_default(),
+            .map_or_default(|Extension(t)| t.0.clone()),
     );
     // Think-capability gate (ollama parity): refuse `think: true` on a
     // provably non-thinking template instead of silently ignoring it.
@@ -3294,8 +3290,9 @@ async fn proxy_core_chat(
                     let audio_note = voice_stream
                         .as_ref()
                         .and_then(|vs| vs.audio_error.as_ref())
-                        .map(|e| format!("{{\"model\":{model:?},\"blazar_audio_error\":{e:?}}}\n"))
-                        .unwrap_or_default();
+                        .map_or_default(|e| {
+                            format!("{{\"model\":{model:?},\"blazar_audio_error\":{e:?}}}\n")
+                        });
                     return Some((
                         Ok(Bytes::from(format!(
                             "{flush_prefix}{think_tail}{audio_tail}{audio_note}{final_chunk}\n"
@@ -3830,8 +3827,7 @@ pub async fn embed(
             // ollama /api/embed shape: {model, embeddings: [[f32]]}
             let embeddings: Vec<Value> = openai["data"]
                 .as_array()
-                .map(|d| d.iter().map(|e| e["embedding"].clone()).collect())
-                .unwrap_or_default();
+                .map_or_default(|d| d.iter().map(|e| e["embedding"].clone()).collect());
             axum::Json(json!({"model": model, "embeddings": embeddings})).into_response()
         })
         .await,
@@ -4716,8 +4712,7 @@ pub async fn session_list(
     let model = query
         .as_deref()
         .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("model=")))
-        .map(percent_decode)
-        .unwrap_or_default();
+        .map_or_default(percent_decode);
     if model.is_empty() {
         return api_error(400, "missing ?model=");
     }

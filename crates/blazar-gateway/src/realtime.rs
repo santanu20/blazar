@@ -554,7 +554,7 @@ fn reply_text(chat: &Value) -> String {
 fn reply_tool_calls(chat: &Value) -> Vec<PendingCall> {
     chat.pointer("/choices/0/message/tool_calls")
         .and_then(Value::as_array)
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|c| {
                     let call_id = c.get("id")?.as_str()?.to_string();
@@ -572,7 +572,6 @@ fn reply_tool_calls(chat: &Value) -> Vec<PendingCall> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Emit the function-call event triad for one tool round: per call

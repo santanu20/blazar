@@ -4081,7 +4081,10 @@ mod tests {
             data_dir: tmp.path().join("data"),
         };
         let s = Store::open(&dirs).unwrap();
-        assert!(s.list_spec_receipts("m", "e").unwrap().is_empty());
+        assert_eq!(
+            s.list_spec_receipts("m", "e").unwrap(),
+            [] as [SpecReceiptRow; 0]
+        );
         let dense_prov = SpecProvenance::default();
         s.put_spec_receipt("m", "e", "dense", 40.0, 40.0, &dense_prov)
             .unwrap();
@@ -4105,8 +4108,14 @@ mod tests {
         assert_eq!(rows[1].mode, "ngram");
         assert_eq!(rows[2].mode, "dense");
         // Receipts are scoped per model+engine: another lane sees none.
-        assert!(s.list_spec_receipts("m", "other").unwrap().is_empty());
-        assert!(s.list_spec_receipts("other", "e").unwrap().is_empty());
+        assert_eq!(
+            s.list_spec_receipts("m", "other").unwrap(),
+            [] as [SpecReceiptRow; 0]
+        );
+        assert_eq!(
+            s.list_spec_receipts("other", "e").unwrap(),
+            [] as [SpecReceiptRow; 0]
+        );
     }
 
     #[test]
@@ -4131,7 +4140,10 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, i64::from(SCHEMA_VERSION));
-        assert!(s.load_pool_ops().unwrap().is_empty());
+        assert_eq!(
+            s.load_pool_ops().unwrap(),
+            [] as [(std::string::String, bool, std::option::Option<i64>, bool); 0]
+        );
         s.put_pool_op("svc:m1", true, Some(1_900_000_000), false)
             .unwrap();
         s.put_pool_op("svc:far:m1", false, None, true).unwrap();
@@ -4169,7 +4181,10 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, i64::from(SCHEMA_VERSION));
-        assert!(s.load_pool_affinity().unwrap().is_empty());
+        assert_eq!(
+            s.load_pool_affinity().unwrap(),
+            [] as [(std::string::String, std::string::String, i64); 0]
+        );
         s.put_pool_affinity("svc:abcdef0123456789", "m1", 1_900_000_100)
             .unwrap();
         let rows = s.load_pool_affinity().unwrap();
@@ -4185,7 +4200,10 @@ mod tests {
         s.put_pool_affinity("svc:abcdef0123456789", "far:m1", 1_900_000_200)
             .unwrap();
         s.clear_pool_affinity("svc:abcdef0123456789").unwrap();
-        assert!(s.load_pool_affinity().unwrap().is_empty());
+        assert_eq!(
+            s.load_pool_affinity().unwrap(),
+            [] as [(std::string::String, std::string::String, i64); 0]
+        );
     }
 
     #[test]
@@ -4212,7 +4230,15 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, i64::from(SCHEMA_VERSION));
-        assert!(s.load_pool_windows().unwrap().is_empty());
+        assert_eq!(
+            s.load_pool_windows().unwrap(),
+            [] as [(
+                std::string::String,
+                std::string::String,
+                std::option::Option<std::string::String>,
+                i64
+            ); 0]
+        );
         s.replace_pool_windows(&[
             ("svc".into(), "req".into(), None, 1_900_000_010),
             ("svc".into(), "hit".into(), Some("m1".into()), 1_900_000_020),

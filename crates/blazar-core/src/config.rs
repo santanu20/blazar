@@ -4920,8 +4920,7 @@ fn flatten_hierarchy(table: &mut toml::Table) -> CoreResult<()> {
                 let home = SECTION_FIELDS
                     .iter()
                     .find(|(_, ms)| ms.contains(&key.as_str()))
-                    .map(|(s, _)| format!(" (it belongs to [{s}])"))
-                    .unwrap_or_default();
+                    .map_or_default(|(s, _)| format!(" (it belongs to [{s}])"));
                 let listed = members.join(", ");
                 return Err(CoreError::Config(format!(
                     "[{section}] does not accept {key:?}{home} - members: {listed}"
@@ -8418,7 +8417,7 @@ mod tests {
         // Absent stanza: the whole translation surface stays off.
         let bare = Config::from_toml("").expect("bare config must parse");
         assert!(!bare.kv.translation.enabled);
-        assert!(bare.kv.translation.allow.is_empty());
+        assert_eq!(bare.kv.translation.allow, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -9565,7 +9564,7 @@ default_ctx = 16384
         assert_eq!(d.prefill_assistant, None);
         assert_eq!(d.skip_chat_parsing, None);
         assert_eq!(d.media_path, None);
-        assert!(d.logit_bias.is_empty());
+        assert_eq!(d.logit_bias, [] as [std::string::String; 0]);
         assert!(!d.ignore_eos);
         assert!(!d.spec_default);
         assert_eq!(d.spec_draft_n_min, 0);

@@ -4747,7 +4747,7 @@ impl Supervisor {
                 .await
                 .map_err(|e| format!("child /lora-adapters body unreadable: {e}"))?
                 .as_array()
-                .map(|entries| {
+                .map_or_default(|entries| {
                     entries
                         .iter()
                         .filter_map(|e| {
@@ -4760,8 +4760,7 @@ impl Supervisor {
                             Some((loaded.to_string(), e.get("id")?.as_i64()?))
                         })
                         .collect()
-                })
-                .unwrap_or_default();
+                });
             let rows = Store::open(&self.dirs)
                 .map_err(|e| format!("store unavailable: {e}"))?
                 .list_loras(Some(model))
@@ -7363,14 +7362,13 @@ impl Supervisor {
         // retry loop (a retry attempt used to re-read an already-removed
         // `pending_ctx` entry), because the auto-split decision below
         // needs the candidate KV estimate before any card scoping.
-        let mut tuning = self
-            .pending_ctx
-            .remove(name)
-            .map(|(_, ctx)| blazar_core::TuningOverrides {
-                ctx: Some(ctx),
-                ..Default::default()
-            })
-            .unwrap_or_default();
+        let mut tuning =
+            self.pending_ctx
+                .remove(name)
+                .map_or_default(|(_, ctx)| blazar_core::TuningOverrides {
+                    ctx: Some(ctx),
+                    ..Default::default()
+                });
         // Config-level FA override rides the same override path the
         // pending ctx uses; None keeps the profile heuristic (auto).
         tuning.fa = self.cfg().flash_attention;
@@ -8764,8 +8762,7 @@ drop them from rpc_servers in config.toml",
         let sha8: String = lane.ref_sha.chars().take(8).collect();
         let pr = lane
             .upstream_pr
-            .map(|p| format!(", upstream PR #{p}"))
-            .unwrap_or_default();
+            .map_or_default(|p| format!(", upstream PR #{p}"));
         format!(
             "curated lane available: `blazar engine install --lane {}` ({}@{}, {} \
              architectures{})",
@@ -14575,7 +14572,7 @@ mod routing_tests {
         assert_eq!(rows[0].name, "CUDA1");
         assert_eq!(rows[0].description, "NVIDIA GeForce RTX 4070 Laptop GPU");
         assert_eq!((rows[0].total_mib, rows[0].free_mib), (7_807, 6_709));
-        assert!(accelerator_rows(&[]).is_empty());
+        assert_eq!(accelerator_rows(&[]), [] as [blazar_core::GpuInfo; 0]);
     }
 
     /// The `OpenVINO` build is the one engine whose device comes from an
@@ -19187,7 +19184,7 @@ mod routing_tests {
         std::fs::write(sup.dirs.config_file(), "idle_timeout_secs = 600\n").unwrap();
         let emptied = sup.reload_config_now().expect("valid file must apply");
         assert!(emptied.keys_changed, "keys removed -> hot-swap required");
-        assert!(sup.cfg().keys.is_empty());
+        assert_eq!(sup.cfg().keys, [] as [blazar_core::ApiKey; 0]);
     }
 
     #[tokio::test]

@@ -389,8 +389,7 @@ async fn e2e__ollama_delete_accepts_the_tags_rendered_name() {
         .unwrap();
     let names: Vec<&str> = t["models"]
         .as_array()
-        .map(|a| a.iter().filter_map(|m| m["name"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|a| a.iter().filter_map(|m| m["name"].as_str()).collect());
     assert!(!names.contains(&"m1:q4_k_m"), "deleted row gone: {names:?}");
     assert!(names.contains(&"m2:q4_k_m"), "sibling untouched: {names:?}");
     // Already-deleted (by any colon form) and unknown names still teach
@@ -434,8 +433,7 @@ async fn e2e__ollama_delete_canonical_delete_method() {
         .unwrap();
     let names: Vec<&str> = t["models"]
         .as_array()
-        .map(|a| a.iter().filter_map(|m| m["name"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|a| a.iter().filter_map(|m| m["name"].as_str()).collect());
     assert!(!names.contains(&"m1:q4_k_m"), "deleted row gone: {names:?}");
     assert!(names.contains(&"m2:q4_k_m"), "sibling untouched: {names:?}");
     // Unknown name via DELETE teaches exactly like POST does.
@@ -1916,8 +1914,7 @@ async fn e2e__object_authz__batch_files_two_key_isolation() {
         .unwrap();
     let beta_ids: Vec<&str> = beta_list["data"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v["id"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|a| a.iter().filter_map(|v| v["id"].as_str()).collect());
     assert!(
         !beta_ids.contains(&batch_id.as_str()),
         "foreign key's listing must not contain alpha's batch"
@@ -1998,8 +1995,7 @@ async fn e2e__object_authz__anthropic_batches_two_key_isolation() {
         .unwrap();
     let beta_ids: Vec<&str> = beta_list["data"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v["id"].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|a| a.iter().filter_map(|v| v["id"].as_str()).collect());
     assert!(!beta_ids.contains(&id.as_str()));
     // alpha still polls its own batch.
     assert_eq!(

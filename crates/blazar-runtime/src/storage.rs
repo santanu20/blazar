@@ -288,9 +288,7 @@ fn shard_set_len(name: &str) -> Option<u32> {
 }
 
 fn shard_first_suffix(stem: &str) -> &str {
-    stem.rfind("-00001-of-")
-        .map(|i| &stem[i..])
-        .unwrap_or_default()
+    stem.rfind("-00001-of-").map_or_default(|i| &stem[i..])
 }
 
 /// Rows not loaded (spawned) within `since_secs` and not currently resident.

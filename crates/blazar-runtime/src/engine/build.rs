@@ -275,9 +275,7 @@ pub fn detect_toolchain(search: &[PathBuf]) -> Toolchain {
 /// PATH split into dirs (the production search list).
 #[must_use]
 pub fn path_dirs() -> Vec<PathBuf> {
-    std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default()
+    std::env::var_os("PATH").map_or_default(|p| std::env::split_paths(&p).collect())
 }
 
 /// Missing-toolchain errors with install hints per platform family.

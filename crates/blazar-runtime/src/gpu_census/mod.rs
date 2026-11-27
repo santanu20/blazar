@@ -398,7 +398,7 @@ mod tests {
             gpu("CUDA1", NVIDIA, false, 8_188, 8_188),
         ];
         assert_eq!(super::vendors_of(&rows), [NVIDIA, AMD]);
-        assert!(super::vendors_of(&[]).is_empty());
+        assert_eq!(super::vendors_of(&[]), [] as [u32; 0]);
     }
 
     #[test]

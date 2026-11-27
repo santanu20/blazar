@@ -355,15 +355,12 @@ pub fn merge_fleet_argv(argv: &mut Vec<String>, announced: &[String]) {
         return;
     }
     if let Some(i) = argv.iter().position(|flag| flag == "--rpc") {
-        let mut parts: Vec<String> = argv
-            .get(i + 1)
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut parts: Vec<String> = argv.get(i + 1).map_or_default(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
         for ep in announced {
             if !parts.contains(ep) {
                 parts.push(ep.clone());

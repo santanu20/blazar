@@ -404,8 +404,7 @@ impl Manifest {
         }
         self.tag
             .strip_prefix("sglang-")
-            .map(str::to_string)
-            .unwrap_or_default()
+            .map_or_default(str::to_string)
     }
 
     /// Lane facts for the sglang admission gate
@@ -461,8 +460,7 @@ impl Manifest {
                 let base = self
                     .base_ref
                     .as_deref()
-                    .map(|b| format!(" (base {b})"))
-                    .unwrap_or_default();
+                    .map_or_default(|b| format!(" (base {b})"));
                 let tier = match self.trust {
                     TrustTier::User => "fork",
                     TrustTier::Curated => "curated fork",
@@ -2813,7 +2811,7 @@ options:
         }
         let m = probe_sglang(&root.join("sglang-server"), "sglang-0.5.19")
             .expect("lenient spec probe keeps the install alive");
-        assert!(m.spec_types.is_empty());
+        assert_eq!(m.spec_types, [] as [std::string::String; 0]);
         assert_eq!(m.quant_methods, Some(vec!["awq".to_string()]));
     }
 

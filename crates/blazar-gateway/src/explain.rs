@@ -621,8 +621,7 @@ fn load_admission(
             if matches!(kind, K::Sglang) {
                 let facts = manifest_json
                     .and_then(|mj| serde_json::from_str::<blazar_runtime::Manifest>(mj).ok())
-                    .map(|m| m.sglang_lane_facts())
-                    .unwrap_or_default();
+                    .map_or_default(|m| m.sglang_lane_facts());
                 if let Some(teach) = blazar_core::hfmeta::sglang_lane_teach(h, dir, &facts) {
                     return json!({ "verdict": "refused", "reason": teach });
                 }

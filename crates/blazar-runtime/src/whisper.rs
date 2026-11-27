@@ -433,8 +433,7 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
     for dir in sorted_tag_dirs(dirs).into_iter().skip(keep) {
         let name = dir
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|n| n.to_string_lossy().into_owned());
         if Some(&name) == pin.as_ref() {
             continue;
         }

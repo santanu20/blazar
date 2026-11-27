@@ -44,8 +44,7 @@ fn main() {
         args.iter()
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1))
-            .map(|v| v.split(',').map(str::to_string).collect())
-            .unwrap_or_default()
+            .map_or_default(|v| v.split(',').map(str::to_string).collect())
     };
 
     let ps = or_default(flag_values("-p"), &["512"]);

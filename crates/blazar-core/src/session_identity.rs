@@ -66,17 +66,14 @@ pub struct SessionIdentity {
 /// unverifiable adapter set then rejects at the strict gate rather
 /// than here (bank paths warn and skip, they never panic).
 fn adapter_bindings(store: &Store, model: &str) -> Vec<LoraBinding> {
-    let mut bindings = store
-        .list_loras(Some(model))
-        .map(|rows| {
-            rows.into_iter()
-                .map(|r| LoraBinding {
-                    path: r.path,
-                    sha256: r.sha256,
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut bindings = store.list_loras(Some(model)).map_or_default(|rows| {
+        rows.into_iter()
+            .map(|r| LoraBinding {
+                path: r.path,
+                sha256: r.sha256,
+            })
+            .collect::<Vec<_>>()
+    });
     bindings.sort_by(|a, b| a.path.cmp(&b.path));
     bindings
 }
@@ -563,7 +560,7 @@ mod tests {
         let (mut saved, mut current) = pair();
         saved.model_sha = None;
         current.model_sha = None;
-        assert!(verify(&saved, &current).is_empty());
+        assert_eq!(verify(&saved, &current), [] as [std::string::String; 0]);
         let diffs = verify_for_restore(&saved, &current);
         assert!(
             diffs

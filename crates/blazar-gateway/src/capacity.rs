@@ -180,8 +180,7 @@ pub(crate) fn live_gpu_census() -> (Vec<DeviceRow>, bool) {
     )
     .filter(|o| o.status.success())
     .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    .map(|t| parse_devices(&t))
-    .unwrap_or_default();
+    .map_or_default(|t| parse_devices(&t));
     let system_rows = if smi_rows.is_empty() {
         system_device_rows(&blazar_runtime::probe_hardware(None).gpus)
     } else {

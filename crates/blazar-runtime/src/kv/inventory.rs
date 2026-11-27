@@ -391,7 +391,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let inv = scan(root.path(), &["ghost".to_string()]);
         assert_eq!(inv[0].session_dir, None);
-        assert!(inv[0].banks.is_empty());
+        assert_eq!(inv[0].banks, [] as [crate::kv::inventory::BankFile; 0]);
         assert_eq!(inv[0].mlx_stage_ready, None);
         assert_eq!(inv[0].total_bytes(), 0);
     }

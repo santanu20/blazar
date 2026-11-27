@@ -1305,7 +1305,10 @@ mod tests {
 
     #[test]
     fn unit__admitted_pairs__follow_the_translation_knob() {
-        assert!(admitted_pairs(&TranslationSection::default()).is_empty());
+        assert_eq!(
+            admitted_pairs(&TranslationSection::default()),
+            [] as [crate::kv::interchange::CodecLane; 0]
+        );
         let on = TranslationSection {
             enabled: true,
             ..TranslationSection::default()
@@ -1698,7 +1701,7 @@ mod tests {
         });
         bare.truncate(8 + 2); // header claims more than remains
         let err = mlx_cache_to_carrier(&bare, &[0u32; 2]).unwrap_err();
-        assert!(!err.is_empty());
+        assert_ne!(err, "");
     }
     #[test]
     fn unit__f16_bits_to_bf16__widens_and_rounds_the_boundary_vectors() {

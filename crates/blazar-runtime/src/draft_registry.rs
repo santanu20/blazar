@@ -213,7 +213,10 @@ mod tests {
         let hits = pairings_for_family(&rows, "QWEN3");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].repo, "c/d", "combined sorts first");
-        assert!(pairings_for_family(&rows, "llama").is_empty());
+        assert_eq!(
+            pairings_for_family(&rows, "llama"),
+            [] as [&crate::draft_registry::DraftPairing; 0]
+        );
     }
 
     #[test]

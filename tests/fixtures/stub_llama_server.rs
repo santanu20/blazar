@@ -469,8 +469,7 @@ fn reply_text(state: &AppState, messages: &[ChatMessage]) -> String {
         .iter()
         .rev()
         .find(|m| m.role == "user")
-        .map(|m| content_text(&m.content))
-        .unwrap_or_default();
+        .map_or_default(|m| content_text(&m.content));
     format!("stub:{state}:{last_user}")
 }
 
@@ -1618,21 +1617,18 @@ async fn slots_action(
 }
 
 async fn router_models() -> axum::Json<serde_json::Value> {
-    let data: Vec<serde_json::Value> = ROUTER_MODELS
-        .get()
-        .map(|names| {
-            names
-                .iter()
-                .map(|n| {
-                    serde_json::json!({
-                        "id": n,
-                        "object": "model",
-                        "status": {"value": "loaded"},
-                    })
+    let data: Vec<serde_json::Value> = ROUTER_MODELS.get().map_or_default(|names| {
+        names
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n,
+                    "object": "model",
+                    "status": {"value": "loaded"},
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+            })
+            .collect()
+    });
     axum::Json(serde_json::json!({"data": data, "object": "list"}))
 }
 

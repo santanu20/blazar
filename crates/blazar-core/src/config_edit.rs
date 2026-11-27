@@ -1486,7 +1486,10 @@ engine = "sglang"
     #[test]
     #[allow(non_snake_case)] // suite convention: unit__scenario__expected
     fn unit__map_table_pins__absent_section_and_pinless_subtables_empty() {
-        assert!(map_table_pins("host = \"127.0.0.1\"\n", "model_overrides").is_empty());
+        assert_eq!(
+            map_table_pins("host = \"127.0.0.1\"\n", "model_overrides"),
+            [] as [std::string::String; 0]
+        );
         // A sub-table header with no pinned leaf shows nothing: nothing
         // is pinned, mirroring "no pins" for struct tables.
         assert!(

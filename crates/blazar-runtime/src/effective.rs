@@ -550,7 +550,10 @@ mod tests {
     #[test]
     fn unit__compare__clean_match_is_empty() {
         let planned = planned_from_argv(&argv(&["-np", "2", "-c", "4096"]));
-        assert!(compare(&planned, &parse_props(&props_np2())).is_empty());
+        assert_eq!(
+            compare(&planned, &parse_props(&props_np2())),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -576,7 +579,10 @@ mod tests {
         // Asked 3904 total; child padded per-slot up to 2048 x 2 = 4096
         // (delta 192 <= 256/slot allowance) - rounding, not loss.
         let planned = planned_from_argv(&argv(&["-np", "2", "-c", "3904"]));
-        assert!(compare(&planned, &parse_props(&props_np2())).is_empty());
+        assert_eq!(
+            compare(&planned, &parse_props(&props_np2())),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -596,7 +602,7 @@ mod tests {
             total_slots: Some(4),
             per_slot_ctx: Some(4096),
         };
-        assert!(compare(&planned, &observed).is_empty());
+        assert_eq!(compare(&planned, &observed), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -612,7 +618,7 @@ mod tests {
             total_slots: Some(2),
             per_slot_ctx: Some(32768),
         };
-        assert!(compare(&planned, &observed).is_empty());
+        assert_eq!(compare(&planned, &observed), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -636,7 +642,7 @@ mod tests {
             total_slots: Some(2),
             per_slot_ctx: Some(32768),
         };
-        assert!(compare(&planned, &observed).is_empty());
+        assert_eq!(compare(&planned, &observed), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -655,7 +661,7 @@ mod tests {
             total_slots: Some(2),
             per_slot_ctx: Some(32768),
         };
-        assert!(compare(&planned, &observed).is_empty());
+        assert_eq!(compare(&planned, &observed), [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -828,7 +834,10 @@ mod tests {
             "--mem-fraction-static",
             "0.82",
         ]));
-        assert!(compare_sglang(&planned, &parse_server_info(&server_info_shape())).is_empty());
+        assert_eq!(
+            compare_sglang(&planned, &parse_server_info(&server_info_shape())),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -836,7 +845,10 @@ mod tests {
         // Nothing pinned, engine derived its own capacity: engine
         // business, not drift (same policy as the llamacpp defaults).
         let planned = planned_from_argv_sglang(&argv(&["--model-path", "/x"]));
-        assert!(compare_sglang(&planned, &parse_server_info(&server_info_shape())).is_empty());
+        assert_eq!(
+            compare_sglang(&planned, &parse_server_info(&server_info_shape())),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]

@@ -1210,25 +1210,23 @@ async fn keys_add(
     let models: Vec<String> = body
         .get("models")
         .and_then(|v| v.as_array())
-        .map(|a| {
+        .map_or_default(|a| {
             a.iter()
                 .filter_map(|m| m.as_str().map(str::to_string))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     // MCP server allowlist: same parse as `models` (string array);
     // absent = every configured server. Duplicates and empty strings
     // are dropped so the persisted entry stays canonical.
     let mcp_servers: Vec<String> = body
         .get("mcp_servers")
         .and_then(|v| v.as_array())
-        .map(|a| {
+        .map_or_default(|a| {
             a.iter()
                 .filter_map(|s| s.as_str().map(str::to_string))
                 .filter(|s| !s.is_empty())
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let mcp_servers_nonstring = body.get("mcp_servers").is_some_and(|v| {
         v.as_array()
             .is_none_or(|a| a.iter().any(|s| !s.is_string()))
@@ -1242,13 +1240,12 @@ async fn keys_add(
     let mcp_tools: Vec<String> = body
         .get("mcp_tools")
         .and_then(|v| v.as_array())
-        .map(|a| {
+        .map_or_default(|a| {
             a.iter()
                 .filter_map(|s| s.as_str().map(str::to_string))
                 .filter(|s| !s.is_empty())
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let mcp_tools_nonstring = body.get("mcp_tools").is_some_and(|v| {
         v.as_array()
             .is_none_or(|a| a.iter().any(|s| !s.is_string()))

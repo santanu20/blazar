@@ -1637,8 +1637,7 @@ fn render_grouped_help() -> String {
         about.insert(
             sc.get_name().to_string(),
             sc.get_about()
-                .map(ToString::to_string)
-                .unwrap_or_default()
+                .map_or_default(ToString::to_string)
                 .replace('\n', " "),
         );
         let al: Vec<String> = sc.get_all_aliases().map(str::to_string).collect();
@@ -3331,8 +3330,7 @@ async fn rpc_worker_joined(opts: RpcWorkerOpts) -> Result<()> {
         let mut cadence_secs = 5u64;
         let devices = blazar_runtime::rpc_fleet::query_worker(&self_probe)
             .await
-            .map(|info| info.devices)
-            .unwrap_or_default();
+            .map_or_default(|info| info.devices);
         match announce(devices.clone()).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(ack) = resp.json::<FleetJoinAck>().await {
@@ -3382,8 +3380,7 @@ async fn rpc_worker_joined(opts: RpcWorkerOpts) -> Result<()> {
                 _ = beats.tick() => {
                     let devices = blazar_runtime::rpc_fleet::query_worker(&self_probe)
                         .await
-                        .map(|info| info.devices)
-                        .unwrap_or_default();
+                        .map_or_default(|info| info.devices);
                     match beat(&devices).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             if warned_offline {
@@ -3914,8 +3911,8 @@ fn worker_unit_text(
     device: Option<&str>,
     port: u16,
 ) -> String {
-    let host_line = host.map(|h| format!(" --host {h}")).unwrap_or_default();
-    let device_line = device.map(|d| format!(" --device {d}")).unwrap_or_default();
+    let host_line = host.map_or_default(|h| format!(" --host {h}"));
+    let device_line = device.map_or_default(|d| format!(" --device {d}"));
     let port_line = if port == 50052 {
         String::new()
     } else {
@@ -4121,7 +4118,7 @@ async fn adopt_cmd(yes: bool, ttl_secs: Option<u64>) -> Result<()> {
                 "queued" => "queued - the donor owner must run `blazar agent approve`".to_owned(),
                 other => format!(
                     "{other}{}",
-                    reply.reason.map(|r| format!(" ({r})")).unwrap_or_default()
+                    reply.reason.map_or_default(|r| format!(" ({r})"))
                 ),
             }
         );
@@ -4565,8 +4562,7 @@ fn kv_gc_apply(
 ) -> Result<String> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+        .map_or_default(|d| d.as_secs());
     let trash_root = data_dir
         .join("sessions")
         .join(".gc-trash")
@@ -7074,8 +7070,7 @@ fn pid_is_blazar_descendant(pid: u32) -> bool {
         let comm = stat
             .split_once('(')
             .and_then(|(_, rest)| rest.rsplit_once(')'))
-            .map(|(name, _)| name.to_string())
-            .unwrap_or_default();
+            .map_or_default(|(name, _)| name.to_string());
         if comm == "blazar" {
             return true;
         }
@@ -7609,24 +7604,22 @@ fn doctor_engine_retention(
     // how much is at stake; sorted for a deterministic listing
     // (read_dir order is filesystem whim).
     let tags: std::collections::HashSet<&str> = engines.iter().map(|e| e.tag.as_str()).collect();
-    let orphaned: Vec<String> = std::fs::read_dir(d.engines_dir())
-        .map(|rd| {
-            let mut dirs: Vec<(String, u64)> = rd
-                .filter_map(Result::ok)
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|name| !tags.contains(name.as_str()))
-                .map(|name| {
-                    let bytes = dir_bytes_deep(&d.engines_dir().join(&name));
-                    (name, bytes)
-                })
-                .collect();
-            dirs.sort_by(|a, b| a.0.cmp(&b.0));
-            dirs.into_iter()
-                .map(|(name, bytes)| format!("{name} ({})", humansize(bytes.cast_signed())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let orphaned: Vec<String> = std::fs::read_dir(d.engines_dir()).map_or_default(|rd| {
+        let mut dirs: Vec<(String, u64)> = rd
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !tags.contains(name.as_str()))
+            .map(|name| {
+                let bytes = dir_bytes_deep(&d.engines_dir().join(&name));
+                (name, bytes)
+            })
+            .collect();
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        dirs.into_iter()
+            .map(|(name, bytes)| format!("{name} ({})", humansize(bytes.cast_signed())))
+            .collect()
+    });
     if !orphaned.is_empty() {
         over.push(format!(
             "orphan dirs (no store row): {}",
@@ -10072,9 +10065,7 @@ async fn doctor_engine(d: &BlazarDirs) -> Vec<Check> {
     // pre-channel daemon (no "channel" key) or under a different channel
     // reports the other channel's target - reconciling it after a switch
     // nags about builds the user deliberately left behind.
-    let cfg_channel = blazar_core::Config::load(d)
-        .map(|c| c.update_channel)
-        .unwrap_or_default();
+    let cfg_channel = blazar_core::Config::load(d).map_or_default(|c| c.update_channel);
     if let Ok(raw) = std::fs::read_to_string(d.run_dir().join("engine-check.json"))
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
     {
@@ -10298,7 +10289,7 @@ async fn live_engine_currency(active: &str, asset: &str) -> Check {
     let Ok(gh) = GhClient::new(token) else {
         return Check::warn("engine currency", "cannot build GitHub client");
     };
-    let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    let channel = config().map_or_default(|c| c.update_channel);
     let fetched = gh.channel_b_release(channel).await;
     match fetched {
         Ok(rel) => {
@@ -10697,20 +10688,16 @@ fn sdcpp_hint_lines(
             "sdcpp update available: {tag} (installed: {installed}) - run: \
              blazar engine update --kind sdcpp"
         )],
-        Some(_) => sdcpp_skip_note(t)
-            .map(|note| {
-                vec![format!(
-                    "sdcpp {installed} is the newest host-installable build ({note})"
-                )]
-            })
-            .unwrap_or_default(),
-        None => sdcpp_skip_note(t)
-            .map(|note| {
-                vec![format!(
-                    "sdcpp {installed} stays: no newer release is host-installable ({note})"
-                )]
-            })
-            .unwrap_or_default(),
+        Some(_) => sdcpp_skip_note(t).map_or_default(|note| {
+            vec![format!(
+                "sdcpp {installed} is the newest host-installable build ({note})"
+            )]
+        }),
+        None => sdcpp_skip_note(t).map_or_default(|note| {
+            vec![format!(
+                "sdcpp {installed} stays: no newer release is host-installable ({note})"
+            )]
+        }),
     }
 }
 /// Per-kind engine versions listing (whisper excepted - it has its own
@@ -10909,7 +10896,7 @@ async fn latest_engine_tag(kind: EngineKind) -> Option<String> {
                 .or_else(|_| std::env::var("GITHUB_TOKEN"))
                 .ok();
             let gh = GhClient::new(token).ok()?;
-            let channel = config().map(|c| c.update_channel).unwrap_or_default();
+            let channel = config().map_or_default(|c| c.update_channel);
             let fetched = match kind {
                 EngineKind::LlamaCpp => gh.channel_b_release(channel).await,
                 EngineKind::MistralRs => gh.latest_mistralrs_release().await,
@@ -10955,9 +10942,7 @@ fn marker_currency_verdict(d: &BlazarDirs, tag: &str, asset: &str) -> Option<Che
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |n| n.as_secs());
-    let cfg_channel = blazar_core::Config::load(d)
-        .map(|c| c.update_channel)
-        .unwrap_or_default();
+    let cfg_channel = blazar_core::Config::load(d).map_or_default(|c| c.update_channel);
     let fresh = now.saturating_sub(v["checked_at"].as_u64().unwrap_or(0)) <= 2 * 86_400
         && marker_channel_matches(&v, cfg_channel);
     if !fresh {
@@ -11125,7 +11110,7 @@ async fn doctor_app_currency() -> Vec<Check> {
     let Ok(gh) = blazar_runtime::GhClient::with_base(&base, token) else {
         return vec![Check::warn("app currency", "cannot build GitHub client")];
     };
-    let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    let channel = config().map_or_default(|c| c.update_channel);
     let fetched = gh.channel_repo_release(&repo, channel).await;
     match fetched {
         Ok(rel) => vec![version_currency_verdict(
@@ -11176,7 +11161,7 @@ async fn doctor_whisper_currency(d: &BlazarDirs) -> Vec<Check> {
             "cannot build GitHub client",
         )];
     };
-    let channel = config().map(|c| c.update_channel).unwrap_or_default();
+    let channel = config().map_or_default(|c| c.update_channel);
     // Asset-aware: whisper.cpp tags assetless v-releases (v1.9.4) while
     // the b-tags carry the binaries - currency must never advertise a
     // tag the install lane cannot install.
@@ -14393,8 +14378,7 @@ fn canonical_plan_for(
         .unwrap_or_else(|| cfg.cache_type.clone());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+        .map_or_default(|d| d.as_secs());
     // epoch seconds fit i64 by construction; cast_signed keeps the
     // conversion explicit for the wrap-checking lints
     let now = now.cast_signed();
@@ -16976,37 +16960,34 @@ async fn replicate_cmd(
         v["of"].as_u64().unwrap_or(0),
         v["model"].as_str().unwrap_or(model),
     );
-    let rows: Vec<Vec<String>> = v["results"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|r| {
-                    let detail = if r["ok"].as_bool().unwrap_or(false) {
-                        format!(
-                            "{} ({} ms)",
-                            r["state"].as_str().unwrap_or("warm"),
-                            r["load_ms"].as_u64().unwrap_or(0)
-                        )
-                    } else if let Some(note) = r["note"].as_str() {
-                        note.to_string()
+    let rows: Vec<Vec<String>> = v["results"].as_array().map_or_default(|a| {
+        a.iter()
+            .map(|r| {
+                let detail = if r["ok"].as_bool().unwrap_or(false) {
+                    format!(
+                        "{} ({} ms)",
+                        r["state"].as_str().unwrap_or("warm"),
+                        r["load_ms"].as_u64().unwrap_or(0)
+                    )
+                } else if let Some(note) = r["note"].as_str() {
+                    note.to_string()
+                } else {
+                    r["error"].as_str().unwrap_or("unknown failure").to_string()
+                };
+                vec![
+                    r["peer"].as_str().unwrap_or("?").to_string(),
+                    r["url"].as_str().unwrap_or("?").to_string(),
+                    if r["ok"].as_bool().unwrap_or(false) {
+                        "ok"
                     } else {
-                        r["error"].as_str().unwrap_or("unknown failure").to_string()
-                    };
-                    vec![
-                        r["peer"].as_str().unwrap_or("?").to_string(),
-                        r["url"].as_str().unwrap_or("?").to_string(),
-                        if r["ok"].as_bool().unwrap_or(false) {
-                            "ok"
-                        } else {
-                            "FAIL"
-                        }
-                        .to_string(),
-                        detail,
-                    ]
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                        "FAIL"
+                    }
+                    .to_string(),
+                    detail,
+                ]
+            })
+            .collect()
+    });
     if !rows.is_empty() {
         println!();
         render_table(&["PEER", "URL", "RESULT", "DETAIL"], &rows, &[2]);
@@ -17590,7 +17571,7 @@ fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>)
             // a zero bar - silence must not read as "0% steering".
             let blocks: String = p["pool"]["affinity"]["history"]
                 .as_array()
-                .map(|h| {
+                .map_or_default(|h| {
                     h.iter()
                         .map(|b| {
                             sparkline_cell(
@@ -17599,8 +17580,7 @@ fn render_status_card(pools: &serde_json::Value, ps: Option<&serde_json::Value>)
                             )
                         })
                         .collect()
-                })
-                .unwrap_or_default();
+                });
             if !blocks.is_empty() {
                 println!("    trend   {blocks}");
             }
@@ -17832,42 +17812,39 @@ fn render_pool_cards(v: &serde_json::Value) {
             p["decision"]["target"].as_str().unwrap_or("unknown"),
             p["decision"]["reason"].as_str().unwrap_or("unknown"),
         );
-        let rows: Vec<Vec<String>> = p["pool"]["members"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|m| {
-                        vec![
-                            m["effective"].as_str().unwrap_or("?").to_string(),
-                            m["tier"].as_str().unwrap_or("?").to_string(),
-                            format!("{} ms", m["est_wait_ms"].as_u64().unwrap_or(0)),
-                            format!(
-                                "{} ms{}",
-                                m["service_ms"].as_u64().unwrap_or(0),
-                                if m["service_measured"].as_bool().unwrap_or(false) {
-                                    ""
-                                } else {
-                                    " (default)"
-                                }
-                            ),
-                            m["affinity_keys"].as_u64().unwrap_or(0).to_string(),
-                            if m["down"].as_bool().unwrap_or(false) {
-                                match m["retry_in_secs"].as_u64() {
-                                    Some(left) => format!("down (retry {left}s)"),
-                                    None => "down".to_string(),
-                                }
-                            } else if m["drained"].as_bool().unwrap_or(false) {
-                                "drained".to_string()
-                            } else if m["pinned"].as_bool().unwrap_or(false) {
-                                "pinned".to_string()
+        let rows: Vec<Vec<String>> = p["pool"]["members"].as_array().map_or_default(|a| {
+            a.iter()
+                .map(|m| {
+                    vec![
+                        m["effective"].as_str().unwrap_or("?").to_string(),
+                        m["tier"].as_str().unwrap_or("?").to_string(),
+                        format!("{} ms", m["est_wait_ms"].as_u64().unwrap_or(0)),
+                        format!(
+                            "{} ms{}",
+                            m["service_ms"].as_u64().unwrap_or(0),
+                            if m["service_measured"].as_bool().unwrap_or(false) {
+                                ""
                             } else {
-                                "-".to_string()
-                            },
-                        ]
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                                " (default)"
+                            }
+                        ),
+                        m["affinity_keys"].as_u64().unwrap_or(0).to_string(),
+                        if m["down"].as_bool().unwrap_or(false) {
+                            match m["retry_in_secs"].as_u64() {
+                                Some(left) => format!("down (retry {left}s)"),
+                                None => "down".to_string(),
+                            }
+                        } else if m["drained"].as_bool().unwrap_or(false) {
+                            "drained".to_string()
+                        } else if m["pinned"].as_bool().unwrap_or(false) {
+                            "pinned".to_string()
+                        } else {
+                            "-".to_string()
+                        },
+                    ]
+                })
+                .collect()
+        });
         if !rows.is_empty() {
             println!();
             println!(
@@ -17925,33 +17902,30 @@ async fn route_cmd(model: &str, json: bool) -> Result<()> {
     } else {
         println!("local     not resident");
     }
-    let rows: Vec<Vec<String>> = v["peers"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|p| {
-                    vec![
-                        p["name"].as_str().unwrap_or("?").to_string(),
-                        p["tier"].as_str().unwrap_or("?").to_string(),
-                        format!("{} ms", p["est_wait_ms"].as_u64().unwrap_or(0)),
-                        humansize(p["free_vram_bytes"].as_i64().unwrap_or(0)),
-                        if p["serves_model"].as_bool().unwrap_or(false) {
-                            "yes"
-                        } else {
-                            "no"
-                        }
-                        .to_string(),
-                        if p["marked_down"].as_bool().unwrap_or(false) {
-                            "down"
-                        } else {
-                            "-"
-                        }
-                        .to_string(),
-                    ]
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let rows: Vec<Vec<String>> = v["peers"].as_array().map_or_default(|a| {
+        a.iter()
+            .map(|p| {
+                vec![
+                    p["name"].as_str().unwrap_or("?").to_string(),
+                    p["tier"].as_str().unwrap_or("?").to_string(),
+                    format!("{} ms", p["est_wait_ms"].as_u64().unwrap_or(0)),
+                    humansize(p["free_vram_bytes"].as_i64().unwrap_or(0)),
+                    if p["serves_model"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                    .to_string(),
+                    if p["marked_down"].as_bool().unwrap_or(false) {
+                        "down"
+                    } else {
+                        "-"
+                    }
+                    .to_string(),
+                ]
+            })
+            .collect()
+    });
     if !rows.is_empty() {
         println!();
         render_table(
@@ -18088,21 +18062,18 @@ fn render_doctor_cert(cert: &serde_json::Value) -> String {
         None => or_unknown(&cert["tested_at"]),
     };
     let _ = writeln!(s, "TESTED    {tested}");
-    let mut rows: Vec<(String, String, String)> = cert["caps"]
-        .as_object()
-        .map(|caps| {
-            caps.iter()
-                .map(|(name, v)| {
-                    let status = v["status"].as_str().unwrap_or("N/A");
-                    let mut receipt = v["receipt"].as_str().unwrap_or("").to_string();
-                    if receipt.chars().count() > 64 {
-                        receipt = format!("{}...", receipt.chars().take(64).collect::<String>());
-                    }
-                    (name.clone(), status.to_string(), receipt)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut rows: Vec<(String, String, String)> = cert["caps"].as_object().map_or_default(|caps| {
+        caps.iter()
+            .map(|(name, v)| {
+                let status = v["status"].as_str().unwrap_or("N/A");
+                let mut receipt = v["receipt"].as_str().unwrap_or("").to_string();
+                if receipt.chars().count() > 64 {
+                    receipt = format!("{}...", receipt.chars().take(64).collect::<String>());
+                }
+                (name.clone(), status.to_string(), receipt)
+            })
+            .collect()
+    });
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let _ = writeln!(s);
     if rows.is_empty() {
@@ -18263,8 +18234,7 @@ fn render_explain_card(v: &serde_json::Value) -> String {
             },
             sem["model"]
                 .as_str()
-                .map(|n| format!(" (model: {n})"))
-                .unwrap_or_default(),
+                .map_or_default(|n| format!(" (model: {n})")),
         ),
     );
 
@@ -20369,15 +20339,14 @@ async fn ask_systemone(
     let probs: Vec<String> = answer
         .get("probabilities")
         .and_then(|v| v.as_object())
-        .map(|m| {
+        .map_or_default(|m| {
             let mut v: Vec<String> = m
                 .iter()
                 .map(|(k, p)| format!("{k} {:.2}", p.as_f64().unwrap_or(0.0)))
                 .collect();
             v.sort();
             v
-        })
-        .unwrap_or_default();
+        });
     println!(
         "  => {choice}  ({})  confidence {confidence:.2}",
         probs.join(" / ")
@@ -22078,12 +22047,11 @@ aborts on this family. Profile pins for it would measure nothing",
             .ok_or_else(|| anyhow!("no profile yet - run `blazar tune {model} --search` first"))?;
         let argv: Vec<String> = serde_json::from_str::<serde_json::Value>(&profile.args_json)?
             .as_array()
-            .map(|a| {
+            .map_or_default(|a| {
                 a.iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let candidates = [1, 2, 4, 8];
         println!(
             "slots search: {clients} concurrent clients against -np {candidates:?} (live servers, ~1 min) ..."
@@ -26301,10 +26269,10 @@ mod engine_delta_tests {
     fn unit__manifest_sets_diff__identical_manifests_diff_nothing() {
         let m = manifest(&["llama"], &["--ctx-size"], &["draft"]);
         let d = manifest_sets_diff(&m, &m);
-        assert!(d.added_arches.is_empty());
-        assert!(d.dropped_arches.is_empty());
-        assert!(d.added_flags.is_empty());
-        assert!(d.added_spec.is_empty());
+        assert_eq!(d.added_arches, [] as [std::string::String; 0]);
+        assert_eq!(d.dropped_arches, [] as [std::string::String; 0]);
+        assert_eq!(d.added_flags, [] as [std::string::String; 0]);
+        assert_eq!(d.added_spec, [] as [std::string::String; 0]);
     }
 }
 
@@ -26320,8 +26288,7 @@ fn engine_recommend_cmd(model: Option<&str>, json: bool) -> Result<()> {
     let live_gpu = hw.gpus.first().map(|g| g.name.clone());
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+        .map_or_default(|d| d.as_secs());
     #[allow(clippy::cast_possible_wrap)] // epoch seconds fit i64 by construction
     let now = now_secs as i64;
     let recs = blazar_core::optimize::engine_recommend(
@@ -27997,19 +27964,16 @@ async fn resident_models() -> (Vec<String>, bool) {
     match probe {
         Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
             Ok(v) => {
-                let names = v["models"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|m| {
-                                m.get("model")
-                                    .or_else(|| m.get("name"))
-                                    .and_then(|n| n.as_str())
-                                    .map(str::to_string)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let names = v["models"].as_array().map_or_default(|a| {
+                    a.iter()
+                        .filter_map(|m| {
+                            m.get("model")
+                                .or_else(|| m.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                });
                 (names, true)
             }
             Err(_) => (Vec::new(), true),
@@ -29049,8 +29013,7 @@ fn connect_backup_path(path: &std::path::Path, ts: u64) -> std::path::PathBuf {
     // extension-less targets and multi-dot names stay intact.
     let mut name = path
         .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
+        .map_or_default(std::ffi::OsStr::to_os_string);
     name.push(format!(".blazar-bak-{ts}"));
     path.with_file_name(name)
 }
@@ -30396,7 +30359,10 @@ mod tests {
         assert!(lines[0].contains("newest host-installable"), "{}", lines[0]);
         // Genuinely current, nothing skipped: silent.
         let t = sd_target("master-1043-bbb", Some("master-1043-bbb"), &[]);
-        assert!(sdcpp_hint_lines("master-1043-bbb", &t).is_empty());
+        assert_eq!(
+            sdcpp_hint_lines("master-1043-bbb", &t),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -34992,7 +34958,10 @@ mod tests {
             collect_rpc_fleet_targets(&cfg),
             vec!["127.0.0.1:50052".to_string(), "10.0.0.4:50052".to_string()]
         );
-        assert!(collect_rpc_fleet_targets(&Config::default()).is_empty());
+        assert_eq!(
+            collect_rpc_fleet_targets(&Config::default()),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[tokio::test]
@@ -36515,7 +36484,10 @@ mod config_get_map_tests {
 
         // The scanner is blind to dot-dirs: a second pass is clean.
         let names = vec!["live-m".to_string()];
-        assert!(blazar_runtime::kv::inventory::orphan_scan(&d.data_dir, &names).is_empty());
+        assert_eq!(
+            blazar_runtime::kv::inventory::orphan_scan(&d.data_dir, &names),
+            [] as [blazar_runtime::kv::inventory::OrphanKv; 0]
+        );
     }
 
     /// `kv status --json` walks the real session layout for live
