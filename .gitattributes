@@ -1,0 +1,6 @@
+# One line-ending policy for every platform: text files are stored and checked
+# out with LF, so a CRLF checkout can never change what tests compare line for
+# line and what scripts parse on every OS.
+* text=auto eol=lf
+*.png binary
+*.webp binary

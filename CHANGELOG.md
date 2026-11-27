@@ -42,6 +42,7 @@ tracked here.
 
 ### Changed
 
+- **Text files check out with LF on every platform.** A root `.gitattributes` sets `* text=auto eol=lf` (and marks the two image assets binary), so a Windows checkout with `core.autocrlf` can no longer turn tracked docs and scripts into CRLF behind tests that compare them line for line. The index was already 100% LF, so the policy renormalizes nothing.
 - **One overhead number, one place.** The gateway-overhead headline is stated once and linked from the other docs; the 1-3% and 5-6% claims carried in the October notes are reconciled to it.
 - **Admission enforces a host-RAM ledger with pressure relief** - spawn admission now accounts host RAM across resident engines and relieves pressure instead of admitting into swap.
 - **SGLang residency is planned in engine units with an adaptive think-default.** Related planner work: dense full residency is preferred over a legal-but-offloaded speculative plan; self-drafting spec lanes are charged the dense capture reserve; a registered-but-unfit spec lane degrades to dense instead of refusing; the dense per-slot reserve is recalibrated to a receipt-calibrated 100 MiB/slot; and the aggregate-throughput tradeoff of a slots=1 full-residency plan is taught explicitly.
