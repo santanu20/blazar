@@ -84,11 +84,12 @@ async fn model_modality_cache(
                             let card = body["data"].as_array()?.first()?;
                             let modalities: Vec<String> = card["architecture"]["output_modalities"]
                                 .as_array()
-                                .map_or_default(|a| {
+                                .map(|a| {
                                     a.iter()
                                         .filter_map(|m| m.as_str().map(str::to_string))
                                         .collect()
-                                });
+                                })
+                                .unwrap_or_default();
                             Some((name, modalities))
                         }
                         _ => None,
@@ -170,16 +171,21 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
         // (owner, id) pairs from the presence cache in ONE lock pass;
         // an id two peers both list appears twice - each row names its
         // owner, clients disambiguate by picking one.
-        let peer_rows = state.remote_presence.lock().ok().map_or_default(|m| {
-            m.iter()
-                .flat_map(|(k, p)| {
-                    let owner = k.split('|').next().unwrap_or("remote");
-                    p.entries
-                        .iter()
-                        .map(move |id| (owner.to_string(), id.clone()))
-                })
-                .collect::<Vec<(String, String)>>()
-        });
+        let peer_rows = state
+            .remote_presence
+            .lock()
+            .ok()
+            .map(|m| {
+                m.iter()
+                    .flat_map(|(k, p)| {
+                        let owner = k.split('|').next().unwrap_or("remote");
+                        p.entries
+                            .iter()
+                            .map(move |id| (owner.to_string(), id.clone()))
+                    })
+                    .collect::<Vec<(String, String)>>()
+            })
+            .unwrap_or_default();
         let seen: std::collections::HashSet<String> = data
             .iter()
             .filter_map(|v| v["id"].as_str().map(str::to_string))
@@ -1153,7 +1159,8 @@ pub async fn openai_proxy(
             "v1/chat/completions",
             &trace_ext
                 .as_ref()
-                .map_or_default(|Extension(t)| t.0.clone()),
+                .map(|Extension(t)| t.0.clone())
+                .unwrap_or_default(),
         );
     }
 

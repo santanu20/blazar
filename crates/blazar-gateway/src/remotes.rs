@@ -787,11 +787,14 @@ async fn fetch_presence(state: &AppState, remote: &Remote) -> Option<Vec<String>
     }
     let entries = match req.timeout(std::time::Duration::from_secs(3)).send().await {
         Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-            Ok(v) => v["data"].as_array().map_or_default(|a| {
-                a.iter()
-                    .filter_map(|m| m["id"].as_str().map(str::to_string))
-                    .collect::<Vec<String>>()
-            }),
+            Ok(v) => v["data"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m["id"].as_str().map(str::to_string))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default(),
             Err(_) => return None,
         },
         Ok(_) => return None,

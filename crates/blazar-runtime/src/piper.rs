@@ -108,18 +108,20 @@ type TagDirEntry = (Option<TagKey>, String, PathBuf);
 /// only. `pub(crate)`: the engines lane's legacy-tree adoption walks
 /// these same dirs, newest first (mirror of the whisper lane).
 pub(crate) fn sorted_tag_dirs(dirs: &BlazarDirs) -> Vec<PathBuf> {
-    let mut dirs: Vec<TagDirEntry> = std::fs::read_dir(bin_root(dirs)).map_or_default(|rd| {
-        rd.flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name == "pin" {
-                    return None;
-                }
-                Some((tag_key(&name), name.clone(), e.path()))
-            })
-            .collect()
-    });
+    let mut dirs: Vec<TagDirEntry> = std::fs::read_dir(bin_root(dirs))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name == "pin" {
+                        return None;
+                    }
+                    Some((tag_key(&name), name.clone(), e.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // Newest first: date-keyed tags by key, shapeless tags after them
     // (alphabetical) so a stray dir never shadows a real release.
     dirs.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
@@ -206,7 +208,8 @@ fn prune(dirs: &BlazarDirs) -> Result<()> {
     for dir in sorted_tag_dirs(dirs).into_iter().skip(keep) {
         let name = dir
             .file_name()
-            .map_or_default(|n| n.to_string_lossy().into_owned());
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if Some(&name) == pin.as_ref() {
             continue;
         }
@@ -394,13 +397,15 @@ pub fn parse_voice_id(voice: &str) -> Option<(String, String, String)> {
 /// `.onnx` and `.onnx.json` halves.
 #[must_use]
 pub fn list_voices(dirs: &BlazarDirs) -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(voices_dir(dirs)).map_or_default(|rd| {
-        rd.flatten()
-            .filter(|e| e.path().is_dir())
-            .filter(|e| voice_file(dirs, &e.file_name().to_string_lossy()).is_some())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect()
-    });
+    let mut out: Vec<String> = std::fs::read_dir(voices_dir(dirs))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter(|e| voice_file(dirs, &e.file_name().to_string_lossy()).is_some())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     out.sort();
     out
 }

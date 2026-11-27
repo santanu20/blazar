@@ -26,7 +26,7 @@ fn integration__detector__names_a_file_sink_that_is_dark_while_events_flow() {
 
     let mut watch = LogSinkWatch::default();
     emit("baseline");
-    assert_eq!(log_health::advance(&mut watch), [] as [&str; 0]);
+    assert!(log_health::advance(&mut watch).is_empty());
     let before = blazar_core::telemetry::sink_stats();
 
     emit("window one");

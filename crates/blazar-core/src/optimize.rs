@@ -1195,14 +1195,8 @@ mod tests {
 
     #[test]
     fn unit__manifest_devices__unparsable_yields_empty_and_reads_description() {
-        assert_eq!(
-            manifest_devices("{}"),
-            [] as [(std::string::String, std::string::String); 0]
-        );
-        assert_eq!(
-            manifest_devices("not json"),
-            [] as [(std::string::String, std::string::String); 0]
-        );
+        assert!(manifest_devices("{}").is_empty());
+        assert!(manifest_devices("not json").is_empty());
         assert_eq!(
             manifest_devices(
                 r#"{"devices":[{"name":"CUDA0","description":"NVIDIA GeForce RTX 4070"},{"name":"Vulkan0"}]}"#

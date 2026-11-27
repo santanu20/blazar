@@ -1437,7 +1437,7 @@ mod tests {
         let s = mk();
         let read = s.finish(Vec::new());
         assert_eq!(read.peak_mib, None);
-        assert_eq!(read.per_rep_peak_mib, [] as [f64; 0]);
+        assert!(read.per_rep_peak_mib.is_empty());
     }
 
     #[test]
@@ -1454,7 +1454,7 @@ mod tests {
         });
         let st: ArmStats = serde_json::from_value(old).expect("old ledger row deserializes");
         assert_eq!(st.peak_vram_mib, None);
-        assert_eq!(st.per_rep_vram_peak, [] as [f64; 0]);
+        assert!(st.per_rep_vram_peak.is_empty());
     }
 
     #[test]

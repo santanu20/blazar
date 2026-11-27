@@ -828,13 +828,26 @@ pub(crate) fn score_members_core(
 pub(crate) fn score_members(state: &AppState, pool: &ModelPool) -> Vec<MemberScore> {
     let queue_depth = u64::try_from(state.queue.depth()).unwrap_or(u64::MAX);
     let ps_rows = state.sup.ps();
-    let healths = state.remote_health.lock().map_or_default(|h| h.clone());
-    let caps = state.remote_capacity.lock().map_or_default(|c| c.clone());
+    let healths = state
+        .remote_health
+        .lock()
+        .map(|h| h.clone())
+        .unwrap_or_default();
+    let caps = state
+        .remote_capacity
+        .lock()
+        .map(|c| c.clone())
+        .unwrap_or_default();
     let local_service = state
         .service_ewma_local
         .lock()
-        .map_or_default(|m| m.clone());
-    let local_ttft = state.ttft_ewma_local.lock().map_or_default(|m| m.clone());
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let local_ttft = state
+        .ttft_ewma_local
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     // Resolve each local member to its serving row name (qualified
     // spellings like "name:quant" canonicalize exactly as the serving
     // lanes do), so tier and service lookups match the names the
@@ -1174,25 +1187,31 @@ pub fn route_json(state: &AppState, pool: &ModelPool) -> serde_json::Value {
     // keys, each holding the member that served the opener last.
     // Read-only introspection - the request path records.
     let affinity_now = std::time::Instant::now();
-    let affinity_entries: Vec<(String, std::time::Instant)> =
-        state.pools_affinity.lock().map_or_default(|m| {
+    let affinity_entries: Vec<(String, std::time::Instant)> = state
+        .pools_affinity
+        .lock()
+        .map(|m| {
             m.iter()
                 .filter(|(k, _)| k.strip_prefix(&format!("{}:", pool.name)).is_some())
                 .map(|(_, (eff, at))| (eff.clone(), *at))
                 .collect()
-        });
+        })
+        .unwrap_or_default();
     let affinity_live: Vec<&(String, std::time::Instant)> = affinity_entries
         .iter()
         .filter(|(_, at)| affinity_now.duration_since(*at) < AFFINITY_TTL)
         .collect();
     // Steering counters ride the same shape ("{pool}:{effective}").
-    let affinity_hits: std::collections::HashMap<String, u64> =
-        state.pools_affinity_hits.lock().map_or_default(|h| {
+    let affinity_hits: std::collections::HashMap<String, u64> = state
+        .pools_affinity_hits
+        .lock()
+        .map(|h| {
             h.iter()
                 .filter(|(k, _)| k.strip_prefix(&format!("{}:", pool.name)).is_some())
                 .map(|(k, v)| (k.clone(), *v))
                 .collect()
-        });
+        })
+        .unwrap_or_default();
     // Pool-level steering rate: hits against every routed request for
     // this pool (session counters both). Percent with one decimal so
     // small fleets read honestly (1 of 3 = 33.3, not "33").

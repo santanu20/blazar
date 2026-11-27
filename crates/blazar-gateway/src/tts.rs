@@ -1722,10 +1722,7 @@ mod tests {
         assert_eq!(normalize_props_voices(&objects), vec!["sean", "bob"]);
         let mixed = serde_json::json!({"voices": ["sean", {"id": "bob"}, 7, null]});
         assert_eq!(normalize_props_voices(&mixed), vec!["sean", "bob"]);
-        assert_eq!(
-            normalize_props_voices(&serde_json::json!({})),
-            [] as [std::string::String; 0]
-        );
+        assert!(normalize_props_voices(&serde_json::json!({})).is_empty());
         assert!(
             normalize_props_voices(&serde_json::json!({"voices": "sean"})).is_empty(),
             "non-array shape degrades to the no-predefined-voices answer"

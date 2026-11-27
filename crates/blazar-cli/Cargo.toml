@@ -1,6 +1,7 @@
 [package]
 name = "blazar"
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "The control plane for local AI inference: one Rust binary uniting OpenAI, Ollama, and Anthropic APIs over llama.cpp, mistral.rs, SGLang, and MLX engines, with resource-aware orchestration and multimodal serving"

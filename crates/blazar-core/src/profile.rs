@@ -19919,9 +19919,9 @@ mod tests {
         quant_method: Option<&str>,
     ) -> &'static str {
         let dir: &'static tempfile::TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let quant_cfg = quant_method.map_or_default(|method| {
-            format!(",\"quantization_config\":{{\"quant_method\":\"{method}\"}}")
-        });
+        let quant_cfg = quant_method
+            .map(|method| format!(",\"quantization_config\":{{\"quant_method\":\"{method}\"}}"))
+            .unwrap_or_default();
         let mut config = format!(
             "{{\"architectures\":[\"OlmoeForCausalLM\"],\"num_experts\":{experts},\
              \"num_experts_per_tok\":{top_k},\"num_hidden_layers\":{layers}{quant_cfg}"

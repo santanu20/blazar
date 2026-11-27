@@ -358,7 +358,7 @@ async fn realtime__tool_loop__call_outstanding_output_then_text_answer() {
         "stub echo should carry its fixed arguments: {added}"
     );
     let call_id = added["item"]["call_id"].as_str().unwrap().to_string();
-    assert_ne!(call_id, "");
+    assert!(!call_id.is_empty());
 
     let args_done = next_ev(&mut ws, "function_call_arguments.done").await;
     assert_eq!(args_done["type"], "response.function_call_arguments.done");

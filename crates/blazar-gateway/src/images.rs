@@ -1968,7 +1968,7 @@ fn native_job_to_openai(job: &serde_json::Value) -> serde_json::Value {
     let data = if images.is_empty() {
         job.pointer("/result/b64_json")
             .filter(|v| !v.is_null())
-            .map_or_default(|b64| {
+            .map(|b64| {
                 vec![serde_json::json!({
                     "b64_json": b64,
                     "fps": job.pointer("/result/fps").cloned().unwrap_or(serde_json::Value::Null),
@@ -1976,6 +1976,7 @@ fn native_job_to_openai(job: &serde_json::Value) -> serde_json::Value {
                     "mime_type": job.pointer("/result/mime_type").cloned().unwrap_or(serde_json::Value::Null),
                 })]
             })
+            .unwrap_or_default()
     } else {
         images
     };

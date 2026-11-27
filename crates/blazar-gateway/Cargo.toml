@@ -1,6 +1,7 @@
 [package]
 name = "blazar-gateway"
 version.workspace = true
+rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Blazar gateway: OpenAI + ollama-compat APIs, metrics aggregation, priority queue, SSE"

@@ -4747,7 +4747,7 @@ impl Supervisor {
                 .await
                 .map_err(|e| format!("child /lora-adapters body unreadable: {e}"))?
                 .as_array()
-                .map_or_default(|entries| {
+                .map(|entries| {
                     entries
                         .iter()
                         .filter_map(|e| {
@@ -4760,7 +4760,8 @@ impl Supervisor {
                             Some((loaded.to_string(), e.get("id")?.as_i64()?))
                         })
                         .collect()
-                });
+                })
+                .unwrap_or_default();
             let rows = Store::open(&self.dirs)
                 .map_err(|e| format!("store unavailable: {e}"))?
                 .list_loras(Some(model))
@@ -7362,13 +7363,14 @@ impl Supervisor {
         // retry loop (a retry attempt used to re-read an already-removed
         // `pending_ctx` entry), because the auto-split decision below
         // needs the candidate KV estimate before any card scoping.
-        let mut tuning =
-            self.pending_ctx
-                .remove(name)
-                .map_or_default(|(_, ctx)| blazar_core::TuningOverrides {
-                    ctx: Some(ctx),
-                    ..Default::default()
-                });
+        let mut tuning = self
+            .pending_ctx
+            .remove(name)
+            .map(|(_, ctx)| blazar_core::TuningOverrides {
+                ctx: Some(ctx),
+                ..Default::default()
+            })
+            .unwrap_or_default();
         // Config-level FA override rides the same override path the
         // pending ctx uses; None keeps the profile heuristic (auto).
         tuning.fa = self.cfg().flash_attention;
@@ -8762,7 +8764,8 @@ drop them from rpc_servers in config.toml",
         let sha8: String = lane.ref_sha.chars().take(8).collect();
         let pr = lane
             .upstream_pr
-            .map_or_default(|p| format!(", upstream PR #{p}"));
+            .map(|p| format!(", upstream PR #{p}"))
+            .unwrap_or_default();
         format!(
             "curated lane available: `blazar engine install --lane {}` ({}@{}, {} \
              architectures{})",

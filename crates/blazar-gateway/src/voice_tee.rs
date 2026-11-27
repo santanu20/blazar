@@ -253,7 +253,7 @@ mod tests {
         let mut tee = VoiceTee::new();
         // Sentence split across two deltas: nothing completes until the
         // terminator + following space land.
-        assert_eq!(tee.feed("The sea "), [] as [std::string::String; 0]);
+        assert!(tee.feed("The sea ").is_empty());
         let ready = tee.feed("is salty. Because erosion. Done.");
         assert_eq!(ready.len(), 2, "two complete sentences: {ready:?}");
         assert_eq!(ready[0], "The sea is salty. ");
@@ -286,7 +286,7 @@ mod tests {
         let mut tee = VoiceTee::new();
         tee.feed("Hello. ");
         tee.degrade();
-        assert_eq!(tee.feed("More text. "), [] as [std::string::String; 0]);
+        assert!(tee.feed("More text. ").is_empty());
         assert!(tee.finish().is_none());
     }
 

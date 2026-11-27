@@ -431,7 +431,8 @@ pub async fn lifecycle(
     let trace_id = req
         .extensions()
         .get::<crate::TraceId>()
-        .map_or_default(|t| t.0.clone());
+        .map(|t| t.0.clone())
+        .unwrap_or_default();
     let key_name = req.extensions().get::<KeyCtx>().map(|k| k.name.clone());
 
     // Bounded body sniff for `model` (the audit lane's proven pattern):

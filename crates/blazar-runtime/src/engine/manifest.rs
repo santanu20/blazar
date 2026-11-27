@@ -404,7 +404,8 @@ impl Manifest {
         }
         self.tag
             .strip_prefix("sglang-")
-            .map_or_default(str::to_string)
+            .map(str::to_string)
+            .unwrap_or_default()
     }
 
     /// Lane facts for the sglang admission gate
@@ -460,7 +461,8 @@ impl Manifest {
                 let base = self
                     .base_ref
                     .as_deref()
-                    .map_or_default(|b| format!(" (base {b})"));
+                    .map(|b| format!(" (base {b})"))
+                    .unwrap_or_default();
                 let tier = match self.trust {
                     TrustTier::User => "fork",
                     TrustTier::Curated => "curated fork",

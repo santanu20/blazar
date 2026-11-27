@@ -2243,7 +2243,8 @@ fn sglang_admission_warning(engines: &[EngineRow], repo: &str, dir: &Path) -> Op
     for lane in engines.iter().filter(|e| e.kind == EngineKind::Sglang) {
         sglang_lanes += 1;
         let facts = serde_json::from_str::<crate::Manifest>(&lane.manifest)
-            .map_or_default(|m| m.sglang_lane_facts());
+            .map(|m| m.sglang_lane_facts())
+            .unwrap_or_default();
         // `?` here = this installed lane can load it, so there is nothing to warn about.
         first_teach.get_or_insert(blazar_core::hfmeta::sglang_lane_teach(&meta, dir, &facts)?);
     }
@@ -3805,7 +3806,9 @@ pub(crate) fn hf_hub_candidates_at(root: &Path, repo: &str, filename: &str) -> V
 }
 
 fn hf_hub_candidates(repo: &str, filename: &str) -> Vec<PathBuf> {
-    hf_hub_root().map_or_default(|root| hf_hub_candidates_at(&root, repo, filename))
+    hf_hub_root()
+        .map(|root| hf_hub_candidates_at(&root, repo, filename))
+        .unwrap_or_default()
 }
 
 /// Bring a hub-cache hit into the models dir under its own name so the

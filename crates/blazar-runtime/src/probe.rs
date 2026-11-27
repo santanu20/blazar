@@ -324,17 +324,19 @@ use crate::engine::manifest::Manifest;
 
 #[must_use]
 pub fn probe_hardware(manifest: Option<&Manifest>) -> Hardware {
-    let mut gpus = manifest.map_or_default(|m| {
-        m.devices
-            .iter()
-            .map(|d| GpuInfo {
-                name: d.name.clone(),
-                description: d.description.clone(),
-                total_mib: d.total_mib,
-                free_mib: d.free_mib,
-            })
-            .collect::<Vec<_>>()
-    });
+    let mut gpus = manifest
+        .map(|m| {
+            m.devices
+                .iter()
+                .map(|d| GpuInfo {
+                    name: d.name.clone(),
+                    description: d.description.clone(),
+                    total_mib: d.total_mib,
+                    free_mib: d.free_mib,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     if gpus.is_empty() || gpus.iter().all(|g| g.total_mib == 0) {
         // Engines without a --list-devices census (mistral.rs) leave the
         // manifest's device list empty too - a GPU the daemon cannot see

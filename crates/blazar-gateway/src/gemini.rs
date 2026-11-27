@@ -806,21 +806,22 @@ pub fn translate_request_gemini(v: &Value, model: &str, stream: bool) -> Result<
             body["response_format"] = json!({"type": "json_object"});
         }
     }
-    let declarations: Vec<Value> =
-        v.get("tools")
-            .and_then(Value::as_array)
-            .map_or_default(|tools| {
-                tools
-                    .iter()
-                    .filter_map(|t| {
-                        t.get("functionDeclarations")
-                            .or_else(|| t.get("function_declarations"))
-                            .and_then(Value::as_array)
-                    })
-                    .flatten()
-                    .cloned()
-                    .collect()
-            });
+    let declarations: Vec<Value> = v
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("functionDeclarations")
+                        .or_else(|| t.get("function_declarations"))
+                        .and_then(Value::as_array)
+                })
+                .flatten()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     if !declarations.is_empty() {
         let tools: Vec<Value> = declarations
             .iter()
@@ -847,11 +848,12 @@ pub fn translate_request_gemini(v: &Value, model: &str, stream: bool) -> Result<
                     v.pointer("/tool_config/function_calling_config/allowed_function_names")
                 })
                 .and_then(Value::as_array)
-                .map_or_default(|a| {
+                .map(|a| {
                     a.iter()
                         .filter_map(|n| n.as_str().map(str::to_string))
                         .collect::<Vec<String>>()
-                });
+                })
+                .unwrap_or_default();
             match mode {
                 "NONE" => {
                     body.as_object_mut().map(|m| m.remove("tools"));

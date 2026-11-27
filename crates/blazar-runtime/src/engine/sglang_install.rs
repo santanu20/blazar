@@ -748,12 +748,9 @@ mod tests {
         );
         // Whitespace tolerated; anything not numeric X.Y[.Z] pins nothing.
         assert_eq!(torch_cuda_pin_specs(" 12.8 "), torch_cuda_pin_specs("12.8"));
-        assert_eq!(torch_cuda_pin_specs(""), [] as [std::string::String; 0]);
-        assert_eq!(torch_cuda_pin_specs("None"), [] as [std::string::String; 0]);
-        assert_eq!(
-            torch_cuda_pin_specs("cuda-13"),
-            [] as [std::string::String; 0]
-        );
+        assert!(torch_cuda_pin_specs("").is_empty());
+        assert!(torch_cuda_pin_specs("None").is_empty());
+        assert!(torch_cuda_pin_specs("cuda-13").is_empty());
     }
 
     #[test]

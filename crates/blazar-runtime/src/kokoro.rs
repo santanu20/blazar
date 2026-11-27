@@ -150,11 +150,12 @@ pub struct KokoroRuntime {
 fn parse_voices(list: &serde_json::Value) -> Vec<String> {
     list.get("voices")
         .and_then(|v| v.as_array())
-        .map_or_default(|arr| {
+        .map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
+        .unwrap_or_default()
 }
 
 impl KokoroRuntime {

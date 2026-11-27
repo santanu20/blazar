@@ -4083,7 +4083,7 @@ mod tests {
         let s = Store::open(&dirs).unwrap();
         assert_eq!(
             s.list_spec_receipts("m", "e").unwrap(),
-            [] as [SpecReceiptRow; 0]
+            [] as [crate::store::SpecReceiptRow; 0]
         );
         let dense_prov = SpecProvenance::default();
         s.put_spec_receipt("m", "e", "dense", 40.0, 40.0, &dense_prov)
@@ -4110,11 +4110,11 @@ mod tests {
         // Receipts are scoped per model+engine: another lane sees none.
         assert_eq!(
             s.list_spec_receipts("m", "other").unwrap(),
-            [] as [SpecReceiptRow; 0]
+            [] as [crate::store::SpecReceiptRow; 0]
         );
         assert_eq!(
             s.list_spec_receipts("other", "e").unwrap(),
-            [] as [SpecReceiptRow; 0]
+            [] as [crate::store::SpecReceiptRow; 0]
         );
     }
 

@@ -376,7 +376,7 @@ mod tests {
                 assert!(!seen.contains(a), "duplicate alias {a}");
                 seen.insert(a);
             }
-            assert_ne!(p.description, "");
+            assert!(!p.description.is_empty());
             assert!(!p.install.0.is_empty() && !p.install.1.is_empty());
         }
     }

@@ -4920,7 +4920,8 @@ fn flatten_hierarchy(table: &mut toml::Table) -> CoreResult<()> {
                 let home = SECTION_FIELDS
                     .iter()
                     .find(|(_, ms)| ms.contains(&key.as_str()))
-                    .map_or_default(|(s, _)| format!(" (it belongs to [{s}])"));
+                    .map(|(s, _)| format!(" (it belongs to [{s}])"))
+                    .unwrap_or_default();
                 let listed = members.join(", ");
                 return Err(CoreError::Config(format!(
                     "[{section}] does not accept {key:?}{home} - members: {listed}"

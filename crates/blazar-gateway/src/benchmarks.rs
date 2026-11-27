@@ -30,8 +30,10 @@ fn payload_test_names(payload: &str) -> Vec<String> {
         // bench_results shape: a bare array of measurement rows.
         Ok(rows @ Value::Array(_)) => serde_json::from_value(rows).unwrap_or_default(),
         // Tuned-profile shape: {score, rows: [...]}.
-        Ok(mut v) => serde_json::from_value(v.get_mut("rows").map_or_default(std::mem::take))
-            .unwrap_or_default(),
+        Ok(mut v) => {
+            serde_json::from_value(v.get_mut("rows").map(std::mem::take).unwrap_or_default())
+                .unwrap_or_default()
+        }
         Err(_) => Vec::new(),
     };
     let mut names: Vec<String> = rows.iter().map(BenchRow::test_name).collect();

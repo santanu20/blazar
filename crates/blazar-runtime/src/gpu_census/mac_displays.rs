@@ -400,26 +400,14 @@ mod tests {
     fn unit__parse_displays__entries_that_state_no_memory_are_dropped() {
         // Constructed: nothing here can be sized and none is Apple Silicon.
         let json = r#"{"SPDisplaysDataType":[{"_name":"No memory reported"},{"sppci_model":"Odd unit","spdisplays_vram":"16 pebbles"},{"spdisplays_ndrvs":[{"_name":"Color LCD"}]}],"SPOtherDataType":[{"_name":"Not a display"}]}"#;
-        assert_eq!(
-            parse_displays(json),
-            [] as [crate::gpu_census::mac_displays::Display; 0]
-        );
+        assert!(parse_displays(json).is_empty());
     }
 
     #[test]
     fn unit__parse_displays__not_json_is_empty() {
-        assert_eq!(
-            parse_displays("system_profiler: not json"),
-            [] as [crate::gpu_census::mac_displays::Display; 0]
-        );
-        assert_eq!(
-            parse_displays(""),
-            [] as [crate::gpu_census::mac_displays::Display; 0]
-        );
-        assert_eq!(
-            parse_displays(r#"{"SPDisplaysDataType":"none"}"#),
-            [] as [crate::gpu_census::mac_displays::Display; 0]
-        );
+        assert!(parse_displays("system_profiler: not json").is_empty());
+        assert!(parse_displays("").is_empty());
+        assert!(parse_displays(r#"{"SPDisplaysDataType":"none"}"#).is_empty());
     }
 
     #[test]

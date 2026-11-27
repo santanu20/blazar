@@ -602,7 +602,7 @@ mod tests {
             shards: ShardFormat::GgufFile,
         };
         let err = plan_execution(&inp).unwrap_err();
-        assert_ne!(err, "");
+        assert!(!err.is_empty());
     }
 
     #[test]

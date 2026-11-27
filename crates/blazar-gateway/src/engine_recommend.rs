@@ -33,7 +33,8 @@ pub async fn engine_recommend(
         let live_gpu = hw.gpus.first().map(|g| g.name.clone());
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or_default(|d| d.as_secs());
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
         #[allow(clippy::cast_possible_wrap)] // epoch seconds fit i64 by construction
         let now = secs as i64;
         let rows = state_for_task.with_store(|store| {

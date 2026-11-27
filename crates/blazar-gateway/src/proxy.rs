@@ -669,7 +669,8 @@ pub fn affinity_hash(req: &serde_json::Value) -> Option<PrefixKey> {
         let system = messages
             .iter()
             .find(|m| role_is(m, "system"))
-            .map_or_default(content);
+            .map(content)
+            .unwrap_or_default();
         let user = messages
             .iter()
             .find(|m| role_is(m, "user"))
@@ -3555,13 +3556,14 @@ fn normalize_system_first_in_value(v: &mut serde_json::Value) -> bool {
         .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("system"))
         .map(|m| m.get("content").and_then(serde_json::Value::as_str))
         .collect::<Option<Vec<_>>>()
-        .map_or_default(|texts| {
+        .map(|texts| {
             texts
                 .into_iter()
                 .filter(|t| !t.is_empty())
                 .map(str::to_string)
                 .collect::<Vec<String>>()
-        });
+        })
+        .unwrap_or_default();
     match system_texts.len() {
         0 => return false,
         1 if messages.first().is_some_and(is_system_message) => return false,
