@@ -327,7 +327,7 @@ fn integration__tune_search_screen__measures_without_persisting() {
     // touching the serving profile.
     let (screen_profile, screen_winning, screen_rows, screen_score) =
         tuner.tune_search_screen(&inp).unwrap();
-    assert!(!screen_rows.is_empty());
+    assert_ne!(screen_rows, [] as [blazar_runtime::BenchRow; 0]);
     assert!(
         screen_score > 0.0,
         "screen returns the grid score for the ledger measurement"

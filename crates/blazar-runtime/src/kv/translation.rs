@@ -420,7 +420,10 @@ mod tests {
     #[test]
     fn unit__translation__registry_admission_follows_the_knob() {
         // Off: Exact-only posture, nothing admitted.
-        assert!(builtin_registry(&section(false, &[])).is_empty());
+        assert_eq!(
+            builtin_registry(&section(false, &[])),
+            [] as [crate::kv::translation::BuiltInConverter; 0]
+        );
         // On with empty allow: every built-in, canonical order.
         assert_eq!(
             builtin_registry(&section(true, &[])),
@@ -500,8 +503,8 @@ mod tests {
         let id = hf_kv_identity(tmp.path(), Some("abc123")).unwrap();
         assert_eq!(id.model_sha256, "abc123");
         assert_eq!(id.rope_fingerprint, "freq_base=1000000");
-        assert!(!id.tokenizer_sha256.is_empty());
-        assert!(!id.model_config_sha256.is_empty());
+        assert_ne!(id.tokenizer_sha256, "");
+        assert_ne!(id.model_config_sha256, "");
         assert!(id.complete());
         // Any missing leg (no recorded digest / no tokenizer.json /
         // no rope declaration) yields None - teachable, never partial.

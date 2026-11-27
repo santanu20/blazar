@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn unit__log_sink_watch__first_tick_is_a_baseline_not_a_verdict() {
         let mut watch = LogSinkWatch::default();
-        assert!(watch.tick(&stats(5, 0, 0), true).is_empty());
+        assert_eq!(watch.tick(&stats(5, 0, 0), true), [] as [&str; 0]);
     }
 
     #[test]
@@ -148,11 +148,11 @@ mod tests {
         let mut watch = LogSinkWatch::default();
         watch.tick(&stats(0, 0, 0), true);
         // Window 1: events flowed, stderr wrote nothing.
-        assert!(watch.tick(&stats(4, 0, 4), true).is_empty());
+        assert_eq!(watch.tick(&stats(4, 0, 4), true), [] as [&str; 0]);
         // Window 2: still dark - the verdict lands exactly here.
         assert_eq!(watch.tick(&stats(9, 0, 9), true), vec![STDERR_SINK]);
         // Window 3: the outage continues but the incident is already reported.
-        assert!(watch.tick(&stats(14, 0, 14), true).is_empty());
+        assert_eq!(watch.tick(&stats(14, 0, 14), true), [] as [&str; 0]);
         assert_eq!(watch.stall_counts(), vec![(STDERR_SINK, 1)]);
     }
 
@@ -162,8 +162,8 @@ mod tests {
         watch.tick(&stats(0, 0, 0), true);
         watch.tick(&stats(4, 0, 4), true);
         // A single dark window followed by traffic on the sink: no stall.
-        assert!(watch.tick(&stats(9, 3, 9), true).is_empty());
-        assert!(watch.tick(&stats(12, 0, 12), true).is_empty());
+        assert_eq!(watch.tick(&stats(9, 3, 9), true), [] as [&str; 0]);
+        assert_eq!(watch.tick(&stats(12, 0, 12), true), [] as [&str; 0]);
         assert_eq!(watch.tick(&stats(16, 0, 16), true), vec![STDERR_SINK]);
         // Recovery, then a fresh incident counts again.
         watch.tick(&stats(20, 2, 20), true);
@@ -176,18 +176,18 @@ mod tests {
     fn unit__log_sink_watch__idle_window_is_not_dark() {
         let mut watch = LogSinkWatch::default();
         watch.tick(&stats(0, 0, 0), true);
-        assert!(watch.tick(&stats(0, 0, 0), true).is_empty());
-        assert!(watch.tick(&stats(0, 0, 0), true).is_empty());
-        assert!(watch.tick(&stats(0, 0, 0), true).is_empty());
-        assert!(watch.stall_counts().is_empty());
+        assert_eq!(watch.tick(&stats(0, 0, 0), true), [] as [&str; 0]);
+        assert_eq!(watch.tick(&stats(0, 0, 0), true), [] as [&str; 0]);
+        assert_eq!(watch.tick(&stats(0, 0, 0), true), [] as [&str; 0]);
+        assert_eq!(watch.stall_counts(), [] as [(&str, u64); 0]);
     }
 
     #[test]
     fn unit__log_sink_watch__unarmed_file_sink_is_ignored() {
         let mut watch = LogSinkWatch::default();
         watch.tick(&stats(0, 0, 0), false);
-        assert!(watch.tick(&stats(4, 4, 0), false).is_empty());
-        assert!(watch.tick(&stats(9, 9, 0), false).is_empty());
+        assert_eq!(watch.tick(&stats(4, 4, 0), false), [] as [&str; 0]);
+        assert_eq!(watch.tick(&stats(9, 9, 0), false), [] as [&str; 0]);
         assert_eq!(watch.stall_counts(), Vec::<(&'static str, u64)>::new());
     }
 
@@ -195,7 +195,7 @@ mod tests {
     fn unit__log_sink_watch__file_sink_stalls_independently_of_stderr() {
         let mut watch = LogSinkWatch::default();
         watch.tick(&stats(0, 0, 0), true);
-        assert!(watch.tick(&stats(4, 4, 0), true).is_empty());
+        assert_eq!(watch.tick(&stats(4, 4, 0), true), [] as [&str; 0]);
         assert_eq!(watch.tick(&stats(9, 9, 0), true), vec![FILE_SINK]);
         assert_eq!(watch.stall_counts(), vec![(FILE_SINK, 1)]);
     }
